@@ -5156,6 +5156,8 @@ async fn submit_public_execution(
             }
         }
     } else {
+        // A deposit no RPC accepted returns without a receipt, handed off: tracking reads its
+        // inclusion, resends it or rules it out.
         let result = command
             .owner
             .submit_public_swap_deposit(

@@ -1,7 +1,9 @@
 use alloy::rpc::types::TransactionRequest;
 use eyre::{Result, eyre};
 
-use super::submission::{PublicActionHandoff, submit_public_action_step_session};
+use super::submission::{
+    PublicActionHandoff, PublicActionStepEnd, submit_public_action_step_session,
+};
 use super::{
     PublicActionGasFeeSelection, PublicActionProgressStep, PublicActionProgressUpdate,
     PublicAssetId, PublicShieldTransactionProfile, VaultedPublicSigner,
@@ -56,8 +58,10 @@ pub(crate) async fn submit_executor_recovery_step(
         &mut None,
         None,
         Some(handoff),
+        PublicActionStepEnd::Receipt,
         &mut receipt_progress,
     )
-    .await?;
+    .await?
+    .into_receipt()?;
     Ok(outcome.receipt)
 }

@@ -364,7 +364,7 @@ pub async fn submit_walletconnect_send_transaction(
                 request.event_tx.as_ref(),
                 request.expiry_timestamp,
                 request.request_control.is_none(),
-                &mut |attempt| {
+                &mut |attempt, _| {
                     if let Some(guard) = observation.as_mut() {
                         guard.ensure_open()?;
                     }

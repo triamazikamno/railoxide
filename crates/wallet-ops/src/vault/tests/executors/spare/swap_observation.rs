@@ -173,6 +173,24 @@ impl MockChain {
         number.is_some_and(|number| number <= self.head && hash == Some(self.hash(number)))
     }
 
+    /// How many of `from`'s transactions canonical blocks hold up to the block `id` names by
+    /// its hash: the account's nonce there. `None` for a block that isn't canonical.
+    pub(super) fn transaction_count_at(&self, from: Address, id: &Value) -> Option<u64> {
+        let number = self.number_of(id)?;
+        let count = self
+            .transactions
+            .iter()
+            .filter(|(_, transaction, _)| {
+                transaction.inner.signer() == from
+                    && transaction
+                        .block_number
+                        .is_some_and(|block| block <= number)
+                    && self.canonical(transaction.block_number, transaction.block_hash)
+            })
+            .count();
+        Some(u64::try_from(count).unwrap())
+    }
+
     fn add_logs(&mut self, number: u64, transaction: B256, logs: Vec<(Address, LogData)>) {
         let block_hash = self.hash(number);
         for (address, data) in logs {

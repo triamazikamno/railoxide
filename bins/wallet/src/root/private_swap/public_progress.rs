@@ -879,6 +879,11 @@ pub(super) fn public_swap_actions(
     ) {
         return Vec::new();
     }
+    // Nothing signed can still move funds: no path, or a direct deposit without a deposit that
+    // wasn't ruled out.
+    let unsigned = swap.path().is_none()
+        || (matches!(swap.path(), Some(PublicSwapPath::Deposit))
+            && swap.live_deposits().next().is_none());
     let cancellable = matches!(
         stage,
         PublicSwapStage::OrderOpen
@@ -914,24 +919,12 @@ pub(super) fn public_swap_actions(
             | SwapStage::SetupNotSent,
         )
         | PublicSwapStage::ApprovalFailed
-            if !claimed.is_stopped()
-                && (swap.path().is_none()
-                    || (matches!(swap.path(), Some(PublicSwapPath::Deposit))
-                        && !swap
-                            .transactions()
-                            .iter()
-                            .any(|tx| tx.kind == PublicSwapTransactionKind::Deposit))) =>
+            if !claimed.is_stopped() && unsigned =>
         {
             actions.push(PublicSwapAction::Continue);
         }
         _ => {}
     }
-    let unsigned = swap.path().is_none()
-        || (matches!(swap.path(), Some(PublicSwapPath::Deposit))
-            && !swap
-                .transactions()
-                .iter()
-                .any(|tx| tx.kind == PublicSwapTransactionKind::Deposit));
     if unsigned && !claimed.is_stopped() {
         actions.push(PublicSwapAction::CancelPreparation);
     }

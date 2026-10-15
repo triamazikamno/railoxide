@@ -98,8 +98,41 @@ pub(super) struct SubmittedPublicActionAttempt {
     live_native_balance: U256,
 }
 
+/// Persists an attempt before its raw send: its hash, the signed request and the signed raw
+/// transaction.
 pub(super) type PublicActionHandoff<'a> =
-    dyn FnMut(FixedBytes<32>, &TransactionRequest) -> Result<()> + Send + 'a;
+    dyn FnMut(FixedBytes<32>, &TransactionRequest, &[u8]) -> Result<()> + Send + 'a;
+
+/// Where a step session ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicActionStepEnd {
+    /// Once a receipt of a handed-off attempt is observed.
+    Receipt,
+    /// As [`Self::Receipt`], except that a first attempt that was handed off but that no RPC
+    /// accepted ends the session without a receipt. The durable hand-off's owner follows that
+    /// attempt from there. Only a session with a hand-off ends this way.
+    HandOff,
+}
+
+/// What a step session ended with.
+pub(super) enum PublicActionStepResult {
+    Receipt(PublicActionStepOutcome),
+    /// The first attempt was handed off and no RPC accepted it, as
+    /// [`PublicActionStepEnd::HandOff`] allows.
+    HandedOff,
+}
+
+impl PublicActionStepResult {
+    /// The receipt a [`PublicActionStepEnd::Receipt`] session ends with.
+    pub(super) fn into_receipt(self) -> Result<PublicActionStepOutcome> {
+        match self {
+            Self::Receipt(outcome) => Ok(outcome),
+            Self::HandedOff => Err(eyre!(
+                "the public action was handed off without waiting for its receipt"
+            )),
+        }
+    }
+}
 
 pub(super) async fn submit_public_action_step_session(
     step: PublicActionProgressStep,
@@ -123,9 +156,15 @@ pub(super) async fn submit_public_action_step_session(
     command_rx: &mut Option<PublicActionCommandReceiver>,
     event_tx: Option<&PublicActionSessionEventSender>,
     mut handoff: Option<&mut PublicActionHandoff<'_>>,
+    end: PublicActionStepEnd,
     progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
-) -> Result<PublicActionStepOutcome> {
+) -> Result<PublicActionStepResult> {
     let private_handoff = handoff.is_some();
+    if end == PublicActionStepEnd::HandOff && !private_handoff {
+        return Err(eyre!(
+            "only a durable hand-off ends a public action at its hand-off"
+        ));
+    }
     let mut railway_auto = fee_policy == PublicActionStepFeePolicy::RefreshRailwayStandard;
     let mut next_gas_fee =
         public_action_step_initial_gas_fee_selection(profile, fee_policy, gas_fee);
@@ -249,12 +288,12 @@ pub(super) async fn submit_public_action_step_session(
             event_tx,
             None,
             !private_handoff,
-            &mut |attempt| {
+            &mut |attempt, signed| {
                 if let Some(context) = transaction_tracking {
                     context.ensure_open()?;
                 }
                 if let Some(handoff) = handoff.as_deref_mut() {
-                    handoff(attempt.tx_hash, &attempted_request)?;
+                    handoff(attempt.tx_hash, &attempted_request, signed)?;
                 }
                 retain_public_action_attempt(
                     observer
@@ -301,6 +340,11 @@ pub(super) async fn submit_public_action_step_session(
                     railway_auto = false;
                     next_gas_fee = command.gas_fee;
                     continue;
+                }
+                // No RPC accepted the handed-off attempt. The durable hand-off's owner
+                // follows it from here rather than waiting for a receipt that may not come.
+                if end == PublicActionStepEnd::HandOff {
+                    return Ok(PublicActionStepResult::HandedOff);
                 }
             }
         }
@@ -389,7 +433,7 @@ pub(super) async fn submit_public_action_step_session(
                             event_tx,
                             None,
                             true,
-                            &mut |attempt| {
+                            &mut |attempt, _| {
                                 if let Some(context) = transaction_tracking {
                                     context.ensure_open()?;
                                 }
@@ -465,11 +509,11 @@ pub(super) async fn submit_public_action_step_session(
                     );
                     let gas_fee = public_action_winner_gas_fee(&submitted_attempts, winner_index);
                     let Some(command) = recv_public_action_command(command_rx).await else {
-                        return Ok(PublicActionStepOutcome {
+                        return Ok(PublicActionStepResult::Receipt(PublicActionStepOutcome {
                             receipt,
                             next_nonce: winner.info.nonce.saturating_add(1),
                             gas_fee,
-                        });
+                        }));
                     };
                     ensure_public_action_command_gas_fee_authorized(
                         authorized_gas_fee,
@@ -482,11 +526,11 @@ pub(super) async fn submit_public_action_step_session(
                     break;
                 }
                 let gas_fee = public_action_winner_gas_fee(&submitted_attempts, winner_index);
-                return Ok(PublicActionStepOutcome {
+                return Ok(PublicActionStepResult::Receipt(PublicActionStepOutcome {
                     receipt,
                     next_nonce: winner.info.nonce.saturating_add(1),
                     gas_fee,
-                });
+                }));
             }
         }
     }
@@ -566,7 +610,7 @@ pub(super) async fn submit_public_action_attempt(
     event_tx: Option<&PublicActionSessionEventSender>,
     expiry_timestamp: Option<u64>,
     log_transaction_details: bool,
-    before_broadcast: &mut (impl FnMut(&SubmittedPublicActionAttempt) -> Result<()> + Send),
+    before_broadcast: &mut (impl FnMut(&SubmittedPublicActionAttempt, &[u8]) -> Result<()> + Send),
 ) -> Result<SubmittedPublicActionAttempt, PublicActionAttemptError> {
     let mut handed_off_attempt = None;
     sign_send_public_action_transaction(
@@ -578,7 +622,7 @@ pub(super) async fn submit_public_action_attempt(
         event_tx,
         expiry_timestamp,
         log_transaction_details,
-        &mut |tx_hash| {
+        &mut |tx_hash, signed| {
             let attempt = SubmittedPublicActionAttempt {
                 tx_hash,
                 info: PublicActionAttemptInfo {
@@ -592,7 +636,7 @@ pub(super) async fn submit_public_action_attempt(
                 estimated_native_gas_cost: preflight.estimated_native_gas_cost,
                 live_native_balance: preflight.live_native_balance,
             };
-            before_broadcast(&attempt)?;
+            before_broadcast(&attempt, signed)?;
             handed_off_attempt = Some(attempt);
             Ok(())
         },
@@ -1087,7 +1131,7 @@ async fn sign_send_public_action_transaction(
     event_tx: Option<&PublicActionSessionEventSender>,
     expiry_timestamp: Option<u64>,
     log_transaction_details: bool,
-    before_broadcast: &mut (impl FnMut(FixedBytes<32>) -> Result<()> + Send),
+    before_broadcast: &mut (impl FnMut(FixedBytes<32>, &[u8]) -> Result<()> + Send),
 ) -> Result<(), PublicActionAttemptError> {
     if log_transaction_details {
         tracing::info!(
@@ -1127,12 +1171,12 @@ async fn broadcast_signed_public_action_transaction(
     label: &str,
     expiry_timestamp: Option<u64>,
     log_transaction_details: bool,
-    before_broadcast: &mut (impl FnMut(FixedBytes<32>) -> Result<()> + Send),
+    before_broadcast: &mut (impl FnMut(FixedBytes<32>, &[u8]) -> Result<()> + Send),
 ) -> Result<(), PublicActionAttemptError> {
     ensure_public_action_broadcast_not_expired(expiry_timestamp, label)
         .map_err(PublicActionAttemptError::Sending)?;
     let tx_hash = keccak256(&signed_tx);
-    before_broadcast(tx_hash).map_err(PublicActionAttemptError::Sending)?;
+    before_broadcast(tx_hash, &signed_tx).map_err(PublicActionAttemptError::Sending)?;
     let provider_handles = self_broadcast_send_raw_transaction_to_rpc_pool_with_logging(
         query_rpc_pool,
         network_mode,
@@ -1409,7 +1453,7 @@ mod tests {
                 "test broadcast",
                 expiry,
                 true,
-                &mut |tx_hash| {
+                &mut |tx_hash, _| {
                     retain_public_action_attempt(
                         &mut observer,
                         &mut attempts,

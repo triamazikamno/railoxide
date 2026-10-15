@@ -92,14 +92,18 @@ impl PublicSwapRecord {
     pub const fn observations(&self) -> PublicSwapObservations {
         self.observations
     }
-    /// Whether a deposit of this swap was handed off to the network.
-    fn deposit_handed_off(&self) -> bool {
+    /// The deposits this swap handed off to the network that were not ruled out, oldest first.
+    pub fn live_deposits(&self) -> impl Iterator<Item = &PublicSwapTransaction> {
         self.transactions
             .iter()
-            .any(|transaction| transaction.kind == PublicSwapTransactionKind::Deposit)
+            .filter(|transaction| transaction.is_live_deposit())
+    }
+    /// Whether a deposit of this swap that wasn't ruled out was handed off to the network.
+    fn deposit_handed_off(&self) -> bool {
+        self.live_deposits().next().is_some()
     }
     /// Whether the Public account has signed nothing that can still move funds: no path is
-    /// recorded, or a direct deposit's path whose deposit was never handed off.
+    /// recorded, or a direct deposit's path whose every handed-off deposit was ruled out.
     fn unsigned(&self) -> bool {
         match &self.path {
             None => true,
@@ -143,11 +147,13 @@ impl PublicSwapRecord {
     /// - its order expired or was cancelled without a trade, and its hook batch's deadline has
     ///   passed;
     /// - its use was stopped before the Public account signed anything;
-    /// - every deposit it handed off was verified reverted in a canonical finalized block.
+    /// - every deposit it handed off that wasn't ruled out was verified reverted in a
+    ///   canonical finalized block.
     ///
-    /// Any other swap is unfinished: one still being prepared, a signed order that was never
-    /// submitted, a deposit or an order whose outcome isn't recorded, proceeds the proxy
-    /// holds, a hand-off without a bridge outcome, and a refund that isn't verified.
+    /// Any other swap is unfinished: one still being prepared, including a live one whose
+    /// only deposits were ruled out, a signed order that was never submitted, a deposit or an
+    /// order whose outcome isn't recorded, proceeds the proxy holds, a hand-off without a
+    /// bridge outcome, and a refund that isn't verified.
     #[must_use]
     pub fn is_finished(&self, stopped: bool, now: u64) -> bool {
         let observed = &self.observations;
@@ -170,11 +176,7 @@ impl PublicSwapRecord {
         match &self.path {
             None => false,
             Some(PublicSwapPath::Deposit) => {
-                let mut deposits = self
-                    .transactions
-                    .iter()
-                    .filter(|transaction| transaction.kind == PublicSwapTransactionKind::Deposit)
-                    .peekable();
+                let mut deposits = self.live_deposits().peekable();
                 deposits.peek().is_some()
                     && deposits.all(|deposit| {
                         deposit
@@ -283,10 +285,51 @@ pub struct PublicSwapTransaction {
     /// a later search for it.
     #[serde(default)]
     pub submitted_from_block: Option<u64>,
-    /// The next finalized block to inspect for an interrupted deposit. Older records resume
-    /// from `submitted_from_block`; only checked canonical blocks advance this cursor.
+    /// The next finalized block to inspect for a deposit. It starts at `submitted_from_block`
+    /// less the origin chain's finality depth, below which a deposit signed after that head
+    /// can't be included, and only checked canonical blocks advance it.
     #[serde(default)]
     pub deposit_scan_from_block: Option<u64>,
+    /// A deposit's signed transaction, kept to resend it unchanged while it is neither
+    /// included nor ruled out. `None` for every other kind.
+    #[serde(default)]
+    pub signed: Option<PublicSwapSignedTransaction>,
+    /// The finalized block at which every block from the deposit's scan boundary had been
+    /// inspected without it and the Public account's nonce had passed its own: it can never
+    /// be included. Deposits only, and never beside a finalized inclusion.
+    #[serde(default)]
+    pub ruled_out: Option<SwapObservation>,
+}
+
+impl PublicSwapTransaction {
+    /// Whether this is a deposit that wasn't ruled out, which can still be or was included.
+    #[must_use]
+    pub const fn is_live_deposit(&self) -> bool {
+        matches!(self.kind, PublicSwapTransactionKind::Deposit) && self.ruled_out.is_none()
+    }
+}
+
+/// A deposit's signed raw transaction, as it was first sent. Its bytes are not formatted.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PublicSwapSignedTransaction(Bytes);
+
+impl std::fmt::Debug for PublicSwapSignedTransaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublicSwapSignedTransaction")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PublicSwapSignedTransaction {
+    #[must_use]
+    pub const fn new(raw: Bytes) -> Self {
+        Self(raw)
+    }
+    #[must_use]
+    pub const fn raw(&self) -> &Bytes {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -830,7 +873,7 @@ impl ExecutorStore {
     }
 
     /// Replace the full approval of a live Public-paid swap before an order was signed or a
-    /// deposit handed off. Its identity and destination setup need stay fixed. Issued shields
+    /// deposit that wasn't ruled out was handed off. Its identity and destination setup need stay fixed. Issued shields
     /// and transaction history remain recorded; unsigned delivery terms must be signed again.
     pub fn reapprove_public_swap(
         &self,
@@ -860,8 +903,8 @@ impl ExecutorStore {
 
     /// Cancel the use `id` of a swap paid from a Public account before that account has signed
     /// anything. The use is stopped and its account released as [`SwapUseRelease`] reports. A
-    /// direct deposit whose path was recorded but whose deposit was never handed off has signed
-    /// nothing either. A swap with a handed-off deposit or a signed order is refused: it ends
+    /// direct deposit whose path was recorded but whose deposit was never handed off, or was
+    /// ruled out, has signed nothing either. A swap with a handed-off deposit or a signed order is refused: it ends
     /// through its own flow.
     pub fn cancel_public_swap(
         &self,
@@ -941,8 +984,8 @@ impl ExecutorStore {
     /// Persist the path the Public account signed for the live use `id`, with its deposit
     /// terms. A path is recorded once: the same path and terms again change nothing, and any
     /// other are refused, as is a path of another kind or token than the use claimed. Only a
-    /// direct deposit that was never handed off takes other terms, those of a later quote. An
-    /// order's path and terms are never replaced.
+    /// direct deposit that was never handed off, or was ruled out, takes other terms, those of
+    /// a later quote. An order's path and terms are never replaced.
     pub fn record_public_swap_path(
         &self,
         operation: ExecutorOperationId,
@@ -1090,7 +1133,8 @@ impl ExecutorStore {
 
     /// Append a transaction handed off for the use `id`'s swap, stopped or not. An entry with
     /// the same hash, kind and request is already recorded and changes nothing, and another
-    /// with that hash is refused. Only one distinct deposit may be handed off. A deposit is
+    /// with that hash is refused. Another deposit is refused while one that wasn't ruled out
+    /// is recorded. A deposit is
     /// refused until the swap's path is
     /// [`PublicSwapPath::Deposit`], so the path and its signed terms are recorded before a
     /// deposit can be handed off. A withdrawal or an invalidation is refused unless the path
@@ -1129,12 +1173,7 @@ impl ExecutorStore {
                     Err(ExecutorStoreError::OperationMismatch)
                 };
             }
-            if transaction.kind == PublicSwapTransactionKind::Deposit
-                && swap
-                    .transactions
-                    .iter()
-                    .any(|recorded| recorded.kind == PublicSwapTransactionKind::Deposit)
-            {
+            if transaction.kind == PublicSwapTransactionKind::Deposit && swap.deposit_handed_off() {
                 return Err(ExecutorStoreError::OperationMismatch);
             }
             swap.transactions.push(transaction);
@@ -1144,7 +1183,8 @@ impl ExecutorStore {
 
     /// Record where the transaction `hash` of the use `id`'s swap, stopped or not, was
     /// included and whether it succeeded. A late provisional receipt cannot downgrade a
-    /// finalized inclusion. A transaction that was never handed off is refused.
+    /// finalized inclusion. A transaction that was never handed off is refused, and so is a
+    /// deposit that was ruled out.
     pub fn record_public_swap_inclusion(
         &self,
         operation: ExecutorOperationId,
@@ -1158,6 +1198,9 @@ impl ExecutorStore {
                 .iter_mut()
                 .find(|transaction| transaction.hash == hash)
                 .ok_or(ExecutorStoreError::OperationMismatch)?;
+            if transaction.ruled_out.is_some() {
+                return Err(ExecutorStoreError::InvalidRecord);
+            }
             if !transaction
                 .inclusion
                 .is_some_and(|recorded| recorded.finalized)
@@ -1193,6 +1236,38 @@ impl ExecutorStore {
                     .unwrap_or(0)
                     .max(next_block),
             );
+            Ok(())
+        })
+    }
+
+    /// Record that the deposit `hash` of the use `id`'s swap, stopped or not, can never be
+    /// included, with the finalized block `evidence` that shows it. A deposit with a finalized
+    /// inclusion is refused. A recorded rule-out is never replaced, though recording it again
+    /// is accepted.
+    pub(crate) fn record_public_swap_deposit_ruled_out(
+        &self,
+        operation: ExecutorOperationId,
+        id: SwapUseId,
+        hash: B256,
+        evidence: SwapObservation,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        self.update(operation, |record| {
+            let transaction = public_swap_mut(record, id)?
+                .transactions
+                .iter_mut()
+                .find(|transaction| {
+                    transaction.hash == hash
+                        && transaction.kind == PublicSwapTransactionKind::Deposit
+                })
+                .ok_or(ExecutorStoreError::OperationMismatch)?;
+            if transaction
+                .inclusion
+                .is_some_and(|inclusion| inclusion.finalized)
+                || transaction.ruled_out.is_some_and(|known| known != evidence)
+            {
+                return Err(ExecutorStoreError::InvalidRecord);
+            }
+            transaction.ruled_out = Some(evidence);
             Ok(())
         })
     }

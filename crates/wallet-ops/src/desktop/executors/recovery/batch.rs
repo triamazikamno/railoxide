@@ -123,7 +123,7 @@ impl ExecutorOwner {
             hardware.consume()?;
         }
         self.notify_change();
-        let mut handoff = |transaction_hash, _: &TransactionRequest| {
+        let mut handoff = |transaction_hash, _: &TransactionRequest, _: &[u8]| {
             self.validate_recovery(prepared)?;
             self.store
                 .record_submission(prepared.operation, hash, transaction_hash)?;

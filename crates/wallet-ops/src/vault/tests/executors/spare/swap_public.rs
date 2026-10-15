@@ -27,10 +27,11 @@ use crate::signer::SoftwareEvmSigner;
 use crate::vault::{
     AcrossOrderTerms, PublicAccountScope, PublicSwapApproval, PublicSwapDeposited,
     PublicSwapInclusion, PublicSwapIntent, PublicSwapObservations, PublicSwapOrder, PublicSwapPath,
-    PublicSwapProxyHolding, PublicSwapRecord, PublicSwapSourceTerms, PublicSwapTransactionKind,
-    SwapAccountChoice, SwapAccountRefusal, SwapAccountRole, SwapAccountUse, SwapAdmissionEvidence,
-    SwapApprovedAccount, SwapBridgeHandoff, SwapBridgeOutcome, SwapDestinationOutcome,
-    SwapObservation, SwapSubmissionStatus, SwapUseId, SwapUseRole, swap_account_refusal,
+    PublicSwapProxyHolding, PublicSwapRecord, PublicSwapSignedTransaction, PublicSwapSourceTerms,
+    PublicSwapTransactionKind, SwapAccountChoice, SwapAccountRefusal, SwapAccountRole,
+    SwapAccountUse, SwapAdmissionEvidence, SwapApprovedAccount, SwapBridgeHandoff,
+    SwapBridgeOutcome, SwapDestinationOutcome, SwapObservation, SwapSubmissionStatus, SwapUseId,
+    SwapUseRole, swap_account_refusal,
 };
 use crate::{
     ExecutorPrivateFeeLimitExceeded, OperationHttpClient, OperationNetworkIsolation,
@@ -1180,7 +1181,8 @@ type OrderRequests = Arc<Mutex<Vec<(Option<PublicSwapOrder>, Value)>>>;
 /// The chain a Public account pays on: a `MockChain` that also answers what the account's
 /// transaction step asks, and includes each broadcast transaction in the next block. An
 /// approval sets the allowance it names, and a deposit emits the pool's event unless deposits
-/// revert. A read of the settlement's fill of an order is the mock chain's.
+/// revert. A read of the settlement's fill of an order is the mock chain's. The account's
+/// nonce at a block named by its hash counts its transactions canonical blocks hold up to it.
 struct OriginChain {
     chain: MockChain,
     source: Address,
@@ -1218,6 +1220,13 @@ struct OriginChain {
     simulated: Vec<Bytes>,
     /// Every transaction broadcast, in order.
     broadcasts: Vec<(B256, TxEnvelope)>,
+    /// Whether every raw send is refused, and nothing is included.
+    rejects_sends: bool,
+    /// Every raw transaction sent, refused or not, in order. A transaction sent again after
+    /// its broadcast is known and not included again.
+    sent: Vec<Bytes>,
+    /// A block the chain reorganizes from once it serves a nonce read by block hash.
+    reorg_on_nonce_read: Option<u64>,
     /// Called with a transaction's hash when its broadcast arrives, before it is included.
     on_broadcast: Box<dyn FnMut(B256) + Send>,
 }
@@ -1269,7 +1278,26 @@ impl OriginChain {
                     "code": -32601, "message": "fee history is unsupported"
                 }});
             }
-            "eth_getTransactionCount" => json!(format!("0x{:x}", self.broadcasts.len())),
+            "eth_getTransactionCount" if params[1].get("blockHash").is_some() => {
+                let Some(count) = self.chain.transaction_count_at(self.source, &params[1]) else {
+                    return json!({"jsonrpc": "2.0", "id": request["id"], "error": {
+                        "code": -32000, "message": "the block isn't canonical"
+                    }});
+                };
+                if let Some(from) = self.reorg_on_nonce_read.take() {
+                    self.chain.reorg(from);
+                }
+                json!(format!("0x{count:x}"))
+            }
+            "eth_getTransactionCount" => {
+                // The head's count also takes in the account's transactions a test included.
+                let head = json!(self.chain.block(self.chain.head).hash);
+                let included = self.chain.transaction_count_at(self.source, &head).unwrap();
+                json!(format!(
+                    "0x{:x}",
+                    included.max(u64::try_from(self.broadcasts.len()).unwrap())
+                ))
+            }
             "eth_estimateGas" => json!("0xc350"),
             "eth_getBalance" => json!("0xde0b6b3a7640000"),
             "eth_call" => {
@@ -1353,7 +1381,20 @@ impl OriginChain {
             "eth_sendRawTransaction" => {
                 let raw: Bytes = serde_json::from_value(params[0].clone()).unwrap();
                 let hash = keccak256(&raw);
+                self.sent.push(raw.clone());
                 (self.on_broadcast)(hash);
+                let refused = if self.rejects_sends {
+                    Some("the transaction was refused")
+                } else if self.broadcasts.iter().any(|(known, _)| *known == hash) {
+                    Some("already known")
+                } else {
+                    None
+                };
+                if let Some(message) = refused {
+                    return json!({"jsonrpc": "2.0", "id": request["id"], "error": {
+                        "code": -32000, "message": message
+                    }});
+                }
                 let transaction = TxEnvelope::decode_2718(&mut &raw[..]).unwrap();
                 let number = self.chain.head + 1;
                 self.chain.head = number;
@@ -1538,6 +1579,9 @@ impl PublicPayment {
             token_reads: Vec::new(),
             simulated: Vec::new(),
             broadcasts: Vec::new(),
+            rejects_sends: false,
+            sent: Vec::new(),
+            reorg_on_nonce_read: None,
             on_broadcast: Box::new(|_| {}),
         }));
         let served = chain.clone();
@@ -2530,9 +2574,10 @@ async fn an_interrupted_failed_deposit_resumes_bounded_final_block_scans() {
             .unwrap(),
         None
     );
+    // Eight blocks from the finality depth below the head the deposit was sent at.
     let paged = payment.saved();
     let deposit = &paged.swap.transactions()[0];
-    assert_eq!(deposit.deposit_scan_from_block, Some(ORIGIN_HEAD + 8));
+    assert_eq!(deposit.deposit_scan_from_block, Some(ORIGIN_HEAD + 7));
     assert_eq!(deposit.inclusion, None);
     assert_eq!(paged.record.public_swaps_to_track().count(), 1);
     restarted.shutdown().await;
@@ -2554,7 +2599,7 @@ async fn an_interrupted_failed_deposit_resumes_bounded_final_block_scans() {
     );
     assert_eq!(
         payment.saved().swap.transactions()[0].deposit_scan_from_block,
-        Some(ORIGIN_HEAD + 8)
+        Some(ORIGIN_HEAD + 7)
     );
     payment.chain.lock().unwrap().chain.receipt_error = None;
     assert_eq!(
@@ -2592,6 +2637,279 @@ async fn an_interrupted_failed_deposit_resumes_bounded_final_block_scans() {
         }
     }
     payment.finish(restarted).await;
+}
+
+// No RPC takes the deposit's send. The deposit still returns, handed off with the bytes it
+// was signed as, rather than waiting for a receipt. After a restart, tracking resends exactly
+// those bytes, signing nothing and recording no other deposit, and a refused resend fails
+// nothing. A swap that was stopped resends nothing, though its deposit is still read.
+#[tokio::test]
+async fn a_deposit_no_rpc_took_is_resent_unchanged_after_a_restart() {
+    let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::MAX).await;
+    let (across, _reply, _lookups, across_task) = across_stub().await;
+    payment.chain.lock().unwrap().rejects_sends = true;
+    let PublicSwapTransactionOutcome::HandedOff { transaction_hash } =
+        payment.deposit(&owner).await.unwrap()
+    else {
+        panic!("the deposit is handed off");
+    };
+    let signed = {
+        let chain = payment.chain.lock().unwrap();
+        assert!(chain.broadcasts.is_empty());
+        let [signed] = chain.sent.as_slice() else {
+            panic!("the deposit was sent once");
+        };
+        signed.clone()
+    };
+    assert_eq!(keccak256(&signed), transaction_hash);
+    let recorded = payment.saved().swap;
+    let [deposit] = recorded.transactions() else {
+        panic!("only the deposit is recorded");
+    };
+    assert_eq!((deposit.hash, deposit.inclusion), (transaction_hash, None));
+    assert_eq!(
+        deposit
+            .signed
+            .as_ref()
+            .map(PublicSwapSignedTransaction::raw),
+        Some(&signed)
+    );
+    owner.shutdown().await;
+    drop(owner);
+
+    let restarted = ExecutorOwner::new(
+        1,
+        payment.db.clone(),
+        payment.view.clone(),
+        payment.destination.clone(),
+        HttpContext::direct_for_tests(),
+    )
+    .unwrap();
+    payment.track(&restarted, &across, None).await.unwrap();
+    payment.chain.lock().unwrap().rejects_sends = false;
+    payment.track(&restarted, &across, None).await.unwrap();
+    {
+        let chain = payment.chain.lock().unwrap();
+        assert_eq!(chain.sent, [signed.clone(), signed.clone(), signed]);
+        assert!(matches!(
+            chain.broadcasts.as_slice(),
+            [(included, _)] if *included == transaction_hash
+        ));
+    }
+    assert_eq!(payment.saved().swap.transactions().len(), 1);
+
+    payment.store.stop_swap_use(payment.operation).unwrap();
+    payment.mine();
+    payment.track(&restarted, &across, None).await.unwrap();
+    assert_eq!(payment.chain.lock().unwrap().sent.len(), 3);
+    assert!(payment.saved().swap.observations().bridge_handoff.is_some());
+    across_task.abort();
+    payment.finish(restarted).await;
+}
+
+// No RPC answered the deposit's send, yet it reached the network, and a reorganization within
+// the finality depth includes it below the head it was sent at. Its scan starts the finality
+// depth below that head, so it finds the deposit there, and the nonce the deposit used rules
+// nothing out.
+#[tokio::test]
+async fn a_deposit_reorganized_below_its_sending_head_is_found_not_ruled_out() {
+    let (mut payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::MAX).await;
+    payment.origin.finality_depth = 3;
+    payment.chain.lock().unwrap().rejects_sends = true;
+    let PublicSwapTransactionOutcome::HandedOff { transaction_hash } =
+        payment.deposit(&owner).await.unwrap()
+    else {
+        panic!("the deposit is handed off");
+    };
+    assert_eq!(
+        payment.saved().swap.transactions()[0].deposit_scan_from_block,
+        Some(ORIGIN_HEAD - 3)
+    );
+    let included_at = ORIGIN_HEAD - 1;
+    {
+        let event = payment.deposited(payment.terms.input_amount, payment.terms.output_amount);
+        let mut origin = payment.chain.lock().unwrap();
+        let transaction = TxEnvelope::decode_2718(&mut &origin.sent[0][..]).unwrap();
+        origin.chain.reorg(included_at);
+        origin.chain.include(
+            included_at,
+            transaction,
+            payment.source,
+            true,
+            vec![(payment.spoke_pool, event.encode_log_data())],
+        );
+        // Blocks up to one past the sending head are final, so a scan from that head would
+        // reach the account's used nonce without the deposit.
+        origin.chain.head = ORIGIN_HEAD + 4;
+    }
+    let handoff = owner
+        .observe_public_swap_handoff(payment.operation, payment.id, &payment.origin)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            handoff.observation.block.number,
+            handoff.observation.transaction_hash
+        ),
+        (included_at, Some(transaction_hash))
+    );
+    assert_eq!(payment.saved().swap.transactions()[0].ruled_out, None);
+    payment.finish(owner).await;
+}
+
+// Another transaction of the Public account used the deposit's nonce, and no RPC took the
+// deposit. It is ruled out only at a canonical finalized block such that every block from its
+// boundary up to that one was inspected without it and the account's nonce there passed its
+// own: not from a scan short of the other transaction, and not from a block that changed
+// after the nonce read. The rule-out survives a restart and admits no late inclusion. Before
+// it the swap takes no other deposit. After it the swap is back in preparation with its
+// destination shield kept, and either deposits again under the next nonce or is cancelled.
+#[tokio::test]
+async fn a_deposit_whose_nonce_another_transaction_used_is_ruled_out() {
+    for cancels in [false, true] {
+        let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::MAX).await;
+        let (across, _reply, _lookups, across_task) = across_stub().await;
+        let shield_state = payment.saved().record.payload_state(payment.shield);
+        payment.chain.lock().unwrap().rejects_sends = true;
+        let PublicSwapTransactionOutcome::HandedOff {
+            transaction_hash: hash,
+        } = payment.deposit(&owner).await.unwrap()
+        else {
+            panic!("the deposit is handed off");
+        };
+        assert!(payment.deposit(&owner).await.is_err());
+        assert_eq!(payment.chain.lock().unwrap().sent.len(), 1);
+
+        let mut other =
+            alloy::rpc::types::TransactionRequest::default().to(Address::repeat_byte(0x99));
+        other.chain_id = Some(DESTINATION_CHAIN);
+        other.from = Some(payment.source);
+        other.nonce = Some(0);
+        other.gas = Some(21_000);
+        other.max_fee_per_gas = Some(100);
+        other.max_priority_fee_per_gas = Some(1);
+        let other = payment
+            .signer
+            .sign_transaction_request(other, "another transaction")
+            .await
+            .unwrap();
+        let other = TxEnvelope::decode_2718(&mut other.as_slice()).unwrap();
+        let used_at = ORIGIN_HEAD + 7;
+        {
+            let mut origin = payment.chain.lock().unwrap();
+            origin
+                .chain
+                .include(used_at, other, payment.source, true, Vec::new());
+            origin.chain.head = used_at + 3;
+        }
+        let ruled_out = || payment.saved().swap.transactions()[0].ruled_out;
+
+        // Eight blocks stop short of the other transaction, where the nonce is still unused.
+        assert_eq!(
+            owner
+                .observe_public_swap_handoff(payment.operation, payment.id, &payment.origin)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            payment.saved().swap.transactions()[0].deposit_scan_from_block,
+            Some(used_at)
+        );
+        assert_eq!(ruled_out(), None);
+        // The next scan reaches the finalized head, whose block changes after the nonce read.
+        let finalized = used_at + 2;
+        payment.chain.lock().unwrap().reorg_on_nonce_read = Some(finalized);
+        assert_eq!(
+            owner
+                .observe_public_swap_handoff(payment.operation, payment.id, &payment.origin)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(ruled_out(), None);
+        // The block after it is final and stays canonical.
+        payment.mine();
+        assert_eq!(
+            owner
+                .observe_public_swap_handoff(payment.operation, payment.id, &payment.origin)
+                .await
+                .unwrap(),
+            None
+        );
+        let evidence = SwapObservation {
+            block: payment.chain.lock().unwrap().chain.block(finalized + 1),
+            transaction_hash: None,
+        };
+        assert_eq!(ruled_out(), Some(evidence));
+        let late = PublicSwapInclusion {
+            observation: SwapObservation {
+                block: evidence.block,
+                transaction_hash: Some(hash),
+            },
+            succeeded: true,
+            finalized: true,
+        };
+        assert!(matches!(
+            payment
+                .store
+                .record_public_swap_inclusion(payment.operation, payment.id, hash, late),
+            Err(ExecutorStoreError::InvalidRecord)
+        ));
+
+        owner.shutdown().await;
+        drop(owner);
+        let restarted = ExecutorOwner::new(
+            1,
+            payment.db.clone(),
+            payment.view.clone(),
+            payment.destination.clone(),
+            HttpContext::direct_for_tests(),
+        )
+        .unwrap();
+        payment.chain.lock().unwrap().rejects_sends = false;
+        payment.track(&restarted, &across, None).await.unwrap();
+        assert_eq!(payment.chain.lock().unwrap().sent.len(), 1);
+        let preparing = payment.saved();
+        assert_eq!(preparing.swap.transactions()[0].ruled_out, Some(evidence));
+        assert!(!preparing.swap.is_finished(false, unix_now()));
+        assert_eq!(preparing.record.public_swaps_to_track().count(), 1);
+
+        if cancels {
+            payment
+                .store
+                .cancel_public_swap(payment.operation, payment.id)
+                .unwrap();
+            assert_eq!(payment.saved().record.public_swaps_to_track().count(), 0);
+        } else {
+            let PublicSwapTransactionOutcome::Included {
+                transaction_hash: second,
+                ..
+            } = payment.deposit(&restarted).await.unwrap()
+            else {
+                panic!("the second deposit is included");
+            };
+            let continued = payment.saved().swap;
+            let [ruled, live] = continued.transactions() else {
+                panic!("both deposits are recorded");
+            };
+            assert_eq!((ruled.hash, live.hash), (hash, second));
+            assert_eq!(live.transaction.nonce, Some(1));
+        }
+        let after = payment.saved();
+        assert_eq!(after.shields, [payment.shield]);
+        assert_eq!(after.record.payload_state(payment.shield), shield_state);
+        for request in &payment.chain.lock().unwrap().requests {
+            assert!(
+                !request["params"]
+                    .to_string()
+                    .contains(&alloy::hex::encode(hash))
+            );
+        }
+        across_task.abort();
+        payment.finish(restarted).await;
+    }
 }
 
 // The Public account signs its proxy's hook batch, then the order that carries it. Both are in

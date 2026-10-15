@@ -9,7 +9,7 @@ use super::gas::public_advanced_transaction_payload_fingerprint;
 use super::runtime::{public_shield_token, verified_public_chain_runtime_config};
 use super::signer::admitted_public_signer_authorized;
 use super::submission::{
-    emit_public_action_event, emit_refreshed_public_action_hardware_session,
+    PublicActionStepEnd, emit_public_action_event, emit_refreshed_public_action_hardware_session,
     public_action_progress_update, recv_public_action_command, submit_public_action_step_session,
 };
 use super::types::{
@@ -130,9 +130,11 @@ pub(crate) async fn submit_public_action_step_with_signer(
         command_rx,
         event_tx,
         None,
+        PublicActionStepEnd::Receipt,
         progress,
     )
     .await?
+    .into_receipt()?
     .receipt;
     if !tx.status {
         return Err(eyre!("{revert_subject} reverted ({})", tx.tx_hash));
@@ -411,9 +413,11 @@ pub async fn submit_public_shield_with_progress(
                     &mut command_rx,
                     event_tx.as_ref(),
                     None,
+                    PublicActionStepEnd::Receipt,
                     &mut progress,
                 )
-                .await?;
+                .await?
+                .into_receipt()?;
                 let receipt = approve_outcome.receipt;
                 if !receipt.status {
                     return Err(eyre!(
@@ -472,9 +476,11 @@ pub async fn submit_public_shield_with_progress(
                 &mut command_rx,
                 event_tx.as_ref(),
                 None,
+                PublicActionStepEnd::Receipt,
                 &mut progress,
             )
             .await?
+            .into_receipt()?
             .receipt;
             if !shield_receipt.status {
                 return Err(eyre!(

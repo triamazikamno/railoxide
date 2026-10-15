@@ -636,11 +636,8 @@ pub(super) fn public_swap_stage(
             SwapSubmissionStatus::Rejected => PublicSwapStage::SubmissionRejected,
         });
     }
-    let mut deposits = swap
-        .transactions()
-        .iter()
-        .filter(|tx| tx.kind == Kind::Deposit)
-        .peekable();
+    // Deposits that were ruled out leave the swap in preparation.
+    let mut deposits = swap.live_deposits().peekable();
     if deposits.peek().is_some() {
         return Some(
             if deposits.all(|deposit| {
@@ -5500,6 +5497,25 @@ pub(super) mod tests {
                 Some(expected)
             );
         }
+        // A deposit ruled out by its used nonce returns the swap to preparation, where it can
+        // continue or be cancelled.
+        let ruled_out = SwapObservation {
+            transaction_hash: None,
+            ..observation
+        };
+        let mut value = serde_json::to_value(&direct).unwrap();
+        let swap = &mut value["swap_uses"][0]["role"]["PublicSourceDestination"]["swap"];
+        swap["path"] = serde_json::json!("Deposit");
+        swap["transactions"] = serde_json::json!([{
+            "kind": "Deposit", "transaction": {}, "hash": B256::ZERO, "ruled_out": ruled_out
+        }]);
+        let record: ExecutorRecord = serde_json::from_value(value).unwrap();
+        let claimed = &record.swap_uses()[0];
+        let stage = public_swap_stage(&record, claimed, None, 101, None, None).unwrap();
+        assert!(matches!(stage, PublicSwapStage::Preparing(_)));
+        let actions = public_swap_actions(claimed.public_swap().unwrap(), claimed, stage, 101);
+        assert!(actions.contains(&PublicSwapAction::Continue));
+        assert!(actions.contains(&PublicSwapAction::CancelPreparation));
         // Cancellation ends the order immediately, but its validity and hook deadlines still
         // gate a new review. Each deadline is inclusive.
         for (valid_to, batch_deadline) in [(100_u32, 200_u32), (200, 100)] {

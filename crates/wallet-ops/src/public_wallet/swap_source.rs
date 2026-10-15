@@ -2,7 +2,10 @@ use alloy::primitives::{B256, Signature};
 use alloy::rpc::types::TransactionRequest;
 use eyre::{Result, WrapErr as _, eyre};
 
-use super::submission::{PublicActionHandoff, submit_public_action_step_session};
+use super::submission::{
+    PublicActionHandoff, PublicActionStepEnd, PublicActionStepResult,
+    submit_public_action_step_session,
+};
 use super::{
     PublicActionGasFeeSelection, PublicActionProgressStep, PublicActionProgressUpdate,
     PublicAssetId, PublicShieldTransactionProfile, VaultedPublicSigner,
@@ -26,7 +29,10 @@ pub(crate) struct PublicSwapStepOutcome {
 /// public-account tracker.
 ///
 /// `transaction.gas` is the reviewed limit, and a higher estimate is an error. Without a
-/// `transaction.nonce` the account's current one is read.
+/// `transaction.nonce` the account's current one is read. With [`PublicActionStepEnd::HandOff`]
+/// the step returns `None` without a receipt when no RPC accepted its handed-off first attempt,
+/// and the owner follows that attempt from its record. An accepted attempt waits for its
+/// receipt in either mode.
 pub(crate) async fn submit_public_swap_step(
     step: PublicActionProgressStep,
     transaction: TransactionRequest,
@@ -35,8 +41,9 @@ pub(crate) async fn submit_public_swap_step(
     gas_fee: PublicActionGasFeeSelection,
     http: &HttpContext,
     handoff: &mut PublicActionHandoff<'_>,
+    end: PublicActionStepEnd,
     progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
-) -> Result<PublicSwapStepOutcome> {
+) -> Result<Option<PublicSwapStepOutcome>> {
     let gas_limit = transaction
         .gas
         .ok_or_else(|| eyre!("the swap's transaction has no reviewed gas limit"))?;
@@ -63,13 +70,17 @@ pub(crate) async fn submit_public_swap_step(
         &mut None,
         None,
         Some(handoff),
+        end,
         progress,
     )
     .await?;
-    Ok(PublicSwapStepOutcome {
-        receipt: outcome.receipt,
-        next_nonce: outcome.next_nonce,
-        gas_fee: outcome.gas_fee,
+    Ok(match outcome {
+        PublicActionStepResult::Receipt(outcome) => Some(PublicSwapStepOutcome {
+            receipt: outcome.receipt,
+            next_nonce: outcome.next_nonce,
+            gas_fee: outcome.gas_fee,
+        }),
+        PublicActionStepResult::HandedOff => None,
     })
 }
 

@@ -53,8 +53,10 @@ impl ExecutorOwner {
     ///
     /// Until its deposit is handed off, an order's swap resends a signed order whose
     /// submission is still pending, unless it was stopped or can no longer be accepted in
-    /// time, and then reads what became of the order. A direct deposit's swap reads its
-    /// hand-off. With a hand-off the bridge is polled, as an explicit status check when
+    /// time, and then reads what became of the order. A direct deposit's swap resends its
+    /// signed deposit unchanged while that is neither included nor ruled out and the swap is
+    /// live, then reads its hand-off. A resend that fails is logged and fails nothing. With a
+    /// hand-off the bridge is polled, as an explicit status check when
     /// `tracking.explicit`, and a refunding deposit's refund to the Public account is verified.
     /// A step with nothing to do is skipped, and the first step that fails returns its error.
     /// Last, an order that is still open with a signed permit has that permit's nonce, the
@@ -97,6 +99,15 @@ impl ExecutorOwner {
                 Box::pin(self.observe_public_swap_order(operation, swap_use, origin, orderbook))
                     .await?;
             } else {
+                if Box::pin(self.resend_public_swap_deposit(operation, swap_use, origin))
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!(
+                        target: "executor_observation",
+                        "resending the signed Public deposit failed"
+                    );
+                }
                 Box::pin(self.observe_public_swap_handoff(operation, swap_use, origin)).await?;
             }
         }

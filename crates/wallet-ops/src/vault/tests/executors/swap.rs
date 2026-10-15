@@ -6005,6 +6005,8 @@ fn stored_public_swap(path: PublicSwapPath) -> StoredPublicSwap {
             inclusion,
             submitted_from_block: Some(19),
             deposit_scan_from_block: None,
+            signed: None,
+            ruled_out: None,
         }
     };
     StoredPublicSwap {
@@ -6348,6 +6350,8 @@ fn public_swap_records_hold_only_their_known_fields_and_hide_the_signed_batch() 
             "hash",
             "inclusion",
             "kind",
+            "ruled_out",
+            "signed",
             "submitted_from_block",
             "transaction"
         ]
@@ -6613,6 +6617,8 @@ fn public_swap_claims_take_a_destination_account_and_cancel_before_signing() {
         inclusion: None,
         submitted_from_block: Some(19),
         deposit_scan_from_block: None,
+        signed: None,
+        ruled_out: None,
     };
     let deposit = handed_off(PublicSwapTransactionKind::Deposit, 81);
     assert!(matches!(

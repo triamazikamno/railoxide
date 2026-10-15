@@ -13,6 +13,7 @@ pub use recipient::resolve_public_ens_recipient;
 mod signer;
 mod submission;
 mod swap_source;
+pub(crate) use submission::PublicActionStepEnd;
 pub(crate) use swap_source::{
     PublicSwapStepOutcome, sign_public_swap_typed_data, submit_public_swap_step,
 };

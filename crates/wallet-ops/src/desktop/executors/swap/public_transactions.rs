@@ -3,16 +3,20 @@
 //!
 //! The swap's record is on the destination chain's owner, which sends these on the origin
 //! chain through that chain's configuration. Each transaction is in the record before it is
-//! broadcast, and its inclusion comes from the step that sent it. The hand-off is read from
-//! finalized whole-block receipts. Interrupted deposits resume a bounded scan of finalized
-//! blocks, matching recorded hashes locally without transaction-hash RPC queries.
+//! broadcast, and its inclusion comes from the step that sent it. A deposit is recorded with
+//! its signed bytes too. One that no RPC accepted is left to tracking without a receipt.
+//! The hand-off is read from finalized whole-block receipts. A deposit without an inclusion is
+//! found by a bounded scan of finalized blocks, matching recorded hashes locally without
+//! transaction-hash RPC queries. Tracking resends its recorded bytes unchanged until it is
+//! found, or ruled out once the scan passed every block it could be in and the Public
+//! account's nonce passed its own.
 //!
 //! An order's Public account sends two more: the withdrawal of proceeds its cow-shed proxy
 //! holds, and the order's early invalidation. Neither touches the order's own hook batch.
 
 use std::time::SystemTime;
 
-use alloy::eips::BlockNumHash;
+use alloy::eips::{BlockId, BlockNumHash};
 use alloy::network::AnyRpcBlock;
 use alloy::network::primitives::{HeaderResponse as _, ReceiptResponse as _};
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
@@ -45,21 +49,23 @@ use crate::block_observer::fetch_checked_block_receipts;
 use crate::cow::CowOrderbookClient;
 use crate::desktop::executor_observation::{ObservationEndpoints, trace_step};
 use crate::public_wallet::{
-    PublicSwapStepOutcome, VaultedPublicSigner, admitted_public_signer_authorized,
-    public_native_action_gas_units_with_buffer, query_erc20_allowance, query_erc20_balance,
-    sign_public_swap_typed_data, submit_public_swap_step,
+    PublicActionStepEnd, PublicSwapStepOutcome, VaultedPublicSigner,
+    admitted_public_signer_authorized, public_native_action_gas_units_with_buffer,
+    query_erc20_allowance, query_erc20_balance, sign_public_swap_typed_data,
+    submit_public_swap_step,
 };
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
     AcrossOrderTerms, ExecutorOperationId, PublicSwapDeposited, PublicSwapInclusion,
-    PublicSwapObservations, PublicSwapPath, PublicSwapRecord, PublicSwapTransaction,
-    PublicSwapTransactionKind, SwapBridgeHandoff, SwapObservation, SwapUseId, SwapUseRecord,
-    SwapUseRole,
+    PublicSwapObservations, PublicSwapPath, PublicSwapRecord, PublicSwapSignedTransaction,
+    PublicSwapTransaction, PublicSwapTransactionKind, SwapBridgeHandoff, SwapObservation,
+    SwapUseId, SwapUseRecord, SwapUseRole,
 };
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, HardwareTrezorPinMatrixProvider, HttpContext,
     PublicActionGasFeeSelection, PublicActionProgressStep, PublicActionProgressUpdate,
     PublicAssetId, query_rpc_pool_with_http_client,
+    self_broadcast_send_raw_transaction_to_rpc_pool_with_logging,
 };
 
 /// Gas units of a `SpokePool.depositV3` a Public account sends with a private-delivery message.
@@ -224,6 +230,17 @@ pub enum PublicSwapTransactionOutcome {
         block_number: u64,
         transaction_hash: B256,
     },
+    /// A deposit recorded and sent, which no RPC accepted. Its receipt isn't awaited:
+    /// tracking finds its inclusion, resends it, or rules it out.
+    HandedOff { transaction_hash: B256 },
+}
+
+/// How far sending one of the swap's transactions followed it.
+enum PublicSwapSent {
+    /// Its receipt was observed and its inclusion recorded.
+    Included(PublicSwapStepOutcome),
+    /// It was recorded and sent, and no RPC accepted it.
+    HandedOff(B256),
 }
 
 /// What withdrawing the proceeds held by the proxy would send and cost, read now.
@@ -506,7 +523,10 @@ impl ExecutorOwner {
     /// [`Self::submit_public_swap_deposit`] with the Public account's signer.
     ///
     /// The path and the signed terms are in the record before the deposit is signed, and the
-    /// deposit is in it before it is broadcast.
+    /// deposit, with its signed bytes, is in it before it is broadcast. A deposit an RPC
+    /// accepted is followed to its receipt, whose provisional inclusion is recorded. One that
+    /// no RPC accepted returns [`PublicSwapTransactionOutcome::HandedOff`] without a receipt,
+    /// and tracking follows it from the record. A deposit that was ruled out takes another.
     pub(crate) async fn submit_public_swap_deposit_with_signer(
         &self,
         operation: ExecutorOperationId,
@@ -526,12 +546,7 @@ impl ExecutorOwner {
                 "this swap places an order; its Public account sends no deposit"
             ));
         }
-        if claimed
-            .swap
-            .transactions()
-            .iter()
-            .any(|transaction| transaction.kind == PublicSwapTransactionKind::Deposit)
-        {
+        if claimed.swap.live_deposits().next().is_some() {
             return Err(eyre!(
                 "this swap's deposit was already handed off; check its progress"
             ));
@@ -610,20 +625,25 @@ impl ExecutorOwner {
         self.store
             .record_public_swap_path(operation, swap_use, PublicSwapPath::Deposit, *terms)?;
         self.notify_change();
-        let outcome = self
-            .submit_public_swap_transaction(
-                operation,
-                swap_use,
-                origin,
-                signer,
-                PublicSwapTransactionKind::Deposit,
-                PublicActionProgressStep::Send,
-                transaction,
-                gas_fee,
-                progress,
-            )
-            .await?;
-        transaction_outcome(&outcome)
+        let sent = Box::pin(self.send_public_swap_transaction(
+            operation,
+            swap_use,
+            origin,
+            signer,
+            PublicSwapTransactionKind::Deposit,
+            PublicActionProgressStep::Send,
+            transaction,
+            gas_fee,
+            PublicActionStepEnd::HandOff,
+            progress,
+        ))
+        .await?;
+        match sent {
+            PublicSwapSent::HandedOff(transaction_hash) => {
+                Ok(PublicSwapTransactionOutcome::HandedOff { transaction_hash })
+            }
+            PublicSwapSent::Included(outcome) => transaction_outcome(&outcome),
+        }
     }
 
     /// Read the deposit's hand-off from finalized whole-block receipts on the origin chain and
@@ -631,8 +651,10 @@ impl ExecutorOwner {
     ///
     /// A deposit with a recorded inclusion is read in that block once it is final. Otherwise
     /// at most eight finalized blocks are inspected per poll from the durable hand-off
-    /// boundary, matching the hash locally and saving progress for restart. A stopped swap's
-    /// deposit is read too.
+    /// boundary, matching the hash locally and saving progress for restart. A deposit those
+    /// blocks don't hold is ruled out once the Public account's nonce at the last of them,
+    /// still canonical, passed its own. A stopped swap's deposit is read too, and a ruled-out
+    /// deposit isn't.
     pub async fn observe_public_swap_handoff(
         &self,
         operation: ExecutorOperationId,
@@ -647,11 +669,7 @@ impl ExecutorOwner {
         let (Some(PublicSwapPath::Deposit), Some(terms)) = (swap.path(), swap.bridge()) else {
             return Ok(None);
         };
-        let deposits: Vec<_> = swap
-            .transactions()
-            .iter()
-            .filter(|transaction| transaction.kind == PublicSwapTransactionKind::Deposit)
-            .collect();
+        let deposits: Vec<_> = swap.live_deposits().collect();
         if deposits.is_empty() {
             return Ok(None);
         }
@@ -693,6 +711,14 @@ impl ExecutorOwner {
                                 swap_use,
                                 update.hash,
                                 next_block,
+                            )?;
+                        }
+                        if let Some(evidence) = update.ruled_out {
+                            self.store.record_public_swap_deposit_ruled_out(
+                                operation,
+                                swap_use,
+                                update.hash,
+                                evidence,
                             )?;
                         }
                     }
@@ -1140,12 +1166,53 @@ impl ExecutorOwner {
         gas_fee: PublicActionGasFeeSelection,
         progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
     ) -> Result<PublicSwapStepOutcome> {
+        match Box::pin(self.send_public_swap_transaction(
+            operation,
+            swap_use,
+            origin,
+            signer,
+            kind,
+            step,
+            transaction,
+            gas_fee,
+            PublicActionStepEnd::Receipt,
+            progress,
+        ))
+        .await?
+        {
+            PublicSwapSent::Included(outcome) => Ok(outcome),
+            PublicSwapSent::HandedOff(_) => Err(eyre!(
+                "the Public account's transaction was sent without its receipt"
+            )),
+        }
+    }
+
+    /// [`Self::submit_public_swap_transaction`], ending where `end` says: with
+    /// [`PublicActionStepEnd::HandOff`], a transaction no RPC accepted is
+    /// [`PublicSwapSent::HandedOff`] without a receipt. A deposit is
+    /// recorded with its signed bytes and a scan boundary the origin chain's finality depth
+    /// below the head: a deposit signed after that head can't be included below it.
+    async fn send_public_swap_transaction(
+        &self,
+        operation: ExecutorOperationId,
+        swap_use: SwapUseId,
+        origin: &EffectiveChainConfig,
+        signer: &VaultedPublicSigner,
+        kind: PublicSwapTransactionKind,
+        step: PublicActionProgressStep,
+        transaction: TransactionRequest,
+        gas_fee: PublicActionGasFeeSelection,
+        end: PublicActionStepEnd,
+        progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
+    ) -> Result<PublicSwapSent> {
         let submitted_from_block = self.while_active(origin_head(origin, &self.http)).await?;
         let ends_swap = matches!(
             kind,
             PublicSwapTransactionKind::Withdrawal | PublicSwapTransactionKind::Invalidation
         );
-        let mut handoff = |hash, transaction: &TransactionRequest| {
+        let deposit = kind == PublicSwapTransactionKind::Deposit;
+        let mut handed_off = None;
+        let mut handoff = |hash, transaction: &TransactionRequest, signed: &[u8]| {
             if !ends_swap {
                 self.require_live_swap_use(operation, Some(swap_use))?;
             }
@@ -1158,9 +1225,14 @@ impl ExecutorOwner {
                     hash,
                     inclusion: None,
                     submitted_from_block: Some(submitted_from_block),
-                    deposit_scan_from_block: None,
+                    deposit_scan_from_block: deposit
+                        .then(|| submitted_from_block.saturating_sub(origin.finality_depth)),
+                    signed: deposit
+                        .then(|| PublicSwapSignedTransaction::new(Bytes::copy_from_slice(signed))),
+                    ruled_out: None,
                 },
             )?;
+            handed_off = Some(hash);
             self.notify_change();
             Ok(())
         };
@@ -1173,9 +1245,15 @@ impl ExecutorOwner {
                 gas_fee,
                 &self.http,
                 &mut handoff,
+                end,
                 progress,
             )))
             .await?;
+        let Some(outcome) = outcome else {
+            return handed_off
+                .map(PublicSwapSent::HandedOff)
+                .ok_or_else(|| eyre!("the Public account's transaction wasn't handed off"));
+        };
         let hash: B256 = outcome.receipt.tx_hash.parse()?;
         // The step reports the block's number. Its hash is read by that number, and the
         // hand-off's read checks the transaction against the final block again.
@@ -1194,7 +1272,47 @@ impl ExecutorOwner {
             },
         )?;
         self.notify_change();
-        Ok(outcome)
+        Ok(PublicSwapSent::Included(outcome))
+    }
+
+    /// Resend, unchanged, the signed bytes of the swap's deposit that is neither included nor
+    /// ruled out, as the current record holds them. Nothing is signed and nothing is sent for
+    /// a swap that was stopped or no longer claims its account. An RPC that already knows the
+    /// deposit accepts it again. A send no RPC accepted says nothing of the deposit, which
+    /// tracking keeps reading.
+    pub(super) async fn resend_public_swap_deposit(
+        &self,
+        operation: ExecutorOperationId,
+        swap_use: SwapUseId,
+        origin: &EffectiveChainConfig,
+    ) -> Result<()> {
+        let claimed = self.claimed_public_swap(operation, swap_use, origin)?;
+        if !claimed.live || claimed.swap.observations().bridge_handoff.is_some() {
+            return Ok(());
+        }
+        let unresolved: Vec<_> = claimed
+            .swap
+            .live_deposits()
+            .filter(|deposit| deposit.inclusion.is_none())
+            .filter_map(|deposit| Some((deposit.hash, deposit.signed.clone()?)))
+            .collect();
+        if unresolved.is_empty() {
+            return Ok(());
+        }
+        let pool = query_rpc_pool_with_http_client(origin.rpc_route.endpoint_urls(), &self.http);
+        for (hash, signed) in unresolved {
+            self.while_active(
+                self_broadcast_send_raw_transaction_to_rpc_pool_with_logging(
+                    &pool,
+                    self.http.network_mode(),
+                    signed.raw().to_vec(),
+                    hash,
+                    false,
+                ),
+            )
+            .await?;
+        }
+        Ok(())
     }
 }
 
@@ -1337,10 +1455,18 @@ struct DepositUpdate {
     hash: B256,
     inclusion: Option<PublicSwapInclusion>,
     next_block: Option<u64>,
+    /// The finalized block that rules the deposit out.
+    ruled_out: Option<SwapObservation>,
 }
 
 /// Resume each handed-off deposit independently. Inspect at most eight finalized blocks per
 /// poll, matching transaction hashes locally before fetching checked whole-block receipts.
+///
+/// A deposit without an inclusion is ruled out when this poll's scan reached a block
+/// without finding it, every block from its boundary up to that one having been inspected,
+/// and the Public account's nonce at that block, read by its hash as canonical, passed the
+/// deposit's own while the block stayed canonical. Another transaction then used the
+/// deposit's nonce, so it can never be included. A read that fails rules nothing out.
 async fn read_public_swap_handoff(
     provider: &DynProvider,
     finality_depth: u64,
@@ -1370,7 +1496,7 @@ async fn read_public_swap_handoff(
             && remaining > 0
         {
             remaining -= 1;
-            let (verified, handoff) = read_deposit_block(
+            let (_, verified, handoff) = read_deposit_block(
                 provider,
                 inclusion.observation.block.number,
                 deposit.hash,
@@ -1382,6 +1508,7 @@ async fn read_public_swap_handoff(
                     hash: deposit.hash,
                     inclusion: Some(inclusion),
                     next_block: None,
+                    ruled_out: None,
                 });
                 if handoff.is_some() {
                     read.handoff = handoff;
@@ -1390,20 +1517,20 @@ async fn read_public_swap_handoff(
                 continue;
             }
         }
-        let Some(mut number) = deposit
-            .deposit_scan_from_block
-            .or(deposit.submitted_from_block)
-        else {
+        let Some(mut number) = deposit.deposit_scan_from_block else {
             continue;
         };
         let mut update = DepositUpdate {
             hash: deposit.hash,
             inclusion: None,
             next_block: None,
+            ruled_out: None,
         };
+        // The last block this poll inspected that doesn't hold the deposit.
+        let mut scanned = None;
         while remaining > 0 && number <= finalized_head {
             remaining -= 1;
-            let (inclusion, handoff) =
+            let (block, inclusion, handoff) =
                 read_deposit_block(provider, number, deposit.hash, expected).await?;
             update.inclusion = inclusion;
             update.next_block = number.checked_add(1);
@@ -1414,10 +1541,21 @@ async fn read_public_swap_handoff(
             if inclusion.is_some() {
                 break;
             }
+            scanned = Some(block);
             let Some(next) = number.checked_add(1) else {
                 break;
             };
             number = next;
+        }
+        if deposit.inclusion.is_none()
+            && update.inclusion.is_none()
+            && let (Some(block), Some(nonce)) = (scanned, deposit.transaction.nonce)
+            && deposit_nonce_used(provider, expected.source, block, nonce).await
+        {
+            update.ruled_out = Some(SwapObservation {
+                block,
+                transaction_hash: None,
+            });
         }
         if update.next_block.is_some() || update.inclusion.is_some() {
             read.updates.push(update);
@@ -1429,14 +1567,41 @@ async fn read_public_swap_handoff(
     Ok(read)
 }
 
+/// Whether the Public account `source` had used the nonce `nonce` by the canonical block
+/// `block`: its transaction count there, read by the block's hash as canonical, is above it,
+/// and the block is still canonical after the read. A read that fails says no.
+async fn deposit_nonce_used(
+    provider: &DynProvider,
+    source: Address,
+    block: BlockNumHash,
+    nonce: u64,
+) -> bool {
+    let Ok(count) = trace_step("public_swap_deposit_nonce", async {
+        provider
+            .get_transaction_count(source)
+            .block_id(BlockId::hash_canonical(block.hash))
+            .await
+    })
+    .await
+    else {
+        return false;
+    };
+    count > nonce && still_canonical(provider, block).await.unwrap_or(false)
+}
+
 /// Verify both successful and failed receipts. A successful deposit must carry the approved
-/// terms; a missing or inconsistent receipt never advances the durable scan cursor.
+/// terms; a missing or inconsistent receipt never advances the durable scan cursor. Returns
+/// the block read with what it holds of the deposit.
 async fn read_deposit_block(
     provider: &DynProvider,
     number: u64,
     hash: B256,
     expected: &ExpectedHandoff<'_>,
-) -> Result<(Option<PublicSwapInclusion>, Option<ObservedHandoff>)> {
+) -> Result<(
+    BlockNumHash,
+    Option<PublicSwapInclusion>,
+    Option<ObservedHandoff>,
+)> {
     let block = trace_step("public_swap_deposit_block", async {
         EthGetBlock::<AnyRpcBlock>::by_number(number.into(), provider.client()).await
     })
@@ -1494,7 +1659,7 @@ async fn read_deposit_block(
             "Public deposit evidence block changed during observation"
         ));
     }
-    Ok((inclusion, handoff))
+    Ok((identity, inclusion, handoff))
 }
 
 /// The `expected` hand-off among the depositor's deposits at the pinned `SpokePool` in the
