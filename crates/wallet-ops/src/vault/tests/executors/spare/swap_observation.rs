@@ -4648,7 +4648,7 @@ async fn an_unconfirmed_settlement_block_hints_what_it_shows_and_records_nothing
             across_settlement_logs(&fixture, &terms, deposit)
         };
         // Block 15 is the head, short of the finality depth of 1.
-        let block = {
+        let (block, settlement) = {
             let mut chain = fixture.chain.lock().unwrap();
             chain.head = 15;
             chain.add_addressed_transaction(15, fixture.settlement, Bytes::new(), logs);
@@ -4656,7 +4656,7 @@ async fn an_unconfirmed_settlement_block_hints_what_it_shows_and_records_nothing
                 chain.receipt_error = Some(-32601);
             }
             chain.rpc_requests.clear();
-            chain.block(15)
+            (chain.block(15), chain.transactions.last().unwrap().0)
         };
         let before = fixture.record();
         let hint = fixture
@@ -4671,6 +4671,7 @@ async fn an_unconfirmed_settlement_block_hints_what_it_shows_and_records_nothing
                 bought: U256::from(BUY_AMOUNT),
                 // The Across order's reshielded surplus is not reported as its shield.
                 shielded: (scenario == 3).then_some(U256::from(BUY_AMOUNT - 24)),
+                shield_transaction: (scenario == 3).then_some(settlement),
                 handoff: (scenario == 0).then_some(crate::SwapHandoffHint {
                     block,
                     deposit_id: Some(U256::from(42)),

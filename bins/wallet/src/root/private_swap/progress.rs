@@ -35,7 +35,7 @@ use wallet_ops::{
     },
 };
 
-use super::dialog::{SwapDialogView, settled_by_cow};
+use super::dialog::{SwapDialogView, provider_mention, settled_by_cow};
 use super::form::{
     ReplacedSwapAccount, SetupSide, broadcaster_result_problem, format_gwei, gas_share_name,
     network_name, swap_steps as review_steps, swap_steps_hint,
@@ -70,6 +70,7 @@ use crate::root::submission_progress::{
     SubmissionProgressGroup, SubmissionProgressStep, SubmissionProgressSubstep,
     render_submission_progress_groups, render_submission_progress_stepper,
 };
+use crate::root::ui_helpers::network_mention;
 use crate::root::utxo::short_hash;
 
 /// Why Cancel order… waits while a setup below the open order is unconfirmed.
@@ -1251,13 +1252,9 @@ impl PrivateSwapsView {
         let receiver = (!private).then(|| self.receiver_row(delivery.receiver, cx));
         let destination = fact_row(
             "Destination",
-            app_text(if private {
-                format!("Private balance on {network}")
-            } else {
-                network.clone()
-            }),
+            destination_value(delivery.destination_chain, private),
         );
-        let provider_row = fact_row("Provider", app_text(provider));
+        let provider_row = fact_row("Provider", provider_mention(delivery.provider, app_text));
         let deposit = observed
             .bridge_handoff
             .and_then(|handoff| handoff.deposit_id)
@@ -3609,6 +3606,23 @@ pub(super) fn fact_row(label: impl Into<SharedString>, value: impl gpui::IntoEle
         .child(value)
 }
 
+/// A swap's destination network as a fact's value, its mark before its name, at the size of
+/// the Settled by mark. A `private` delivery's destination is the private balance there.
+pub(super) fn destination_value(chain_id: u64, private: bool) -> gpui::Div {
+    let network = network_mention(chain_id, px(16.0).into());
+    if private {
+        app_text("Private balance on")
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(network)
+    } else {
+        network
+            .text_size(theme::APP_TEXT_SIZE)
+            .line_height(gpui::relative(theme::APP_TEXT_LINE_HEIGHT))
+    }
+}
+
 /// Attempts of this pair on the swap's stealth account that ended without a fill before the
 /// attempt the swap follows. The attempt whose bridge deposit delivered another attempt's
 /// trade isn't one, nor an order that still competes with the followed one or that its trade
@@ -3648,8 +3662,9 @@ fn earlier_attempts_note(attempts: &SwapAttempts<'_>) -> Option<String> {
 /// A swap step and its sub-steps for the shared stepper. A sub-step names its network and its
 /// stealth account, with a control that copies the account's address, and ends with its block
 /// or what it waits for. A step that carries its own block ends with it. The order step shows
-/// its order ID under its detail, with a control that copies it in full. `action` is the
-/// step's own action, shown under those.
+/// its order ID under its detail, and a step that carries a transaction its hash, each
+/// shortened with a control that copies it in full. `action` is the step's own action, shown
+/// under those.
 pub(super) fn progress_group(
     step: &SwapStep,
     detail: String,
@@ -3676,31 +3691,58 @@ pub(super) fn progress_group(
             }
         })
         .collect();
-    let order = step.order.map(|order| {
-        let order_id = order.0.to_string();
-        let copy_id = SharedString::from(format!("{id}-order-copy"));
+    let id_row = |selector: &'static str,
+                  label: &'static str,
+                  hash: String,
+                  copy: &str,
+                  tooltip: &'static str| {
+        let copy_id = SharedString::from(format!("{id}-{copy}-copy"));
         div()
             .flex()
             .items_center()
             .gap_1()
-            .debug_selector(|| "swap-step-order".into())
-            .child(app_muted_text("Order ID").flex_none())
-            .child(app_muted_text(short_hash(&order_id)).font_family(theme::APP_MONO_FONT_FAMILY))
-            .child(clipboard_with_toast(copy_id, order_id).tooltip("Copy order ID"))
+            .debug_selector(move || selector.into())
+            .child(app_muted_text(label).flex_none())
+            .child(app_muted_text(short_hash(&hash)).font_family(theme::APP_MONO_FONT_FAMILY))
+            .child(clipboard_with_toast(copy_id, hash).tooltip(tooltip))
             .into_any_element()
-    });
-    let action = match (order, action) {
-        (Some(order), Some(action)) => Some(
+    };
+    let mut rows = [
+        step.order.map(|order| {
+            id_row(
+                "swap-step-order",
+                "Order ID",
+                order.0.to_string(),
+                "order",
+                "Copy order ID",
+            )
+        }),
+        step.transaction.map(|transaction| {
+            id_row(
+                "swap-step-transaction",
+                "Tx hash",
+                transaction.to_string(),
+                "transaction",
+                "Copy transaction hash",
+            )
+        }),
+        action,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let action = if rows.len() > 1 {
+        Some(
             div()
                 .flex()
                 .flex_col()
                 .items_start()
                 .gap_1()
-                .child(order)
-                .child(action)
+                .children(rows)
                 .into_any_element(),
-        ),
-        (order, action) => order.or(action),
+        )
+    } else {
+        rows.pop()
     };
     SubmissionProgressGroup {
         step: SubmissionProgressStep {

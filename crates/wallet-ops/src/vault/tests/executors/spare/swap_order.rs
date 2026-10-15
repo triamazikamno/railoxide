@@ -2960,8 +2960,8 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
     assert_eq!(shield._shieldRequests[0].preimage.token.tokenAddress, WETH);
 
     // The order expires with its post-hook still signed at the nonce after the retry's
-    // pre-hook, so it can deposit for the retry's trade under its own minimum of 1,000. The
-    // retry's review discloses that minimum, and signing needs it accepted.
+    // pre-hook, under its own minimum of 1,000. An ordinary retry discloses no continuing
+    // minimum and signs without accepting one.
     let observed = fixture.record(&store).nonce_observation().unwrap();
     let expired = SwapOrderObservations {
         pre_hook_dead: Some(SwapPreHookDeath {
@@ -3016,13 +3016,12 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
     quote_task.abort();
     let retry_minimum = retry.bridge().unwrap().destination_minimum;
     assert_eq!(retry_minimum, U256::from(1_200));
-    assert_eq!(retry.continuing_minimum(), Some(U256::from(1_000)));
-    let issued = fixture.record(&store).issued().len();
+    assert_eq!(retry.continuing_minimum(), None);
     let output_pois = OutputPois::default();
     let authorization = password();
     let anchors = crate::TokenAnchorRateCache::new();
-    let sign_retry = |continuing_minimum| {
-        owner.issue_swap_order(crate::SwapOrderSigning {
+    let SwapOrderOutcome::Submitted { uid: retried } = owner
+        .issue_swap_order(crate::SwapOrderSigning {
             review: &retry,
             swap_use,
             private_minimum: retry.suggested_private_minimum(),
@@ -3038,28 +3037,12 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
             bridge: Some(route),
             destination_minimum: Some(retry_minimum),
             destination: None,
-            continuing_minimum,
+            continuing_minimum: None,
         })
-    };
-    // Neither no acceptance nor a stale one, of a higher continuing minimum than the one that
-    // now applies, signs anything.
-    for (accepted, approved) in [(None, 0), (Some(U256::from(1_001)), 1_001)] {
-        assert_eq!(
-            sign_retry(accepted).await.unwrap(),
-            SwapOrderOutcome::ReviewRequired(SwapReviewChange::ContinuingApproval {
-                approved: U256::from(approved),
-                current: U256::from(1_000),
-            })
-        );
-        let unsigned = fixture.record(&store);
-        assert_eq!(unsigned.swap().unwrap().orders().len(), 1);
-        assert_eq!(unsigned.issued().len(), issued);
-        assert_eq!(submissions.lock().unwrap().len(), 2);
-    }
-    let SwapOrderOutcome::Submitted { uid: retried } =
-        sign_retry(Some(U256::from(1_000))).await.unwrap()
+        .await
+        .unwrap()
     else {
-        panic!("the retry is submitted once the continuing minimum is accepted");
+        panic!("the retry is submitted without accepting a continuing minimum");
     };
     let record = fixture.record(&store);
     let [_, retried_order] = record.swap().unwrap().orders() else {
@@ -3110,7 +3093,8 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
     // What qualifies the speed-up is its `CoW` buy amount, lower than the open retry's.
     let speed_up_buy = speed_up.suggested_private_minimum();
     assert!(speed_up_buy < retried_order.bounds().buy_amount);
-    // As for the retry, neither no acceptance nor a stale higher one signs anything.
+    // Neither no acceptance nor a stale one, of a higher continuing minimum than the one that
+    // now applies, signs anything.
     for (accepted, approved) in [(None, 0), (Some(U256::from(1_001)), 1_001)] {
         assert_eq!(
             sign_order(

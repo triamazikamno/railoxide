@@ -331,16 +331,6 @@ fn reusable_spend_authorization_warning_matches_lifetime() {
 }
 
 #[test]
-fn hardware_spend_authorization_copy_uses_concise_device_language() {
-    let copy = crate::root::spend_authorization::hardware_spend_authorization_instruction("Ledger");
-
-    assert!(copy.contains("Ledger"));
-    assert!(copy.contains("Railgun derivation request"));
-    assert!(!copy.contains("passphrase wallet"));
-    assert!(!copy.contains("Remembered spend authorization"));
-}
-
-#[test]
 fn spend_authorization_recipient_display_shortens_long_recipients() {
     let recipient = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp";
 

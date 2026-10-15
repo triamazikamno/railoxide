@@ -484,8 +484,8 @@ pub struct SwapReview {
     isolation: OperationNetworkIsolation,
     /// The bridge leg, for Bridge delivery.
     bridge: Option<SwapBridgeQuote>,
-    /// Earlier Across approvals of the same swap use that can still decide this attempt's
-    /// delivery. Empty for every other delivery and for a new use.
+    /// Earlier Across approvals of the same swap use that can still decide a speed-up's
+    /// delivery. Empty for an ordinary retry, every other delivery and a new use.
     continuing: SwapContinuingApprovals,
 }
 
@@ -548,15 +548,16 @@ impl SwapReview {
     pub const fn cow_fee(&self) -> Option<U256> {
         self.cow_fee
     }
-    /// Earlier Across approvals of the same swap use that can still decide this attempt's
-    /// delivery.
+    /// Earlier Across approvals of the same swap use that can still decide this speed-up's
+    /// delivery. Empty for any other plan.
     #[must_use]
     pub const fn continuing(&self) -> &SwapContinuingApprovals {
         &self.continuing
     }
-    /// The lower destination minimum an earlier attempt of this swap can still deliver, which
-    /// approval of this review must cover. Source-chain surplus is not part of it. `None` when
-    /// no earlier approval can deliver less than this attempt's own minimum.
+    /// The lower destination minimum an earlier attempt of this speed-up's swap can still
+    /// deliver, which approval of this review must cover. Source-chain surplus is not part of
+    /// it. `None` for any other plan, and when no earlier approval can deliver less than this
+    /// attempt's own minimum.
     #[must_use]
     pub fn continuing_minimum(&self) -> Option<U256> {
         self.bridge
@@ -713,8 +714,8 @@ impl SwapReview {
     pub(crate) const fn set_bridge_for_tests(&mut self, bridge: &SwapBridgeQuote) {
         self.bridge = Some(*bridge);
     }
-    /// This review with `approvals` as its continuing approvals. UI tests use it for a retry's
-    /// review, since their records hold no earlier order.
+    /// This review with `approvals` as its continuing approvals. UI tests use it for a
+    /// speed-up's review, since their records hold no earlier order.
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn with_continuing_for_tests(
@@ -1201,8 +1202,9 @@ pub struct SwapOrderRequest<'a> {
     /// The destination chain's owner, session and authorization. Required exactly for a private
     /// Bridge delivery.
     pub destination: Option<SwapDestinationContext>,
-    /// The lower continuing destination minimum the user accepted with this review:
-    /// [`SwapReview::continuing_minimum`]. `None` when the review disclosed none.
+    /// The lower continuing destination minimum the user accepted with a speed-up's review:
+    /// [`SwapReview::continuing_minimum`]. `None` when the review disclosed none, as for any
+    /// other plan.
     pub continuing_minimum: Option<U256>,
     pub verify_proof: bool,
 }
@@ -1278,9 +1280,10 @@ pub enum SwapReviewChange {
     /// now send approval transactions the review didn't price, or sign a permit whose hook the
     /// order wasn't priced with. Nothing was sent.
     ApprovalPlan,
-    /// An earlier attempt of the same swap can still deliver `current` on the destination
-    /// chain. That is lower than this attempt's minimum and lower than the continuing minimum
-    /// the user accepted, `approved`, which is zero when none was disclosed.
+    /// An earlier attempt of the swap a speed-up relaxes can still deliver `current` on the
+    /// destination chain. That is lower than this attempt's minimum and lower than the
+    /// continuing minimum the user accepted, `approved`, which is zero when none was disclosed.
+    /// An ordinary retry never asks for this.
     ContinuingApproval {
         approved: U256,
         current: U256,
@@ -1689,8 +1692,8 @@ pub(crate) struct SwapOrderSigning<'a> {
     pub(crate) destination_minimum: Option<U256>,
     /// Required exactly for a private Bridge delivery: see [`SwapOrderRequest::destination`].
     pub(crate) destination: Option<SwapDestinationSigning<'a>>,
-    /// The lower continuing destination minimum the user accepted with this review, `None`
-    /// when the review disclosed none: see [`SwapOrderRequest::continuing_minimum`].
+    /// The lower continuing destination minimum the user accepted with a speed-up's review,
+    /// `None` when the review disclosed none: see [`SwapOrderRequest::continuing_minimum`].
     pub(crate) continuing_minimum: Option<U256>,
 }
 
@@ -2056,34 +2059,23 @@ impl ExecutorOwner {
             );
             review.bridge = Some(quote?);
         }
-        // A retry of a public Across swap can settle with an earlier attempt's deposit. An
-        // explicitly reused account starts a new use, whose attempts are compared with nothing.
-        // A speed-up names its use.
-        let speed_up = review.plan.speed_up;
-        if is_public_across(review.plan.delivery)
+        // A speed-up of a public Across swap leaves its open order live, so that order or an
+        // earlier attempt's deposit can still decide its delivery. An ordinary retry's earlier
+        // orders can't fill, so it discloses none. An explicitly reused account starts a new
+        // use, whose attempts are compared with nothing. A speed-up names its use and signs at
+        // its open order's nonce.
+        if let Some(speed_up) = review.plan.speed_up
+            && is_public_across(review.plan.delivery)
             && !review.plan.executor.is_reused()
             && let Some(operation) = review.plan.operation()
-            && let Some(swap_use) = match speed_up {
-                Some(speed_up) => Some(speed_up.swap_use),
-                None => self
-                    .swap_account_record(operation)?
-                    .and_then(|record| record.active_swap_use()),
-            }
         {
-            // Only a plan made for the confirmed delegation names the nonce its pre-hook signs,
-            // and a speed-up signs at its open order's.
-            let nonce = speed_up
-                .map(|speed_up| speed_up.pre_hook_nonce)
-                .or_else(|| {
-                    review
-                        .plan
-                        .executor
-                        .delegated()
-                        .is_some()
-                        .then_some(review.plan.context.execution_nonce)
-                });
             review.continuing = self
-                .swap_continuing_approvals(operation, swap_use, review.plan.delivery, nonce)
+                .swap_continuing_approvals(
+                    operation,
+                    speed_up.swap_use,
+                    review.plan.delivery,
+                    Some(speed_up.pre_hook_nonce),
+                )
                 .await?;
         }
         Ok(review)
@@ -2875,9 +2867,11 @@ impl ExecutorOwner {
         {
             return Ok(SwapOrderOutcome::ReviewRequired(change));
         }
-        // An earlier attempt's post-hook above the nonce this pre-hook signs at can still
-        // deposit under its own lower minimum. The user must have accepted that minimum.
-        if is_public_across(plan.delivery)
+        // For a speed-up, an earlier attempt's post-hook above the nonce this pre-hook signs
+        // at, the open order's included, can still deposit under its own lower minimum. The
+        // user must have accepted that minimum. An ordinary retry discloses none.
+        if plan.speed_up.is_some()
+            && is_public_across(plan.delivery)
             && let Some(destination_minimum) = destination_minimum
         {
             let continuing = trace_step(

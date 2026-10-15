@@ -8,7 +8,7 @@ use alloy::eips::BlockNumHash;
 use alloy::network::{
     AnyRpcBlock, AnyTransactionReceipt, ReceiptResponse as _, primitives::HeaderResponse as _,
 };
-use alloy::primitives::{Address, U256, keccak256};
+use alloy::primitives::{Address, B256, U256, keccak256};
 use alloy::providers::{DynProvider, EthGetBlock, Provider as _};
 use alloy::rpc::types::Log;
 use alloy::sol_types::{SolCall as _, SolEvent as _};
@@ -61,6 +61,9 @@ pub struct SwapSettlementHint {
     /// A Reshield order's private credit after the shield fee, in bought-token base units, when
     /// the block shows it. Always `None` for other deliveries.
     pub shielded: Option<U256>,
+    /// The transaction of that Reshield credit, when the block shows the credit with one.
+    /// Always `None` for other deliveries.
+    pub shield_transaction: Option<B256>,
     /// A Bridge order's hand-off, when the block shows it.
     pub handoff: Option<SwapHandoffHint>,
 }
@@ -197,14 +200,16 @@ impl ExecutorOwner {
                                 sent,
                             }
                         });
+                        // An Across order's reshielded surplus is not the order's delivery.
+                        let credit = settlement
+                            .credit
+                            .filter(|_| matches!(order.delivery(), SwapDelivery::Reshield));
                         SwapSettlementHint {
                             block: settlement.trade.block,
                             bought: settlement.amounts.buy_amount,
-                            // An Across order's reshielded surplus is not the order's delivery.
-                            shielded: settlement
-                                .credit
-                                .filter(|_| matches!(order.delivery(), SwapDelivery::Reshield))
-                                .map(|credit| credit.private_amount),
+                            shielded: credit.map(|credit| credit.private_amount),
+                            shield_transaction: credit
+                                .and_then(|credit| credit.observation.transaction_hash),
                             handoff,
                         }
                     }));

@@ -13,13 +13,15 @@ use wallet_ops::vault::{
     BridgeProvider, ExecutorRecord, PublicSwapRecord, SwapBridgeOutcome, SwapUseRecord, SwapUseRole,
 };
 
+use super::dialog::provider_mention;
 use super::form::network_name;
 use super::model::{
     PublicCardLine, PublicSwapLabels, PublicSwapStage, SwapIdentity, SwapOrderGroup, SwapStage,
-    private_delivery_credit, provider_name, public_swap_stage, public_swap_steps, swap_setup_block,
+    private_delivery_credit, public_swap_stage, public_swap_steps, swap_setup_block,
 };
 use super::progress::{
-    address_row, amount_with_note, block_label, fact_row, hash_row, progress_group,
+    address_row, amount_with_note, block_label, destination_value, fact_row, hash_row,
+    progress_group,
 };
 use super::{PrivateSwapsView, local_date_time_label, local_time_label, now_unix, short_receiver};
 use crate::root::public_action::PublicActionStepStatus;
@@ -481,16 +483,15 @@ impl PrivateSwapsView {
                 source,
                 false,
             )),
-            PublicSwapFact::Destination => Some(fact_row(
-                "Destination",
-                app_text(format!("Private balance on {}", labels.destination)),
-            )),
+            PublicSwapFact::Destination => self
+                .public_record_chain(record)
+                .map(|chain| fact_row("Destination", destination_value(chain, true))),
             PublicSwapFact::Started => claimed
                 .started_at()
                 .map(|at| fact_row("Started", app_text(local_date_time_label(at)))),
             PublicSwapFact::Provider => Some(fact_row(
                 "Provider",
-                app_text(provider_name(BridgeProvider::Across)),
+                provider_mention(BridgeProvider::Across, app_text),
             )),
             // A fact, not a link: looking the block up is the user's choice.
             PublicSwapFact::Fill => fill.map(|block| {

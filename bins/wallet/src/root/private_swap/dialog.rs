@@ -25,7 +25,7 @@ use ui::controls::{
 use ui::theme;
 use wallet_ops::{
     SwapOrderState, is_swap_record,
-    vault::{ExecutorOperationId, ExecutorRecord, SwapDelivery, SwapOrderRecord},
+    vault::{BridgeProvider, ExecutorOperationId, ExecutorRecord, SwapDelivery, SwapOrderRecord},
 };
 
 use super::model::{
@@ -35,7 +35,8 @@ use super::model::{
 };
 use super::{PrivateSwapsView, local_date_time_label, swap_tokens};
 use crate::assets::{
-    COW_DAO_LIGHT_PATH, COW_PROTOCOL_LOGO_LIGHT_PATH, LIST_ICON_PATH, WalletIconSource,
+    ACROSS_LOGOMARK_PATH, COW_DAO_LIGHT_PATH, COW_PROTOCOL_LOGO_LIGHT_PATH, LIST_ICON_PATH,
+    NEAR_SYMBOL_WHITE_PATH, WalletIconSource,
 };
 use crate::root::{dialog_max_height, secondary_dialog_content_width};
 
@@ -1497,4 +1498,34 @@ pub(super) fn settled_by_cow() -> gpui::Div {
                 .object_fit(gpui::ObjectFit::Contain),
         )
         .child(app_text("CoW Protocol"))
+}
+
+/// The asset path of a bridge provider's mark.
+pub(super) const fn provider_mark_path(provider: BridgeProvider) -> &'static str {
+    match provider {
+        BridgeProvider::Across => ACROSS_LOGOMARK_PATH,
+        BridgeProvider::NearIntents => NEAR_SYMBOL_WHITE_PATH,
+    }
+}
+
+/// A bridge provider's mark, `size` square, at its own aspect ratio.
+pub(super) fn provider_mark(provider: BridgeProvider, size: gpui::AbsoluteLength) -> gpui::Img {
+    img(provider_mark_path(provider))
+        .size(size)
+        .flex_none()
+        .object_fit(gpui::ObjectFit::Contain)
+}
+
+/// A bridge provider named as a label or value, laid out like [`settled_by_cow`]: its mark,
+/// then its name as the text `styled` makes of it.
+pub(super) fn provider_mention(
+    provider: BridgeProvider,
+    styled: impl FnOnce(&'static str) -> gpui::Div,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(provider_mark(provider, px(16.0).into()))
+        .child(styled(provider_name(provider)))
 }

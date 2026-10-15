@@ -54,11 +54,11 @@
 //!   with its private session started: the retry of a synthesized swap that sells 0.05 WETH
 //!   for USDC delivered by Across to a public receiver on Arbitrum One. Its first order
 //!   expired with an approved delivery of 90 USDC, and the form holds a synthesized quote that
-//!   delivers 100, so it shows the earlier order's warning with its checkbox. Ticking it
-//!   enables Review…, which opens the review with its Earlier approval row and warning.
-//!   Approving the review takes the vault password and ends in an error on the form. The form
-//!   asks for no quote and no routes, so another gas share leaves Review… waiting for a bridge
-//!   quote until the share is set back.
+//!   delivers 100. An ordinary retry discloses no earlier approval, so Review… is enabled and
+//!   opens the review without an Earlier approval row or its warning. Approving the review
+//!   takes the vault password and ends in an error on the form. The form asks for no quote
+//!   and no routes, so another gas share leaves Review… waiting for a bridge quote until the
+//!   share is set back.
 //! - `quote-error` opens the private swap form in place of a Public account's, on Ethereum: a
 //!   new swap of 0.05 WETH for USDC whose quote failed while pricing. The failure is
 //!   synthesized, a sell token price outside the range the gas rate can represent, with the
@@ -1483,11 +1483,11 @@ pub(super) fn quote_error() -> Option<(Address, Address, U256, eyre::Report)> {
 }
 
 /// The record and the review a `retry-review` mode holds its form on: the swap's expired first
-/// order, and a quote for its retry that delivers 100 USDC while that order's approval of 90
-/// can still decide the delivery. A `speed-up-review`, `speed-up:open` or
-/// `speed-up:just-placed` mode holds the swap with that retry open instead, a quote that
-/// delivers 95 USDC for a lower deposit, and the retry's ID, the order the form speeds up.
-/// `None` in every other mode.
+/// order, and a quote for its retry that delivers 100 USDC with no continuing approval. A
+/// `speed-up-review`, `speed-up:open` or `speed-up:just-placed` mode holds the swap with that
+/// retry open instead, a quote that delivers 95 USDC for a lower deposit while the first
+/// order's approval of 90 can still decide the delivery, and the retry's ID, the order the
+/// form speeds up. `None` in every other mode.
 pub(super) fn retry_review(
     profile: &SwapProfile,
     isolation: OperationNetworkIsolation,
@@ -1520,6 +1520,12 @@ pub(super) fn retry_review(
         post_hook_nonce: first.post_hook()?.nonce(),
         quote_timestamp: deposit.quote_timestamp,
     };
+    // Only a speed-up discloses an earlier approval.
+    let continuing = if open.is_some() {
+        vec![earlier]
+    } else {
+        Vec::new()
+    };
     let review = SwapReview::for_ui_fixture(
         profile,
         &record,
@@ -1536,7 +1542,7 @@ pub(super) fn retry_review(
         SWAP_DELIVERY,
         U256::from(delivered),
         U256::from(delivered),
-        vec![earlier],
+        continuing,
         isolation,
     );
     match review {
@@ -2089,6 +2095,8 @@ impl PrivateSwapsView {
                     block,
                     bought: U256::from(SWAP_BOUGHT),
                     shielded: (!bridged).then_some(U256::from(REPORTED_SHIELDED)),
+                    // The settlement transaction runs the post-hook's shield.
+                    shield_transaction: (!bridged).then(|| keccak256("settlement transaction")),
                     handoff: bridged.then_some(SwapHandoffHint {
                         block,
                         deposit_id: Some(U256::from(3_481_207_u32)),

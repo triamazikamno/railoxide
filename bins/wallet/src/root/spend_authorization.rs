@@ -8,8 +8,8 @@ use alloy::primitives::U256;
 use gpui::{
     Anchor, AnyElement, App, AppContext, ClickEvent, Context, Entity, Focusable, FontWeight,
     InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, img, prelude::FluentBuilder as _, px,
-    relative, rems, rgb,
+    StatefulInteractiveElement, Styled, StyledImage as _, Window, div, img,
+    prelude::FluentBuilder as _, px, relative, rems, rgb,
 };
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, IndexPath, Selectable, Sizable, WindowExt,
@@ -615,8 +615,8 @@ impl SpendAuthorizationSummary {
         self
     }
 
-    /// An alert under the rows that names what the spend makes public. `summary` is its
-    /// message under the hint's title, and the hint's card holds the full text.
+    /// An alert under the rows that names what the spend makes public. `summary` follows
+    /// "Made public:" on its one line, and the hint's card holds the full text.
     pub(super) fn with_disclosure(
         mut self,
         summary: impl Into<Arc<str>>,
@@ -2352,13 +2352,9 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
             .child(Alert::warning(
                 "wallet-hardware-spend-custody-warning",
                 format!(
-                    "Your {device} will not show the details of this action. Check them here before you approve."
+                    "Your {device} shows only a Railgun derivation request, not these details. Check them here before you approve."
                 ),
             ).small())
-            .child(
-                app_muted_text(hardware_spend_authorization_instruction(self.device_label))
-                    .whitespace_normal(),
-            )
             .when(show_trezor_app_passphrase, |this| {
                 #[cfg(feature = "hardware")]
                 {
@@ -2705,12 +2701,25 @@ fn render_spend_authorization_compact_row(
                     )),
             )
     } else {
-        let value = match &row.value_network {
+        let value = match (&row.value_network, &row.icon_path) {
             // The network wraps under the text before it, at the right edge too.
-            Some(value) => spend_authorization_row_label(value, app_text)
+            (Some(value), _) => spend_authorization_row_label(value, app_text)
                 .flex_wrap()
                 .justify_end(),
-            None => app_text(row.value.to_string()),
+            // The row's mark before its text, the size of a network's in a label.
+            (None, Some(icon)) => div()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap_x_1()
+                .child(
+                    img(icon.clone())
+                        .size(rems(0.75))
+                        .flex_none()
+                        .object_fit(gpui::ObjectFit::Contain),
+                )
+                .child(app_text(row.value.to_string()).min_w_0()),
+            (None, None) => app_text(row.value.to_string()),
         };
         value
             .flex_auto()
@@ -2755,12 +2764,12 @@ fn render_spend_authorization_compact_row(
         )
 }
 
-/// The disclosure alert: the hint's title, the summary as its message, and an info button
+/// The disclosure alert: "Made public:" and the summary on one line, and an info button
 /// inside its right edge. The whole alert shows the hint's card on hover and opens it on click.
 /// A hint with a warning makes it a warning alert.
 fn render_spend_authorization_disclosure(disclosure: &SpendAuthorizationDisclosure) -> gpui::Div {
     let id = "wallet-spend-auth-disclosure-alert";
-    let summary = disclosure.summary.to_string();
+    let summary = format!("Made public: {}", disclosure.summary);
     let alert = if disclosure.hint.warning.is_some() {
         Alert::warning(id, summary)
     } else {
@@ -2771,7 +2780,6 @@ fn render_spend_authorization_disclosure(disclosure: &SpendAuthorizationDisclosu
         &disclosure.hint,
         Some(
             alert
-                .title(disclosure.hint.title.to_string())
                 .small()
                 // Room for the info button.
                 .pr_10()
@@ -4629,10 +4637,6 @@ impl WalletRoot {
             cx,
         );
     }
-}
-
-pub(in crate::root) fn hardware_spend_authorization_instruction(device_label: &str) -> String {
-    format!("Approve the Railgun derivation request on your {device_label}.")
 }
 
 #[cfg(feature = "hardware")]

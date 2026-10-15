@@ -25,6 +25,8 @@ pub(crate) const TREZOR_SYMBOL_WHITE_ICON_PATH: &str = "railgun/icons/trezor-sym
 pub(crate) const WALLETCONNECT_ICON_PATH: &str = "railgun/icons/walletconnect.svg";
 pub(crate) const COW_PROTOCOL_LOGO_LIGHT_PATH: &str = "railgun/icons/cow-protocol-logo-light.svg";
 pub(crate) const COW_DAO_LIGHT_PATH: &str = "railgun/icons/cow-dao-light.svg";
+pub(crate) const ACROSS_LOGOMARK_PATH: &str = "railgun/icons/across-logomark-aqua-circle.svg";
+pub(crate) const NEAR_SYMBOL_WHITE_PATH: &str = "railgun/icons/near-symbol-white.svg";
 const TELEGRAM_ICON_PATH: &str = "railgun/icons/telegram.svg";
 const ARROW_BIG_RIGHT_DASH_ICON_PATH: &str = "railgun/icons/arrow-big-right-dash.svg";
 const SHIELD_ICON_PATH: &str = "railgun/icons/shield.svg";
@@ -73,6 +75,8 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     WALLETCONNECT_ICON_PATH,
     COW_PROTOCOL_LOGO_LIGHT_PATH,
     COW_DAO_LIGHT_PATH,
+    ACROSS_LOGOMARK_PATH,
+    NEAR_SYMBOL_WHITE_PATH,
     TELEGRAM_ICON_PATH,
     ARROW_BIG_RIGHT_DASH_ICON_PATH,
     SHIELD_ICON_PATH,
@@ -122,6 +126,9 @@ const WALLETCONNECT_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/walletco
 const COW_PROTOCOL_LOGO_LIGHT_BYTES: &[u8] =
     include_bytes!("../assets/icons/cow-protocol-logo-light.svg");
 const COW_DAO_LIGHT_BYTES: &[u8] = include_bytes!("../assets/icons/cow-dao-light.svg");
+const ACROSS_LOGOMARK_BYTES: &[u8] =
+    include_bytes!("../assets/icons/across-logomark-aqua-circle.svg");
+const NEAR_SYMBOL_WHITE_BYTES: &[u8] = include_bytes!("../assets/icons/near-symbol-white.svg");
 const TELEGRAM_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/telegram.svg");
 const ARROW_BIG_RIGHT_DASH_ICON_BYTES: &[u8] =
     include_bytes!("../../../crates/ui/assets/icons/arrow-big-right-dash.svg");
@@ -424,6 +431,8 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         WALLETCONNECT_ICON_PATH => Some(WALLETCONNECT_ICON_BYTES),
         COW_PROTOCOL_LOGO_LIGHT_PATH => Some(COW_PROTOCOL_LOGO_LIGHT_BYTES),
         COW_DAO_LIGHT_PATH => Some(COW_DAO_LIGHT_BYTES),
+        ACROSS_LOGOMARK_PATH => Some(ACROSS_LOGOMARK_BYTES),
+        NEAR_SYMBOL_WHITE_PATH => Some(NEAR_SYMBOL_WHITE_BYTES),
         TELEGRAM_ICON_PATH => Some(TELEGRAM_ICON_BYTES),
         ARROW_BIG_RIGHT_DASH_ICON_PATH => Some(ARROW_BIG_RIGHT_DASH_ICON_BYTES),
         SHIELD_ICON_PATH => Some(SHIELD_ICON_BYTES),

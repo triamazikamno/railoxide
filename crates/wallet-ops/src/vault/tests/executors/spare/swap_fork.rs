@@ -3188,7 +3188,7 @@ async fn swap_fork_retry_settlement_deposits_an_expired_attempts_across_terms() 
         let reshielded = surplus == BridgeSurplus::Reshield;
         wallet.pair = (USDC, across_delivery(surplus));
         let first = wallet.swap(&fork).await;
-        let (operation, executor, swap_use) = (first.operation, first.executor, first.swap_use);
+        let (operation, executor) = (first.operation, first.executor);
 
         // The first attempt expires with its pre-hook's nonce k unused.
         mine_past(&fork, u64::from(first.order.validTo)).await;
@@ -3212,80 +3212,32 @@ async fn swap_fork_retry_settlement_deposits_an_expired_attempts_across_terms() 
             .timestamp()
             .await
             .saturating_sub(u64::from(valid_until(0)));
-        let unaccepted = Signing {
-            destination_minimum: higher,
-            continuing_minimum: None,
-            valid_for: std::time::Duration::from_secs(ahead + 10 * 60),
-            minimum_discount: U256::ZERO,
+        // An ordinary retry discloses no continuing minimum, so it signs without accepting
+        // the first attempt's lower one.
+        let SwapAmountPlan::Fits(plan) = wallet.plan(
+            delegated,
+            std::slice::from_ref(&first.note),
+            U256::from(SELL_AMOUNT),
+            None,
+        ) else {
+            panic!("one note fits one order");
         };
-        let plan = || {
-            let SwapAmountPlan::Fits(plan) = wallet.plan(
-                delegated,
-                std::slice::from_ref(&first.note),
-                U256::from(SELL_AMOUNT),
-                None,
-            ) else {
-                panic!("one note fits one order");
-            };
-            plan
-        };
-        // The harness builds its review by hand, so the continuing approvals are read here as
-        // a review reads them. The first attempt's post-hook at k + 1 is above the retry's
-        // pre-hook nonce and its quote is still fresh.
-        let continuing = wallet
-            .owner
-            .swap_continuing_approvals(operation, swap_use, wallet.pair.1, Some(pre_nonce))
-            .await
-            .unwrap();
-        assert_eq!(
-            continuing
-                .approvals()
-                .iter()
-                .map(|approval| (
-                    approval.uid,
-                    approval.destination_minimum,
-                    approval.post_hook_nonce
-                ))
-                .collect::<Vec<_>>(),
-            vec![(first.uid, lower, post_nonce)],
-            "{label}"
-        );
-
-        // Signing refuses until the review accepted the first attempt's lower minimum.
-        let refused = wallet
-            .sign_with(
-                &fork,
-                plan(),
-                std::slice::from_ref(&first.note),
-                None,
-                unaccepted,
-            )
-            .await;
-        assert_eq!(
-            refused.err(),
-            Some(SwapOrderOutcome::ReviewRequired(
-                crate::SwapReviewChange::ContinuingApproval {
-                    approved: U256::ZERO,
-                    current: lower,
-                }
-            )),
-            "{label}"
-        );
-        assert_eq!(wallet.record(operation).swap().unwrap().orders().len(), 1);
         let Ok(retry) = wallet
             .sign_with(
                 &fork,
-                plan(),
+                plan,
                 std::slice::from_ref(&first.note),
                 None,
                 Signing {
-                    continuing_minimum: Some(lower),
-                    ..unaccepted
+                    destination_minimum: higher,
+                    continuing_minimum: None,
+                    valid_for: std::time::Duration::from_secs(ahead + 10 * 60),
+                    minimum_discount: U256::ZERO,
                 },
             )
             .await
         else {
-            panic!("{label}: the retry is submitted with the continuing minimum accepted");
+            panic!("{label}: the retry is submitted without accepting a continuing minimum");
         };
         let record = wallet.record(operation);
         let (expired_terms, retry_terms) = (

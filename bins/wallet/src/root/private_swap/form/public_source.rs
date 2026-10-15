@@ -1774,6 +1774,9 @@ impl PrivateSwapsView {
                     allowance.as_ref().map(|(allowance, _)| allowance.as_str()),
                 ),
             )
+            .with_icon(Some(WalletIconSource::embedded(provider_mark_path(
+                BridgeProvider::Across,
+            ))))
             .with_hint(SpendAuthorizationHint::new(
                 provider_name(BridgeProvider::Across),
                 fee.as_deref()
@@ -3738,10 +3741,17 @@ impl PrivateSwapsView {
     ) -> Collapsible {
         let open = form.details_open;
         let headline = if review.intent().order {
-            self.public_rate_label(form, review, cx)
-                .unwrap_or_else(|| "Unavailable".into())
+            app_text(
+                self.public_rate_label(form, review, cx)
+                    .unwrap_or_else(|| "Unavailable".into()),
+            )
         } else {
-            "Bridged by Across".to_owned()
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(app_text("Bridged by"))
+                .child(provider_mention(BridgeProvider::Across, app_text))
         };
         let details = Self::details_header(
             open,

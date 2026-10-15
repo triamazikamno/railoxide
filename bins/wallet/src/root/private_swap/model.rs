@@ -1384,6 +1384,9 @@ pub(in crate::root) struct SwapLabels {
     pub(in crate::root) uncovered_gas: Option<String>,
     /// The latest order's `CoW` order ID, which the order step shows.
     pub(in crate::root) order: Option<OrderUid>,
+    /// A swap back to the private balance: the transaction of its post-hook shield, once
+    /// observation verified the delivery. `None` for any other delivery.
+    pub(in crate::root) shield_transaction: Option<B256>,
     /// A Bridge swap's destination. `None` for delivery on the swap's own network.
     pub(in crate::root) bridge: Option<SwapBridgeLabels>,
 }
@@ -1662,6 +1665,9 @@ pub(in crate::root) struct SwapFillHint {
     /// A swap back to the private balance: its shield in the reported trade block, with the
     /// private credit after the shield fee. `Looking` for any other delivery.
     pub(in crate::root) shield: SwapSeen,
+    /// The transaction of that shield, when the reported trade block shows it. `None`
+    /// otherwise.
+    pub(in crate::root) shield_transaction: Option<B256>,
     /// The swap's own network, such as "Ethereum", whose blocks the count is of.
     pub(in crate::root) origin: String,
 }
@@ -2076,6 +2082,9 @@ pub(in crate::root) struct SwapStep {
     pub(in crate::root) account: Option<SwapStepAccount>,
     /// The `CoW` order ID of the order step, once the swap has an order.
     pub(in crate::root) order: Option<OrderUid>,
+    /// The shield transaction of a swap back to the private balance, on its private-balance
+    /// step, once the reported trade block or verified delivery shows it.
+    pub(in crate::root) transaction: Option<B256>,
     /// The block the step completed in, shown at its trailing edge. Only a Public-paid swap's
     /// steps carry one.
     pub(in crate::root) block: Option<u64>,
@@ -2094,6 +2103,7 @@ impl SwapStep {
             children: Vec::new(),
             account: None,
             order: None,
+            transaction: None,
             block: None,
         }
     }
@@ -2105,6 +2115,11 @@ impl SwapStep {
 
     const fn with_order(mut self, order: Option<OrderUid>) -> Self {
         self.order = order;
+        self
+    }
+
+    const fn with_transaction(mut self, transaction: Option<B256>) -> Self {
+        self.transaction = transaction;
         self
     }
 }
@@ -2136,7 +2151,8 @@ const BRIDGE_DEPOSIT: &str = "Bridge deposit";
 /// tells whether the reported trade block shows its shield. A Public address swap has
 /// no private-balance step, as [`external_steps`] describes, and a Bridge swap hands off to its
 /// bridge instead, as [`bridge_steps`] describes. Once the swap has an order, the order step
-/// carries its ID.
+/// carries its ID, and the private-balance step carries its shield transaction once the reported
+/// trade block or verified delivery shows it.
 pub(in crate::root) fn swap_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
     let mut steps = if let Some(bridge) = &labels.bridge {
         let mut steps = bridge_steps(stage, labels, bridge);
@@ -2193,12 +2209,28 @@ fn reshield_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
                         .map_or_else(String::new, SwapFillHint::traded),
                     Pending,
                 ),
+                // A shield the reported block shows is done, as a private Bridge delivery's
+                // is, while the trade above still confirms.
                 delivered(
-                    Pending,
+                    if labels
+                        .fill_hint
+                        .as_ref()
+                        .is_some_and(|hint| matches!(hint.shield, SwapSeen::Detected(_)))
+                    {
+                        Done
+                    } else {
+                        Pending
+                    },
                     labels
                         .fill_hint
                         .as_ref()
                         .map_or_else(String::new, SwapFillHint::shielded),
+                )
+                .with_transaction(
+                    labels
+                        .fill_hint
+                        .as_ref()
+                        .and_then(|hint| hint.shield_transaction),
                 ),
             ]
         }
@@ -2330,7 +2362,7 @@ fn reshield_steps(stage: SwapStage, labels: &SwapLabels) -> Vec<SwapStep> {
             setup(Done, ""),
             open(Done, String::new()),
             traded(Done),
-            delivered(Done, "Finalized".into()),
+            delivered(Done, "Finalized".into()).with_transaction(labels.shield_transaction),
         ],
         SwapStage::Order(SwapOrderState::NotDelivered) => vec![
             setup(Done, ""),
@@ -3291,6 +3323,7 @@ pub(super) mod tests {
             minimum: None,
             uncovered_gas: None,
             order: None,
+            shield_transaction: None,
             bridge: None,
         }
     }
@@ -3767,10 +3800,22 @@ pub(super) mod tests {
             traded.last().map(|step| step.status),
             Some(PublicActionStepStatus::Pending)
         );
-        let done = swap_steps(SwapStage::Order(SwapOrderState::Done), &labels());
+        let shield_transaction = Some(B256::repeat_byte(0x5e));
+        let done = swap_steps(
+            SwapStage::Order(SwapOrderState::Done),
+            &SwapLabels {
+                shield_transaction,
+                ..labels()
+            },
+        );
         assert!(
             done.iter()
                 .all(|step| step.status == PublicActionStepStatus::Done)
+        );
+        // The verified delivery keeps showing its shield transaction.
+        assert_eq!(
+            done.last().map(|step| step.transaction),
+            Some(shield_transaction)
         );
         let undelivered = swap_steps(SwapStage::Order(SwapOrderState::NotDelivered), &labels());
         assert_ne!(
@@ -4189,6 +4234,7 @@ pub(super) mod tests {
             bought: Some("49.40 USDC".into()),
             detected: false,
             shield: SwapSeen::Looking,
+            shield_transaction: None,
             origin: "Ethereum".into(),
         }
     }
@@ -4267,29 +4313,39 @@ pub(super) mod tests {
             );
         }
         // Once the reported block was read, the trade's amount is the chain's, and the private
-        // return tells whether the block shows the shield. Both stay pending.
-        for (shield, detail) in [
+        // return tells whether the block shows the shield. The trade stays pending, and a
+        // shield the block shows is done, with its transaction.
+        let shield_transaction = Some(B256::repeat_byte(0x5e));
+        for (shield, transaction, status, detail) in [
             (
                 SwapSeen::Detected(Some("49.28 USDC".into())),
+                shield_transaction,
+                Done,
                 "Shield detected · 49.28 USDC",
             ),
-            (SwapSeen::Detected(None), "Shield detected"),
-            (SwapSeen::NotFound, "No shield detected yet"),
+            (
+                SwapSeen::Detected(None),
+                shield_transaction,
+                Done,
+                "Shield detected",
+            ),
+            (SwapSeen::NotFound, None, Pending, "No shield detected yet"),
         ] {
             hinted.fill_hint = Some(SwapFillHint {
                 detected: true,
                 shield,
+                shield_transaction: transaction,
                 ..fill_hint()
             });
             let steps = swap_steps(stages[0], &hinted);
             assert_eq!(
                 steps[2..]
                     .iter()
-                    .map(|step| (step.status, step.detail.as_str()))
+                    .map(|step| (step.status, step.detail.as_str(), step.transaction))
                     .collect::<Vec<_>>(),
                 [
-                    (Pending, "Confirming (5/12) · 49.40 USDC bought"),
-                    (Pending, detail),
+                    (Pending, "Confirming (5/12) · 49.40 USDC bought", None),
+                    (status, detail, transaction),
                 ]
             );
         }

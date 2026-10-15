@@ -34,6 +34,7 @@ use super::{
     AbortOnDrop, BridgeProvider, BridgeRoutes, PrivateSwapsView, ReceiveTo, SwapBuyItem, SwapForm,
     action_alert, bridge_routes_retry_button, error_alert, network_name, same_offer,
 };
+use crate::root::private_swap::dialog::provider_mark;
 use crate::root::shell::WalletTab;
 use crate::root::ui_helpers::network_token_icon;
 use crate::root::{PRIVATE_ASSET_LIST_WIDTH, dialog_max_height};
@@ -1339,15 +1340,21 @@ impl PrivateSwapsView {
     }
 }
 
-/// The tag of a token only NEAR Intents delivers.
+/// The tag of a token only NEAR Intents delivers: the provider's mark, its text's size, and
+/// "NEAR".
 fn near_tag() -> Tag {
     Tag::secondary()
         .outline()
         .small()
         .rounded_full()
         .flex_none()
+        .gap_1()
         .text_xs()
         .line_height(relative(theme::APP_TEXT_LINE_HEIGHT))
+        .child(provider_mark(
+            BridgeProvider::NearIntents,
+            rems(0.75).into(),
+        ))
         .child("NEAR")
 }
 

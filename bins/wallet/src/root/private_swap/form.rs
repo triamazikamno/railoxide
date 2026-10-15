@@ -89,7 +89,7 @@ use self::buy_picker::{
 };
 use self::public_source::{PublicSwapForm, public_strip};
 use self::quote_failure::{QuoteFailure, map_quote_failure};
-use super::dialog::{SwapDialogView, powered_by_cow};
+use super::dialog::{SwapDialogView, powered_by_cow, provider_mark_path, provider_mention};
 use super::model::{
     SwapFormMode as FormMode, SwapSetupProgress, SwapStage, SwapStepAccount, format_bps_percent,
     private_delivery_credit, provider_name, quote_anchor_delta_bps, swap_cost_bps, swap_form_mode,
@@ -181,6 +181,9 @@ const BLOCKED_SHIELD_LABEL: &str = "I accept that this Shield may be blocked";
 const BLOCKED_SHIELD_PROBLEM: &str = "Accept the blocked Shield risk before you review the swap.";
 const BLOCKED_SHIELD_REVIEW_WARNING: &str = "Cross-chain Shields are often blocked right now. A blocked Shield can't be spent privately. You can refund it to the stealth account that made it, which is public and needs gas for the refund.";
 /// The steps of a new swap, as its reviews' stepper names them.
+/// The Earlier approval row's hint on a speed-up's review.
+const EARLIER_APPROVAL_HINT: &str = "An earlier order of this swap approved this minimum. Whichever order trades, another order's approved bridge deposit can run in the same settlement. If it is this one, this is what the swap delivers.";
+
 const SWAP_STEPS: [&str; 2] = ["Set up stealth account", "Place order"];
 /// The steps of a private Bridge swap, which sets up a stealth account on each network.
 const PRIVATE_BRIDGE_SWAP_STEPS: [&str; 2] = ["Set up stealth accounts", "Place order"];
@@ -827,7 +830,7 @@ impl QuotedBridge {
     }
 }
 
-/// What a retry's review says about an earlier order of the same swap whose approved bridge
+/// What a speed-up's review says about an earlier order of the same swap whose approved bridge
 /// deposit can still run: the amounts are of the token received on the destination network.
 struct ContinuingDelivery {
     /// The earlier order's approved minimum.
@@ -837,8 +840,6 @@ struct ContinuingDelivery {
     /// The destination network's name.
     network: String,
     surplus: BridgeSurplus,
-    /// The reviewed order speeds up an open one, so two orders can trade.
-    speeds_up: bool,
 }
 
 impl ContinuingDelivery {
@@ -862,41 +863,20 @@ impl ContinuingDelivery {
             BridgeSurplus::KeepInAccount => "stays in the stealth account",
             BridgeSurplus::BridgedByProvider => "is returned separately",
         };
-        let trades = if self.speeds_up {
-            "Whichever order trades"
-        } else {
-            "If this order trades"
-        };
         format!(
-            "{trades}, that earlier approved deposit may run in its place, and you receive {} there instead of at least {}. Anything left on {source} {rest} and doesn't add to it.",
+            "Whichever order trades, that earlier approved deposit may run in its place, and you receive {} there instead of at least {}. Anything left on {source} {rest} and doesn't add to it.",
             self.lower, self.new
         )
     }
 
-    /// The Earlier approval row's hint.
-    const fn hint(&self) -> &'static str {
-        if self.speeds_up {
-            "An earlier order of this swap approved this minimum. Whichever order trades, another order's approved bridge deposit can run in the same settlement. If it is this one, this is what the swap delivers."
-        } else {
-            "An earlier order of this swap approved this minimum, and its bridge deposit can still run if this order trades. Then this is what the swap delivers."
-        }
-    }
-
-    /// The review's warning. With two orders that can trade, it also says that the order that
-    /// trades needn't be the one whose deposit runs.
+    /// The review's warning. Two orders can trade, so it also says that the order that trades
+    /// needn't be the one whose deposit runs.
     fn warning(&self) -> String {
-        let warning = format!(
-            "This swap may deliver {} instead of {}.",
+        format!(
+            "This swap may deliver {} instead of {}. Whichever order trades, another order's approved deposit can run in its settlement and decide what is delivered.",
             self.lower_there(),
             self.new
-        );
-        if self.speeds_up {
-            format!(
-                "{warning} Whichever order trades, another order's approved deposit can run in its settlement and decide what is delivered."
-            )
-        } else {
-            warning
-        }
+        )
     }
 }
 
@@ -1080,6 +1060,10 @@ impl SelectItem for ProviderSelectItem {
         provider_name(self.provider).into()
     }
 
+    fn display_title(&self) -> Option<gpui::AnyElement> {
+        Some(provider_mention(self.provider, app_text).into_any_element())
+    }
+
     fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
         // The list gives every row the height of one measured row, so the reason shares the
         // provider's line instead of wrapping below it.
@@ -1089,7 +1073,7 @@ impl SelectItem for ProviderSelectItem {
             .flex()
             .items_center()
             .gap_2()
-            .child(app_text(provider_name(self.provider)).flex_none())
+            .child(provider_mention(self.provider, app_text).flex_none())
             .children(
                 self.unavailable
                     .clone()
@@ -3288,7 +3272,7 @@ impl PrivateSwapsView {
             form.back_to_detail = Some(operation);
         }
         form.speed_up = speed_up;
-        // Only the earlier approval is left to accept.
+        // Only a speed-up's earlier approval is left to accept.
         form.price_acknowledged = true;
         form.high_costs_acknowledged = true;
         self.refresh_provider_select(window, cx);
@@ -7629,13 +7613,13 @@ impl PrivateSwapsView {
             rows.push(self.shield_failure_row(delivery, buy, cx));
         }
         // An earlier order's lower minimum, on the destination network like the Receive card's.
-        let continuing = self.continuing_delivery(review, speed_up.is_some(), cx);
+        let continuing = self.continuing_delivery(review, cx);
         if let Some(continuing) = &continuing {
             rows.push(
                 SpendAuthorizationSummaryRow::new("Earlier approval", continuing.lower_there())
                     .with_hint(SpendAuthorizationHint::new(
                         "Earlier approval",
-                        [continuing.hint().to_owned()],
+                        [EARLIER_APPROVAL_HINT],
                     )),
             );
         }
@@ -7762,11 +7746,9 @@ impl PrivateSwapsView {
         };
         let public = SpendAuthorizationHint::new("What becomes public", public);
         let (title, confirm_label) = match setup {
-            Some([_]) => ("Set up stealth account and swap", "Create stealth account"),
-            Some(_) => (
-                "Set up stealth accounts and swap",
-                "Create stealth accounts",
-            ),
+            // The steps name the setup.
+            Some([_]) => ("Private swap", "Create stealth account"),
+            Some(_) => ("Private swap", "Create stealth accounts"),
             None if speed_up.is_some() => ("Speed up swap", "Speed up"),
             None => ("Private swap", "Swap"),
         };
@@ -8353,6 +8335,9 @@ impl PrivateSwapsView {
             });
         }
         SpendAuthorizationSummaryRow::new("Bridge", value)
+            .with_icon(Some(WalletIconSource::embedded(provider_mark_path(
+                delivery.provider,
+            ))))
             .with_hint(SpendAuthorizationHint::new(provider, paragraphs))
     }
 
@@ -8531,8 +8516,8 @@ impl PrivateSwapsView {
                         orderbook,
                         bridge: result.bridge,
                         destination_minimum: approval.bounds.destination_minimum,
-                        // A first order has no earlier one. If signing finds one, it asks for
-                        // a full review.
+                        // A first order has no earlier one, and signing checks only a
+                        // speed-up for one.
                         continuing_minimum: None,
                         full_review: false,
                         // The use whose saved approval this step confirms.
@@ -9573,14 +9558,10 @@ impl PrivateSwapsView {
         )
     }
 
-    /// The lower delivery an earlier order of `review`'s swap can still make, beside the
-    /// reviewed one. `None` when no earlier approval can deliver less.
-    fn continuing_delivery(
-        &self,
-        review: &SwapReview,
-        speeds_up: bool,
-        cx: &App,
-    ) -> Option<ContinuingDelivery> {
+    /// The lower delivery an earlier order of a speed-up `review`'s swap can still make, beside
+    /// the reviewed one. `None` when no earlier approval can deliver less, as for any review
+    /// other than a speed-up's.
+    fn continuing_delivery(&self, review: &SwapReview, cx: &App) -> Option<ContinuingDelivery> {
         let lower = review.continuing_minimum()?;
         let SwapDelivery::Bridge(delivery) = review.plan().delivery() else {
             return None;
@@ -9597,7 +9578,6 @@ impl PrivateSwapsView {
             ),
             network: network_name(network),
             surplus: delivery.surplus,
-            speeds_up,
         })
     }
 
@@ -11490,7 +11470,7 @@ impl PrivateSwapsView {
         let QuoteState::Ready(review) = &form.quote else {
             return None;
         };
-        let continuing = self.continuing_delivery(review, form.speed_up.is_some(), cx)?;
+        let continuing = self.continuing_delivery(review, cx)?;
         let warning_color = cx.theme().warning;
         Some(
             div()
@@ -12751,8 +12731,12 @@ impl PrivateSwapsView {
         let (sell, buy) = (plan.sell_token(), plan.buy_token());
         let costs_label = self.costs_label(review, " in costs", cx);
         let open = form.details_open;
-        let details =
-            Self::details_header(open, self.rate_label(review, cx), Some(costs_label), cx);
+        let details = Self::details_header(
+            open,
+            app_text(self.rate_label(review, cx)),
+            Some(costs_label),
+            cx,
+        );
         if !open {
             return details;
         }
@@ -12851,7 +12835,7 @@ impl PrivateSwapsView {
     /// opens it.
     fn details_header(
         open: bool,
-        headline: String,
+        headline: gpui::Div,
         costs: Option<String>,
         cx: &Context<'_, Self>,
     ) -> Collapsible {
@@ -12882,7 +12866,7 @@ impl PrivateSwapsView {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(app_text(headline).flex_1().min_w_0().truncate())
+                            .child(headline.flex_1().min_w_0().truncate())
                             .children(costs.map(|costs| app_muted_text(costs).flex_none()))
                             .child(
                                 Icon::new(if open {
@@ -13025,7 +13009,7 @@ impl PrivateSwapsView {
                         fee,
                         cx,
                     )))
-                    .child(app_muted_text(provider)),
+                    .child(provider_mention(delivery.provider, app_muted_text)),
                 true,
                 Some(if bridge.private.is_some() {
                     format!("{provider}'s fee, already out of the minimum you receive.")

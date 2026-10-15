@@ -2001,6 +2001,7 @@ impl PrivateSwapsView {
                 minimum: None,
                 uncovered_gas: None,
                 order: None,
+                shield_transaction: None,
                 bridge: None,
             };
         };
@@ -2324,6 +2325,11 @@ impl PrivateSwapsView {
                 .filter(|rest| !rest.is_zero())
                 .map(|rest| self.money(buy, rest, cx)),
             order: order.map(SwapOrderRecord::uid),
+            // The delivery observation of a swap back to the private balance is its shield.
+            shield_transaction: evidence
+                .filter(|order| matches!(order.delivery(), SwapDelivery::Reshield))
+                .and_then(|order| order.observations().delivered)
+                .and_then(|delivered| delivered.transaction_hash),
             bridge,
         }
     }
@@ -2595,6 +2601,14 @@ impl PrivateSwapsView {
         // Debug UI fixture: its reported fill counts from a head of its own.
         #[cfg(debug_assertions)]
         let head = ui_fixture::reported_head().or(head);
+        let shield = match (order.delivery(), buy) {
+            (SwapDelivery::Reshield, Some(buy)) => SwapEarlyHint::seen(early, |settlement| {
+                settlement
+                    .shielded
+                    .map(|amount| self.token_amount(buy, amount, cx))
+            }),
+            _ => SwapSeen::Looking,
+        };
         Some(SwapFillHint {
             confirmations: hint
                 .trade_block
@@ -2608,14 +2622,10 @@ impl PrivateSwapsView {
                 .zip(buy)
                 .map(|(amount, buy)| self.token_amount(buy, amount, cx)),
             detected: settlement.is_some(),
-            shield: match (order.delivery(), buy) {
-                (SwapDelivery::Reshield, Some(buy)) => SwapEarlyHint::seen(early, |settlement| {
-                    settlement
-                        .shielded
-                        .map(|amount| self.token_amount(buy, amount, cx))
-                }),
-                _ => SwapSeen::Looking,
-            },
+            shield_transaction: settlement
+                .and_then(|settlement| settlement.shield_transaction)
+                .filter(|_| matches!(shield, SwapSeen::Detected(_))),
+            shield,
             origin: form::network_name(self.origin_chain_id),
         })
     }

@@ -9720,11 +9720,11 @@ fn across_review_and_confirm_step_show_the_bound_destination_terms(cx: &mut Test
     );
 }
 
-/// A retry whose earlier order approved a lower Across minimum says so before and in its
-/// review, asks for acceptance of that delivery for each quote, and binds the accepted minimum
-/// into the approval. A signing round that finds a lower one than was accepted places nothing.
+/// A speed-up whose swap's earlier order approved a lower Across minimum says so before and in
+/// its review, asks for acceptance of that delivery for each quote, and binds the accepted
+/// minimum into the approval.
 #[gpui::test]
-fn a_retry_review_discloses_and_binds_the_earlier_across_approval(cx: &mut TestAppContext) {
+fn a_speed_up_review_discloses_and_binds_the_earlier_across_approval(cx: &mut TestAppContext) {
     use broadcaster_core::contracts::cow::OrderUid;
     let stubs = SwapStubs::start();
     with_swap_view_and_rpc(
@@ -9737,34 +9737,41 @@ fn a_retry_review_discloses_and_binds_the_earlier_across_approval(cx: &mut TestA
                     swaps.pick_buy_token(STUB_POLYGON_USDT, window, cx);
                 });
             });
-            // The form's quote with an earlier order's approval at 90% of its minimum.
-            let quote_retry = |cx: &mut gpui::VisualTestContext| {
-                let quoted = refreshed_review(swaps, runtime, cx);
-                let minimum = quoted.bridge().unwrap().destination_minimum;
-                let lower = minimum * U256::from(9) / U256::from(10);
-                let review = Arc::new((*quoted).clone().with_continuing_for_tests(vec![
-                    wallet_ops::SwapContinuingApproval {
-                        uid: OrderUid::new(B256::repeat_byte(0x11), Address::repeat_byte(3), 20),
-                        attempt: 0,
-                        destination_minimum: lower,
-                        post_hook_nonce: U256::from(2),
-                        quote_timestamp: 1,
-                    },
-                ]));
-                assert_eq!(review.continuing_minimum(), Some(lower));
-                cx.update(|_, cx| {
-                    swaps.update(cx, |swaps, cx| {
-                        // Only the earlier approval is left to accept.
-                        let form = swaps.form.as_mut().unwrap();
-                        form.price_acknowledged = true;
-                        form.high_costs_acknowledged = true;
-                        form.quote = QuoteState::Ready(Arc::clone(&review));
-                        cx.notify();
-                    });
-                });
-                (review, minimum, lower)
+            // The form's quote with an earlier order's approval at 90% of its minimum, as the
+            // speed-up of an open order that signed a higher minimum.
+            let quoted = refreshed_review(swaps, runtime, cx);
+            let minimum = quoted.bridge().unwrap().destination_minimum;
+            let lower = minimum * U256::from(9) / U256::from(10);
+            let review = Arc::new((*quoted).clone().with_continuing_for_tests(vec![
+                wallet_ops::SwapContinuingApproval {
+                    uid: OrderUid::new(B256::repeat_byte(0x11), Address::repeat_byte(3), 20),
+                    attempt: 0,
+                    destination_minimum: lower,
+                    post_hook_nonce: U256::from(2),
+                    quote_timestamp: 1,
+                },
+            ]));
+            assert_eq!(review.continuing_minimum(), Some(lower));
+            let signed = review
+                .buy_amount_for(review.suggested_private_minimum())
+                .unwrap();
+            let mut bounds = test_approval().bounds;
+            bounds.buy_amount = signed + U256::ONE;
+            let open = SpeedUpOrder {
+                uid: OrderUid::new(B256::repeat_byte(0x12), Address::repeat_byte(3), 20),
+                bounds,
             };
-            let (review, minimum, lower) = quote_retry(cx);
+            cx.update(|_, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    // Only the earlier approval is left to accept.
+                    let form = swaps.form.as_mut().unwrap();
+                    form.speed_up = Some(open.clone());
+                    form.price_acknowledged = true;
+                    form.high_costs_acknowledged = true;
+                    form.quote = QuoteState::Ready(Arc::clone(&review));
+                    cx.notify();
+                });
+            });
 
             // The review stays closed until the lower delivery is accepted in the form.
             swaps.read_with(cx, |swaps, _| {
@@ -9783,18 +9790,25 @@ fn a_retry_review_discloses_and_binds_the_earlier_across_approval(cx: &mut TestA
                 assert!(form.continuing_acknowledged);
                 assert_eq!(form.review_problem(&review), None);
 
-                // The review names both minimums on the destination network.
+                // The review names both orders' signed minimums on the swap's own network, and
+                // the earlier approval beside this order's minimum on the destination network.
                 let amount =
                     |amount| swaps.network_token_amount(137, STUB_POLYGON_USDT, amount, cx);
                 let earlier = format!("{} on Polygon", amount(lower));
-                let summary = swaps.swap_summary(&review, None, None, None, None, cx);
+                let summary = swaps.swap_summary(&review, None, None, None, Some(&open), cx);
+                let rows = summary.rows_for_test();
                 assert!(
-                    summary
-                        .rows_for_test()
-                        .contains(&("Earlier approval".to_owned(), earlier.clone())),
-                    "{:?}",
-                    summary.rows_for_test()
+                    rows.contains(&("Earlier approval".to_owned(), earlier.clone())),
+                    "{rows:?}"
                 );
+                for minimum in [open.bounds.buy_amount, signed] {
+                    let shown = format!(
+                        "{} on {}",
+                        swaps.token_amount(review.plan().buy_token(), minimum, cx),
+                        swaps.chain_label()
+                    );
+                    assert!(rows.iter().any(|(_, value)| *value == shown), "{rows:?}");
+                }
                 assert_eq!(
                     summary.receive_card_for_test().map(|(_, amount, _)| amount),
                     Some(amount(minimum)),
@@ -9809,90 +9823,30 @@ fn a_retry_review_discloses_and_binds_the_earlier_across_approval(cx: &mut TestA
                     "{:?}",
                     summary.warnings_for_test()
                 );
-
-                // As the speed-up of an open order, the same review also names both orders'
-                // signed minimums, on the swap's own network, and its warning covers more than
-                // this order trading.
-                let signed = review
-                    .buy_amount_for(review.suggested_private_minimum())
-                    .unwrap();
-                let mut bounds = test_approval().bounds;
-                bounds.buy_amount = signed + U256::ONE;
-                let open = SpeedUpOrder {
-                    uid: OrderUid::new(B256::repeat_byte(0x12), Address::repeat_byte(3), 20),
-                    bounds,
-                };
-                let sped_up = swaps.swap_summary(&review, None, None, None, Some(&open), cx);
-                let rows = sped_up.rows_for_test();
-                assert!(rows.contains(&("Earlier approval".to_owned(), earlier.clone())));
-                for minimum in [open.bounds.buy_amount, signed] {
-                    let shown = format!(
-                        "{} on {}",
-                        swaps.token_amount(review.plan().buy_token(), minimum, cx),
-                        swaps.chain_label()
-                    );
-                    assert!(rows.iter().any(|(_, value)| *value == shown), "{rows:?}");
-                }
-                let lower_delivery = |summary: &SpendAuthorizationSummary| {
-                    summary
-                        .warnings_for_test()
-                        .into_iter()
-                        .find(|warning| warning.contains(&earlier) && warning.contains(&own))
-                        .unwrap()
-                };
-                assert_ne!(
-                    lower_delivery(&sped_up),
-                    lower_delivery(&summary),
-                    "two orders that can trade need more than the retry's warning"
-                );
             });
-
-            // Another quote asks again.
-            cx.update(|window, cx| {
-                swaps.update(cx, |swaps, cx| {
-                    swaps.set_slippage(100, window, cx);
-                    assert!(
-                        !swaps.form.as_ref().unwrap().continuing_acknowledged,
-                        "acceptance of the previous quote cannot carry across changed terms"
-                    );
-                });
-            });
-            let (review, _, lower) = quote_retry(cx);
 
             cx.update(|window, cx| {
                 swaps.update(cx, |swaps, cx| {
-                    // The order's review, as the swap's own form opens it.
-                    let form = swaps.form.as_mut().unwrap();
-                    form.operation = Some(operation);
-                    form.continuing_acknowledged = true;
+                    // The speed-up's review, as its form opens it.
+                    swaps.form.as_mut().unwrap().operation = Some(operation);
                     swaps.request_order_review(None, window, cx);
                     let pending = swaps
                         .pending_authorization
                         .clone()
                         .unwrap_or_else(|| panic!("{:?}", swaps.form.as_ref().unwrap().error));
                     let SwapAction::Order(approval) = &pending.action else {
-                        panic!("the order's review");
+                        panic!("the speed-up's review");
                     };
                     assert!(Arc::ptr_eq(&approval.review, &review));
+                    assert_eq!(approval.speed_up, Some(open.uid));
                     assert_eq!(approval.continuing_minimum, Some(lower));
 
-                    // Signing found a lower minimum than the one accepted. Nothing is placed,
-                    // and the acceptance is asked for again.
-                    let change = SwapReviewChange::ContinuingApproval {
-                        approved: U256::ZERO,
-                        current: lower,
-                    };
-                    swaps.finish_order(
-                        operation,
-                        wallet_ops::SwapOrderOutcome::ReviewRequired(change),
-                        window,
-                        cx,
+                    // Another gas share asks again.
+                    swaps.set_gas_preset(GasPreset::Loose, window, cx);
+                    assert!(
+                        !swaps.form.as_ref().unwrap().continuing_acknowledged,
+                        "acceptance of the previous quote cannot carry across changed terms"
                     );
-                    assert_eq!(swaps.reapproval, Some((operation, change)));
-                    assert!(swaps.job.is_none(), "no order is placed");
-                    let form = swaps.form.as_ref().unwrap();
-                    assert_eq!(form.operation, Some(operation));
-                    assert!(!form.continuing_acknowledged);
                 });
             });
         },
@@ -12618,6 +12572,7 @@ fn early_hint(block: u64, report: Option<wallet_ops::SwapBridgeReport>) -> SwapE
             block: block_hash,
             bought: U256::from(99),
             shielded: None,
+            shield_transaction: None,
             handoff: Some(wallet_ops::SwapHandoffHint {
                 block: block_hash,
                 deposit_id: Some(U256::from(7)),
@@ -12683,6 +12638,7 @@ fn a_reported_private_fill_reads_its_block_once(cx: &mut TestAppContext) {
                         block: alloy::eips::BlockNumHash::new(398, B256::repeat_byte(98)),
                         bought: U256::from(99),
                         shielded: Some(U256::from(98)),
+                        shield_transaction: None,
                         handoff: None,
                     }),
                     ..unread
