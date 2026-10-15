@@ -27,7 +27,8 @@ use ui::clipboard::clipboard_with_toast;
 #[cfg(feature = "hardware")]
 use ui::controls::app_masked_input;
 use ui::controls::{
-    app_amount_text, app_button, app_button_base, app_muted_text, app_strong_text, app_text,
+    app_amount_text, app_button, app_button_base, app_muted_shimmer_text, app_muted_text,
+    app_strong_text, app_text,
 };
 use ui::hint::hint_card;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
@@ -2387,7 +2388,7 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
                         .items_center()
                         .gap_2()
                         .child(Spinner::new().small())
-                        .child(app_muted_text(format!("Waiting for {device}…"))),
+                        .child(app_muted_shimmer_text(format!("Waiting for {device}…"))),
                 )
             })
             .when_some(self.error.as_ref(), |this, error| {

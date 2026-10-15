@@ -7,6 +7,7 @@ use gpui_component::{
     Disableable, Icon, IconName, IndexPath, Selectable, Sizable,
     button::{Button, ButtonGroup, ButtonVariants},
     select::{SearchableVec, SelectDelegate, SelectItem},
+    shimmer::ShimmerText,
 };
 
 use crate::theme::{self, AMOUNT_PANEL_TEXT_SIZE, APP_TEXT_LINE_HEIGHT, APP_TEXT_SIZE};
@@ -292,6 +293,21 @@ pub fn app_amount_text(label: impl Into<SharedString>) -> Div {
 #[must_use]
 pub fn app_muted_text(label: impl Into<SharedString>) -> Div {
     app_text(label).text_color(rgb(theme::TEXT_MUTED))
+}
+
+/// [`app_text`] with a loading shimmer, for a wait under way.
+#[must_use]
+pub fn app_shimmer_text(label: impl Into<SharedString>) -> Div {
+    div()
+        .text_size(APP_TEXT_SIZE)
+        .line_height(relative(APP_TEXT_LINE_HEIGHT))
+        .child(ShimmerText::new(label))
+}
+
+/// [`app_muted_text`] with a loading shimmer, for a wait under way.
+#[must_use]
+pub fn app_muted_shimmer_text(label: impl Into<SharedString>) -> Div {
+    app_shimmer_text(label).text_color(rgb(theme::TEXT_MUTED))
 }
 
 #[must_use]

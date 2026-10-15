@@ -26,7 +26,9 @@ use gpui_component::{
     tag::Tag,
     tooltip::Tooltip,
 };
-use ui::controls::{app_muted_text, app_segment_button, app_strong_text, app_text};
+use ui::controls::{
+    app_muted_shimmer_text, app_muted_text, app_segment_button, app_strong_text, app_text,
+};
 use ui::theme;
 use wallet_ops::{PublicBroadcasterCandidate, WalletSession};
 
@@ -773,7 +775,7 @@ impl ListDelegate for BuyTokensDelegate {
                 .gap_2()
                 .child(Spinner::new().small())
                 .child(
-                    app_muted_text(format!("Getting the tokens {network} can receive…"))
+                    app_muted_shimmer_text(format!("Getting the tokens {network} can receive…"))
                         .min_w_0()
                         .whitespace_normal(),
                 ),

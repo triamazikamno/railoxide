@@ -19,7 +19,9 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text, app_text};
+use ui::controls::{
+    app_button, app_button_base, app_muted_shimmer_text, app_muted_text, app_strong_text, app_text,
+};
 use ui::theme;
 use wallet_ops::{
     DesktopPrivateSpendAuthorization, ExecutorAsset, ExecutorPaidRecoveryRequest,
@@ -296,13 +298,15 @@ impl PrivateSwapsView {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .child(app_muted_text(if reserving {
-                        "Reserving the swap's stealth account…"
-                    } else if error.is_some() {
-                        "The swap wasn't set up. Nothing was paid."
+                    .child(if reserving {
+                        app_muted_shimmer_text("Reserving the swap's stealth account…")
                     } else {
-                        "This swap is no longer saved in this wallet."
-                    }))
+                        app_muted_text(if error.is_some() {
+                            "The swap wasn't set up. Nothing was paid."
+                        } else {
+                            "This swap is no longer saved in this wallet."
+                        })
+                    })
                     .children(error.map(progress_error)),
                 None,
             );

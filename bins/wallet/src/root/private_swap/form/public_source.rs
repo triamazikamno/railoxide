@@ -3492,7 +3492,12 @@ impl PrivateSwapsView {
                             .items_center()
                             .gap_2()
                             .child(Spinner::new().small())
-                            .child(app_text(status).flex_1().min_w_0().whitespace_normal())
+                            .child(
+                                app_shimmer_text(status)
+                                    .flex_1()
+                                    .min_w_0()
+                                    .whitespace_normal(),
+                            )
                     }),
             )
             .children(match &form.quote {

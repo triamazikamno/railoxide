@@ -41,7 +41,8 @@ use gpui_component::{
 use ui::clipboard::{clipboard_with_toast, copy_to_clipboard_with_toast};
 use ui::controls::{
     app_amount_input, app_amount_text, app_button, app_button_base, app_button_label, app_input,
-    app_muted_text, app_segment_button, app_strong_text, app_text,
+    app_muted_shimmer_text, app_muted_text, app_segment_button, app_shimmer_text, app_strong_text,
+    app_text,
 };
 use ui::hint::hint_card;
 use ui::recipient_picker::RecipientPickerEvent;
@@ -10187,7 +10188,7 @@ impl PrivateSwapsView {
                                     .gap_x_2()
                                     .child(Spinner::new().small())
                                     .child(
-                                        app_muted_text(if order {
+                                        app_muted_shimmer_text(if order {
                                             "Getting a quote and checking the price…"
                                         } else {
                                             "Getting a quote…"
@@ -10445,7 +10446,7 @@ impl PrivateSwapsView {
         match form.bridge_state() {
             BridgeState::Loading => {
                 return line.child(Spinner::new().small()).child(
-                    app_muted_text(format!("Getting the tokens {network} can receive…"))
+                    app_muted_shimmer_text(format!("Getting the tokens {network} can receive…"))
                         .flex_1()
                         .min_w_0()
                         .whitespace_normal(),
@@ -10504,7 +10505,7 @@ impl PrivateSwapsView {
                 .whitespace_normal(),
             ),
             QuoteState::Loading => line.child(Spinner::new().small()).child(
-                app_muted_text("Getting a quote and checking the price…")
+                app_muted_shimmer_text("Getting a quote and checking the price…")
                     .flex_1()
                     .min_w_0()
                     .whitespace_normal(),
@@ -13209,7 +13210,7 @@ impl PrivateSwapsView {
                     .items_center()
                     .gap_2()
                     .child(Spinner::new().small())
-                    .child(app_text(format!(
+                    .child(app_shimmer_text(format!(
                         "Setting up the swap's stealth {} · {status}",
                         if form.private_bridge() {
                             "accounts"
