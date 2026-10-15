@@ -190,17 +190,20 @@ impl ExecutorOwner {
         } else {
             observed
         };
-        // The orderbook may learn of a fill after the first answer, so it is asked once more
-        // before an expiry is recorded. A trade it reports now is read by the next call.
-        if next.expired.is_some()
-            && observed.expired.is_none()
+        // The orderbook may learn of a fill after the first answer: an order invalidated after
+        // it filled reads as cancelled, and past validTo as expired. It is asked once more
+        // before a new cancellation or expiry is recorded. If it now reports a trade, this call
+        // records neither and the next call reads the trade.
+        if ((next.expired.is_some() && observed.expired.is_none())
+            || (next.cancelled.is_some() && observed.cancelled.is_none()))
             && let Some(orderbook) = orderbook
             && self
                 .public_swap_trade_block(orderbook, uid)
                 .await?
                 .is_some()
         {
-            next.expired = None;
+            next.expired = observed.expired;
+            next.cancelled = observed.cancelled;
         }
         if next == observed {
             return self.public_swap_record(operation);
@@ -579,9 +582,9 @@ async fn read_expiry(
 
 /// The final block at which the settlement holds the order invalidated. A sending step's
 /// inclusion can be provisional, so it never decides cancellation. `invalidateOrder` sets the
-/// order's `filledAmount` to the maximum, which no fill reaches. The caller reads this only
-/// while the orderbook reports no
-/// trade: an order invalidated after it filled reads the same.
+/// order's `filledAmount` to the maximum, which no fill reaches. An order invalidated after it
+/// filled reads the same, so the caller reads this only while the orderbook reports no trade
+/// and asks the orderbook once more before recording it.
 async fn read_invalidation(
     provider: &DynProvider,
     read: &OrderRead<'_>,

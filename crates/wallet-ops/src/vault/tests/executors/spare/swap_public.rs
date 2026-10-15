@@ -1502,6 +1502,9 @@ struct PublicPayment {
     batch_nonce: B256,
     /// The block the orderbook stub reports the order's trade in. `None` reports no trade.
     trade_block: Arc<Mutex<Option<u64>>>,
+    /// Answers for the orderbook stub's next reads of the order's trades, taken in order before
+    /// it falls back to [`Self::trade_block`].
+    trade_answers: Arc<Mutex<std::collections::VecDeque<Option<u64>>>>,
     /// The destination account's recorded shield.
     shield: B256,
     /// The swap's record as each broadcast found it, with the broadcast transaction's hash.
@@ -1745,6 +1748,7 @@ impl PublicPayment {
                 valid_to: now + 5 * 60,
                 batch_nonce,
                 trade_block: Arc::default(),
+                trade_answers: Arc::default(),
                 shield,
                 at_broadcast,
                 broadcast,
@@ -1833,7 +1837,8 @@ impl PublicPayment {
     /// An orderbook on the origin chain that records each order request with the swap's order
     /// as the record held it when the request arrived. With `lose_first_response` it accepts
     /// the first order without answering, and answers the next as a duplicate. A read of the
-    /// order's trades answers [`Self::trade_block`].
+    /// order's trades answers the next of [`Self::trade_answers`], or else
+    /// [`Self::trade_block`].
     async fn orderbook(
         &self,
         lose_first_response: bool,
@@ -1852,6 +1857,7 @@ impl PublicPayment {
         let (operation, id) = (self.operation, self.id);
         let settlement = self.settlement();
         let trade_block = self.trade_block.clone();
+        let trade_answers = self.trade_answers.clone();
         let task = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let mut stream = BufReader::new(stream);
@@ -1865,7 +1871,8 @@ impl PublicPayment {
                 if request_line.starts_with("GET") {
                     // The only read is of the order's trades, by its UID.
                     assert!(request_line.contains("/api/v1/trades?orderUid=0x"));
-                    let reported = *trade_block.lock().unwrap();
+                    let queued = trade_answers.lock().unwrap().pop_front();
+                    let reported = queued.unwrap_or_else(|| *trade_block.lock().unwrap());
                     let reply = reported
                         .map_or_else(|| json!([]), |block| json!([{"blockNumber": block}]))
                         .to_string();
@@ -3942,6 +3949,58 @@ async fn an_invalidation_included_after_a_fill_leaves_the_public_order_traded() 
     orderbook_task.abort();
     let _ = orderbook_task.await;
     payment.finish(owner).await;
+}
+
+// An order invalidated after it filled reads as cancelled, and past its validTo also as
+// expired. The orderbook doesn't report the trade at the first lookup but does when asked again
+// before either is recorded, so neither is: the swap stays tracked past its batch's deadline,
+// and the next observation reads the trade.
+#[tokio::test]
+async fn an_invalidated_fill_the_orderbook_reports_late_is_neither_cancelled_nor_expired() {
+    for past_valid_to in [false, true] {
+        let (payment, owner) = PublicPayment::start_order().await;
+        let (orderbook, _requests, orderbook_task) = payment.orderbook(false).await;
+        let uid = payment.submitted(&owner, &orderbook).await;
+
+        let paid = U256::from(1_020);
+        let block = payment.settle(uid, paid, Some(&payment.deposited(paid, U256::from(1_009))));
+        *payment.trade_block.lock().unwrap() = None;
+        let PublicSwapTransactionOutcome::Included { block_number, .. } =
+            invalidate(&payment, &owner, &orderbook).await.unwrap()
+        else {
+            panic!("the invalidation succeeds");
+        };
+        {
+            let mut origin = payment.chain.lock().unwrap();
+            origin.chain.invalidated.push((uid, block_number));
+            if past_valid_to {
+                origin.late_from = Some((block_number, u64::from(payment.valid_to) + 1));
+            }
+        }
+
+        // The invalidation's block is final. The orderbook reports no trade at the first
+        // lookup, and the trade from then on.
+        payment.mine();
+        payment.trade_answers.lock().unwrap().push_back(None);
+        *payment.trade_block.lock().unwrap() = Some(block);
+        let swap = payment.observe(&owner, &orderbook).await;
+        let observed = swap.observations();
+        assert_eq!(
+            (observed.cancelled, observed.expired, observed.traded),
+            (None, None, None)
+        );
+        let deadline = u64::from(swap.order().unwrap().batch().deadline());
+        assert!(!swap.is_finished(false, deadline + 1));
+
+        let traded = payment.observe(&owner, &orderbook).await.observations();
+        assert_eq!(traded.traded.unwrap().block.number, block);
+        assert_eq!((traded.cancelled, traded.expired), (None, None));
+        assert_eq!(payment.state(), Some(PublicSwapOrderState::Bridged));
+
+        orderbook_task.abort();
+        let _ = orderbook_task.await;
+        payment.finish(owner).await;
+    }
 }
 
 // An invalidation only cancels once the settlement holds it in final canonical state. A
