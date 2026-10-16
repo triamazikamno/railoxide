@@ -3693,6 +3693,8 @@ fn with_swap_view_and_store(
             .unwrap();
         let observation = session.observation_rx.borrow().clone();
         root.update(cx, |root, _| {
+            // The swap disclaimer would open above the first swap dialog; its own test shows it.
+            root.ui_state.swap_disclaimer_acknowledged = true;
             root.chain_states.insert(
                 1,
                 ChainUtxoState::Ready {
@@ -4039,6 +4041,73 @@ fn my_orders_without_rows_keeps_focus_in_the_dialog(cx: &mut TestAppContext) {
         });
         assert!(cx.debug_bounds(row).is_none());
         escape_closes(cx);
+    });
+}
+
+/// The disclaimer opens above each new swap dialog until "I understand" is pressed, and the
+/// question-mark button opens it again.
+#[gpui::test]
+fn swap_disclaimer_opens_until_acknowledged_and_from_its_button(cx: &mut TestAppContext) {
+    with_swap_view(cx, |root, swaps, _, _, _, cx| {
+        root.update(cx, |root, _| {
+            root.ui_state.swap_disclaimer_acknowledged = false;
+        });
+        let open_form = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| {
+                    swaps.open_new_form(Address::repeat_byte(1), window, cx);
+                });
+                window.draw(cx).clear(cx);
+            });
+        };
+        let close_swap_dialog = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                swaps.update(cx, |swaps, cx| swaps.close_swap_dialog(window, cx));
+                window.draw(cx).clear(cx);
+            });
+        };
+        let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+            let bounds = cx.debug_bounds(selector).unwrap();
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        };
+        // The disclaimer is shown above the swap dialog, which has the focus otherwise.
+        let shown = |cx: &mut gpui::VisualTestContext| {
+            let shown = cx.debug_bounds("swap-disclaimer").is_some();
+            cx.update(|window, cx| {
+                let swaps = swaps.read(cx);
+                assert!(swaps.dialog.is_some());
+                assert_eq!(swaps.swap_dialog_active(window, cx), !shown);
+            });
+            shown
+        };
+        let acknowledged = |cx: &mut gpui::VisualTestContext| {
+            root.read_with(cx, |root, _| root.ui_state.swap_disclaimer_acknowledged)
+        };
+        open_form(cx);
+        assert!(shown(cx));
+        // Escape closes it without acknowledging, so the next swap dialog shows it again. The
+        // focus returns to the swap dialog after the close animation.
+        cx.simulate_keystrokes("escape");
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(!shown(cx));
+        assert!(!acknowledged(cx));
+        close_swap_dialog(cx);
+        open_form(cx);
+        assert!(shown(cx));
+        // "I understand" leaves the swap dialog open, and the disclaimer no longer opens by
+        // itself.
+        click("swap-disclaimer-acknowledge", cx);
+        assert!(!shown(cx));
+        assert!(acknowledged(cx));
+        close_swap_dialog(cx);
+        open_form(cx);
+        assert!(!shown(cx));
+        click("swap-disclaimer-open", cx);
+        assert!(shown(cx));
     });
 }
 

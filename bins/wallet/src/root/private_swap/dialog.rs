@@ -1,7 +1,7 @@
 //! The swap dialog. One dialog shows the swap form, My orders, or one swap's order detail, and a
 //! back button moves between them. Escape and × close it. The asset and broadcaster pickers,
-//! spend authorization review, a setup's retry, stealth-account recovery and confirmations open
-//! on top of it.
+//! spend authorization review, a setup's retry, stealth-account recovery, confirmations and the
+//! swap disclaimer open on top of it.
 //!
 //! Background work may change the dialog only while it has focus and shows the swap the work
 //! belongs to, so a quote or order result never replaces or interrupts another dialog.
@@ -402,6 +402,10 @@ impl PrivateSwapsView {
         });
         self.load_detail_destination(view, cx);
         self.focus_view(view, window, cx);
+        // Above the swap dialog, which takes the focus back when the disclaimer closes.
+        if !self.swap_disclaimer_acknowledged(cx) {
+            self.open_swap_disclaimer(window, cx);
+        }
         cx.notify();
     }
 
@@ -827,7 +831,8 @@ impl PrivateSwapsView {
                 )
             })
             .when(view == Some(SwapDialogView::Form), |row| {
-                row.child(self.render_orders_button(cx))
+                row.child(Self::render_disclaimer_button(cx))
+                    .child(self.render_orders_button(cx))
             })
     }
 

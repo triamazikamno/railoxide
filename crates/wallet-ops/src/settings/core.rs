@@ -128,6 +128,9 @@ pub struct WalletUiState {
     pub public_account_sort: PublicAccountSort,
     #[serde(default)]
     pub public_hide_empty_accounts: bool,
+    /// "I understand" was pressed in the swap disclaimer, so it no longer opens by itself.
+    #[serde(default)]
+    pub swap_disclaimer_acknowledged: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -149,6 +152,7 @@ impl Default for WalletUiState {
             last_public_accounts: BTreeMap::new(),
             public_account_sort: PublicAccountSort::default(),
             public_hide_empty_accounts: false,
+            swap_disclaimer_acknowledged: false,
         }
     }
 }

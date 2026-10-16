@@ -40,6 +40,7 @@ use super::WalletRoot;
 use super::spend_authorization::{SpendAuthorizationIntent, SpendAuthorizationSummary};
 
 mod dialog;
+mod disclaimer;
 mod form;
 mod model;
 mod progress;
