@@ -359,7 +359,9 @@ async fn each_swap_setup_gets_its_own_executor_and_authorizes_only_that_executor
         record.reserved_inputs(),
         vec![ExecutorInputIdentity::from_utxo(&input)]
     );
-    owner.stop_swap_setup(operation).unwrap();
+    owner
+        .cancel_swap_use(None, operation, SwapUseId::first(operation))
+        .unwrap();
     assert!(owner.swap_setup_preview(operation).is_err());
     assert!(
         owner
@@ -1239,8 +1241,17 @@ async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_a
         (origin.records().unwrap(), destination.records().unwrap()),
         before
     );
-    // A stopped destination account takes no further setup.
-    destination.stop_swap_setup(destination_operation).unwrap();
+    // Registering the swap's account in Public stops its use before the account is handed off,
+    // and the stopped destination account takes no further setup.
+    let live = record(&origin, operation);
+    assert!(!live.swap_use(swap_use).unwrap().is_stopped());
+    origin
+        .register_public_account(operation, &authorization)
+        .await
+        .unwrap();
+    let registered = record(&origin, operation);
+    assert!(registered.swap_use(swap_use).unwrap().is_stopped());
+    assert_eq!(registered.issued(), live.issued());
     assert!(
         destination
             .resume_swap_setup(
@@ -1251,16 +1262,6 @@ async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_a
             .await
             .is_err()
     );
-    // Registering the swap's account in Public stops its use before the account is handed off.
-    let live = record(&origin, operation);
-    assert!(!live.swap_use(swap_use).unwrap().is_stopped());
-    origin
-        .register_public_account(operation, &authorization)
-        .await
-        .unwrap();
-    let registered = record(&origin, operation);
-    assert!(registered.swap_use(swap_use).unwrap().is_stopped());
-    assert_eq!(registered.issued(), live.issued());
     origin.shutdown().await;
     destination.shutdown().await;
     drop((origin, destination));

@@ -4944,7 +4944,7 @@ impl PrivateSwapsView {
     }
 
     /// The form's reserved account and, for a reused source, its draft's swap-use identity.
-    /// A new source keeps the record's legacy lookup even when the form has a use identity.
+    /// A new source is read through the record's own swap even when the form has a use identity.
     fn reserved_swap(&self, form: &SwapForm) -> Option<(&ExecutorRecord, Option<SwapUseId>)> {
         let record = self.record(form.operation?)?;
         let swap_use = if form.reuse_account {

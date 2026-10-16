@@ -3643,14 +3643,14 @@ impl PrivateSwapsView {
     }
 }
 
-/// Whether a source use's saved approval has the swap set its destination account up. An
-/// approval from before accounts were bound has it do so, as every such swap did.
+/// Whether a source use's saved approval has the swap set its destination account up, as
+/// recorded by the destination account the approval binds.
 fn sets_up_destination(swap_use: &SwapUseRecord) -> bool {
     swap_use.approval().is_some_and(|approval| {
         approval
             .accounts
             .and_then(|accounts| accounts.destination)
-            .is_none_or(|account| account.setup)
+            .is_some_and(|account| account.setup)
     })
 }
 

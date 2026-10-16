@@ -4159,12 +4159,9 @@ fn require_delegated_plan(plan: &SwapInputPlan) -> Result<DelegatedSwapExecutor>
     })
 }
 
-/// An order is signed only for the swap use that claims its account and was not stopped. An
-/// account reserved without a use takes its first one with its first order.
+/// An order is signed only for the swap use that claims its account and was not stopped.
 fn require_swap_use(record: &ExecutorRecord, swap_use: SwapUseId) -> Result<()> {
-    if is_live_swap_use(record, swap_use)
-        || record.swap_uses().is_empty() && swap_use == SwapUseId::first(record.operation())
-    {
+    if is_live_swap_use(record, swap_use) {
         return Ok(());
     }
     if record

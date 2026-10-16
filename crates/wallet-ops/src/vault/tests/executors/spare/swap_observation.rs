@@ -698,13 +698,27 @@ impl Fixture {
         )
         .unwrap();
         let operation = ExecutorOperationId::random().unwrap();
-        // The swap owner's purpose summary marks the record as a swap executor.
+        // The swap owner's purpose summary marks the record as a swap executor. A swap reserves
+        // its account with the terms the user approved, which its first use holds.
+        let approval = (purpose == "Private swap").then(|| SwapApproval {
+            bounds: swap_bounds(),
+            price_verified: None,
+            price_acknowledged: false,
+            delivery: SwapDelivery::Reshield,
+            tokens: Some(SwapApprovalTokens {
+                sell: SELL,
+                buy: BUY,
+            }),
+            accounts: None,
+        });
         store
-            .reserve(
+            .reserve_with_swap_approval(
                 operation,
                 delegate,
                 Some(purpose),
                 &[ExecutorAsset::Erc20(SELL), ExecutorAsset::Erc20(BUY)],
+                approval,
+                None,
             )
             .unwrap();
         store.bind_address(operation, EXECUTOR).unwrap();
@@ -800,17 +814,29 @@ impl Fixture {
             ..swap_bounds()
         };
         // A private Bridge order is recorded only for a use that names the destination
-        // stealth account serving it.
-        if let SwapDelivery::Bridge(bridge) = delivery
-            && bridge.is_private()
-        {
-            let destination = ExecutorOperationId::random().unwrap();
-            let destination_store =
-                ExecutorStore::new(self.db.clone(), self.view.clone(), bridge.destination_chain)
-                    .unwrap();
+        // stealth account serving it. The use the swap reserved its account with names none,
+        // so it is cancelled before the account is claimed again. An account no swap claims
+        // takes the order's use through a claim too.
+        let private = match delivery {
+            SwapDelivery::Bridge(bridge) if bridge.is_private() => Some(bridge),
+            _ => None,
+        };
+        let reserved = self.record().active_swap_use();
+        if private.is_some() || reserved.is_none() {
+            let id = match reserved {
+                Some(reserved) => {
+                    self.store
+                        .cancel_swap_use(self.operation, reserved)
+                        .unwrap();
+                    SwapUseId::random().unwrap()
+                }
+                None => SwapUseId::first(self.operation),
+            };
+            let destination =
+                private.map(|bridge| (bridge, ExecutorOperationId::random().unwrap()));
             self.store
                 .claim_swap_pair(crate::vault::SwapPairClaim {
-                    id: crate::vault::SwapUseId::first(self.operation),
+                    id,
                     source: crate::vault::SwapAccountChoice::Existing(self.operation),
                     delegate: self.delegate,
                     purpose_summary: None,
@@ -823,17 +849,26 @@ impl Fixture {
                         tokens: Some(SwapApprovalTokens { sell: SELL, buy }),
                         accounts: None,
                     },
-                    destination: Some(crate::vault::SwapDestinationClaim {
-                        chain_id: bridge.destination_chain,
-                        account: crate::vault::SwapAccountChoice::New(destination),
-                        delegate: self.delegate,
-                        destination_token: bridge.destination_token,
+                    destination: destination.map(|(private, operation)| {
+                        crate::vault::SwapDestinationClaim {
+                            chain_id: private.destination_chain,
+                            account: crate::vault::SwapAccountChoice::New(operation),
+                            delegate: self.delegate,
+                            destination_token: private.destination_token,
+                        }
                     }),
                 })
                 .unwrap();
-            destination_store
-                .bind_address(destination, bridge.receiver)
+            if let Some((private, operation)) = destination {
+                ExecutorStore::new(
+                    self.db.clone(),
+                    self.view.clone(),
+                    private.destination_chain,
+                )
+                .unwrap()
+                .bind_address(operation, private.receiver)
                 .unwrap();
+            }
         }
         self.store
             .record_swap_attempt(
@@ -878,11 +913,8 @@ impl Fixture {
         let nonce = observed.nonce().to::<u64>() + offset;
         let inputs = vec![self.input.clone()];
         SwapAttempt {
-            // The use that claims the account, or its first one with its first order.
-            use_id: self
-                .record()
-                .active_swap_use()
-                .unwrap_or_else(|| crate::vault::SwapUseId::first(self.operation)),
+            // The use that claims the account.
+            use_id: self.record().active_swap_use().unwrap(),
             submission: None,
             terms: SwapTerms::new(
                 SELL,
@@ -1991,16 +2023,20 @@ async fn an_order_on_an_included_setup_is_observed_from_the_confirmed_block() {
 }
 
 #[tokio::test]
-async fn a_stopped_or_approved_setup_is_not_offered_for_another_swap() {
+async fn an_approved_or_restricted_setup_is_not_offered_for_another_swap() {
     let fixture = Fixture::start().await;
-    assert!(listed(&fixture.owner, fixture.operation).is_some());
     let refusal = |operation| {
         fixture
             .owner
             .swap_account_refusal(operation, SwapAccountRole::Source)
             .unwrap()
     };
-    assert_eq!(refusal(fixture.operation), None);
+    // A setup whose approved order still awaits placement belongs to that swap.
+    assert!(listed(&fixture.owner, fixture.operation).is_none());
+    assert_eq!(
+        refusal(fixture.operation),
+        Some(SwapAccountRefusal::ClaimedByAnotherSwap)
+    );
     // Each restriction keeps an account out of the list for its own reason: a delegate this
     // chain doesn't accept, an account kept for recovery, and one registered in Public.
     let [foreign, public] = std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
@@ -2031,40 +2067,7 @@ async fn a_stopped_or_approved_setup_is_not_offered_for_another_swap() {
             Some(SwapAccountRefusal::RecoveryOnly),
         ]
     );
-    assert_eq!(fixture.owner.swap_account_candidates().unwrap().len(), 1);
-    fixture.owner.stop_swap_setup(fixture.operation).unwrap();
-    assert!(listed(&fixture.owner, fixture.operation).is_none());
-    assert_eq!(
-        refusal(fixture.operation),
-        Some(SwapAccountRefusal::RecoveryOnly)
-    );
-    fixture.finish().await;
-
-    // A setup whose approved order still awaits placement belongs to that swap.
-    let fixture = Fixture::start().await;
-    fixture
-        .owner
-        .record_swap_approval(
-            fixture.operation,
-            SwapUseId::first(fixture.operation),
-            SwapApproval {
-                bounds: swap_bounds(),
-                price_verified: Some(false),
-                price_acknowledged: true,
-                delivery: SwapDelivery::Reshield,
-                tokens: None,
-                accounts: None,
-            },
-        )
-        .unwrap();
-    assert!(listed(&fixture.owner, fixture.operation).is_none());
-    assert_eq!(
-        fixture
-            .owner
-            .swap_account_refusal(fixture.operation, SwapAccountRole::Source)
-            .unwrap(),
-        Some(SwapAccountRefusal::ClaimedByAnotherSwap)
-    );
+    assert!(fixture.owner.swap_account_candidates().unwrap().is_empty());
     fixture.finish().await;
 }
 

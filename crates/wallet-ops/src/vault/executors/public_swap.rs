@@ -336,9 +336,8 @@ impl PublicSwapSignedTransaction {
 pub struct PublicSwapInclusion {
     pub observation: SwapObservation,
     pub succeeded: bool,
-    /// First action receipts and older records remain provisional until canonical finality
-    /// is verified by whole-block observation.
-    #[serde(default)]
+    /// First action receipts remain provisional until canonical finality is verified by
+    /// whole-block observation.
     pub finalized: bool,
 }
 
@@ -362,10 +361,6 @@ pub struct PublicSwapOrder {
     #[serde(default)]
     submission_status: SwapSubmissionStatus,
     /// The signed permit the order's pre-hook submits. `None` for an order without one.
-    ///
-    /// A build from before this field drops it on read, rebuilds the app data without the
-    /// pre-hook and gets another UID, so it refuses to resend the order. An order the
-    /// orderbook already accepted keeps its app data and can still fill.
     #[serde(default)]
     permit: Option<PublicSwapPermit>,
 }
@@ -536,7 +531,7 @@ pub struct PublicSwapObservations {
     #[serde(default)]
     pub expired: Option<SwapObservation>,
     /// Finalized settlement state shows the order invalidated and no trade was reported.
-    #[serde(default, deserialize_with = "deserialize_finalized_cancellation")]
+    #[serde(default)]
     pub cancelled: Option<SwapObservation>,
     /// The settlement paid the proxy and held no matching deposit: the amount it paid.
     #[serde(default)]
@@ -559,18 +554,6 @@ pub struct PublicSwapObservations {
     /// Across's refund to the Public account, verified in finalized receipts.
     #[serde(default)]
     pub bridge_refund: Option<SwapObservation>,
-}
-
-fn deserialize_finalized_cancellation<'de, D>(
-    deserializer: D,
-) -> Result<Option<SwapObservation>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    // Older first-receipt cancellations carried a transaction hash and were not final.
-    // Finalized settlement-state observations have always been hashless.
-    Ok(Option::<SwapObservation>::deserialize(deserializer)?
-        .filter(|observation| observation.transaction_hash.is_none()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

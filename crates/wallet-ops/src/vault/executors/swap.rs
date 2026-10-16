@@ -427,7 +427,7 @@ pub struct BridgeDelivery {
     pub destination_token: Address,
     pub surplus: BridgeSurplus,
     /// `Some` when the delivery shields to the wallet on the destination chain. `receiver` is
-    /// then the destination stealth account. `None` in records from before private delivery.
+    /// then the destination stealth account. `None` when the bridge pays `receiver` unshielded.
     #[serde(default)]
     pub private: Option<BridgePrivateDelivery>,
 }
@@ -477,9 +477,8 @@ impl BridgeOrderTerms {
 
 /// The signed `depositV3` arguments besides the depositor (the executor) and the destination
 /// chain. A private delivery's deposit pays `recipient`, Across's handler, with a message of
-/// hash `message_hash`; the message itself is in the recorded post-hook. Without them, as in
-/// every record from before private delivery, it pays the delivery's receiver with an empty
-/// message.
+/// hash `message_hash`; the message itself is in the recorded post-hook. Without them, for a
+/// delivery that doesn't shield, it pays the delivery's receiver with an empty message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AcrossOrderTerms {
     pub spoke_pool: Address,
@@ -630,8 +629,8 @@ pub struct SwapApprovedBounds {
     pub gas_estimate: Option<U256>,
     /// The allowed gas in buy-token units. For an approval, `gas_share_bps` of `gas_estimate`
     /// rounded up. For an order attempt, the gas the signed minimum leaves room for, which
-    /// differs from that share when the order kept an approved minimum; older attempt records
-    /// hold the share. `None` in records from before gas shares.
+    /// differs from that share when the order kept an approved minimum. `None` in records from
+    /// before gas shares.
     #[serde(default)]
     pub gas_allowance: Option<U256>,
     /// The RPC gas price in wei at quote time, without the cushion. `None` in records from
@@ -942,7 +941,6 @@ pub enum SwapBridgeOutcome {
         block: BlockNumHash,
         transaction_hash: B256,
         output_amount: U256,
-        #[serde(default)]
         shielded: bool,
     },
     /// Success as reported by the provider, not checked on the destination chain: 1Click's
@@ -1699,16 +1697,6 @@ impl ExecutorStore {
             speed_up,
         } = attempt;
         self.update(operation, |record| {
-            // An account reserved without swap links takes its first use with its first order.
-            if record.swap_uses.is_empty() && use_id == SwapUseId::first(operation) {
-                record.begin_first_swap_use(
-                    use_id,
-                    SwapUseRole::Source {
-                        approval: None,
-                        destination_operation: None,
-                    },
-                );
-            }
             if record.active_swap_use != Some(use_id) {
                 return Err(ExecutorStoreError::SwapUseActive);
             }
@@ -2011,8 +1999,7 @@ impl ExecutorStore {
 
     /// Persist the terms approved with a swap's setup, replacing an earlier approval. Only the
     /// expected latest use takes one, as an active source use without orders that was not
-    /// stopped; an order records its own bounds. A reserved account without a use takes its
-    /// first one here.
+    /// stopped; an order records its own bounds.
     pub fn record_swap_approval(
         &self,
         operation: ExecutorOperationId,
@@ -2023,7 +2010,7 @@ impl ExecutorStore {
             if record.address.is_none() || record.swap_setup_stopped {
                 return Err(ExecutorStoreError::OperationMismatch);
             }
-            if !record.swap_uses.is_empty() && record.active_swap_use != Some(expected_use) {
+            if record.active_swap_use != Some(expected_use) {
                 return Err(ExecutorStoreError::OperationMismatch);
             }
             let has_orders = record
@@ -2068,34 +2055,7 @@ impl ExecutorStore {
                     }
                     *known = Some(Box::new(approval));
                 }
-                None if record.swap.is_none() && expected_use == SwapUseId::first(operation) => {
-                    record.begin_first_swap_use(
-                        expected_use,
-                        SwapUseRole::Source {
-                            approval: Some(Box::new(approval)),
-                            destination_operation: None,
-                        },
-                    );
-                }
                 _ => return Err(ExecutorStoreError::OperationMismatch),
-            }
-            Ok(())
-        })
-    }
-
-    /// Stop before an order is issued. Retain setup signatures and their input reservations,
-    /// since stopping local work does not revoke a payload already sent to a broadcaster.
-    pub(crate) fn stop_swap_setup(
-        &self,
-        operation: ExecutorOperationId,
-    ) -> Result<ExecutorRecord, ExecutorStoreError> {
-        self.update(operation, |record| {
-            if record.swap.is_some() {
-                return Err(ExecutorStoreError::OperationMismatch);
-            }
-            record.swap_setup_stopped = true;
-            if let Some(swap_use) = record.swap_uses.last_mut() {
-                swap_use.stopped = true;
             }
             Ok(())
         })

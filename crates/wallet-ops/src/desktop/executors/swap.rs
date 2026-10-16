@@ -592,7 +592,7 @@ impl<'a> SwapAccountReplacements<'a> {
     /// Save `approval` for a setup resumed in this job. One that binds its accounts is saved
     /// with [`Self::bind_approval`], whether or not this job holds the destination account, so
     /// it names the swap's accounts as they are after a replacement. One that binds none is
-    /// saved as it is, which also gives a record without a use its first one.
+    /// saved as it is.
     pub fn save_resumed_approval(&self, approval: SwapApproval) -> Result<()> {
         if approval.accounts.is_some() {
             self.bind_approval(approval)?;
@@ -998,12 +998,7 @@ pub fn own_pending_setup(record: &ExecutorRecord) -> Option<U256> {
     if record.is_swap_setup_stopped() {
         return None;
     }
-    let swap_use = record.active_swap_use().or_else(|| {
-        record
-            .swap_uses()
-            .is_empty()
-            .then(|| SwapUseId::first(record.operation()))
-    })?;
+    let swap_use = record.active_swap_use()?;
     record.unresolved_swap_setup_nonce(swap_use)
 }
 
@@ -1602,18 +1597,6 @@ impl ExecutorOwner {
             swap_use,
             replacement,
         })
-    }
-
-    /// Remove a setup from active swaps, preserving the account for observation and recovery.
-    /// Stopping a swap also stops its destination stealth account on that chain's next load;
-    /// call this on the destination chain's owner to stop that account at once.
-    pub fn stop_swap_setup(&self, operation: ExecutorOperationId) -> Result<()> {
-        self.ensure_active()?;
-        self.swap_setup_record(operation)?
-            .ok_or_else(|| eyre!("swap executor is unavailable"))?;
-        self.store.stop_swap_setup(operation)?;
-        self.notify_change();
-        Ok(())
     }
 
     /// Reserve a fresh executor for a new swap, with the terms the user approved for it. The

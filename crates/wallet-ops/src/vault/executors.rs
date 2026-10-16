@@ -147,13 +147,12 @@ pub enum ExecutorAsset {
 pub const SWAP_DESTINATION_PURPOSE_SUMMARY: &str = "Private swap destination";
 
 /// What a destination stealth account serves, kept in its own record on the destination chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SwapDestinationRecord {
     pub origin_chain: u64,
     pub origin_operation: ExecutorOperationId,
     pub destination_token: Address,
     /// What became of the account's shield payload, from the origin swap's bridge outcome.
-    #[serde(default)]
     pub outcome: Option<SwapDestinationOutcome>,
 }
 
@@ -317,8 +316,7 @@ enum ExecutorExecutionResult {
 
 /// A payload's inclusion as an earlier version stored it. It is compatibility data: kept
 /// as stored, never written, and read only where an `Executed` one places
-/// [`ExecutorRecord::nonce_watermark`] for a record without a stored watermark and names
-/// the payload that ran at its nonce for a stopped swap destination's delivery guard.
+/// [`ExecutorRecord::nonce_watermark`] for a record without a stored watermark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct ExecutorPayloadInclusion {
     block: BlockNumHash,
@@ -667,20 +665,6 @@ impl ExecutorRecord {
     pub(crate) fn require_reconciliation(&mut self) {
         self.nonce_watermark = self.nonce_watermark();
         self.nonce_observation = None;
-    }
-
-    /// The payload an earlier version's block scan stored as executed at `nonce`. Nothing
-    /// stores one any more, so a record written by this version has none.
-    fn recorded_winner(&self, nonce: U256) -> Option<B256> {
-        self.issued
-            .iter()
-            .find(|payload| {
-                payload.nonce == nonce
-                    && payload.inclusion.is_some_and(|inclusion| {
-                        inclusion.result == ExecutorExecutionResult::Executed
-                    })
-            })
-            .map(|payload| payload.hash)
     }
 
     /// A reverted attempt does not revoke its signed payload or free its private inputs.

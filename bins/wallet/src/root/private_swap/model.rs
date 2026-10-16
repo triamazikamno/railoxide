@@ -5696,7 +5696,7 @@ pub(super) mod tests {
         );
         assert_eq!(steps.len(), 3, "no order or approval without a transaction");
         assert_eq!(steps[1].status, PublicActionStepStatus::Pending);
-        // A provisional revert can be reorganized, and every legacy attempt must resolve.
+        // A provisional revert can be reorganized, and every earlier attempt must resolve.
         for (inclusions, expected) in [
             (vec![(false, false)], PublicSwapStage::Depositing),
             (vec![(true, false)], PublicSwapStage::DepositFailed),

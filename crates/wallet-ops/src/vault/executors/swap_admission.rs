@@ -227,8 +227,6 @@ pub fn swap_account_refusal(
             None
         }
         SwapAccountUse::Claimed(id) | SwapAccountUse::SpeedUp(SwapSpeedUp { swap_use: id, .. }) => {
-            // An account reserved without swap links takes its first use with its first order.
-            let first = record.swap_uses.is_empty() && id == SwapUseId::first(record.operation);
             let fits = record
                 .swap_use(id)
                 .is_none_or(|claimed| match (&claimed.role, role) {
@@ -244,7 +242,7 @@ pub fn swap_account_refusal(
                     ) => *destination_token == token,
                     _ => false,
                 });
-            if !(record.active_swap_use == Some(id) || first) || !fits {
+            if record.active_swap_use != Some(id) || !fits {
                 return Some(Refusal::ClaimedByAnotherSwap);
             }
             Some(id)
@@ -317,7 +315,7 @@ pub fn swap_account_refusal(
             }
         }
     }
-    // Earlier shields need a completed delivery or proven invalidation of an unplaced use.
+    // Earlier shields need a completed delivery.
     let unresolved_delivery = record
         .swap_uses
         .iter()
@@ -332,8 +330,7 @@ pub fn swap_account_refusal(
                 Some(SwapDestinationOutcome::Shielded { .. }) => None,
                 Some(SwapDestinationOutcome::Held { .. }) => Some(Refusal::EarlierDeliveryHeld),
                 Some(SwapDestinationOutcome::Unfilled) | None => {
-                    (!invalidated_orderless_shields(record, earlier))
-                        .then_some(Refusal::EarlierDeliveryUnresolved)
+                    Some(Refusal::EarlierDeliveryUnresolved)
                 }
             },
             _ => None,
@@ -456,31 +453,6 @@ fn cancelled_fresh_source(record: &ExecutorRecord) -> bool {
             && matches!(swap_use.role, SwapUseRole::Source { .. })
             && !record.has_swap_use_order(swap_use.id)
     })
-}
-
-/// Only a stopped use whose exact source had no order can lose its delivery guard when
-/// every shield is canonically invalidated by another known payload. A consumed nonce alone
-/// does not establish which payload ran, or exclude a later bridge delivery, so this reads
-/// the winner an earlier version stored with an inclusion. Nothing stores one any more, and
-/// a record without one keeps its guard.
-fn invalidated_orderless_shields(record: &ExecutorRecord, swap_use: &super::SwapUseRecord) -> bool {
-    let (SwapUseRole::Destination { shields, .. }
-    | SwapUseRole::PublicSourceDestination { shields, .. }) = &swap_use.role
-    else {
-        return false;
-    };
-    swap_use.stopped
-        && swap_use.stopped_before_order
-        && !shields.is_empty()
-        && shields.iter().all(|hash| {
-            record.issued.iter().any(|payload| {
-                payload.hash == *hash
-                    && payload.purpose == ExecutorPayloadPurpose::SwapDestinationShield
-                    && record
-                        .recorded_winner(payload.nonce)
-                        .is_some_and(|winner| winner != *hash)
-            })
-        })
 }
 
 /// Whether a setup's nonce is resolved. Fresh evidence has a nonce observation by now, and

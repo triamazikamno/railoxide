@@ -1524,9 +1524,9 @@ async fn read_public_swap_handoff(
         } else {
             false
         };
-        let Some(mut number) = deposit.deposit_scan_from_block else {
-            continue;
-        };
+        let mut number = deposit
+            .deposit_scan_from_block
+            .ok_or_else(|| eyre!("a handed-off deposit has no scan boundary"))?;
         let mut update = DepositUpdate {
             hash: deposit.hash,
             inclusion: None,

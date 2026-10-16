@@ -1,12 +1,11 @@
 use super::{
     Address, B256, BridgeDelivery, Deserialize, ExecutorAsset, ExecutorDerivationScheme,
-    ExecutorNonceObservation, ExecutorNonceWatermark, ExecutorOperationId, ExecutorPayloadPurpose,
-    ExecutorRecord, ExecutorRecordOrigin, ExecutorStore, ExecutorStoreError, ExecutorUseCheck,
-    FixedBytes, IssuedExecutorPayload, LEGACY_VERSION, PublicSwapRecord,
-    SWAP_DESTINATION_PURPOSE_SUMMARY, Serialize, SwapAccountRole, SwapAccountUse,
-    SwapAdmissionEvidence, SwapApproval, SwapApprovedAccount, SwapDelivery, SwapDestinationOutcome,
-    SwapDestinationRecord, SwapOperationRecord, SwapOrderRecord, U256, VERSION, local_timestamp,
-    swap_account_refusal,
+    ExecutorNonceObservation, ExecutorNonceWatermark, ExecutorOperationId, ExecutorRecord,
+    ExecutorRecordOrigin, ExecutorStore, ExecutorStoreError, ExecutorUseCheck, FixedBytes,
+    IssuedExecutorPayload, LEGACY_VERSION, PublicSwapRecord, SWAP_DESTINATION_PURPOSE_SUMMARY,
+    Serialize, SwapAccountRole, SwapAccountUse, SwapAdmissionEvidence, SwapApproval,
+    SwapApprovedAccount, SwapDelivery, SwapDestinationOutcome, SwapDestinationRecord,
+    SwapOperationRecord, SwapOrderRecord, U256, VERSION, local_timestamp, swap_account_refusal,
 };
 
 /// One logical swap: its review, account pair, setup choices and order attempts.
@@ -513,9 +512,9 @@ const fn destination_view(swap_use: &SwapUseRecord) -> Option<SwapDestinationRec
     }
 }
 
-/// The stored shape of an [`ExecutorRecord`]. Version 1 holds one swap's links in
-/// `swap_approval`, `swap_destination` and `destination_operation`. Version 2 leaves those
-/// empty and holds them in `swap_uses`.
+/// The stored shape of an [`ExecutorRecord`]. Version 1 holds one swap's links in `swap`
+/// and `swap_approval`. Version 2 leaves `swap_approval` empty and holds the links in
+/// `swap_uses`.
 ///
 /// Earlier builds also stored `recovery_transactions` and `recovery_observation`, for a
 /// step-by-step recovery no build can start. A stored record may still carry those keys.
@@ -552,10 +551,6 @@ pub(super) struct ExecutorRecordWire {
     swap_setup_stopped: bool,
     #[serde(default)]
     released_payloads: Vec<B256>,
-    #[serde(default)]
-    swap_destination: Option<SwapDestinationRecord>,
-    #[serde(default)]
-    destination_operation: Option<ExecutorOperationId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     swap_uses: Vec<SwapUseRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -594,8 +589,6 @@ impl TryFrom<ExecutorRecordWire> for ExecutorRecord {
             swap_approval,
             swap_setup_stopped,
             released_payloads,
-            swap_destination,
-            destination_operation,
             mut swap_uses,
             mut active_swap_use,
             nonce_watermark,
@@ -604,9 +597,7 @@ impl TryFrom<ExecutorRecordWire> for ExecutorRecord {
         let has_use_metadata = !swap_uses.is_empty()
             || active_swap_use.is_some()
             || swap.as_ref().is_some_and(SwapOperationRecord::has_use_ids);
-        let has_legacy_links = swap_approval.is_some()
-            || swap_destination.is_some()
-            || destination_operation.is_some();
+        let has_legacy_links = swap_approval.is_some();
         if version == LEGACY_VERSION && has_use_metadata {
             return Err("version 1 executor record carries swap uses");
         }
@@ -622,26 +613,7 @@ impl TryFrom<ExecutorRecordWire> for ExecutorRecord {
                 role,
                 stopped_before_order: false,
             };
-            // Both kinds of link on one record conflict. Keep both, the source use last.
-            if let Some(destination) = swap_destination {
-                swap_uses.push(first_use(
-                    SwapUseId::first(destination.origin_operation),
-                    SwapUseRole::Destination {
-                        origin_chain: destination.origin_chain,
-                        origin_operation: destination.origin_operation,
-                        destination_token: destination.destination_token,
-                        shields: issued
-                            .iter()
-                            .filter(|payload| {
-                                payload.purpose == ExecutorPayloadPurpose::SwapDestinationShield
-                            })
-                            .map(|payload| payload.hash)
-                            .collect(),
-                        outcome: destination.outcome,
-                    },
-                ));
-            }
-            if swap.is_some() || swap_approval.is_some() || destination_operation.is_some() {
+            if swap.is_some() || swap_approval.is_some() {
                 let id = SwapUseId::first(operation);
                 if let Some(swap) = &mut swap {
                     swap.assign_use(id);
@@ -650,7 +622,7 @@ impl TryFrom<ExecutorRecordWire> for ExecutorRecord {
                     id,
                     SwapUseRole::Source {
                         approval: swap_approval.map(Box::new),
-                        destination_operation,
+                        destination_operation: None,
                     },
                 ));
             }
@@ -741,8 +713,6 @@ impl From<ExecutorRecord> for ExecutorRecordWire {
             swap_approval: None,
             swap_setup_stopped,
             released_payloads,
-            swap_destination: None,
-            destination_operation: None,
             swap_uses,
             active_swap_use,
             nonce_watermark,

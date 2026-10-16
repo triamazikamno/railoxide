@@ -2041,11 +2041,8 @@ impl PrivateSwapsView {
     ) -> gpui::Div {
         let busy = self.busy();
         let record = self.record(operation);
-        let stopped = record.is_some_and(ExecutorRecord::is_swap_setup_stopped);
         let hidden =
             record.is_some_and(|record| record.is_hidden() && self.pending_order(record).is_none());
-        let setting_up =
-            !stopped && matches!(stage, SwapStage::SetupSubmitting | SwapStage::SetupPending);
         let setup_job = self
             .job
             .as_ref()
@@ -2060,17 +2057,6 @@ impl PrivateSwapsView {
                 .disabled(busy && !setup_job)
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.confirm_cancel_preparation(operation, window, cx);
-                }))
-        });
-        let setting_up = setting_up && prepared.is_none();
-        let stop = setting_up.then(|| {
-            app_button("swap-progress-stop", "Stop and remove…")
-                .debug_selector(|| "swap-progress-stop".into())
-                .small()
-                .flex_none()
-                .disabled(busy && !setup_job)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.confirm_stop_setup(operation, window, cx);
                 }))
         });
         let resubmit = self
@@ -2323,7 +2309,6 @@ impl PrivateSwapsView {
             .items_center()
             .gap_2()
             .children(cancel)
-            .children(stop)
             .children(cancel_preparation)
             .children(remove)
             .child(div().flex_1())
@@ -2360,86 +2345,6 @@ impl PrivateSwapsView {
             tracking.auto_place = false;
             tracking.clear_setup_progress();
         }
-    }
-
-    fn confirm_stop_setup(
-        &self,
-        operation: ExecutorOperationId,
-        window: &mut Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        if self
-            .record(operation)
-            .is_none_or(|record| record.swap().is_some())
-        {
-            return;
-        }
-        let view = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |dialog, _, _| {
-            let view = view.clone();
-            dialog
-                .title(app_strong_text("Stop and remove this swap?"))
-                .button_props(
-                    DialogButtonProps::default()
-                        .cancel_text("Keep waiting")
-                        .ok_text("Stop and remove")
-                        .ok_variant(ButtonVariant::Danger),
-                )
-                .confirm()
-                .child(app_text("No order will be placed. A setup already sent to a broadcaster may still confirm and charge its fee. Its private fee inputs stay reserved until resolved. The account remains in Stealth accounts for recovery.").whitespace_normal())
-                .on_ok(move |_, _, cx| {
-                    view.update(cx, |view, cx| view.stop_setup(operation, cx))
-                        .unwrap_or(false)
-                })
-        });
-    }
-
-    /// The detail stays open and shows the stopped setup, which remains in My orders. A
-    /// private Bridge swap's destination stealth account is stopped with it when its network is
-    /// loaded. Otherwise that network's next load stops it.
-    ///
-    /// A swap whose use claims its accounts is cancelled through that use instead, which
-    /// covers both accounts in one write and releases an existing destination account rather
-    /// than stopping it: see [`Self::cancel_preparation`]. Only a use from before approvals
-    /// bound their destination, which that cancellation can't locate, is stopped here.
-    fn stop_setup(&mut self, operation: ExecutorOperationId, cx: &mut Context<'_, Self>) -> bool {
-        if !self.session_is_current(cx)
-            || self
-                .record(operation)
-                .is_none_or(|record| record.swap().is_some())
-        {
-            return false;
-        }
-        if self.record(operation).is_some_and(|record| {
-            prepared_swap_use(record).is_some_and(|swap_use| {
-                record.destination_operation().is_none()
-                    || swap_use_destination(record, swap_use.id()).is_some()
-            })
-        }) {
-            return self.cancel_preparation(operation, cx);
-        }
-        let destination = self.record(operation).and_then(|record| {
-            let delivery = swap_private_delivery(record)?;
-            let (_, owner) = self.destination_owner(delivery.destination_chain, cx)?;
-            Some((owner, record.destination_operation()?))
-        });
-        let Some(origin) = self.private_owner() else {
-            return false;
-        };
-        if let Err(error) = origin.stop_swap_setup(operation) {
-            self.fail(operation, error.to_string());
-            cx.notify();
-            return false;
-        }
-        if let Some((owner, destination_operation)) = destination {
-            // A failed write is repeated when the destination network reconciles its accounts.
-            let _ = owner.stop_swap_setup(destination_operation);
-        }
-        self.stop_setup_job(operation);
-        self.form = None;
-        self.reload_records();
-        cx.notify();
-        true
     }
 
     /// A claimed source use without an order, whether its source account is new or reused.
@@ -2634,32 +2539,17 @@ impl PrivateSwapsView {
         });
     }
 
-    /// Cancel the preparation of `operation`'s swap, which has no order yet, through the
-    /// owners: the swap's use is stopped on both of its accounts in one write, and each
-    /// account is released or kept as the native cancellation reports. The detail stays open
-    /// and reports that outcome for each account. An existing account is never retired by
-    /// this. The destination network's owner hears of the change when its session is loaded.
-    fn cancel_preparation(
-        &mut self,
-        operation: ExecutorOperationId,
-        cx: &mut Context<'_, Self>,
-    ) -> bool {
-        let Some(id) = self
-            .record(operation)
-            .and_then(prepared_swap_use)
-            .map(SwapUseRecord::id)
-        else {
-            return false;
-        };
-        self.cancel_prepared_use(id, None, cx)
-    }
-
-    /// [`Self::cancel_preparation`] for the swap use `id`, with `setup_job`, the revision of
-    /// the setup job that ran for it when the user was asked. That job may have replaced the
-    /// swap's used account since, which moves the use to another operation, and this view may
-    /// not have followed it yet. So the job is stopped under whichever operation it is
-    /// registered, the use is cancelled on the account that holds it by then, and the swap
-    /// moves there before its cancellation is reported.
+    /// Cancel the preparation of swap use `id`, which has no order yet, through the owners:
+    /// the use is stopped on both of its accounts in one write, and each account is released
+    /// or kept as the native cancellation reports. The detail stays open and reports that
+    /// outcome for each account. An existing account is never retired by this. The
+    /// destination network's owner hears of the change when its session is loaded.
+    ///
+    /// `setup_job` is the revision of the setup job that ran for it when the user was asked.
+    /// That job may have replaced the swap's used account since, which moves the use to
+    /// another operation, and this view may not have followed it yet. So the job is stopped
+    /// under whichever operation it is registered, the use is cancelled on the account that
+    /// holds it by then, and the swap moves there before its cancellation is reported.
     fn cancel_prepared_use(
         &mut self,
         id: SwapUseId,

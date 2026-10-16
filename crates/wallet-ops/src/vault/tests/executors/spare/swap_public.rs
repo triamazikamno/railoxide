@@ -4133,7 +4133,7 @@ async fn an_invalidation_without_a_trade_cancels_the_public_order_and_keeps_its_
     };
 
     let provisional = payment.saved().swap;
-    let inclusion = provisional.transactions()[0].inclusion.unwrap();
+    assert!(provisional.transactions()[0].inclusion.is_some());
     assert_eq!(provisional.observations().cancelled, None);
     assert_eq!(payment.state(), Some(PublicSwapOrderState::Open));
     assert!(provisional.order_can_fill(unix_now()));
@@ -4156,32 +4156,6 @@ async fn an_invalidation_without_a_trade_cancels_the_public_order_and_keeps_its_
     assert!(matches!(
         owner.claim_public_swap(competing()).unwrap_err().downcast_ref(),
         Some(ExecutorStoreError::PublicSwapSellsSameToken { swap, .. }) if *swap == payment.id
-    ));
-
-    // Older records concluded cancellation directly from the sending step's receipt. Loading
-    // that persisted shape discards its provisional cancellation before UI and admission use it.
-    payment
-        .store
-        .record_public_swap_observations(
-            payment.operation,
-            payment.id,
-            PublicSwapObservations {
-                cancelled: Some(inclusion.observation),
-                ..provisional.observations()
-            },
-        )
-        .unwrap();
-    let migrated = payment.saved().swap;
-    assert_eq!(migrated.observations().cancelled, None);
-    assert!(migrated.order_can_fill(unix_now()));
-    assert_eq!(payment.state(), Some(PublicSwapOrderState::Open));
-    assert!(!migrated.is_finished(true, u64::from(order.batch().deadline()) + 1));
-    assert!(matches!(
-        owner
-            .claim_public_swap(competing())
-            .unwrap_err()
-            .downcast_ref(),
-        Some(ExecutorStoreError::PublicSwapSellsSameToken { .. })
     ));
 
     // The provisional invalidation leaves the canonical chain. A final block now still reads

@@ -1853,15 +1853,23 @@ impl PrivateSwapsView {
                     amount: U256::from(SETUP_RETIRED_APPROVED_FEE),
                 });
             }
+            // Both accounts' uses started when the accounts were reserved.
+            let swap_use = SwapUseId::first(operation);
+            let started = now_unix().saturating_sub(240);
             let record = staged_setup_account(
                 operation,
                 (4, SWAP_ACCOUNT, delegate?),
                 origin,
                 &serde_json::json!({
-                    "purpose_summary": "Private swap",
-                    "retired": setup == Setup::Retired,
-                    "swap_approval": approval,
-                    "destination_operation": delivery.map(|_| destination_operation),
+                    "version": 2, "purpose_summary": "Private swap",
+                    "retired": setup == Setup::Retired, "active_swap_use": swap_use,
+                    "swap_uses": [{
+                        "id": swap_use, "started_at": started, "fresh": true,
+                        "role": { "Source": {
+                            "approval": approval,
+                            "destination_operation": delivery.map(|_| destination_operation),
+                        }},
+                    }],
                 }),
             )?;
             let destination = match delivery {
@@ -1869,10 +1877,16 @@ impl PrivateSwapsView {
                     destination_operation,
                     (12, delivery.receiver, Address::repeat_byte(0x5d)),
                     destination,
-                    &serde_json::json!({ "swap_destination": {
-                        "origin_chain": SWAP_ORIGIN, "origin_operation": operation,
-                        "destination_token": delivery.destination_token,
-                    }}),
+                    &serde_json::json!({
+                        "version": 2, "active_swap_use": swap_use,
+                        "swap_uses": [{
+                            "id": swap_use, "started_at": started, "fresh": true,
+                            "role": { "Destination": {
+                                "origin_chain": SWAP_ORIGIN, "origin_operation": operation,
+                                "destination_token": delivery.destination_token,
+                            }},
+                        }],
+                    }),
                 )?),
                 None => None,
             };
@@ -2058,10 +2072,17 @@ impl PrivateSwapsView {
                     destination,
                     (12, SETUP_DESTINATION_ACCOUNT, Address::repeat_byte(0x5d)),
                     (true, true),
-                    &serde_json::json!({ "swap_destination": {
-                        "origin_chain": SWAP_ORIGIN, "origin_operation": operation,
-                        "destination_token": PRIVATE_DELIVERY.destination_token,
-                    }}),
+                    &serde_json::json!({
+                        "version": 2, "active_swap_use": swap_use,
+                        "swap_uses": [{
+                            "id": swap_use, "started_at": now_unix().saturating_sub(240),
+                            "fresh": true,
+                            "role": { "Destination": {
+                                "origin_chain": SWAP_ORIGIN, "origin_operation": operation,
+                                "destination_token": PRIVATE_DELIVERY.destination_token,
+                            }},
+                        }],
+                    }),
                 )
             });
             self.destinations.insert(

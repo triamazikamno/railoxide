@@ -924,7 +924,7 @@ fn second_ready_swap(
     use wallet_ops::vault::ExecutorNonceObservation;
     let operation = ExecutorOperationId::random().unwrap();
     executors
-        .reserve(
+        .reserve_with_swap_approval(
             operation,
             delegate,
             Some("Private swap"),
@@ -932,6 +932,8 @@ fn second_ready_swap(
                 wallet_ops::ExecutorAsset::Erc20(Address::repeat_byte(2)),
                 wallet_ops::ExecutorAsset::Erc20(Address::repeat_byte(1)),
             ],
+            Some(test_approval()),
+            None,
         )
         .unwrap();
     executors
@@ -949,9 +951,6 @@ fn second_ready_swap(
         operation,
         ExecutorNonceObservation::new(BlockNumHash::new(12, B256::repeat_byte(12)), U256::ONE),
     );
-    executors
-        .record_swap_approval(operation, SwapUseId::first(operation), test_approval())
-        .unwrap();
     cx.update(|_, cx| {
         swaps.update(cx, |swaps, _| {
             swaps.reload_records();
@@ -1037,7 +1036,7 @@ fn included_order(
 fn an_observation_pass_that_reads_the_setup_included_places_its_order(cx: &mut TestAppContext) {
     use alloy::eips::BlockNumHash;
     use wallet_ops::vault::ExecutorNonceObservation;
-    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, _, cx| {
         let id = operation.opaque_id();
         let setup_row = |row: &str| format!("submission-step-swap-setup-{id}-origin-{row}");
         let order_row = |index: usize| format!("submission-step-swap-step-{id}-{index}");
@@ -1051,19 +1050,6 @@ fn an_observation_pass_that_reads_the_setup_included_places_its_order(cx: &mut T
             .unwrap();
         // A private Bridge swap on another account, with no destination account set up.
         let bridge = ExecutorOperationId::random().unwrap();
-        executors
-            .reserve(bridge, delegate, Some("Private swap"), &[])
-            .unwrap();
-        executors
-            .bind_address(bridge, Address::repeat_byte(0x23))
-            .unwrap();
-        record_setup(
-            executors,
-            bridge,
-            delegate,
-            B256::repeat_byte(0x24),
-            Vec::new(),
-        );
         let mut approval = test_approval();
         approval.delivery = SwapDelivery::Bridge(BridgeDelivery {
             provider: BridgeProvider::Across,
@@ -1076,8 +1062,25 @@ fn an_observation_pass_that_reads_the_setup_included_places_its_order(cx: &mut T
             }),
         });
         executors
-            .record_swap_approval(bridge, SwapUseId::first(bridge), approval)
+            .reserve_with_swap_approval(
+                bridge,
+                delegate,
+                Some("Private swap"),
+                &[],
+                Some(approval),
+                None,
+            )
             .unwrap();
+        executors
+            .bind_address(bridge, Address::repeat_byte(0x23))
+            .unwrap();
+        record_setup(
+            executors,
+            bridge,
+            delegate,
+            B256::repeat_byte(0x24),
+            Vec::new(),
+        );
         let owner = swaps.read_with(cx, |swaps, _| Arc::clone(swaps.private_owner().unwrap()));
         owner.swap_notes_for_tests(&[valid_note(Address::repeat_byte(1), 1_000)]);
         cx.update(|window, cx| {
@@ -1135,7 +1138,7 @@ fn automatic_placement_waits_for_the_setups_change(cx: &mut TestAppContext) {
     use alloy::eips::BlockNumHash;
     use wallet_ops::UtxoPpoiState;
     use wallet_ops::vault::ExecutorNonceObservation;
-    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, _, cx| {
         let sell = Address::repeat_byte(1);
         let other = Address::repeat_byte(2);
         let transaction = B256::repeat_byte(80);
@@ -1242,7 +1245,7 @@ fn automatic_placement_waits_for_the_setups_change(cx: &mut TestAppContext) {
 fn a_setup_without_a_transaction_waits_only_for_settlement(cx: &mut TestAppContext) {
     use alloy::eips::BlockNumHash;
     use wallet_ops::vault::ExecutorNonceObservation;
-    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, _, cx| {
         let sell = Address::repeat_byte(1);
         let owner = swaps.read_with(cx, |swaps, _| Arc::clone(swaps.private_owner().unwrap()));
         let held = [valid_note(sell, 1_000)];
@@ -1316,7 +1319,7 @@ fn a_setup_without_a_transaction_waits_only_for_settlement(cx: &mut TestAppConte
 #[gpui::test]
 fn a_setup_under_an_order_is_read_each_pass_and_woken_by_private_sync(cx: &mut TestAppContext) {
     use wallet_ops::vault::{SwapObservation, SwapOrderObservations};
-    with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, _, cx| {
         let uid = included_order(executors, operation, u32::MAX);
         let transaction = B256::repeat_byte(80);
         let record = executors
@@ -1405,7 +1408,7 @@ fn cancel_waits_for_the_setup_below_the_order_and_speed_up_follows_its_inclusion
 ) {
     use alloy::eips::BlockNumHash;
     use wallet_ops::vault::ExecutorNonceObservation;
-    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, _, cx| {
         let now = u32::try_from(now_unix()).unwrap();
         included_order(executors, operation, now + 600);
         // The detail with this session's latest read: its Speed up and whether Cancel order…
@@ -1459,7 +1462,7 @@ fn cancel_waits_for_the_setup_below_the_order_and_speed_up_follows_its_inclusion
 fn a_setup_no_longer_included_before_signing_returns_the_swap_to_its_setup(
     cx: &mut TestAppContext,
 ) {
-    with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
         let id = operation.opaque_id();
         let setup_row = format!("submission-step-swap-setup-{id}-origin-sent").leak();
         pending_setup(executors, operation);
@@ -1551,7 +1554,7 @@ fn a_setup_no_longer_included_before_signing_returns_the_swap_to_its_setup(
 #[gpui::test]
 fn a_setup_no_longer_included_under_its_order_offers_its_retry(cx: &mut TestAppContext) {
     use wallet_ops::vault::{SwapObservation, SwapOrderObservations};
-    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, _, cx| {
         let uid = included_order(executors, operation, u32::MAX);
         let retry = |cx: &mut gpui::VisualTestContext, included: bool| {
             cx.update(|window, cx| {
@@ -1727,7 +1730,7 @@ fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut Test
         ExecutorNonceObservation, ExecutorPayloadContext, ExecutorPayloadPurpose,
         IssuedExecutorPayload, SwapAccountChoice, SwapPairClaim,
     };
-    with_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
         let issued = pending_setup(executors, operation);
         executors
             .record_swap_approval(operation, SwapUseId::first(operation), test_approval())
@@ -1985,7 +1988,7 @@ fn setup_whose_nonce_is_recorded_as_consumed_is_approved_and_needs_no_setup_page
     use alloy::eips::BlockNumHash;
     use alloy::primitives::B256;
     use wallet_ops::vault::ExecutorNonceObservation;
-    with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, _, cx| {
         pending_setup(executors, operation);
         executors
             .record_swap_approval(operation, SwapUseId::first(operation), test_approval())
@@ -2044,7 +2047,7 @@ fn setup_whose_nonce_is_recorded_as_consumed_is_approved_and_needs_no_setup_page
 fn swap_detail_shows_the_setup_until_its_account_is_ready(cx: &mut TestAppContext) {
     use alloy::eips::BlockNumHash;
     use wallet_ops::vault::ExecutorNonceObservation;
-    with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
         pending_setup(executors, operation);
         executors
             .record_swap_approval(operation, SwapUseId::first(operation), test_approval())
@@ -2138,7 +2141,7 @@ fn a_setup_waiting_for_five_resends_offers_its_retry(cx: &mut TestAppContext) {
 
     use super::super::setup_progress::{SetupProgress, SetupProgressEnd};
 
-    with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
         executors
             .bind_address(operation, Address::repeat_byte(3))
             .unwrap();
@@ -2210,7 +2213,7 @@ fn a_setup_waiting_for_five_resends_offers_its_retry(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_replaced_account_keeps_the_swap_and_its_open_detail(cx: &mut TestAppContext) {
     use wallet_ops::vault::SwapUseSide;
-    with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
         let swap_use = SwapUseId::first(operation);
         executors
             .bind_address(operation, Address::repeat_byte(3))
@@ -2340,7 +2343,7 @@ fn a_replaced_account_keeps_the_swap_and_its_open_detail(cx: &mut TestAppContext
 /// the confirmation cancels the swap where it is by then.
 fn cancel_preparation_after_replacement(cx: &mut TestAppContext, followed: bool) {
     use wallet_ops::vault::SwapUseSide;
-    with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
         let swap_use = SwapUseId::first(operation);
         executors
             .bind_address(operation, Address::repeat_byte(3))
@@ -2499,7 +2502,7 @@ fn retired_swap_with_estimate(
 #[gpui::test]
 fn retry_with_new_account_keeps_the_saved_terms_and_reserves_one_account(cx: &mut TestAppContext) {
     let stubs = SwapStubs::start();
-    with_swap_view_and_rpc(
+    with_approved_swap_view_and_rpc(
         cx,
         Some(stubs.rpc()),
         |root, swaps, executors, operation, runtime, cx| {
@@ -2626,7 +2629,7 @@ fn retry_with_new_account_keeps_the_saved_terms_and_reserves_one_account(cx: &mu
 fn a_hardware_retry_with_new_account_reserves_it_before_its_review(cx: &mut TestAppContext) {
     use wallet_ops::vault::WalletSource;
     let stubs = SwapStubs::start();
-    with_swap_view_and_rpc(
+    with_approved_swap_view_and_rpc(
         cx,
         Some(stubs.rpc()),
         |root, swaps, executors, operation, runtime, cx| {
@@ -2682,13 +2685,12 @@ fn a_hardware_retry_with_new_account_reserves_it_before_its_review(cx: &mut Test
 
 /// Retry setup… sits on the stage a setup failed at: the response stage after a broadcaster
 /// didn't answer. A setup whose nonce is recorded as consumed waits for its verification, so
-/// its action opens nothing. A swap with no saved approval has no terms for a retry to keep:
-/// its row offers none, and the footer opens the form.
+/// its action opens nothing.
 #[gpui::test]
 fn retry_setup_sits_on_the_failed_stage_while_the_setup_can_be_sent_again(cx: &mut TestAppContext) {
     use alloy::eips::BlockNumHash;
     use wallet_ops::vault::ExecutorNonceObservation;
-    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, _, cx| {
         let show = |cx: &mut gpui::VisualTestContext, operation| {
             cx.update(|window, cx| {
                 swaps.update(cx, |swaps, cx| {
@@ -2699,22 +2701,8 @@ fn retry_setup_sits_on_the_failed_stage_while_the_setup_can_be_sent_again(cx: &m
             });
         };
 
-        // No approval is saved with the swap yet.
-        show(cx, operation);
-        assert!(cx.debug_bounds("swap-setup-retry-origin").is_none());
-        let resume = cx.debug_bounds("swap-progress-continue").unwrap();
-        cx.simulate_click(resume.center(), gpui::Modifiers::none());
-        swaps.read_with(cx, |swaps, _| {
-            let form = swaps.form.as_ref().expect("the swap's form");
-            assert_eq!(form.operation, Some(operation));
-            assert!(swaps.setup_retry.is_none());
-        });
-
-        // Its approval is saved, and no broadcaster answered the setup this session sent.
+        // No broadcaster answered the setup this session sent.
         pending_setup(executors, operation);
-        executors
-            .record_swap_approval(operation, SwapUseId::first(operation), test_approval())
-            .unwrap();
         swaps.update(cx, |swaps, cx| {
             drop(swaps.start_setup_progress(operation, SetupSide::Origin, cx));
             swaps.finish_setup_progress(
@@ -2738,7 +2726,7 @@ fn retry_setup_sits_on_the_failed_stage_while_the_setup_can_be_sent_again(cx: &m
         let included = ExecutorOperationId::random().unwrap();
         let delegate = Address::repeat_byte(0x99);
         executors
-            .reserve(
+            .reserve_with_swap_approval(
                 included,
                 delegate,
                 Some("Private swap"),
@@ -2746,6 +2734,8 @@ fn retry_setup_sits_on_the_failed_stage_while_the_setup_can_be_sent_again(cx: &m
                     wallet_ops::ExecutorAsset::Erc20(Address::repeat_byte(1)),
                     wallet_ops::ExecutorAsset::Erc20(Address::repeat_byte(2)),
                 ],
+                Some(test_approval()),
+                None,
             )
             .unwrap();
         executors
@@ -2758,9 +2748,6 @@ fn retry_setup_sits_on_the_failed_stage_while_the_setup_can_be_sent_again(cx: &m
             B256::repeat_byte(5),
             Vec::new(),
         );
-        executors
-            .record_swap_approval(included, SwapUseId::first(included), test_approval())
-            .unwrap();
         confirm_setup(
             executors,
             included,
@@ -2897,7 +2884,7 @@ fn idle_waku(
 fn a_setup_retry_keeps_the_saved_terms_and_saves_a_raised_fee_limit(cx: &mut TestAppContext) {
     use wallet_ops::vault::SwapApprovalTokens;
     let stubs = SwapStubs::start();
-    with_swap_view_and_rpc(
+    with_approved_swap_view_and_rpc(
         cx,
         Some(stubs.rpc()),
         |root, swaps, executors, operation, runtime, cx| {
@@ -3176,7 +3163,7 @@ fn a_swap_saves_the_fee_token_and_limit_of_its_own_setup(cx: &mut TestAppContext
 #[gpui::test]
 fn a_setup_retry_reviews_the_broadcaster_and_fee_token_its_dialog_holds(cx: &mut TestAppContext) {
     let stubs = SwapStubs::start();
-    with_swap_view_and_rpc(
+    with_approved_swap_view_and_rpc(
         cx,
         Some(stubs.rpc()),
         |root, swaps, executors, operation, runtime, cx| {
@@ -3298,7 +3285,7 @@ fn dismissed_expired_swap_stays_dormant_after_restart(cx: &mut TestAppContext) {
         SwapOrderObservations, SwapPreHookDeath, SwapPreHookDeathCause, SwapProof, SwapRecipient,
         SwapTerms,
     };
-    with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, _, cx| {
         let setup = pending_setup(executors, operation);
         let setup_hash = setup.issued()[0].hash();
         let observed =
@@ -3590,9 +3577,68 @@ fn with_swap_view_and_rpc(
     );
 }
 
+/// [`with_swap_view`] whose account is reserved as a new swap's is, with its first swap use
+/// approved with [`test_approval`]'s terms, which the test may replace before an order.
+fn with_approved_swap_view(
+    cx: &mut TestAppContext,
+    test: impl FnOnce(
+        &Entity<WalletRoot>,
+        &Entity<PrivateSwapsView>,
+        &ExecutorStore,
+        ExecutorOperationId,
+        &tokio::runtime::Runtime,
+        &mut gpui::VisualTestContext,
+    ),
+) {
+    with_approved_swap_view_and_rpc(cx, None, test);
+}
+
+/// [`with_approved_swap_view`] with the session's chain RPC at `rpc`.
+fn with_approved_swap_view_and_rpc(
+    cx: &mut TestAppContext,
+    rpc: Option<reqwest::Url>,
+    test: impl FnOnce(
+        &Entity<WalletRoot>,
+        &Entity<PrivateSwapsView>,
+        &ExecutorStore,
+        ExecutorOperationId,
+        &tokio::runtime::Runtime,
+        &mut gpui::VisualTestContext,
+    ),
+) {
+    swap_view_fixture(
+        cx,
+        rpc,
+        Some(test_approval()),
+        |root, swaps, executors, operation, runtime, _, cx| {
+            test(root, swaps, executors, operation, runtime, cx);
+        },
+    );
+}
+
 fn with_swap_view_and_store(
     cx: &mut TestAppContext,
     rpc: Option<reqwest::Url>,
+    test: impl FnOnce(
+        &Entity<WalletRoot>,
+        &Entity<PrivateSwapsView>,
+        &ExecutorStore,
+        ExecutorOperationId,
+        &tokio::runtime::Runtime,
+        &wallet_ops::WalletSessionStore,
+        &mut gpui::VisualTestContext,
+    ),
+) {
+    swap_view_fixture(cx, rpc, None, test);
+}
+
+/// The swap view over an account reserved for a private swap. With `approval`, the
+/// reservation takes the account's first swap use with it, as a new swap's does; without
+/// one, the account holds no swap use.
+fn swap_view_fixture(
+    cx: &mut TestAppContext,
+    rpc: Option<reqwest::Url>,
+    approval: Option<SwapApproval>,
     test: impl FnOnce(
         &Entity<WalletRoot>,
         &Entity<PrivateSwapsView>,
@@ -3681,7 +3727,7 @@ fn with_swap_view_and_store(
         let operation = ExecutorOperationId::random().unwrap();
         let executors = ExecutorStore::new(vault.db(), view, 1).unwrap();
         executors
-            .reserve(
+            .reserve_with_swap_approval(
                 operation,
                 chain.accepted_executor_profile().unwrap().delegate(),
                 Some("Private swap"),
@@ -3689,6 +3735,8 @@ fn with_swap_view_and_store(
                     wallet_ops::ExecutorAsset::Erc20(Address::repeat_byte(1)),
                     wallet_ops::ExecutorAsset::Erc20(Address::repeat_byte(2)),
                 ],
+                approval,
+                None,
             )
             .unwrap();
         let observation = session.observation_rx.borrow().clone();
@@ -3738,7 +3786,7 @@ fn with_swap_view_and_store(
 fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
     cx: &mut TestAppContext,
 ) {
-    with_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
         use alloy::eips::{BlockNumHash, eip7702::constants::EIP7702_DELEGATION_DESIGNATOR};
         use alloy::primitives::{B256, Bytes};
         use wallet_ops::vault::{
@@ -4428,7 +4476,7 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
         SwapProof, SwapTerms, SwapTradeAmounts, SwapUseId,
     };
 
-    with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
         stranded_swap(executors, operation);
         let mut record = executors.records().unwrap().pop().unwrap();
         let previous = record.swap().unwrap().orders().last().unwrap().uid();
@@ -4752,7 +4800,7 @@ fn press_swap_recover(
 /// behind both dialogs.
 #[gpui::test]
 fn closing_swap_recovery_returns_focus_to_the_swap_detail(cx: &mut TestAppContext) {
-    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, _, cx| {
         stranded_swap(executors, operation);
         press_swap_recover(
             swaps,
@@ -4787,7 +4835,7 @@ fn closing_swap_recovery_returns_focus_to_the_swap_detail(cx: &mut TestAppContex
 
 #[gpui::test]
 fn expired_order_can_be_checked_and_hidden_without_releasing_inputs(cx: &mut TestAppContext) {
-    with_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
         let (uid, _) = placed_swap(executors, operation, SwapDelivery::Reshield);
         executors
             .record_swap_submission(
@@ -4874,7 +4922,7 @@ fn expired_order_can_be_checked_and_hidden_without_releasing_inputs(cx: &mut Tes
 fn routine_order_polling_waits_for_a_settlement_hint_without_reconciling_history(
     cx: &mut TestAppContext,
 ) {
-    with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, _, cx| {
         stranded_swap(executors, operation);
         let record = executors.records().unwrap().pop().unwrap();
         let uid = record.swap().unwrap().orders()[0].uid();
@@ -5604,7 +5652,7 @@ fn external_swaps_show_their_delivery_and_recover_only_the_sell_token(cx: &mut T
 
     let receiver = Address::repeat_byte(0x51);
     let (sell, buy) = (Address::repeat_byte(1), Address::repeat_byte(2));
-    with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, _, cx| {
         cx.update(|_, cx| {
             root.update(cx, |root, _| {
                 root.public_address_book = vec![cold_wallet_entry(receiver)];
@@ -5742,7 +5790,7 @@ fn external_swaps_show_their_delivery_and_recover_only_the_sell_token(cx: &mut T
 fn restarted_external_swap_requotes_its_approved_delivery(cx: &mut TestAppContext) {
     let receiver = Address::repeat_byte(0x51);
     let stubs = SwapStubs::start();
-    with_swap_view_and_rpc(
+    with_approved_swap_view_and_rpc(
         cx,
         Some(stubs.rpc()),
         |root, _, executors, operation, runtime, cx| {
@@ -5813,7 +5861,7 @@ fn restarted_external_swap_requotes_its_approved_delivery(cx: &mut TestAppContex
 fn reopened_external_swap_keeps_its_delivery_and_names_a_receiver_change(cx: &mut TestAppContext) {
     let (receiver, moved) = (Address::repeat_byte(0x51), Address::repeat_byte(0x7b));
     let stubs = SwapStubs::start();
-    with_swap_view_and_rpc(
+    with_approved_swap_view_and_rpc(
         cx,
         Some(stubs.rpc()),
         |root, _, executors, operation, runtime, cx| {
@@ -8060,6 +8108,16 @@ fn private_bridge_setups_show_side_by_side_until_each_is_confirmed(cx: &mut Test
                     sell: Address::repeat_byte(1),
                     buy: Address::repeat_byte(2),
                 }),
+                accounts: Some(SwapApprovedAccounts {
+                    source: SwapApprovedAccount {
+                        address: None,
+                        setup: true,
+                    },
+                    destination: Some(SwapApprovedAccount {
+                        address: None,
+                        setup: true,
+                    }),
+                }),
                 ..test_approval()
             };
             executors
@@ -8279,6 +8337,16 @@ fn retrying_the_destination_setup_keeps_the_source_setups_progress(cx: &mut Test
                 tokens: Some(SwapApprovalTokens {
                     sell: Address::repeat_byte(1),
                     buy: Address::repeat_byte(2),
+                }),
+                accounts: Some(SwapApprovedAccounts {
+                    source: SwapApprovedAccount {
+                        address: None,
+                        setup: true,
+                    },
+                    destination: Some(SwapApprovedAccount {
+                        address: None,
+                        setup: true,
+                    }),
                 }),
                 ..test_approval()
             };
@@ -8780,7 +8848,6 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
                 cx.debug_bounds("swap-progress-cancel-preparation")
                     .is_some()
             );
-            assert!(cx.debug_bounds("swap-progress-stop").is_none());
             let place = cx.debug_bounds("swap-progress-continue").unwrap();
             cx.simulate_click(place.center(), gpui::Modifiers::none());
             cx.update(|window, cx| {
@@ -9933,7 +10000,7 @@ fn speed_up_follows_the_owners_rule_for_the_swaps_orders(cx: &mut TestAppContext
     use wallet_ops::vault::{
         ExecutorNonceObservation, SwapObservation, SwapOrderObservations, SwapSubmissionStatus,
     };
-    with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
         let now = u32::try_from(now_unix()).unwrap();
         let place = |uid_hash, hook_hash, valid_to, speeds_up, buy_amount: u64| {
             let (uid, observed) = placed_order(
@@ -10102,7 +10169,7 @@ fn an_earlier_order_past_the_validity_window_frees_speed_up(cx: &mut TestAppCont
 /// An open order that sped up an earlier one whose expiry is a minute inside the profile's
 /// validity window, or with `past_window` a minute beyond it.
 fn earlier_order_expiry(cx: &mut TestAppContext, past_window: bool) {
-    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, _, cx| {
         let window_secs = swaps.read_with(cx, |swaps, cx| {
             swaps.swap_profile(cx).unwrap().valid_to_window().as_secs()
         });
@@ -10174,7 +10241,7 @@ fn earlier_order_expiry(cx: &mut TestAppContext, past_window: bool) {
 #[gpui::test]
 fn speed_up_waits_for_the_latest_order_to_be_open_a_while(cx: &mut TestAppContext) {
     use wallet_ops::vault::SwapSubmissionStatus;
-    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, _, cx| {
         let now = u32::try_from(now_unix()).unwrap();
         // Each order is valid for ten minutes, so it was signed that long before its expiry.
         let place = |uid_hash, hook_hash, valid_to, speeds_up, buy_amount: u64| {
@@ -10265,7 +10332,7 @@ fn a_rejected_speed_up_leaves_the_swap_on_its_open_original(cx: &mut TestAppCont
         SwapObservation, SwapOrderObservations, SwapPreHookDeath, SwapPreHookDeathCause,
         SwapSubmissionStatus,
     };
-    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, _, cx| {
         let now = u32::try_from(now_unix()).unwrap();
         let place = |uid_hash, hook_hash, valid_to, speeds_up, minimum: u64| {
             placed_order(
@@ -10389,7 +10456,7 @@ fn competing_orders_follow_the_one_that_traded(cx: &mut TestAppContext, original
     use wallet_ops::vault::{
         SwapObservation, SwapOrderObservations, SwapSubmissionStatus, SwapTradeAmounts,
     };
-    with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, _, cx| {
         let now = u32::try_from(now_unix()).unwrap();
         let place = |uid_hash, hook_hash, valid_to, speeds_up, minimum: u64| {
             let (uid, observed) = placed_order(
@@ -10770,7 +10837,7 @@ fn speed_up_form_on_a_quote(
 fn a_speed_up_form_reviews_only_a_lower_signed_minimum(cx: &mut TestAppContext) {
     use crate::root::spend_authorization::spend_authorization_can_use_cached_password;
     let stubs = SwapStubs::start();
-    with_swap_view_and_rpc(
+    with_approved_swap_view_and_rpc(
         cx,
         Some(stubs.rpc()),
         |root, swaps, executors, operation, runtime, cx| {
@@ -10939,7 +11006,7 @@ fn a_speed_up_form_reviews_only_a_lower_signed_minimum(cx: &mut TestAppContext) 
 #[gpui::test]
 fn a_late_speed_up_authorization_signs_nothing(cx: &mut TestAppContext) {
     let stubs = SwapStubs::start();
-    with_swap_view_and_rpc(
+    with_approved_swap_view_and_rpc(
         cx,
         Some(stubs.rpc()),
         |root, swaps, executors, operation, runtime, cx| {
@@ -12660,7 +12727,7 @@ fn early_hint(block: u64, report: Option<wallet_ops::SwapBridgeReport>) -> SwapE
 fn a_reported_private_fill_reads_its_block_once(cx: &mut TestAppContext) {
     use wallet_ops::vault::SwapSubmissionStatus;
 
-    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, _, cx| {
         let (uid, _) = placed_order(
             executors,
             operation,
@@ -12753,7 +12820,7 @@ fn a_reported_bridge_fill_is_asked_about_early_until_its_hand_off_is_recorded(
     use wallet_ops::SwapBridgeReport;
     use wallet_ops::vault::BridgeProvider;
 
-    with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, _, cx| {
         let (uid, observed) = open_across_order(root, executors, operation, cx);
         // What each request of the next pass asks early, and the handed-off orders it polls.
         let asked = |swaps: &PrivateSwapsView, cx: &App| {
@@ -13094,7 +13161,7 @@ fn a_bridge_providers_early_report_changes_the_copy_and_offers_no_action(cx: &mu
         "swap-progress-remove",
     ];
     const NOTHING_TO_DO: &str = "Nothing more to do. The result is confirmed after";
-    with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, _, cx| {
         let (uid, _) = open_across_order(root, executors, operation, cx);
         // The footer of the reported fill before its provider answered.
         let mut footer = None;
@@ -13181,7 +13248,7 @@ fn across_bridge_swaps_show_the_hand_off_and_each_outcome(cx: &mut TestAppContex
     };
 
     let receiver = Address::repeat_byte(0x51);
-    with_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, _, cx| {
         cx.update(|_, cx| {
             root.update(cx, |root, _| {
                 root.public_address_book = vec![cold_wallet_entry(receiver)];
@@ -13524,7 +13591,7 @@ fn a_delivery_under_an_earlier_attempts_terms_keeps_each_attempts_minimum(cx: &m
         SwapOrderObservations, SwapPreHookDeath, SwapPreHookDeathCause,
     };
 
-    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, _, cx| {
         let bridge = BridgeDelivery {
             provider: BridgeProvider::Across,
             destination_chain: 137,
@@ -13693,7 +13760,7 @@ fn a_trade_delivered_by_its_speed_ups_deposit_follows_that_deposit(cx: &mut Test
         BridgeDelivery, BridgeProvider, BridgeSurplus, SwapBridgeOutcome, SwapOrderObservations,
     };
 
-    with_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, _, cx| {
         let delivery = SwapDelivery::Bridge(BridgeDelivery {
             provider: BridgeProvider::Across,
             destination_chain: 137,
@@ -13806,7 +13873,7 @@ fn across_refund_recovery(cx: &mut TestAppContext, split: bool) {
     };
 
     let stubs = split.then(SwapStubs::start);
-    with_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
         let delivery = SwapDelivery::Bridge(BridgeDelivery {
             provider: BridgeProvider::Across,
             destination_chain: 137,
@@ -13994,7 +14061,7 @@ fn checking_an_across_refund_asks_across_before_the_balance(cx: &mut TestAppCont
     use wallet_ops::vault::{BridgeDelivery, BridgeProvider, BridgeSurplus, SwapBridgeOutcome};
 
     let stubs = SwapStubs::start();
-    with_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
         let delivery = SwapDelivery::Bridge(BridgeDelivery {
             provider: BridgeProvider::Across,
             destination_chain: 137,
@@ -14543,7 +14610,7 @@ fn near_intents_deposit_that_needs_attention_is_checked_with_the_provider(cx: &m
     use wallet_ops::vault::{BridgeDelivery, BridgeProvider, BridgeSurplus, SwapBridgeOutcome};
 
     let stubs = SwapStubs::start();
-    with_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
         let delivery = SwapDelivery::Bridge(BridgeDelivery {
             provider: BridgeProvider::NearIntents,
             destination_chain: 137,
@@ -14643,7 +14710,7 @@ fn a_filled_order_reads_its_executed_fee_once_per_session(cx: &mut TestAppContex
     use wallet_ops::vault::{SwapObservation, SwapOrderObservations, SwapTradeAmounts};
 
     let stubs = SwapStubs::start();
-    with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
         let delivery = SwapDelivery::External {
             receiver: Address::repeat_byte(0x51),
         };
@@ -14781,7 +14848,7 @@ fn unfilled_expiry(cx: &mut TestAppContext, legacy: bool) {
         SwapObservation, SwapOrderObservations, SwapPreHookDeath, SwapPreHookDeathCause,
     };
 
-    with_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
         let (uid, observed) =
             placed_swap_with(executors, operation, SwapDelivery::Reshield, |bounds| {
                 bounds.slippage_bps = 120;
