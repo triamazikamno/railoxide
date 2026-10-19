@@ -141,13 +141,14 @@ pub(in crate::root) fn authorized_public_action_gas_fee_selection(
     selection: PublicActionGasFeeSelection,
     quote: Option<PublicActionGasFeeQuote>,
     profile: PublicShieldTransactionProfile,
+    asset: PublicAssetId,
     chain_id: u64,
 ) -> Result<PublicActionGasFeeSelection, String> {
     match selection {
         PublicActionGasFeeSelection::Auto => {
             let quote = quote.ok_or_else(|| "Wait for the gas fee quote".to_string())?;
             let (max_fee_per_gas, max_priority_fee_per_gas) =
-                if profile.uses_legacy_envelope(chain_id) {
+                if profile.uses_legacy_envelope(chain_id, asset) {
                     (quote.rpc_gas_price, 0)
                 } else {
                     (
@@ -191,10 +192,174 @@ pub(in crate::root) struct PublicShieldDraft {
     pub(in crate::root) vault_store: Arc<DesktopVaultStore>,
     pub(in crate::root) amount: U256,
     pub(in crate::root) profile: PublicShieldTransactionProfile,
+    /// Required for a native Mimic Railway shield, and bound to this draft's inputs.
+    pub(in crate::root) native_preparation: Option<Arc<RailwayNativeShieldPreparation>>,
+    /// The native shield's stealth-account operation, which a Ledger or Trezor wallet
+    /// approves before submission.
+    pub(in crate::root) native_operation: Option<wallet_ops::vault::ExecutorOperationId>,
     pub(in crate::root) gas_fee: PublicActionGasFeeSelection,
     pub(in crate::root) gas_fee_mode: PublicActionGasFeeMode,
     pub(in crate::root) authorized_fee_ceiling: PublicActionGasFeeSelection,
     pub(in crate::root) fee_display: PublicActionFeeDisplay,
+}
+
+/// The asset and profile a Shield gas quote was requested for.
+pub(in crate::root) type PublicShieldRoute = (PublicAssetId, PublicShieldTransactionProfile);
+
+/// The Shield quote, only when it was admitted for the current route.
+pub(in crate::root) fn public_shield_quote_for_route(
+    quote: Option<PublicActionGasFeeQuote>,
+    quoted_route: Option<PublicShieldRoute>,
+    current_route: PublicShieldRoute,
+) -> Option<PublicActionGasFeeQuote> {
+    quote.filter(|_| quoted_route == Some(current_route))
+}
+
+/// Native Mimic needs a software payer. A Ledger or Trezor wallet's stealth-account approval
+/// admits only a software or imported one, as for a self-broadcast executor unshield.
+pub(in crate::root) const fn railway_native_shield_payer(
+    source: PublicAccountSource,
+    wallet_is_hardware: bool,
+) -> RailwayNativeShieldPayer {
+    match source {
+        PublicAccountSource::HardwareDerived => RailwayNativeShieldPayer::Hardware,
+        PublicAccountSource::ExecutorDerived(_) if wallet_is_hardware => {
+            RailwayNativeShieldPayer::HardwareWallet
+        }
+        _ => RailwayNativeShieldPayer::Software,
+    }
+}
+
+/// Expected and maximum cost of a prepared native Mimic shield: its raw estimate and its
+/// buffered signing limit priced with the selected fee.
+pub(in crate::root) fn native_mimic_gas_cost_projection(
+    chain_id: u64,
+    raw_gas_limit: u64,
+    gas_limit: u64,
+    selection: PublicActionGasFeeSelection,
+    quote: Option<PublicActionGasFeeQuote>,
+) -> Option<Eip1559GasCostProjection> {
+    // As in fee resolution, a custom fee without a quote is priced at its own cap.
+    let quote = quote.or_else(|| match selection {
+        PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas, ..
+        } => Some(PublicActionGasFeeQuote::from_rpc_gas_price(max_fee_per_gas)),
+        PublicActionGasFeeSelection::Auto => None,
+    })?;
+    let resolved = resolve_public_action_gas_fee(
+        chain_id,
+        PublicShieldTransactionProfile::Railway,
+        PublicAssetId::Native,
+        selection,
+        Some(quote),
+    )
+    .ok()?;
+    // Decimals only scale the USD values, which are not requested here.
+    let projection = project_public_action_fee(
+        raw_gas_limit,
+        gas_limit,
+        quote,
+        resolved,
+        PublicActionFeeSource::NetworkSimulation,
+        None,
+        18,
+    );
+    Some(Eip1559GasCostProjection {
+        expected_fee_per_gas: projection.expected_fee_per_gas,
+        maximum_fee_per_gas: projection.max_fee_per_gas,
+        expected_cost: projection.expected_gas_cost,
+        maximum_cost: projection.maximum_gas_cost,
+    })
+}
+
+/// What a native Mimic preparation is bound to. Any change makes it stale.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::root) struct NativeMimicShieldKey {
+    pub(in crate::root) wallet_id: Option<Arc<str>>,
+    pub(in crate::root) chain_id: u64,
+    pub(in crate::root) public_account_uuid: Arc<str>,
+    pub(in crate::root) amount: U256,
+}
+
+/// The stealth-account operation of a native shield of `key`, bound in `bound`. A native
+/// shield sent again with the same inputs reuses its stealth account.
+pub(in crate::root) fn bind_native_mimic_shield_operation(
+    bound: &mut Option<(NativeMimicShieldKey, wallet_ops::vault::ExecutorOperationId)>,
+    key: NativeMimicShieldKey,
+) -> Result<wallet_ops::vault::ExecutorOperationId, wallet_ops::vault::ExecutorStoreError> {
+    let operation = match bound.as_ref().filter(|(current, _)| *current == key) {
+        Some((_, operation)) => *operation,
+        None => wallet_ops::vault::ExecutorOperationId::random()?,
+    };
+    *bound = Some((key, operation));
+    Ok(operation)
+}
+
+/// The current native Mimic preparation of the Shield form. Every start or invalidation
+/// advances the generation, so a late completion of an earlier request is ignored.
+pub(in crate::root) struct NativeMimicShieldPreparationState<
+    T = Arc<RailwayNativeShieldPreparation>,
+> {
+    pub(in crate::root) generation: u64,
+    pub(in crate::root) pending: bool,
+    outcome: Option<(NativeMimicShieldKey, Result<T, Arc<str>>)>,
+}
+
+impl<T> Default for NativeMimicShieldPreparationState<T> {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            pending: false,
+            outcome: None,
+        }
+    }
+}
+
+impl<T> NativeMimicShieldPreparationState<T> {
+    pub(in crate::root) fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = false;
+        self.outcome = None;
+    }
+
+    pub(in crate::root) fn begin(&mut self) -> u64 {
+        self.invalidate();
+        self.pending = true;
+        self.generation
+    }
+
+    /// Admits `result` only for the latest request and only while `key` is still the form's.
+    pub(in crate::root) fn complete(
+        &mut self,
+        generation: u64,
+        key: NativeMimicShieldKey,
+        current: Option<&NativeMimicShieldKey>,
+        result: Result<T, Arc<str>>,
+    ) -> bool {
+        if generation != self.generation || current != Some(&key) {
+            return false;
+        }
+        self.pending = false;
+        self.outcome = Some((key, result));
+        true
+    }
+
+    pub(in crate::root) fn prepared(&self, current: Option<&NativeMimicShieldKey>) -> Option<&T> {
+        match &self.outcome {
+            Some((key, Ok(prepared))) if Some(key) == current => Some(prepared),
+            _ => None,
+        }
+    }
+
+    pub(in crate::root) fn error(
+        &self,
+        current: Option<&NativeMimicShieldKey>,
+    ) -> Option<&Arc<str>> {
+        match &self.outcome {
+            Some((key, Err(error))) if Some(key) == current => Some(error),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

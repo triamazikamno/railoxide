@@ -2426,6 +2426,7 @@ impl WalletRoot {
                 chain_id,
                 &effective_chain,
                 wallet_ops::PublicShieldTransactionProfile::Railoxide,
+                wallet_ops::PublicAssetId::Native,
                 &http,
             )
             .await;

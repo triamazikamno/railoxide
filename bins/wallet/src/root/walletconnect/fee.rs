@@ -6,9 +6,9 @@ use wallet_ops::{
     HttpContext, PublicActionFeeProjection, PublicActionFeeSource, PublicActionGasFeeQuote,
     PublicActionGasFeeSelection, PublicActionResolvedGasFee, PublicAdvancedTransactionEstimate,
     PublicAdvancedTransactionEstimateRequest, PublicAdvancedTransactionSimulationError,
-    PublicShieldTransactionProfile, PublicTransactionIntent, SelfBroadcastGasFeeQuote,
-    WalletConnectDecodedCallKind, WalletConnectParsedRequest, WalletConnectReviewedFee,
-    WalletConnectReviewedTransaction, project_public_action_fee,
+    PublicAssetId, PublicShieldTransactionProfile, PublicTransactionIntent,
+    SelfBroadcastGasFeeQuote, WalletConnectDecodedCallKind, WalletConnectParsedRequest,
+    WalletConnectReviewedFee, WalletConnectReviewedTransaction, project_public_action_fee,
     public_native_action_gas_units_from_walletconnect_intent,
     quote_public_action_gas_fee_with_reads, resolve_public_action_gas_fee,
     simulate_public_advanced_transaction_with_fee_and_reads,
@@ -384,6 +384,7 @@ pub(super) fn walletconnect_fee_projection(
     let resolved = resolve_public_action_gas_fee(
         chain_id,
         PublicShieldTransactionProfile::Railoxide,
+        PublicAssetId::Native,
         selection,
         quote,
     )
@@ -1340,6 +1341,7 @@ impl WalletRoot {
         let Ok(resolved) = resolve_public_action_gas_fee(
             chain_id,
             PublicShieldTransactionProfile::Railoxide,
+            PublicAssetId::Native,
             selection,
             Some(quote),
         ) else {

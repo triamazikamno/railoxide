@@ -396,6 +396,7 @@ impl WalletRoot {
         self.public_form.editing_account_uuid = None;
         self.public_form.selected_asset = None;
         self.public_form.mimic_railway_shield = self.mimic_railway_shields_by_default;
+        self.public_form.native_mimic_shield.invalidate();
         self.public_form.public_send_kind = PublicSendKind::Transfer;
         self.public_form.advanced_send_estimate = None;
         self.public_form.advanced_send_estimate_invalidated = false;
@@ -606,6 +607,7 @@ impl WalletRoot {
         self.public_form.selected_asset = Some(asset);
         // Selecting a balance starts a fresh shield draft, so restore the configured default.
         self.public_form.mimic_railway_shield = self.mimic_railway_shields_by_default;
+        self.public_form.native_mimic_shield.invalidate();
         self.public_form.public_send_kind = PublicSendKind::Transfer;
         self.public_form.advanced_send_estimate = None;
         self.public_form.advanced_send_estimate_invalidated = false;
@@ -1211,17 +1213,26 @@ impl WalletRoot {
         #[cfg(debug_assertions)]
         if Self::public_shield_error_ui_fixture_active() {
             let root = root.clone();
-            return app_button(
-                "wallet-public-preview-shield-error",
-                "Preview Shield failure…",
-            )
-            .small()
-            .on_click(move |_, window, cx| {
-                root.update(cx, |root, cx| {
-                    root.open_public_shield_error_ui_fixture(PublicAssetId::Native, window, cx);
-                });
-            })
-            .into_any_element();
+            let label = match super::public_action::public_shield_ui_fixture() {
+                Some(
+                    super::public_action::PublicShieldUiFixture::EstimateError
+                    | super::public_action::PublicShieldUiFixture::FundingError,
+                ) => "Preview Shield failure…",
+                _ => "Preview Mimic Railway shield…",
+            };
+            return app_button("wallet-public-preview-shield-error", label)
+                .small()
+                .on_click(move |_, window, cx| {
+                    root.update(cx, |root, cx| {
+                        let account = root
+                            .public_form
+                            .selected_account_uuid
+                            .clone()
+                            .unwrap_or_else(|| Arc::from("ui-fixture"));
+                        root.open_public_action_dialog(account, PublicAssetId::Native, window, cx);
+                    });
+                })
+                .into_any_element();
         }
         let derive_root = root.clone();
         let import_root = root.clone();

@@ -1279,6 +1279,9 @@ impl WalletRoot {
             send_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
             shield_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
             shield_gas_fee_authorization_ceiling: None,
+            shield_gas_fee_route: None,
+            native_mimic_shield: public_action::NativeMimicShieldPreparationState::default(),
+            native_mimic_shield_operation: None,
             import_global: false,
             selected_account_uuid: None,
             editing_account_uuid: None,
@@ -1695,6 +1698,15 @@ impl WalletRoot {
             })
             .detach();
         }
+        cx.subscribe(
+            &root.public_form.shield_amount_input,
+            |this, _input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.refresh_native_mimic_shield_preparation(cx);
+                }
+            },
+        )
+        .detach();
         for input in [
             root.governance.reward_gas_fee.max_fee_input.clone(),
             root.governance

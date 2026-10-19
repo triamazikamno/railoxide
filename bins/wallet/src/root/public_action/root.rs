@@ -1,17 +1,5 @@
 use super::*;
 
-#[cfg(debug_assertions)]
-fn public_shield_error_ui_fixture_mode() -> Option<bool> {
-    static FUNDING_ERROR: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    *FUNDING_ERROR.get_or_init(
-        || match std::env::var("RAILOXIDE_UI_FIXTURE").ok()?.as_str() {
-            "shield:estimate-error" => Some(false),
-            "shield:funding-error" => Some(true),
-            _ => None,
-        },
-    )
-}
-
 impl WalletRoot {
     pub(in crate::root) fn open_public_action_dialog(
         &mut self,
@@ -75,8 +63,10 @@ impl WalletRoot {
         });
     }
 
-    /// `shield:estimate-error` and `shield:funding-error` stage an inert progress dialog
-    /// when a Public asset dialog is opened on a scratch profile. No action is submitted.
+    /// `shield:estimate-error`, `shield:funding-error` and `shield:mimic-pending` stage an
+    /// inert progress dialog when a Public asset dialog is opened on a scratch profile. The
+    /// other `shield:mimic-*` fixtures stage the native Mimic Shield form instead. No action
+    /// is submitted and no record is written.
     #[cfg(debug_assertions)]
     pub(in crate::root) fn open_public_shield_error_ui_fixture(
         &mut self,
@@ -84,8 +74,20 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> bool {
-        let Some(funding_error) = public_shield_error_ui_fixture_mode() else {
-            return false;
+        let funding_error = match public_shield_ui_fixture() {
+            None => return false,
+            Some(PublicShieldUiFixture::EstimateError) => false,
+            Some(PublicShieldUiFixture::FundingError) => true,
+            Some(PublicShieldUiFixture::MimicPending) => {
+                self.open_native_mimic_pending_ui_fixture(window, cx);
+                return true;
+            }
+            Some(
+                PublicShieldUiFixture::MimicPrepared | PublicShieldUiFixture::MimicUnavailable,
+            ) => {
+                self.stage_native_mimic_form_ui_fixture(window, cx);
+                return false;
+            }
         };
         let asset = self
             .effective_chain_configs
@@ -147,7 +149,7 @@ impl WalletRoot {
 
     #[cfg(debug_assertions)]
     pub(in crate::root) fn public_shield_error_ui_fixture_active() -> bool {
-        public_shield_error_ui_fixture_mode().is_some()
+        public_shield_ui_fixture().is_some()
     }
 
     pub(in crate::root) fn focus_public_action_dialog_input(
@@ -222,9 +224,20 @@ impl WalletRoot {
         let max_gas_reserve = selected_asset
             .and_then(|asset| self.public_action_estimated_gas_cost(mode, asset, cx))
             .map(|projection| projection.maximum_cost);
-        let max_label = balance_entry
-            .as_ref()
-            .and_then(|entry| public_action_max_label(entry, max_gas_reserve));
+        let native_mimic = self.native_mimic_shield_applies(mode);
+        let max_label = balance_entry.as_ref().and_then(|entry| {
+            // Native Mimic Max prepares its own reserve; before that only the balance is known.
+            if native_mimic && max_gas_reserve.is_none() {
+                return entry.amount.amount().map(|_| {
+                    format!(
+                        "{} {} before gas",
+                        public_balance_amount_label(&entry.amount, entry.asset.decimals),
+                        entry.asset.symbol,
+                    )
+                });
+            }
+            public_action_max_label(entry, max_gas_reserve)
+        });
         let fee_amount = selected_asset.and_then(|asset| {
             let input = match mode {
                 PublicActionMode::Shield => &self.public_form.shield_amount_input,
@@ -241,7 +254,10 @@ impl WalletRoot {
         });
         let fee_display = self.public_action_fee_display(mode, fee_amount, cx);
         let gas_pending = match mode {
-            PublicActionMode::Shield => self.public_form.shield_gas_fee.refreshing,
+            PublicActionMode::Shield => {
+                self.public_form.shield_gas_fee.refreshing
+                    || (native_mimic && self.public_form.native_mimic_shield.pending)
+            }
             PublicActionMode::Send => self.public_form.send_gas_fee.refreshing,
         };
         let fee_ready = fee_display.expected_gas_cost.is_some();
@@ -306,9 +322,11 @@ impl WalletRoot {
                     ))
                     .child(render_mimic_railway_shield_control(
                         submit_root.clone(),
-                        self.public_form.mimic_railway_shield,
+                        self.mimic_railway_shield_effective(),
                         self.public_form.shielding,
+                        self.native_mimic_shield_unavailable(),
                     ))
+                    .children(self.render_native_mimic_shield_status(cx))
                     .child(render_eip1559_gas_fee_editor(
                         gas_fee_root,
                         &Eip1559GasFeeTarget::Public {
@@ -661,6 +679,7 @@ impl WalletRoot {
         self.public_form.advanced_send_estimate_invalidated = false;
         self.invalidate_advanced_public_send_estimate();
         self.public_form.shield_error = None;
+        self.public_form.native_mimic_shield.invalidate();
         if !self.public_form.sending && !self.public_form.shielding {
             self.clear_public_action_progress_state();
         }
@@ -824,6 +843,7 @@ impl WalletRoot {
             gas_fee.quote_error = None;
         }
         self.public_form.shield_gas_fee_authorization_ceiling = None;
+        self.public_form.shield_gas_fee_route = None;
     }
 
     pub(in crate::root) fn invalidate_public_action_gas_fee_quote(
@@ -840,6 +860,39 @@ impl WalletRoot {
         gas_fee.quote_error = None;
         if action_mode == PublicActionMode::Shield {
             self.public_form.shield_gas_fee_authorization_ceiling = None;
+            self.public_form.shield_gas_fee_route = None;
+        }
+    }
+
+    /// The asset and profile a quote for `mode` is requested and admitted for.
+    pub(in crate::root) fn public_action_quote_route(
+        &self,
+        mode: PublicActionMode,
+    ) -> PublicShieldRoute {
+        let asset = self
+            .public_form
+            .selected_asset
+            .unwrap_or(PublicAssetId::Native);
+        let profile = if mode == PublicActionMode::Shield && self.mimic_railway_shield_effective() {
+            PublicShieldTransactionProfile::Railway
+        } else {
+            PublicShieldTransactionProfile::Railoxide
+        };
+        (asset, profile)
+    }
+
+    /// The quote for `mode`; a Shield quote only when admitted for the current route.
+    pub(in crate::root) fn public_action_quote(
+        &self,
+        mode: PublicActionMode,
+    ) -> Option<PublicActionGasFeeQuote> {
+        match mode {
+            PublicActionMode::Shield => public_shield_quote_for_route(
+                self.public_form.shield_gas_fee.quote,
+                self.public_form.shield_gas_fee_route,
+                self.public_action_quote_route(mode),
+            ),
+            PublicActionMode::Send => self.public_form.send_gas_fee.quote,
         }
     }
 
@@ -969,7 +1022,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         #[cfg(debug_assertions)]
-        if public_shield_error_ui_fixture_mode().is_some() {
+        if public_shield_ui_fixture().is_some() {
             return;
         }
         let submitting = self.public_form.sending || self.public_form.shielding;
@@ -989,17 +1042,14 @@ impl WalletRoot {
             return;
         };
         let http = self.http.clone();
-        let profile =
-            if action_mode == PublicActionMode::Shield && self.public_form.mimic_railway_shield {
-                PublicShieldTransactionProfile::Railway
-            } else {
-                PublicShieldTransactionProfile::Railoxide
-            };
+        let route = self.public_action_quote_route(action_mode);
+        let (asset, profile) = route;
         cx.spawn(async move |this, cx| {
             let result = quote_public_action_gas_fee_bundle_with_profile(
                 chain_id,
                 &effective_chain,
                 profile,
+                asset,
                 &http,
             )
             .await;
@@ -1009,6 +1059,18 @@ impl WalletRoot {
                     PublicActionMode::Send => root.public_form.send_gas_fee.refresh_id,
                 };
                 if current_refresh_id != refresh_id {
+                    return;
+                }
+                // A quote for an earlier asset or profile never serves the current route.
+                if root.public_action_quote_route(action_mode) != route {
+                    match action_mode {
+                        PublicActionMode::Shield => {
+                            root.public_form.shield_gas_fee.refreshing = false;
+                        }
+                        PublicActionMode::Send => {
+                            root.public_form.send_gas_fee.refreshing = false;
+                        }
+                    }
                     return;
                 }
                 match result {
@@ -1028,6 +1090,7 @@ impl WalletRoot {
                         if action_mode == PublicActionMode::Shield {
                             root.public_form.shield_gas_fee_authorization_ceiling =
                                 Some(authorization_ceiling);
+                            root.public_form.shield_gas_fee_route = Some(route);
                         }
                         match action_mode {
                             PublicActionMode::Shield => {
@@ -1490,6 +1553,9 @@ impl WalletRoot {
             PublicActionMode::Send => self.public_form.sending = false,
         }
         mark_public_action_active_step_stopped(&mut self.public_form.action_progress);
+        // Submission consumed the native preparation and stopping bypasses the completion
+        // handler that would restore it.
+        self.refresh_native_mimic_shield_preparation(cx);
         cx.notify();
     }
 
@@ -1503,6 +1569,9 @@ impl WalletRoot {
             PublicActionMode::Send => self.public_form.sending = false,
         }
         self.clear_public_action_progress_state();
+        // Submission consumed the native preparation and discarding bypasses the completion
+        // handler that would restore it.
+        self.refresh_native_mimic_shield_preparation(cx);
         cx.notify();
     }
 
@@ -1782,6 +1851,10 @@ impl WalletRoot {
             cx.notify();
             return;
         }
+        if self.native_mimic_shield_applies(mode) {
+            self.set_native_mimic_shield_amount_to_max(amount, decimals, window, cx);
+            return;
+        }
 
         let Some(public_account_uuid) = self.public_form.selected_account_uuid.clone() else {
             return;
@@ -1791,7 +1864,7 @@ impl WalletRoot {
         let symbol = entry.asset.symbol;
         let http = self.http.clone();
         let steps = public_action_progress_steps(mode, PublicAssetId::Native);
-        let profile = if mode == PublicActionMode::Shield && self.public_form.mimic_railway_shield {
+        let profile = if mode == PublicActionMode::Shield && self.mimic_railway_shield_effective() {
             PublicShieldTransactionProfile::Railway
         } else {
             PublicShieldTransactionProfile::Railoxide
@@ -1908,23 +1981,25 @@ impl WalletRoot {
         }
     }
 
-    fn public_action_authorized_gas_fee_selection(
+    pub(in crate::root) fn public_action_authorized_gas_fee_selection(
         &self,
         mode: PublicActionMode,
         profile: PublicShieldTransactionProfile,
+        asset: PublicAssetId,
         cx: &App,
     ) -> Result<PublicActionGasFeeSelection, String> {
-        let (selection, quote) = match mode {
-            PublicActionMode::Shield => (
-                self.public_form.shield_gas_fee.selection(cx)?,
-                self.public_form.shield_gas_fee.quote,
-            ),
-            PublicActionMode::Send => (
-                self.public_form.send_gas_fee.selection(cx)?,
-                self.public_form.send_gas_fee.quote,
-            ),
+        let selection = match mode {
+            PublicActionMode::Shield => self.public_form.shield_gas_fee.selection(cx)?,
+            PublicActionMode::Send => self.public_form.send_gas_fee.selection(cx)?,
         };
-        authorized_public_action_gas_fee_selection(selection, quote, profile, self.selected_chain)
+        let quote = self.public_action_quote(mode);
+        authorized_public_action_gas_fee_selection(
+            selection,
+            quote,
+            profile,
+            asset,
+            self.selected_chain,
+        )
     }
 
     pub(in crate::root) fn public_action_fee_display(
@@ -1942,13 +2017,15 @@ impl WalletRoot {
                 protocol_fee: None,
             };
         };
+        let native_mimic_gas_limit = self
+            .native_mimic_shield_applies(mode)
+            .then(|| self.native_mimic_shield_gas(cx))
+            .flatten()
+            .map(|(_, gas_limit)| gas_limit);
         PublicActionFeeDisplay::from_estimate(
             self.effective_chain_configs.get(self.selected_chain),
             self.public_action_estimated_gas_cost(mode, asset, cx),
-            (mode == PublicActionMode::Shield
-                && asset == PublicAssetId::Native
-                && self.public_form.mimic_railway_shield)
-                .then_some(6_000_000),
+            native_mimic_gas_limit,
             (mode == PublicActionMode::Shield)
                 .then(|| amount.map(|amount| (asset, public_shield_protocol_fee_amount(amount))))
                 .flatten(),
@@ -1969,11 +2046,18 @@ impl WalletRoot {
             }
             PublicActionMode::Send => (PublicActionKind::Send, &self.public_form.send_gas_fee),
         };
-        let profile = if mode == PublicActionMode::Shield && self.public_form.mimic_railway_shield {
-            PublicShieldTransactionProfile::Railway
-        } else {
-            PublicShieldTransactionProfile::Railoxide
-        };
+        let quote = self.public_action_quote(mode);
+        if self.native_mimic_shield_applies(mode) {
+            let (raw_gas_limit, gas_limit) = self.native_mimic_shield_gas(cx)?;
+            return native_mimic_gas_cost_projection(
+                self.selected_chain,
+                raw_gas_limit,
+                gas_limit,
+                gas_fee.selection(cx).ok()?,
+                quote,
+            );
+        }
+        let (_, profile) = self.public_action_quote_route(mode);
         let gas_fee_mode = match gas_fee.mode {
             Eip1559GasFeeMode::Auto => PublicActionGasFeeMode::Auto,
             Eip1559GasFeeMode::Custom => PublicActionGasFeeMode::Custom,
@@ -1989,7 +2073,7 @@ impl WalletRoot {
             asset,
             profile,
             gas_fee.selection(cx).ok()?,
-            gas_fee.quote,
+            quote,
             authorization_ceiling,
         )
         .ok()
@@ -2006,10 +2090,7 @@ impl WalletRoot {
                 max_priority_fee_per_gas,
             } => Some((*max_fee_per_gas, *max_priority_fee_per_gas)),
             PublicActionGasFeeSelection::Auto => {
-                let quote = match mode {
-                    PublicActionMode::Shield => self.public_form.shield_gas_fee.quote,
-                    PublicActionMode::Send => self.public_form.send_gas_fee.quote,
-                }?;
+                let quote = self.public_action_quote(mode)?;
                 Some((
                     quote.suggested_max_fee_per_gas,
                     quote.suggested_max_priority_fee_per_gas,
@@ -2216,6 +2297,7 @@ impl WalletRoot {
                 let gas_fee = match self.public_action_authorized_gas_fee_selection(
                     PublicActionMode::Send,
                     PublicShieldTransactionProfile::Railoxide,
+                    PublicAssetId::Native,
                     cx,
                 ) {
                     Ok(selection) => selection,
@@ -2491,6 +2573,11 @@ impl WalletRoot {
         if self.public_form.shielding {
             return;
         }
+        // The fixture's ordinary route is real; a Custom fee would otherwise let it send.
+        #[cfg(debug_assertions)]
+        if public_shield_ui_fixture() == Some(PublicShieldUiFixture::MimicUnavailable) {
+            return;
+        }
         self.clear_public_action_progress_state();
         let Some(draft) = self.public_shield_draft(cx) else {
             return;
@@ -2571,7 +2658,7 @@ impl WalletRoot {
                 return None;
             }
         };
-        let profile = if self.public_form.mimic_railway_shield {
+        let profile = if self.mimic_railway_shield_effective() {
             PublicShieldTransactionProfile::Railway
         } else {
             PublicShieldTransactionProfile::Railoxide
@@ -2583,6 +2670,7 @@ impl WalletRoot {
         let gas_fee = match self.public_action_authorized_gas_fee_selection(
             PublicActionMode::Shield,
             profile,
+            asset,
             cx,
         ) {
             Ok(selection) => selection,
@@ -2608,6 +2696,20 @@ impl WalletRoot {
         } else {
             gas_fee
         };
+        let native_preparation = if profile == PublicShieldTransactionProfile::Railway
+            && asset == PublicAssetId::Native
+        {
+            let Some(preparation) = self.current_native_mimic_shield_preparation(cx) else {
+                self.public_form.shield_error = Some(Arc::from(
+                    "Wait for the Mimic Railway shield to be prepared",
+                ));
+                cx.notify();
+                return None;
+            };
+            Some(preparation)
+        } else {
+            None
+        };
         let fee_display =
             self.public_action_fee_display(PublicActionMode::Shield, Some(amount), cx);
         if fee_display.expected_gas_cost.is_none()
@@ -2620,6 +2722,27 @@ impl WalletRoot {
             cx.notify();
             return None;
         }
+        // Bound before authorization, which a Ledger or Trezor wallet gives for this operation.
+        let native_operation = if native_preparation.is_some() {
+            match bind_native_mimic_shield_operation(
+                &mut self.public_form.native_mimic_shield_operation,
+                NativeMimicShieldKey {
+                    wallet_id: self.selected_wallet_id.clone(),
+                    chain_id,
+                    public_account_uuid: Arc::clone(&public_account_uuid),
+                    amount,
+                },
+            ) {
+                Ok(operation) => Some(operation),
+                Err(error) => {
+                    self.public_form.shield_error = Some(Arc::from(error.to_string()));
+                    cx.notify();
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
         Some(PublicShieldDraft {
             gateway_execution: None,
             chain_id,
@@ -2634,6 +2757,8 @@ impl WalletRoot {
             vault_store,
             amount,
             profile,
+            native_preparation,
+            native_operation,
             gas_fee,
             gas_fee_mode,
             authorized_fee_ceiling,
@@ -2689,6 +2814,8 @@ impl WalletRoot {
             vault_store,
             amount,
             profile,
+            native_preparation,
+            native_operation,
             gas_fee,
             gas_fee_mode,
             authorized_fee_ceiling,
@@ -2723,6 +2850,8 @@ impl WalletRoot {
         let trezor_pin_matrix_provider = None;
         self.public_form.shielding = true;
         self.public_form.shield_error = None;
+        // A preparation serves one submission; a later attempt is prepared and reviewed anew.
+        self.public_form.native_mimic_shield.invalidate();
         let http = self.http.clone();
         let active_wallet_id = self.selected_wallet_id.clone();
         let icon_path =
@@ -2776,6 +2905,8 @@ impl WalletRoot {
             asset,
             amount,
             profile,
+            native_preparation,
+            native_operation,
             gas_fee,
             gas_fee_mode,
             authorized_fee_ceiling,
@@ -2783,6 +2914,7 @@ impl WalletRoot {
             event_tx: Some(event_tx),
         };
         let submitted_public_account_uuid = Arc::clone(&public_account_uuid);
+        let native_mimic = request.native_preparation.is_some();
         let join = self.spawn_public_transaction_submission(chain_id, async move {
             submit_public_shield_with_progress(request, &http, move |update| {
                 let _ = progress_tx.send(update);
@@ -2796,7 +2928,10 @@ impl WalletRoot {
                 execution.finish(matches!(&result, Ok(Ok(_))));
             }
             let _ = this.update(cx, |root, cx| {
-                if root.selected_wallet_id != active_wallet_id || root.selected_chain != chain_id {
+                if root.selected_wallet_id != active_wallet_id {
+                    return;
+                }
+                if root.selected_chain != chain_id {
                     return;
                 }
                 if !public_action_accepts_update(
@@ -2808,8 +2943,14 @@ impl WalletRoot {
                 }
                 root.public_form.shielding = false;
                 root.public_form.action_task_abort_handle = None;
+                if native_mimic && !matches!(&result, Ok(Ok(_))) {
+                    root.refresh_native_mimic_shield_preparation(cx);
+                }
                 match result {
                     Ok(Ok(_result)) => {
+                        if native_mimic {
+                            root.public_form.native_mimic_shield_operation = None;
+                        }
                         root.public_form.action_command_tx = None;
                         root.public_form.action_action_error = None;
                         root.public_form.mimic_railway_shield =
@@ -2825,6 +2966,17 @@ impl WalletRoot {
                         }
                     }
                     Ok(Err(error)) => {
+                        // A retired stealth account, or one that may hold an undelivered
+                        // shield's value, is never reused.
+                        if error
+                            .downcast_ref::<wallet_ops::ExecutorAccountUsed>()
+                            .is_some()
+                            || error
+                                .downcast_ref::<wallet_ops::RailwayNativeShieldUndelivered>()
+                                .is_some()
+                        {
+                            root.public_form.native_mimic_shield_operation = None;
+                        }
                         let message = format_report_chain(&error);
                         if is_spend_authorization_failure_error(&message) {
                             root.clear_spend_authorization(cx);

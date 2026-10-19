@@ -18,7 +18,7 @@ pub(in crate::root) fn public_action_form(
 }
 
 const MIMIC_RAILWAY_TITLE: &str = "Mimic Railway";
-const MIMIC_RAILWAY_INTRO: &str = "Construct this shield like Railway so on-chain observers cannot easily identify which wallet created it.";
+const MIMIC_RAILWAY_INTRO: &str = "Build this shield the way Railway v5.26.1 builds a single-asset shield. A native-token shield goes through a fresh stealth account in one transaction.";
 const MIMIC_RAILWAY_TRADEOFF_ALLOWANCE: &str =
     "ERC-20 shields may grant the RAILGUN contract an unlimited token allowance.";
 const MIMIC_RAILWAY_TRADEOFF_GAS: &str = "Gas limits and maximum fee estimates may be higher.";
@@ -77,26 +77,52 @@ pub(in crate::root) fn render_mimic_railway_shield_control(
     root: Entity<WalletRoot>,
     checked: bool,
     disabled: bool,
+    native_unavailable: Option<RailwayNativeShieldUnavailable>,
 ) -> gpui::Div {
     let toggle_root = root;
+    // The reason is a lowercase clause for embedding; the tooltip shows it as a sentence.
+    let unavailable_reason = native_unavailable.map(|reason| {
+        let reason = reason.to_string();
+        let mut chars = reason.chars();
+        let first = chars.next().map(|first| first.to_uppercase().to_string());
+        SharedString::from(format!("{}{}.", first.unwrap_or_default(), chars.as_str()))
+    });
+    let unavailable = unavailable_reason.is_some();
+    let checkbox = Checkbox::new("wallet-public-shield-mimic-railway")
+        .label(MIMIC_RAILWAY_TITLE)
+        .checked(checked)
+        .small()
+        .disabled(disabled || unavailable)
+        .on_click(move |checked, _window, cx| {
+            toggle_root.update(cx, |root, cx| {
+                root.public_form.mimic_railway_shield = *checked;
+                root.invalidate_public_action_gas_fee_quote(PublicActionMode::Shield);
+                root.refresh_public_action_gas_fee_quote(PublicActionMode::Shield, cx);
+                root.public_form.native_mimic_shield.invalidate();
+                root.refresh_native_mimic_shield_preparation(cx);
+                root.set_public_action_error(PublicActionMode::Shield, None);
+                cx.notify();
+            });
+        });
     div()
         .flex()
         .items_center()
         .gap_1()
         .child(
-            Checkbox::new("wallet-public-shield-mimic-railway")
-                .label(MIMIC_RAILWAY_TITLE)
-                .checked(checked)
-                .small()
-                .disabled(disabled)
-                .on_click(move |checked, _window, cx| {
-                    toggle_root.update(cx, |root, cx| {
-                        root.public_form.mimic_railway_shield = *checked;
-                        root.invalidate_public_action_gas_fee_quote(PublicActionMode::Shield);
-                        root.refresh_public_action_gas_fee_quote(PublicActionMode::Shield, cx);
-                        root.set_public_action_error(PublicActionMode::Shield, None);
-                        cx.notify();
-                    });
+            div()
+                .id("wallet-public-shield-mimic-railway-row")
+                .child(checkbox)
+                .when_some(unavailable_reason, |row, reason| {
+                    row.tooltip(private_action_tooltip(
+                        "Mimic Railway unavailable",
+                        theme::TEXT,
+                        move || {
+                            div()
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .child(reason.clone())
+                                .into_any_element()
+                        },
+                    ))
                 }),
         )
         .child(render_private_action_info_icon_with_body(

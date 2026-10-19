@@ -7,6 +7,7 @@ mod helpers;
 mod native_topup;
 mod poi_contexts;
 mod public_broadcaster;
+mod railway_native_shield_fork;
 mod self_broadcast;
 mod signer;
 mod sync_start;

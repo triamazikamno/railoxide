@@ -17,7 +17,7 @@ use super::types::{
     PublicActionGasFeeQuote, PublicActionGasFeeSelection, PublicActionGasLimitStrategy,
     PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
     PublicActionSessionEvent, PublicActionSessionEventSender, PublicActionStepFeePolicy,
-    PublicShieldTransactionProfile,
+    PublicAssetId, PublicShieldTransactionProfile,
 };
 use crate::block_observer::BlockObserver;
 use crate::settings::EffectiveChainGasSettings;
@@ -123,6 +123,9 @@ pub(crate) enum PublicActionStepEnd {
     /// accepted ends the session without a receipt. The durable hand-off's owner follows that
     /// attempt from there. Only a session with a hand-off ends this way.
     HandOff,
+    /// As [`Self::Receipt`], except that a successful receipt doesn't complete the step: the
+    /// caller does once it verified the transaction's effect.
+    Evidence,
 }
 
 /// What a step session ended with.
@@ -152,6 +155,7 @@ pub(super) async fn submit_public_action_step_session(
     step: PublicActionProgressStep,
     base_tx_req: TransactionRequest,
     profile: PublicShieldTransactionProfile,
+    asset: PublicAssetId,
     gas_limit_strategy: PublicActionGasLimitStrategy,
     signer: &VaultedPublicSigner,
     label: &str,
@@ -207,6 +211,7 @@ pub(super) async fn submit_public_action_step_session(
             next_gas_fee,
             gas,
             profile,
+            asset,
             gas_limit_strategy,
             authorized_gas_limit,
             nonce,
@@ -264,6 +269,15 @@ pub(super) async fn submit_public_action_step_session(
                     return Err(error).wrap_err(
                         "advanced transaction requires a refreshed estimate and authorization",
                     );
+                }
+                // A native Mimic shield's reviewed gas and fee bounds cannot be widened by a
+                // retry; it needs fresh preparation and review on the same stealth account.
+                if matches!(
+                    gas_limit_strategy,
+                    PublicActionGasLimitStrategy::RailwayNativePrepared { .. }
+                ) {
+                    return Err(error)
+                        .wrap_err("native shield requires refreshed preparation and review");
                 }
                 let Some(command) = recv_public_action_command(command_rx).await else {
                     return Err(error);
@@ -414,6 +428,7 @@ pub(super) async fn submit_public_action_step_session(
                             command.gas_fee,
                             gas,
                             profile,
+                            asset,
                             gas_limit_strategy,
                             authorized_gas_limit,
                             Some(nonce),
@@ -443,6 +458,7 @@ pub(super) async fn submit_public_action_step_session(
                             event_tx,
                             PublicActionSessionEvent::AttemptHandoff { step },
                         );
+                        let replacement_request = replacement.tx_req.clone();
                         match submit_public_action_attempt(
                             step,
                             replacement,
@@ -452,10 +468,14 @@ pub(super) async fn submit_public_action_step_session(
                             label,
                             event_tx,
                             None,
-                            true,
-                            &mut |attempt, _| {
+                            !private_handoff,
+                            &mut |attempt, signed| {
                                 if let Some(context) = transaction_tracking {
                                     context.ensure_open()?;
+                                }
+                                // A replacement is handed off as its first attempt was.
+                                if let Some(handoff) = handoff.as_deref_mut() {
+                                    handoff(attempt.tx_hash, &replacement_request, signed)?;
                                 }
                                 retain_public_action_attempt(
                                     observer.as_mut().expect("public action observer established"),
@@ -509,12 +529,14 @@ pub(super) async fn submit_public_action_step_session(
                     );
                 }
                 if receipt.status {
-                    progress(public_action_progress_update(
-                        step,
-                        PublicActionProgressStatus::Done,
-                        Some(receipt.tx_hash.clone()),
-                        None,
-                    ));
+                    if end != PublicActionStepEnd::Evidence {
+                        progress(public_action_progress_update(
+                            step,
+                            PublicActionProgressStatus::Done,
+                            Some(receipt.tx_hash.clone()),
+                            None,
+                        ));
+                    }
                 } else {
                     let message = "Transaction reverted".to_string();
                     progress(public_action_progress_update(
@@ -528,7 +550,18 @@ pub(super) async fn submit_public_action_step_session(
                         PublicActionSessionEvent::StepFailed { step, message },
                     );
                     let gas_fee = public_action_winner_gas_fee(&submitted_attempts, winner_index);
-                    let Some(command) = recv_public_action_command(command_rx).await else {
+                    // A native Mimic retry needs fresh preparation and review on the same
+                    // stealth account, never a new payer nonce for the same signed payload.
+                    let prepared_native = matches!(
+                        gas_limit_strategy,
+                        PublicActionGasLimitStrategy::RailwayNativePrepared { .. }
+                    );
+                    let command = if prepared_native {
+                        None
+                    } else {
+                        recv_public_action_command(command_rx).await
+                    };
+                    let Some(command) = command else {
                         return Ok(PublicActionStepResult::Receipt(PublicActionStepOutcome {
                             receipt,
                             next_nonce: winner.info.nonce.saturating_add(1),
@@ -605,6 +638,7 @@ pub(super) fn public_action_step_initial_gas_fee_selection(
 
 pub(super) const fn railway_auto_fee_within_authorized_ceiling(
     chain_id: u64,
+    asset: PublicAssetId,
     authorized_fee: PublicActionGasFeeSelection,
     resolved_fee: &SelfBroadcastResolvedGasFee,
 ) -> bool {
@@ -616,7 +650,7 @@ pub(super) const fn railway_auto_fee_within_authorized_ceiling(
         return false;
     };
     resolved_fee.max_fee_per_gas <= max_fee_per_gas
-        && (PublicShieldTransactionProfile::Railway.uses_legacy_envelope(chain_id)
+        && (PublicShieldTransactionProfile::Railway.uses_legacy_envelope(chain_id, asset)
             || resolved_fee.max_priority_fee_per_gas <= max_priority_fee_per_gas)
 }
 
@@ -702,6 +736,7 @@ pub(super) async fn public_action_preflight_from_rpc_pool(
     gas_fee: PublicActionGasFeeSelection,
     gas: &EffectiveChainGasSettings,
     profile: PublicShieldTransactionProfile,
+    asset: PublicAssetId,
     gas_limit_strategy: PublicActionGasLimitStrategy,
     authorized_gas_limit: Option<u64>,
     nonce: Option<u64>,
@@ -720,6 +755,7 @@ pub(super) async fn public_action_preflight_from_rpc_pool(
         gas_fee,
         gas,
         profile,
+        asset,
         gas_limit_strategy,
         authorized_gas_limit,
         nonce,
@@ -745,6 +781,7 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_reads(
     gas_fee: PublicActionGasFeeSelection,
     gas: &EffectiveChainGasSettings,
     profile: PublicShieldTransactionProfile,
+    asset: PublicAssetId,
     gas_limit_strategy: PublicActionGasLimitStrategy,
     authorized_gas_limit: Option<u64>,
     nonce: Option<u64>,
@@ -780,6 +817,7 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_reads(
                         http.network_mode(),
                         chain_id,
                         profile,
+                        asset,
                     )
                     .await
                 }
@@ -821,6 +859,7 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_reads(
             quote,
             gas,
             profile,
+            asset,
             gas_limit_strategy,
             authorized_gas_limit,
             nonce,
@@ -923,6 +962,7 @@ async fn public_action_preflight(
     quote: Option<PublicActionGasFeeQuote>,
     gas: &EffectiveChainGasSettings,
     profile: PublicShieldTransactionProfile,
+    asset: PublicAssetId,
     gas_limit_strategy: PublicActionGasLimitStrategy,
     authorized_gas_limit: Option<u64>,
     nonce: Option<u64>,
@@ -934,11 +974,12 @@ async fn public_action_preflight(
     funding_budget: Option<PublicShieldFundingBudget>,
 ) -> std::result::Result<PublicActionPreflight, PublicActionPreflightError> {
     let provider = &provider_handle.provider;
-    let resolved = resolve_public_action_gas_fee(chain_id, profile, gas_fee, quote)?;
+    let resolved = resolve_public_action_gas_fee(chain_id, profile, asset, gas_fee, quote)?;
     if railway_auto {
         *stage = "fee_authorization";
         let within_ceiling = railway_auto_fee_within_authorized_ceiling(
             chain_id,
+            asset,
             authorized_fee_ceiling
                 .ok_or_else(|| eyre!("missing Railway fee authorization ceiling"))?,
             &resolved,
@@ -1004,7 +1045,8 @@ async fn public_action_preflight(
         }
         .wrap_err("fetch public action nonce")?
     };
-    let tx_req = if super::gas::public_action_uses_legacy_envelope(chain_id, profile, quote) {
+    let tx_req = if super::gas::public_action_uses_legacy_envelope(chain_id, profile, asset, quote)
+    {
         public_action_legacy_transaction_request(
             base_tx_req,
             chain_id,
@@ -1046,7 +1088,15 @@ async fn public_action_preflight(
         gas_limit
     } else {
         match gas_limit_strategy {
-            PublicActionGasLimitStrategy::RailwayNativeFixed => 6_000_000,
+            PublicActionGasLimitStrategy::RailwayNativePrepared { reviewed_gas_limit } => {
+                // The complete type-4 request, sender, value and authorization included.
+                let raw_gas_limit =
+                    public_action_estimate_gas(&provider_handle, chain_id, &tx_req, rpc_reads)
+                        .await
+                        .wrap_err("estimate native shield gas")?;
+                *stage = "gas_limit_authorization";
+                railway_native_signing_gas_limit(raw_gas_limit, reviewed_gas_limit)?
+            }
             PublicActionGasLimitStrategy::ChainBuffer => {
                 public_action_estimate_gas(&provider_handle, chain_id, &tx_req, rpc_reads)
                     .await
@@ -1237,6 +1287,21 @@ pub(super) fn ensure_advanced_gas_estimate_authorized(
         ));
     }
     Ok(())
+}
+
+/// A native shield signs Railway's 120% of its final raw estimate, at most its reviewed
+/// limit. The final shield key can move the estimate slightly from the prepared one, so only a
+/// raw estimate above the reviewed limit is refused.
+pub(super) fn railway_native_signing_gas_limit(
+    raw_gas_limit: u64,
+    reviewed_gas_limit: u64,
+) -> Result<u64> {
+    if raw_gas_limit > reviewed_gas_limit {
+        return Err(eyre!(
+            "native shield gas estimate {raw_gas_limit} exceeds its reviewed signing limit {reviewed_gas_limit}; prepare and review the shield again"
+        ));
+    }
+    Ok(super::gas::railway_gas_limit(raw_gas_limit).min(reviewed_gas_limit))
 }
 
 async fn sign_send_public_action_transaction(
@@ -1478,6 +1543,7 @@ mod tests {
                 },
                 &chain.gas,
                 PublicShieldTransactionProfile::Railoxide,
+                PublicAssetId::Native,
                 PublicActionGasLimitStrategy::ChainBuffer,
                 Some(50_000),
                 None,
@@ -1619,6 +1685,335 @@ mod tests {
                 },
             );
         }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn handoff_session_records_each_replacement_before_its_broadcast() {
+        use std::sync::Mutex;
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone)]
+        struct LogWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let handed_off = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
+            Arc::new({
+                let handed_off = handed_off.clone();
+                let sent = sent.clone();
+                move |request: serde_json::Value| {
+                    let result = match request["method"].as_str().unwrap_or_default() {
+                        "eth_sendRawTransaction" => {
+                            let raw = request["params"][0].as_str().unwrap();
+                            let hash = keccak256(alloy::hex::decode(raw).unwrap());
+                            let recorded = handed_off
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .any(|(handed_off, _)| *handed_off == hash);
+                            sent.lock().unwrap().push((hash, recorded));
+                            json!(hash)
+                        }
+                        "eth_getBlockByNumber" => {
+                            let mut block: alloy::rpc::types::Block =
+                                alloy::rpc::types::Block::default();
+                            block.header.inner.base_fee_per_gas = Some(5);
+                            serde_json::to_value(block).unwrap()
+                        }
+                        "eth_gasPrice" => json!("0x64"),
+                        "eth_maxPriorityFeePerGas" => json!("0x2"),
+                        "eth_feeHistory" => json!({
+                            "oldestBlock": "0x1",
+                            "baseFeePerGas": ["0x5", "0x5"],
+                            "gasUsedRatio": [0.5],
+                            "reward": [["0x1", "0x2", "0x3", "0x4"]]
+                        }),
+                        "eth_estimateGas" => json!("0x5208"),
+                        "eth_getTransactionCount" => json!("0x7"),
+                        "eth_getBalance" => json!("0x3635c9adc5dea00000"),
+                        "eth_getTransactionReceipt" => serde_json::Value::Null,
+                        _ => json!("0x1"),
+                    };
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                }
+            }),
+            Arc::default(),
+            Arc::default(),
+        )
+        .await;
+        let http = HttpContext::direct_for_tests();
+        let mut chain = crate::settings::build_effective_chain_configs(
+            &crate::settings::WalletSettings::default(),
+        )
+        .unwrap()
+        .get(1)
+        .cloned()
+        .unwrap();
+        chain.rpc_route = RpcChainRoute::new(1, vec![endpoint.clone()]);
+        let signer = VaultedPublicSigner::Software(
+            crate::signer::SoftwareEvmSigner::from_private_key([7; 32]).unwrap(),
+        );
+        let fee = |max_fee_per_gas| PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas,
+            max_priority_fee_per_gas: 2,
+        };
+        // The first replacement's hand-off fails; the second's succeeds.
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        for max_fee_per_gas in [200, 300] {
+            command_tx
+                .send(PublicActionCommand {
+                    kind: crate::PublicActionCommandKind::Replacement,
+                    gas_fee: fee(max_fee_per_gas),
+                })
+                .unwrap();
+        }
+        let mut command_rx = Some(command_rx);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handoff = {
+            let handed_off = handed_off.clone();
+            move |tx_hash: FixedBytes<32>, request: &TransactionRequest, _: &[u8]| -> Result<()> {
+                let mut handed_off = handed_off.lock().unwrap();
+                handed_off.push((tx_hash, request.max_fee_per_gas.or(request.gas_price)));
+                if handed_off.len() == 2 {
+                    return Err(eyre!("replacement hand-off failed"));
+                }
+                Ok(())
+            }
+        };
+        let handoff: &mut PublicActionHandoff<'_> = &mut handoff;
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer = LogWriter(logs.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let mut events = Vec::new();
+        let mut submitted = Vec::new();
+        let mut progress = |_| {};
+        let session = Box::pin(submit_public_action_step_session(
+            PublicActionProgressStep::Shield,
+            TransactionRequest::default()
+                .with_to(Address::repeat_byte(2))
+                .with_value(U256::from(1)),
+            PublicShieldTransactionProfile::Railoxide,
+            PublicAssetId::Native,
+            PublicActionGasLimitStrategy::ChainBuffer,
+            &signer,
+            "handoff replacement test",
+            crate::query_rpc_pool_with_http_client(vec![endpoint], &http),
+            &chain.rpc_route,
+            1,
+            &http,
+            None,
+            1,
+            signer.address(),
+            &chain.gas,
+            None,
+            None,
+            None,
+            fee(100),
+            PublicActionStepFeePolicy::Custom,
+            None,
+            &mut command_rx,
+            Some(&event_tx),
+            Some(handoff),
+            PublicActionStepEnd::Receipt,
+            &mut progress,
+        ));
+        let observe = async {
+            while submitted.len() < 2 {
+                let event = event_rx.recv().await.unwrap();
+                if let PublicActionSessionEvent::AttemptSubmitted { attempt, .. } = &event {
+                    submitted.push(attempt.clone());
+                }
+                events.push(event);
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                result = session => panic!("session ended early: {:?}", result.err()),
+                () = observe => {}
+            }
+        })
+        .with_subscriber(subscriber)
+        .await
+        .expect("both accepted attempts are submitted");
+
+        let handed_off = handed_off.lock().unwrap().clone();
+        assert_eq!(handed_off.len(), 3);
+        // Each broadcast attempt was recorded first; the failed replacement was never sent.
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![(handed_off[0].0, true), (handed_off[2].0, true)]
+        );
+        for (attempt, (tx_hash, max_fee_per_gas)) in
+            submitted.iter().zip([handed_off[0], handed_off[2]])
+        {
+            assert_eq!(attempt.tx_hash, alloy::hex::encode_prefixed(tx_hash));
+            assert_eq!(Some(attempt.max_fee_per_gas), max_fee_per_gas);
+        }
+        assert_ne!(handed_off[0].1, handed_off[2].1);
+        // The rejection leaves the session observing and accepting the next replacement.
+        let rejected = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    PublicActionSessionEvent::AttemptRejected { message, .. }
+                        if message.contains("replacement hand-off failed")
+                )
+            })
+            .expect("failed replacement hand-off is rejected");
+        let accepted = events
+            .iter()
+            .rposition(|event| matches!(event, PublicActionSessionEvent::AttemptSubmitted { .. }))
+            .unwrap();
+        assert!(rejected < accepted);
+        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(!logs.contains("public action transaction"), "{logs}");
+        assert!(!logs.contains("self-broadcast tx"), "{logs}");
+        drop(command_tx);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn native_shield_preflight_failure_ends_session_despite_queued_retry() {
+        use std::sync::Mutex;
+
+        const REVIEWED_GAS_LIMIT: u64 = 50_000;
+        let methods = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
+            Arc::new({
+                let methods = methods.clone();
+                move |request: serde_json::Value| {
+                    let method = request["method"].as_str().unwrap_or_default().to_owned();
+                    let result = match method.as_str() {
+                        "eth_getBlockByNumber" => {
+                            let mut block: alloy::rpc::types::Block =
+                                alloy::rpc::types::Block::default();
+                            block.header.inner.base_fee_per_gas = Some(5);
+                            serde_json::to_value(block).unwrap()
+                        }
+                        "eth_gasPrice" => json!("0x64"),
+                        "eth_maxPriorityFeePerGas" => json!("0x2"),
+                        "eth_feeHistory" => json!({
+                            "oldestBlock": "0x1",
+                            "baseFeePerGas": ["0x5", "0x5"],
+                            "gasUsedRatio": [0.5],
+                            "reward": [["0x1", "0x2", "0x3", "0x4"]]
+                        }),
+                        "eth_estimateGas" => json!(format!("0x{:x}", REVIEWED_GAS_LIMIT + 1)),
+                        "eth_getTransactionCount" => json!("0x7"),
+                        "eth_getBalance" => json!("0x3635c9adc5dea00000"),
+                        "eth_getTransactionReceipt" => serde_json::Value::Null,
+                        _ => json!("0x1"),
+                    };
+                    methods.lock().unwrap().push(method);
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                }
+            }),
+            Arc::default(),
+            Arc::default(),
+        )
+        .await;
+        let http = HttpContext::direct_for_tests();
+        let mut chain = crate::settings::build_effective_chain_configs(
+            &crate::settings::WalletSettings::default(),
+        )
+        .unwrap()
+        .get(1)
+        .cloned()
+        .unwrap();
+        chain.rpc_route = RpcChainRoute::new(1, vec![endpoint.clone()]);
+        let signer = VaultedPublicSigner::Software(
+            crate::signer::SoftwareEvmSigner::from_private_key([7; 32]).unwrap(),
+        );
+        let fee = PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 2,
+        };
+        // The sender stays alive so only the native-shield rule can end the session.
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        command_tx
+            .send(PublicActionCommand {
+                kind: crate::PublicActionCommandKind::Retry,
+                gas_fee: fee,
+            })
+            .unwrap();
+        let mut command_rx = Some(command_rx);
+        let handed_off = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handoff = {
+            let handed_off = handed_off.clone();
+            move |_: FixedBytes<32>, _: &TransactionRequest, _: &[u8]| -> Result<()> {
+                handed_off.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        };
+        let handoff: &mut PublicActionHandoff<'_> = &mut handoff;
+        let mut progress = |_| {};
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            Box::pin(submit_public_action_step_session(
+                PublicActionProgressStep::Shield,
+                TransactionRequest::default()
+                    .with_to(Address::repeat_byte(2))
+                    .with_value(U256::from(1)),
+                PublicShieldTransactionProfile::Railoxide,
+                PublicAssetId::Native,
+                PublicActionGasLimitStrategy::RailwayNativePrepared {
+                    reviewed_gas_limit: REVIEWED_GAS_LIMIT,
+                },
+                &signer,
+                "native shield preflight test",
+                crate::query_rpc_pool_with_http_client(vec![endpoint], &http),
+                &chain.rpc_route,
+                1,
+                &http,
+                None,
+                1,
+                signer.address(),
+                &chain.gas,
+                None,
+                None,
+                None,
+                fee,
+                PublicActionStepFeePolicy::Custom,
+                None,
+                &mut command_rx,
+                None,
+                Some(handoff),
+                PublicActionStepEnd::Receipt,
+                &mut progress,
+            )),
+        )
+        .await
+        .expect("native shield preflight failure ends the session");
+
+        let error = result.err().expect("oversized native estimate fails");
+        assert!(
+            report_chain_string(&error).contains("refreshed preparation"),
+            "{error:?}"
+        );
+        let methods = methods.lock().unwrap().clone();
+        assert!(methods.iter().any(|method| method == "eth_estimateGas"));
+        assert!(
+            !methods
+                .iter()
+                .any(|method| method == "eth_sendRawTransaction")
+        );
+        assert!(!handed_off.load(std::sync::atomic::Ordering::SeqCst));
+        drop(command_tx);
         server.abort();
     }
 }

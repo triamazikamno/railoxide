@@ -338,6 +338,7 @@ impl WalletRoot {
             self.public_form.mimic_railway_shield = saved_mimic_railway_shield;
             if shield_profile_changed {
                 self.invalidate_public_action_gas_fee_quote(PublicActionMode::Shield);
+                self.public_form.native_mimic_shield.invalidate();
             }
         }
 

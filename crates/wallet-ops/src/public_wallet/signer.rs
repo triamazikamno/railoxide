@@ -933,6 +933,34 @@ pub(crate) async fn admitted_public_signer_authorized(
     .await
 }
 
+/// The software or imported payer a Ledger or Trezor wallet's executor approval admitted with
+/// its vault password, as the self-broadcast gas payer of an executor unshield.
+pub(crate) async fn admitted_gas_payer_signer(
+    vault_store: &DesktopVaultStore,
+    view_session: &DesktopViewSession,
+    authorization: &crate::DesktopPrivateSpendAuthorization,
+    public_account_uuid: &str,
+    executor_owner: Option<&std::sync::Arc<crate::ExecutorOwner>>,
+    chain_id: u64,
+) -> Result<VaultedPublicSigner> {
+    let crate::DesktopPrivateSpendAuthorization::HardwareExecutor(hardware) = authorization else {
+        return Err(eyre!("Authorize the reviewed gas payer again."));
+    };
+    let password = hardware.gas_payer_password(public_account_uuid)?;
+    admitted_public_signer(
+        vault_store,
+        view_session,
+        Some(password.as_str()),
+        public_account_uuid,
+        authorization.protected_seed_session().as_deref(),
+        None,
+        None,
+        executor_owner,
+        chain_id,
+    )
+    .await
+}
+
 pub(crate) async fn admitted_public_signer(
     vault_store: &DesktopVaultStore,
     view_session: &DesktopViewSession,

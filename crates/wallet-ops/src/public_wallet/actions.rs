@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use alloy::network::TransactionBuilder as _;
 use alloy::primitives::{Address, Bytes, U256};
 use alloy::rpc::types::TransactionRequest;
@@ -6,21 +8,32 @@ use eyre::{Result, WrapErr, eyre};
 
 use super::contracts::{PublicErc20, PublicRelayAdapt, RelayAdaptCall};
 use super::gas::public_advanced_transaction_payload_fingerprint;
-use super::runtime::{public_shield_token, verified_public_chain_runtime_config};
-use super::signer::admitted_public_signer_authorized;
+use super::railway_native::{
+    RailwayNativeShieldPayer, RailwayNativeShieldPreparation, ensure_native_shield_delivered,
+    railway_native_shield_profile,
+};
+use super::runtime::{
+    PublicChainRuntimeConfig, public_shield_token, verified_public_chain_runtime_config,
+};
+use super::signer::{
+    VaultedPublicSigner, admitted_gas_payer_signer, admitted_public_signer_authorized,
+};
 use super::submission::{
-    PublicActionStepEnd, PublicShieldFundingBudget, emit_public_action_event,
+    PublicActionHandoff, PublicActionStepEnd, PublicShieldFundingBudget, emit_public_action_event,
     emit_refreshed_public_action_hardware_session, public_action_progress_update,
     recv_public_action_command, submit_public_action_step_session,
 };
 use super::types::{
     PublicActionCommandReceiver, PublicActionGasFeeMode, PublicActionGasFeeSelection,
-    PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
-    PublicActionSessionEvent, PublicActionSessionEventSender, PublicActionStepFeePolicy,
-    PublicAdvancedTransactionAuthorization, PublicAssetId, PublicSendRequest, PublicSendResult,
-    PublicShieldRequest, PublicShieldTransactionProfile, PublicTransactionIntent,
+    PublicActionGasLimitStrategy, PublicActionProgressStatus, PublicActionProgressStep,
+    PublicActionProgressUpdate, PublicActionSessionEvent, PublicActionSessionEventSender,
+    PublicActionStepFeePolicy, PublicAdvancedTransactionAuthorization, PublicAssetId,
+    PublicSendRequest, PublicSendResult, PublicShieldRequest, PublicShieldTransactionProfile,
+    PublicTransactionIntent,
 };
+use crate::block_observer::resolve_source_transaction_by_block;
 use crate::settings::EffectiveChainConfig;
+use crate::vault::DesktopViewSession;
 use crate::{
     HttpContext, RpcChainRoute, RpcRoute, ShieldSendOutput, WalletRpcOrigin,
     query_rpc_pool_with_http_client, report_chain_string,
@@ -113,7 +126,8 @@ pub(crate) async fn submit_public_action_step_with_signer(
         step,
         tx_req,
         PublicShieldTransactionProfile::Railoxide,
-        PublicShieldTransactionProfile::Railoxide.gas_limit_strategy(PublicAssetId::Native),
+        PublicAssetId::Native,
+        PublicShieldTransactionProfile::Railoxide.gas_limit_strategy(),
         signer,
         operation_label,
         query_rpc_pool,
@@ -222,7 +236,7 @@ pub async fn submit_public_shield(
 }
 
 pub async fn submit_public_shield_with_progress(
-    request: PublicShieldRequest,
+    mut request: PublicShieldRequest,
     http: &HttpContext,
     mut progress: impl FnMut(PublicActionProgressUpdate) + Send,
 ) -> Result<ShieldSendOutput> {
@@ -238,24 +252,53 @@ pub async fn submit_public_shield_with_progress(
     )
     .await?;
     let token = public_shield_token(request.asset, &chain)?;
-    let recipient = request
-        .view_session
-        .receive_address()
-        .wrap_err("derive selected private wallet receive address")?;
-    let railgun_addr = broadcaster_core::crypto::railgun::Address::from(recipient.as_str());
-    let addr_data = broadcaster_core::crypto::railgun::AddressData::try_from(&railgun_addr)
-        .wrap_err("invalid selected private wallet receive address")?;
-    let signer = admitted_public_signer_authorized(
-        &request.vault_store,
-        &request.view_session,
-        request.authorization.as_ref(),
-        &request.public_account_uuid,
-        request.trezor_app_passphrase,
-        request.trezor_pin_matrix_provider,
-        request.executor_owner.as_ref(),
-        request.chain_id,
-    )
-    .await?;
+    let addr_data = public_shield_recipient(&request.view_session)?;
+    let native_mimic = request.profile == PublicShieldTransactionProfile::Railway
+        && request.asset == PublicAssetId::Native;
+    if native_mimic != request.native_preparation.is_some() {
+        return Err(eyre!(
+            "Mimic Railway native shielding needs a fresh preparation and review"
+        ));
+    }
+    let signer = if native_mimic
+        && let Some(authorization @ crate::DesktopPrivateSpendAuthorization::HardwareExecutor(_)) =
+            request.authorization.as_ref()
+    {
+        // A Ledger or Trezor wallet approves the stealth account's execution with its payer.
+        admitted_gas_payer_signer(
+            &request.vault_store,
+            &request.view_session,
+            authorization,
+            &request.public_account_uuid,
+            request.executor_owner.as_ref(),
+            request.chain_id,
+        )
+        .await?
+    } else {
+        admitted_public_signer_authorized(
+            &request.vault_store,
+            &request.view_session,
+            request.authorization.as_ref(),
+            &request.public_account_uuid,
+            request.trezor_app_passphrase.take(),
+            request.trezor_pin_matrix_provider.take(),
+            request.executor_owner.as_ref(),
+            request.chain_id,
+        )
+        .await?
+    };
+    if let Some(preparation) = request.native_preparation.clone() {
+        return Box::pin(submit_railway_native_shield(
+            request,
+            &preparation,
+            signer,
+            &chain,
+            &addr_data,
+            http,
+            &mut progress,
+        ))
+        .await;
+    }
     signer
         .while_active(async {
             let mut nonce = None;
@@ -377,7 +420,8 @@ pub async fn submit_public_shield_with_progress(
                     request.asset,
                     request.profile,
                     chain.gas.gas_limit_buffer,
-                );
+                )
+                .ok_or_else(|| eyre!("public shield has no gas model"))?;
             let remaining_max_fee_per_gas = if approval_required
                 && request.profile == PublicShieldTransactionProfile::Railway
                 && request.gas_fee_mode == PublicActionGasFeeMode::Auto
@@ -386,6 +430,7 @@ pub async fn submit_public_shield_with_progress(
                     super::gas::resolve_public_action_gas_fee(
                         request.chain_id,
                         request.profile,
+                        request.asset,
                         request.authorized_fee_ceiling,
                         None,
                     )?
@@ -421,7 +466,8 @@ pub async fn submit_public_shield_with_progress(
                     PublicActionProgressStep::Approve,
                     approve_tx,
                     request.profile,
-                    request.profile.gas_limit_strategy(request.asset),
+                    request.asset,
+                    request.profile.gas_limit_strategy(),
                     &signer,
                     "public-shield-approve",
                     query_rpc_pool.clone(),
@@ -490,7 +536,8 @@ pub async fn submit_public_shield_with_progress(
                 PublicActionProgressStep::Shield,
                 shield_tx,
                 request.profile,
-                request.profile.gas_limit_strategy(request.asset),
+                request.asset,
+                request.profile.gas_limit_strategy(),
                 &signer,
                 "public-shield",
                 query_rpc_pool,
@@ -534,6 +581,212 @@ pub async fn submit_public_shield_with_progress(
             })
         })
         .await
+}
+
+/// A Mimic Railway native shield from a stealth account of the selected private wallet,
+/// funded and sent by the admitted payer `signer`.
+async fn submit_railway_native_shield(
+    mut request: PublicShieldRequest,
+    preparation: &RailwayNativeShieldPreparation,
+    signer: VaultedPublicSigner,
+    chain: &PublicChainRuntimeConfig,
+    recipient: &broadcaster_core::crypto::railgun::AddressData,
+    http: &HttpContext,
+    progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
+) -> Result<ShieldSendOutput> {
+    let mut command_rx = request.command_rx.take();
+    let event_tx = request.event_tx.take();
+    // Checked before the shield key or any transaction is signed.
+    let profile = railway_native_shield_profile(
+        request.chain_id,
+        &request.effective_chain,
+        RailwayNativeShieldPayer::of(&signer, request.authorization.as_ref()),
+    )?;
+    let payer = signer.address();
+    preparation.ensure_matches(&profile, payer, recipient, request.amount)?;
+    let owner = request.executor_owner.as_ref().ok_or_else(|| {
+        eyre!("Wait for the private wallet's network to load, then shield again.")
+    })?;
+    let (Some(operation), Some(authorization)) =
+        (request.native_operation, request.authorization.as_ref())
+    else {
+        return Err(eyre!(
+            "Mimic Railway native shielding needs a fresh preparation and review"
+        ));
+    };
+    let shield_private_key = signer.derive_shield_private_key().await?;
+    let shield_request = preparation.shield_request(&shield_private_key)?;
+    let purpose_summary = format!(
+        "Shield {} → {}",
+        request
+            .effective_chain
+            .native_currency
+            .format_amount(request.amount),
+        request
+            .view_session
+            .receive_address()
+            .wrap_err("derive selected private wallet receive address")?,
+    );
+    // An executor-derived payer holds its owner's activity, which issuing takes, so it is
+    // released and admitted again to send.
+    let readmit = matches!(signer, VaultedPublicSigner::Executor(..));
+    let signer = if readmit {
+        drop(signer);
+        None
+    } else {
+        Some(signer)
+    };
+    let issued = owner
+        .issue_native_shield(
+            operation,
+            &request.view_session,
+            payer,
+            authorization,
+            profile.wrapped_native,
+            request.amount,
+            shield_request,
+            &purpose_summary,
+        )
+        .await?;
+    let stealth_account = issued
+        .transaction()
+        .to
+        .and_then(|to| to.to().copied())
+        .ok_or_else(|| eyre!("the native shield has no stealth account"))?;
+    let signer = match signer {
+        Some(signer) => signer,
+        None => {
+            admitted_public_signer_authorized(
+                &request.vault_store,
+                &request.view_session,
+                Some(authorization),
+                &request.public_account_uuid,
+                None,
+                None,
+                Some(owner),
+                request.chain_id,
+            )
+            .await?
+        }
+    };
+    if signer.address() != payer {
+        return Err(eyre!("the Public account changed; review the shield again"));
+    }
+    let mut handoff = owner.native_shield_handoff(&issued)?;
+    let handoff: &mut PublicActionHandoff<'_> = &mut handoff;
+    let fee_policy = if request.gas_fee_mode == PublicActionGasFeeMode::Auto {
+        PublicActionStepFeePolicy::Captured
+    } else {
+        PublicActionStepFeePolicy::Custom
+    };
+    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
+    let receipt = signer
+        .while_active(async {
+            Ok(submit_public_action_step_session(
+                PublicActionProgressStep::Shield,
+                issued.transaction().clone(),
+                request.profile,
+                request.asset,
+                PublicActionGasLimitStrategy::RailwayNativePrepared {
+                    reviewed_gas_limit: preparation.gas_limit(),
+                },
+                &signer,
+                "public-shield",
+                Arc::clone(&query_rpc_pool),
+                &chain.rpc_route,
+                chain.finality_depth,
+                http,
+                request.transaction_tracking.as_ref(),
+                request.chain_id,
+                payer,
+                &chain.gas,
+                Some(PublicShieldFundingBudget {
+                    gas_units: preparation.gas_limit(),
+                    remaining_shield_gas_units: 0,
+                    remaining_max_fee_per_gas: None,
+                }),
+                None,
+                None,
+                request.gas_fee,
+                fee_policy,
+                Some(request.authorized_fee_ceiling),
+                &mut command_rx,
+                event_tx.as_ref(),
+                Some(handoff),
+                PublicActionStepEnd::Evidence,
+                &mut *progress,
+            )
+            .await?
+            .into_receipt()?
+            .receipt)
+        })
+        .await?;
+    // Reconciliation below takes the owner's activity.
+    drop(signer);
+    // The session reported the revert, which returned the value to the payer.
+    if !receipt.status {
+        return Err(eyre!(
+            "Mimic Railway native shield transaction reverted ({}); prepare and review a new shield to try again",
+            receipt.tx_hash
+        ));
+    }
+    // Native delivery needs a Shield event, not only the receipt's status.
+    let logs = async {
+        let hash = receipt
+            .tx_hash
+            .parse()
+            .wrap_err("read the native shield receipt")?;
+        let source =
+            resolve_source_transaction_by_block(&query_rpc_pool, receipt.block_number, hash)
+                .await?;
+        Ok::<_, eyre::Report>(source.logs)
+    }
+    .await;
+    if let Err(error) =
+        ensure_native_shield_delivered(&profile, stealth_account, &receipt.tx_hash, logs)
+    {
+        let error = eyre::Report::new(error);
+        let message = report_chain_string(&error);
+        progress(public_action_progress_update(
+            PublicActionProgressStep::Shield,
+            PublicActionProgressStatus::Error,
+            Some(receipt.tx_hash.clone()),
+            Some(message.clone()),
+        ));
+        emit_public_action_event(
+            event_tx.as_ref(),
+            PublicActionSessionEvent::StepFailed {
+                step: PublicActionProgressStep::Shield,
+                message,
+            },
+        );
+        return Err(error);
+    }
+    progress(public_action_progress_update(
+        PublicActionProgressStep::Shield,
+        PublicActionProgressStatus::Done,
+        Some(receipt.tx_hash.clone()),
+        None,
+    ));
+    // The shield is proven; a failed read leaves the account to its next reconciliation.
+    let _ = owner.reconcile_account(operation).await;
+    Ok(ShieldSendOutput {
+        wrap: None,
+        approve: None,
+        shield: receipt,
+    })
+}
+
+/// The selected private wallet's receive address, which a Public Shield pays.
+pub fn public_shield_recipient(
+    view_session: &DesktopViewSession,
+) -> Result<broadcaster_core::crypto::railgun::AddressData> {
+    let recipient = view_session
+        .receive_address()
+        .wrap_err("derive selected private wallet receive address")?;
+    let railgun_addr = broadcaster_core::crypto::railgun::Address::from(recipient.as_str());
+    broadcaster_core::crypto::railgun::AddressData::try_from(&railgun_addr)
+        .wrap_err("invalid selected private wallet receive address")
 }
 
 pub(super) const fn public_shield_approval_amount(

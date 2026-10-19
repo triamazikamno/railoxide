@@ -23,19 +23,23 @@ use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     Eip1559GasCostProjection, PublicActionCommand, PublicActionCommandKind,
-    PublicActionCommandSender, PublicActionGasFeeMode, PublicActionGasFeeQuote,
-    PublicActionGasFeeSelection, PublicActionKind, PublicActionProgressStatus,
-    PublicActionProgressStep, PublicActionProgressUpdate, PublicActionSessionEvent,
-    PublicAdvancedTransactionAuthorization, PublicAdvancedTransactionEstimate,
-    PublicAdvancedTransactionEstimateRequest, PublicAssetId, PublicBalanceAmount,
-    PublicBalanceEntry, PublicSendRequest, PublicShieldRequest, PublicShieldTransactionProfile,
-    PublicTransactionIntent, RAILGUN_PROTOCOL_FEE_BPS,
+    PublicActionCommandSender, PublicActionFeeSource, PublicActionGasFeeMode,
+    PublicActionGasFeeQuote, PublicActionGasFeeSelection, PublicActionKind,
+    PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
+    PublicActionSessionEvent, PublicAdvancedTransactionAuthorization,
+    PublicAdvancedTransactionEstimate, PublicAdvancedTransactionEstimateRequest, PublicAssetId,
+    PublicBalanceAmount, PublicBalanceEntry, PublicSendRequest, PublicShieldRequest,
+    PublicShieldTransactionProfile, PublicTransactionIntent, RAILGUN_PROTOCOL_FEE_BPS,
+    RailwayNativeShieldPayer, RailwayNativeShieldPreparation, RailwayNativeShieldUnavailable,
     estimate_public_action_gas_cost_with_profile_and_ceiling, estimate_public_advanced_transaction,
     estimate_public_native_action_gas_reserve_with_profile_and_ceiling,
-    format_protocol_fee_percentage, parse_send_amount,
+    format_protocol_fee_percentage, parse_send_amount, prepare_railway_native_shield,
+    prepare_railway_native_shield_max, project_public_action_fee,
     public_action_maximum_gas_cost_is_significant, public_action_replacement_bumped_fee,
-    public_shield_protocol_fee_amount, quote_public_action_gas_fee_bundle_with_profile,
-    submit_public_send_with_progress, submit_public_shield_with_progress,
+    public_shield_protocol_fee_amount, public_shield_recipient,
+    quote_public_action_gas_fee_bundle_with_profile, railway_native_shield_profile,
+    resolve_public_action_gas_fee, submit_public_send_with_progress,
+    submit_public_shield_with_progress,
     vault::{DesktopVaultStore, DesktopViewSession, PublicAccountSource, PublicAccountStatus},
 };
 
@@ -43,7 +47,7 @@ use super::gas_fee::{
     Eip1559GasFeeEditTarget, Eip1559GasFeeMode, Eip1559GasFeeTarget, GasRetryInputs, format_gwei,
     render_eip1559_gas_fee_editor,
 };
-use super::private_action::render_private_action_info_icon_with_body;
+use super::private_action::{private_action_tooltip, render_private_action_info_icon_with_body};
 use super::public_account::public_account_display_label;
 use super::public_balances::public_asset_icon_path;
 use super::spend_authorization::{
@@ -62,12 +66,15 @@ use super::{
 use crate::assets::{RailgunActionIcon, WalletIconSource};
 
 mod controls;
+mod native_shield;
 mod progress;
 mod root;
 mod stepper;
 mod types;
 
 pub(super) use controls::*;
+#[cfg(debug_assertions)]
+pub(super) use native_shield::{PublicShieldUiFixture, public_shield_ui_fixture};
 pub(super) use progress::*;
 pub(super) use stepper::*;
 pub(super) use types::*;

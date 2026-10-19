@@ -1348,16 +1348,6 @@ fn public_native_action_gas_reserve_uses_buffered_units() {
         public_native_action_gas_units_with_buffer(&ETHEREUM_GAS_MODEL, &send_steps, 7),
         PUBLIC_NATIVE_SEND_GAS_UNITS + 7,
     );
-    assert_eq!(
-        public_native_action_gas_reserve_with_profile(
-            &ETHEREUM_GAS_MODEL,
-            7,
-            &shield_steps,
-            PublicShieldTransactionProfile::Railway,
-            GAS_LIMIT_BUFFER,
-        ),
-        U256::from(6_000_000_u64 * 7),
-    );
 }
 
 #[test]
@@ -1673,6 +1663,7 @@ fn walletconnect_custom_fee_resolves_without_an_automatic_quote() {
     let resolved = super::gas::resolve_public_action_gas_fee(
         1,
         PublicShieldTransactionProfile::Railoxide,
+        PublicAssetId::Native,
         custom,
         None,
     )
@@ -1683,6 +1674,7 @@ fn walletconnect_custom_fee_resolves_without_an_automatic_quote() {
         super::gas::resolve_public_action_gas_fee(
             1,
             PublicShieldTransactionProfile::Railoxide,
+            PublicAssetId::Native,
             PublicActionGasFeeSelection::Auto,
             None,
         )
@@ -1804,6 +1796,7 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
         custom_fee,
         &chain.gas,
         PublicShieldTransactionProfile::Railoxide,
+        PublicAssetId::Native,
         super::types::PublicActionGasLimitStrategy::ChainBuffer,
         None,
         None,
@@ -1831,6 +1824,7 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
         PublicActionGasFeeSelection::Auto,
         &chain.gas,
         PublicShieldTransactionProfile::Railoxide,
+        PublicAssetId::Native,
         super::types::PublicActionGasLimitStrategy::ChainBuffer,
         None,
         None,
@@ -2143,7 +2137,7 @@ async fn advanced_estimate_uses_an_endpoint_admitted_after_its_quote() {
 }
 
 #[test]
-fn railway_profile_uses_floor_multiplier_and_fixed_native_gas() {
+fn railway_profile_uses_floor_multiplier_and_no_native_gas_model() {
     assert_eq!(railway_gas_limit(100_001), 120_001);
     assert_eq!(
         public_shield_approval_amount(PublicShieldTransactionProfile::Railway, U256::from(7_u64)),
@@ -2157,41 +2151,18 @@ fn railway_profile_uses_floor_multiplier_and_fixed_native_gas() {
         suggested_max_fee_per_gas: 1,
         suggested_max_priority_fee_per_gas: 0,
     };
-    let native = estimate_public_action_gas_cost_with_profile(
-        1,
-        &default_effective_chain(1),
-        PublicActionKind::Shield,
-        PublicAssetId::Native,
-        PublicShieldTransactionProfile::Railway,
-        PublicActionGasFeeSelection::Auto,
-        Some(quote),
-    )
-    .expect("Railway native shield estimate");
-    let expected_native_shield =
-        public_native_relay_adapt_shield_gas_units(&ETHEREUM_GAS_MODEL, GasEstimateMode::Expected);
-    assert_eq!(native.expected_cost, U256::from(expected_native_shield));
-    assert_eq!(native.maximum_cost, U256::from(6_000_000_u64));
-    let native_with_ceiling = estimate_public_action_gas_cost_with_profile_and_ceiling(
-        1,
-        &default_effective_chain(1),
-        PublicActionKind::Shield,
-        PublicAssetId::Native,
-        PublicShieldTransactionProfile::Railway,
-        PublicActionGasFeeSelection::Auto,
-        Some(quote),
-        Some(PublicActionGasFeeSelection::Custom {
-            max_fee_per_gas: 2,
-            max_priority_fee_per_gas: 0,
-        }),
-    )
-    .expect("Railway native shield estimate with ceiling");
-    assert_eq!(
-        native_with_ceiling.expected_cost,
-        U256::from(expected_native_shield)
-    );
-    assert_eq!(
-        native_with_ceiling.maximum_cost,
-        U256::from(6_000_000_u64 * 2)
+    // A native Mimic shield's fees come only from its prepared estimate, never a fixed limit.
+    assert!(
+        estimate_public_action_gas_cost_with_profile(
+            1,
+            &default_effective_chain(1),
+            PublicActionKind::Shield,
+            PublicAssetId::Native,
+            PublicShieldTransactionProfile::Railway,
+            PublicActionGasFeeSelection::Auto,
+            Some(quote),
+        )
+        .is_err()
     );
 
     let token = address!("0x3333333333333333333333333333333333333333");
@@ -2225,7 +2196,7 @@ fn railway_profile_uses_floor_multiplier_and_fixed_native_gas() {
 }
 
 #[test]
-fn railway_bnb_legacy_fee_resolution_uses_rpc_or_custom_max_fee() {
+fn railway_bnb_legacy_fee_resolution_is_erc20_only() {
     let quote = PublicActionGasFeeQuote {
         observed_fee_model: Some(EvmFeeModel::Eip1559),
         rpc_gas_price: 7,
@@ -2233,19 +2204,43 @@ fn railway_bnb_legacy_fee_resolution_uses_rpc_or_custom_max_fee() {
         suggested_max_fee_per_gas: 12,
         suggested_max_priority_fee_per_gas: 2,
     };
+    let token = PublicAssetId::Erc20(address!("0x3333333333333333333333333333333333333333"));
     let auto = super::gas::resolve_public_action_gas_fee(
         56,
         PublicShieldTransactionProfile::Railway,
+        token,
         PublicActionGasFeeSelection::Auto,
         Some(quote),
     )
     .expect("Railway BNB auto fee");
     assert_eq!(auto.max_fee_per_gas, 7);
     assert_eq!(auto.max_priority_fee_per_gas, 0);
+    let native = super::gas::resolve_public_action_gas_fee(
+        56,
+        PublicShieldTransactionProfile::Railway,
+        PublicAssetId::Native,
+        PublicActionGasFeeSelection::Auto,
+        Some(quote),
+    )
+    .expect("Railway BNB native type-4 fee");
+    assert_eq!(native.max_fee_per_gas, 12);
+    assert_eq!(native.max_priority_fee_per_gas, 2);
+    // Observing a legacy chain never downgrades the native type-4 envelope.
+    let legacy_observed = PublicActionGasFeeQuote {
+        observed_fee_model: Some(EvmFeeModel::Legacy),
+        ..quote
+    };
+    assert!(!super::gas::public_action_uses_legacy_envelope(
+        56,
+        PublicShieldTransactionProfile::Railway,
+        PublicAssetId::Native,
+        Some(legacy_observed),
+    ));
 
     let railoxide = super::gas::resolve_public_action_gas_fee(
         56,
         PublicShieldTransactionProfile::Railoxide,
+        PublicAssetId::Native,
         PublicActionGasFeeSelection::Auto,
         Some(quote),
     )
@@ -2256,6 +2251,7 @@ fn railway_bnb_legacy_fee_resolution_uses_rpc_or_custom_max_fee() {
     let custom = super::gas::resolve_public_action_gas_fee(
         56,
         PublicShieldTransactionProfile::Railway,
+        token,
         PublicActionGasFeeSelection::Custom {
             max_fee_per_gas: 11,
             max_priority_fee_per_gas: 3,
@@ -2270,26 +2266,19 @@ fn railway_bnb_legacy_fee_resolution_uses_rpc_or_custom_max_fee() {
         56,
         &default_effective_chain(56),
         PublicActionKind::Shield,
-        PublicAssetId::Native,
+        token,
         PublicShieldTransactionProfile::Railway,
         PublicActionGasFeeSelection::Auto,
         Some(quote),
     )
     .expect("Railway BNB gas projection");
-    let expected_native_shield =
-        public_native_relay_adapt_shield_gas_units(&ETHEREUM_GAS_MODEL, GasEstimateMode::Expected);
     assert_eq!(projection.expected_fee_per_gas, 7);
     assert_eq!(projection.maximum_fee_per_gas, 7);
-    assert_eq!(
-        projection.expected_cost,
-        U256::from(expected_native_shield * 7)
-    );
-    assert_eq!(projection.maximum_cost, U256::from(6_000_000_u64 * 7));
     let projection_with_ceiling = estimate_public_action_gas_cost_with_profile_and_ceiling(
         56,
         &default_effective_chain(56),
         PublicActionKind::Shield,
-        PublicAssetId::Native,
+        token,
         PublicShieldTransactionProfile::Railway,
         PublicActionGasFeeSelection::Auto,
         Some(quote),
@@ -2301,11 +2290,11 @@ fn railway_bnb_legacy_fee_resolution_uses_rpc_or_custom_max_fee() {
     .expect("Railway BNB gas projection with ceiling");
     assert_eq!(
         projection_with_ceiling.expected_cost,
-        U256::from(expected_native_shield * 7)
+        projection.expected_cost
     );
     assert_eq!(
         projection_with_ceiling.maximum_cost,
-        U256::from(6_000_000_u64 * 13)
+        projection.maximum_cost / U256::from(7) * U256::from(13)
     );
 }
 
@@ -2323,9 +2312,25 @@ fn railway_standard_quote_uses_lower_median_60th_rewards_and_110_percent_base() 
     assert_eq!(quote.suggested_max_priority_fee_per_gas, 20);
     assert_eq!(quote.suggested_max_fee_per_gas, 131);
     assert_eq!(quote.current_base_fee_per_gas, Some(100));
-    let bundle = railway_standard_gas_fee_quote_bundle(&base_fees, Some(rewards.as_slice()))
+    let bundle = railway_standard_gas_fee_quote_bundle(&base_fees, Some(rewards.as_slice()), None)
         .expect("Railway standard and aggressive quote");
     assert_eq!(bundle.standard, quote);
+    // BNB native caps the next base fee before the 110% multiplier: floor(50 * 1.1) + 20.
+    let capped =
+        railway_standard_gas_fee_quote_bundle(&base_fees, Some(rewards.as_slice()), Some(50))
+            .expect("Railway BNB native quote")
+            .standard;
+    assert_eq!(capped.suggested_max_fee_per_gas, 75);
+    assert_eq!(capped.suggested_max_priority_fee_per_gas, 20);
+    // Unusable observations fail this provider rather than being repaired.
+    for (base_fees, rewards) in [
+        (&[][..], Some(rewards.as_slice())),
+        (&base_fees[..], None),
+        (&base_fees[..], Some(&[][..])),
+        (&base_fees[..], Some(&[vec![1]][..])),
+    ] {
+        assert!(railway_standard_gas_fee_quote_bundle(base_fees, rewards, Some(50)).is_err());
+    }
     assert_eq!(
         bundle.authorization_ceiling,
         PublicActionGasFeeSelection::Custom {
@@ -2369,6 +2374,7 @@ fn railway_auto_fee_ceiling_allows_decreases_but_rejects_increases() {
     };
     assert!(railway_auto_fee_within_authorized_ceiling(
         1,
+        PublicAssetId::Erc20(Address::ZERO),
         ceiling,
         &crate::SelfBroadcastResolvedGasFee {
             rpc_gas_price: 0,
@@ -2378,6 +2384,7 @@ fn railway_auto_fee_ceiling_allows_decreases_but_rejects_increases() {
     ));
     assert!(railway_auto_fee_within_authorized_ceiling(
         1,
+        PublicAssetId::Erc20(Address::ZERO),
         ceiling,
         &crate::SelfBroadcastResolvedGasFee {
             rpc_gas_price: 0,
@@ -2387,6 +2394,7 @@ fn railway_auto_fee_ceiling_allows_decreases_but_rejects_increases() {
     ));
     assert!(!railway_auto_fee_within_authorized_ceiling(
         1,
+        PublicAssetId::Erc20(Address::ZERO),
         ceiling,
         &crate::SelfBroadcastResolvedGasFee {
             rpc_gas_price: 0,
@@ -2396,6 +2404,7 @@ fn railway_auto_fee_ceiling_allows_decreases_but_rejects_increases() {
     ));
     assert!(!railway_auto_fee_within_authorized_ceiling(
         1,
+        PublicAssetId::Erc20(Address::ZERO),
         ceiling,
         &crate::SelfBroadcastResolvedGasFee {
             rpc_gas_price: 0,
@@ -2405,6 +2414,7 @@ fn railway_auto_fee_ceiling_allows_decreases_but_rejects_increases() {
     ));
     assert!(railway_auto_fee_within_authorized_ceiling(
         56,
+        PublicAssetId::Erc20(Address::ZERO),
         PublicActionGasFeeSelection::Custom {
             max_fee_per_gas: 55,
             max_priority_fee_per_gas: 0,
@@ -2827,9 +2837,13 @@ fn railway_profile_uses_legacy_envelope_only_on_bnb() {
     assert_eq!(legacy.gas_price, Some(42));
     assert_eq!(legacy.max_fee_per_gas, None);
     assert_eq!(legacy.max_priority_fee_per_gas, None);
-    assert!(PublicShieldTransactionProfile::Railway.uses_legacy_envelope(56));
+    let token = PublicAssetId::Erc20(Address::ZERO);
+    assert!(PublicShieldTransactionProfile::Railway.uses_legacy_envelope(56, token));
+    assert!(
+        !PublicShieldTransactionProfile::Railway.uses_legacy_envelope(56, PublicAssetId::Native)
+    );
     for chain_id in [1, 137, 42161] {
-        assert!(!PublicShieldTransactionProfile::Railway.uses_legacy_envelope(chain_id));
+        assert!(!PublicShieldTransactionProfile::Railway.uses_legacy_envelope(chain_id, token));
     }
 }
 
@@ -2904,11 +2918,6 @@ async fn shield_submission_checks_remaining_funding_before_estimation_and_signin
             PublicAssetId::Native,
             PublicShieldTransactionProfile::Railoxide,
         ),
-        (
-            "native",
-            PublicAssetId::Native,
-            PublicShieldTransactionProfile::Railway,
-        ),
         ("retry", token, PublicShieldTransactionProfile::Railoxide),
         (
             "estimate_reserve",
@@ -2922,7 +2931,8 @@ async fn shield_submission_checks_remaining_funding_before_estimation_and_signin
             asset,
             profile,
             chain.gas.gas_limit_buffer,
-        );
+        )
+        .unwrap();
         let estimate_gas = approval_gas.saturating_add(shield_gas.saturating_mul(2));
         let estimate = if case == "estimate_reserve" {
             MockRpcEstimateResult::Success(estimate_gas)
@@ -2984,6 +2994,8 @@ async fn shield_submission_checks_remaining_funding_before_estimation_and_signin
                     _ => U256::from(5_000),
                 },
                 profile,
+                native_preparation: None,
+                native_operation: None,
                 gas_fee: fee(max_fee),
                 gas_fee_mode: if case == "auto_ceiling" {
                     PublicActionGasFeeMode::Auto
@@ -3064,7 +3076,8 @@ async fn shield_speedup_funding_uses_the_previously_signed_gas_limit() {
         PublicAssetId::Native,
         PublicShieldTransactionProfile::Railoxide,
         chain.gas.gas_limit_buffer,
-    );
+    )
+    .unwrap();
     let signed_gas_limit = model_gas / 2;
     let native_balance = U256::from(1_000_000_000_000_000_000_000_u128);
     let value = native_balance - U256::from(model_gas) * U256::from(100);
@@ -3089,6 +3102,7 @@ async fn shield_speedup_funding_uses_the_previously_signed_gas_limit() {
             },
             &chain.gas,
             PublicShieldTransactionProfile::Railoxide,
+            PublicAssetId::Native,
             super::types::PublicActionGasLimitStrategy::ChainBuffer,
             None,
             Some(7),
@@ -3178,6 +3192,7 @@ async fn native_preflight_filters_broker_withdrawals_and_tries_each_candidate_on
             },
             &default_effective_chain(1).gas,
             PublicShieldTransactionProfile::Railway,
+            PublicAssetId::Native,
             super::types::PublicActionGasLimitStrategy::ChainBuffer,
             None,
             None,
@@ -3288,6 +3303,8 @@ fn public_actions_reject_zero_amount_and_public_only_shield_before_signing() {
                     U256::ZERO
                 },
                 profile: PublicShieldTransactionProfile::Railoxide,
+                native_preparation: None,
+                native_operation: None,
                 gas_fee: PublicActionGasFeeSelection::Auto,
                 gas_fee_mode: PublicActionGasFeeMode::Auto,
                 authorized_fee_ceiling: PublicActionGasFeeSelection::Custom {
@@ -3843,6 +3860,7 @@ async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_prefli
     let resolved = resolve_public_action_gas_fee(
         1,
         PublicShieldTransactionProfile::Railoxide,
+        PublicAssetId::Native,
         gas_fee,
         Some(quote),
     )
@@ -3893,6 +3911,7 @@ async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_prefli
         PublicActionGasFeeSelection::Auto,
         &chain.gas,
         PublicShieldTransactionProfile::Railoxide,
+        PublicAssetId::Native,
         super::types::PublicActionGasLimitStrategy::ChainBuffer,
         Some(admitted.gas_limit),
         None,
@@ -3955,6 +3974,7 @@ async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_prefli
         gas_fee,
         &chain.gas,
         PublicShieldTransactionProfile::Railoxide,
+        PublicAssetId::Native,
         super::types::PublicActionGasLimitStrategy::ChainBuffer,
         None,
         None,
@@ -4012,6 +4032,7 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
     let resolved = resolve_public_action_gas_fee(
         1,
         PublicShieldTransactionProfile::Railoxide,
+        PublicAssetId::Native,
         gas_fee,
         Some(quote),
     )
@@ -4070,6 +4091,7 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
             gas_fee,
             &chain.gas,
             PublicShieldTransactionProfile::Railoxide,
+            PublicAssetId::Native,
             super::types::PublicActionGasLimitStrategy::ChainBuffer,
             None,
             None,
@@ -4113,6 +4135,7 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
         let error = super::submission::public_action_preflight_from_rpc_pool_with_reads(
             &pool, &http, &chain.rpc_route, 1, from, TransactionRequest::default().with_to(to),
             gas_fee, &chain.gas, PublicShieldTransactionProfile::Railoxide,
+            PublicAssetId::Native,
             super::types::PublicActionGasLimitStrategy::ChainBuffer,
             None, None, None,
             None, false, Some(&reads),
@@ -4394,6 +4417,7 @@ async fn native_preflight_logs_failure_stage_without_sensitive_payloads() {
             },
             &chain.gas,
             PublicShieldTransactionProfile::Railway,
+            PublicAssetId::Native,
             super::types::PublicActionGasLimitStrategy::ChainBuffer,
             None,
             None,
@@ -4588,4 +4612,386 @@ async fn ens_recipient_uses_normalized_alloy_calls_on_the_configured_desktop_rou
             .is_err()
     );
     server.abort();
+}
+
+/// The SDK vector address in `vault/tests/key_export.rs`.
+const TEST_SHIELD_RECIPIENT: &str = "0zk1qykzjxctynyz4z43pukckpv43jyzhyvy0ehrd5wuc54l5enqf9qfrrv7j6fe3z53la7enqphqvxys9aqyp9xx0km95ehqslx8apmu8l7anc7emau4tvsultrkvd";
+
+fn test_shield_recipient() -> broadcaster_core::crypto::railgun::AddressData {
+    broadcaster_core::crypto::railgun::AddressData::try_from(
+        &broadcaster_core::crypto::railgun::Address::from(TEST_SHIELD_RECIPIENT),
+    )
+    .unwrap()
+}
+
+/// A native Mimic preparation with a fixed raw estimate.
+fn test_railway_native_preparation(
+    chain_id: u64,
+    payer: Address,
+    recipient: broadcaster_core::crypto::railgun::AddressData,
+    amount: U256,
+    raw_gas_limit: u64,
+) -> RailwayNativeShieldPreparation {
+    let profile = railway_native_shield_profile(
+        chain_id,
+        &default_effective_chain(chain_id),
+        RailwayNativeShieldPayer::Software,
+    )
+    .unwrap();
+    RailwayNativeShieldPreparation::new(profile, payer, recipient, amount, raw_gas_limit)
+}
+
+#[test]
+fn railway_native_shield_eligibility_explains_unavailable_routes() {
+    for chain_id in [1, 56, 137, 42161] {
+        let chain = default_effective_chain(chain_id);
+        let profile =
+            railway_native_shield_profile(chain_id, &chain, RailwayNativeShieldPayer::Software)
+                .unwrap();
+        assert_eq!(
+            profile.delegate,
+            broadcaster_core::deployment::RailgunDeployment::for_chain(chain_id)
+                .unwrap()
+                .relay_adapt_7702_contract
+        );
+        assert_eq!(Some(profile.wrapped_native), chain.wrapped_native_token);
+    }
+    let mut other_delegate = default_effective_chain(1);
+    other_delegate
+        .railgun
+        .as_mut()
+        .unwrap()
+        .deployment
+        .relay_adapt_7702_contract = Address::repeat_byte(1);
+    for (chain_id, chain, payer, unavailable) in [
+        (
+            10,
+            default_effective_chain(1),
+            RailwayNativeShieldPayer::Software,
+            RailwayNativeShieldUnavailable::UnsupportedChain,
+        ),
+        (
+            1,
+            other_delegate,
+            RailwayNativeShieldPayer::Software,
+            RailwayNativeShieldUnavailable::IncompatibleContracts,
+        ),
+        (
+            1,
+            default_effective_chain(1),
+            RailwayNativeShieldPayer::Hardware,
+            RailwayNativeShieldUnavailable::HardwarePayer,
+        ),
+        (
+            1,
+            default_effective_chain(1),
+            RailwayNativeShieldPayer::HardwareWallet,
+            RailwayNativeShieldUnavailable::HardwareWallet,
+        ),
+    ] {
+        assert_eq!(
+            railway_native_shield_profile(chain_id, &chain, payer),
+            Err(unavailable)
+        );
+    }
+}
+
+#[test]
+fn railway_native_preparation_binds_its_inputs_and_chain() {
+    let payer = Address::repeat_byte(0x11);
+    let recipient = test_shield_recipient();
+    let amount = U256::from(1_000_000_000_000_000_000_u128);
+    let preparation = test_railway_native_preparation(56, payer, recipient, amount, 100_000);
+
+    // A changed chain, payer, amount or recipient needs a new preparation.
+    let profile = railway_native_shield_profile(
+        56,
+        &default_effective_chain(56),
+        RailwayNativeShieldPayer::Software,
+    )
+    .unwrap();
+    preparation
+        .ensure_matches(&profile, payer, &recipient, amount)
+        .unwrap();
+    let ethereum = railway_native_shield_profile(
+        1,
+        &default_effective_chain(1),
+        RailwayNativeShieldPayer::Software,
+    )
+    .unwrap();
+    let mut other_recipient = recipient;
+    other_recipient.master_public_key += U256::from(1);
+    for (profile, payer, recipient, amount) in [
+        (&ethereum, payer, &recipient, amount),
+        (&profile, Address::repeat_byte(0x12), &recipient, amount),
+        (&profile, payer, &recipient, amount + U256::from(1)),
+        (&profile, payer, &other_recipient, amount),
+    ] {
+        assert!(
+            preparation
+                .ensure_matches(profile, payer, recipient, amount)
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn railway_native_shield_signs_the_prepared_type_4_envelope() {
+    use alloy::consensus::TxEnvelope;
+    use alloy::eips::Decodable2718;
+
+    let signer =
+        VaultedPublicSigner::Software(SoftwareEvmSigner::from_private_key([7; 32]).unwrap());
+    let payer = signer.address();
+    let amount = U256::from(5_000_u64);
+    let preparation =
+        test_railway_native_preparation(1, payer, test_shield_recipient(), amount, 100_000);
+    let profile = railway_native_shield_profile(
+        1,
+        &default_effective_chain(1),
+        RailwayNativeShieldPayer::Software,
+    )
+    .unwrap();
+    // The shape of the stealth account's issued transaction.
+    let account = alloy::signers::local::PrivateKeySigner::random();
+    let prepared = super::railway_native::native_shield_transaction_request(
+        &profile,
+        payer,
+        account.address(),
+        amount,
+        Bytes::from_static(&[1, 2, 3]),
+        super::railway_native::native_shield_authorization(&account, &profile, 0).unwrap(),
+    );
+    let input = prepared.input.input().cloned().unwrap();
+    let authorization = prepared.authorization_list.clone().unwrap();
+    let approved = public_action_eip1559_transaction_request(prepared, 1, payer, 100, 2, 9)
+        .with_gas_limit(preparation.gas_limit());
+    let signed = signer
+        .sign_transaction_request(approved, "test")
+        .await
+        .unwrap();
+    let TxEnvelope::Eip7702(signed) = TxEnvelope::decode_2718(&mut signed.as_slice()).unwrap()
+    else {
+        panic!("a type-4 transaction");
+    };
+    let tx = signed.tx();
+    assert_eq!(
+        (tx.chain_id, tx.to, tx.value, &tx.input, tx.nonce),
+        (1, account.address(), amount, &input, 9)
+    );
+    assert_eq!(tx.authorization_list, authorization);
+    assert_eq!(
+        (tx.gas_limit, tx.max_fee_per_gas),
+        (preparation.gas_limit(), 100)
+    );
+}
+
+#[tokio::test]
+async fn railway_native_max_refits_the_amount_to_each_new_estimate() {
+    let payer = Address::repeat_byte(0x11);
+    let recipient = test_shield_recipient();
+    let balance = U256::from(10_000_000_u64);
+    // The second estimate rises, so its first fitted amount no longer leaves enough gas.
+    let mut raw_estimates = [100_000_u64, 110_000, 110_000].into_iter();
+    let preparation = super::railway_native::fit_railway_native_shield_max(balance, 10, |amount| {
+        std::future::ready(Ok(test_railway_native_preparation(
+            1,
+            payer,
+            recipient,
+            amount,
+            raw_estimates.next().unwrap(),
+        )))
+    })
+    .await
+    .unwrap();
+    assert_eq!(preparation.gas_limit(), 132_000);
+    assert_eq!(preparation.amount(), U256::from(10_000_000_u64 - 1_320_000));
+    assert!(preparation.amount() + U256::from(preparation.gas_limit()) * U256::from(10) <= balance);
+
+    assert!(
+        super::railway_native::fit_railway_native_shield_max(U256::from(1_200_000), 10, |amount| {
+            std::future::ready(Ok(test_railway_native_preparation(
+                1, payer, recipient, amount, 100_000,
+            )))
+        })
+        .await
+        .is_err(),
+        "no amount remains after the maximum gas cost"
+    );
+}
+
+#[tokio::test]
+async fn railway_native_preparation_estimates_the_full_request() {
+    let calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let logged = calls.clone();
+    let responder: crate::rpc_broker::tests::RpcResponder = Arc::new(move |request: Value| {
+        logged.lock().unwrap().push(request.clone());
+        let result = match request["method"].as_str().unwrap_or_default() {
+            "eth_estimateGas" => json!("0x186a0"),
+            // eth_chainId and anything else.
+            _ => json!("0x1"),
+        };
+        json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+    });
+    let (url, server) =
+        crate::rpc_broker::tests::spawn_rpc_mock(responder, Arc::default(), Arc::default()).await;
+    let mut chain = default_effective_chain(1);
+    chain.rpc_route = RpcChainRoute::new(1, vec![url]);
+    let http = HttpContext::direct_for_tests();
+    let payer = Address::repeat_byte(0x11);
+    let amount = U256::from(5_000_u64);
+
+    let error = prepare_railway_native_shield(
+        1,
+        &chain,
+        RailwayNativeShieldPayer::Hardware,
+        payer,
+        test_shield_recipient(),
+        amount,
+        &http,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<RailwayNativeShieldUnavailable>(),
+        Some(&RailwayNativeShieldUnavailable::HardwarePayer)
+    );
+    assert!(calls.lock().unwrap().is_empty());
+
+    let preparation = prepare_railway_native_shield(
+        1,
+        &chain,
+        RailwayNativeShieldPayer::Software,
+        payer,
+        test_shield_recipient(),
+        amount,
+        &http,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (preparation.raw_gas_limit(), preparation.gas_limit()),
+        (100_000, 120_000)
+    );
+    let calls = calls.lock().unwrap().clone();
+    let estimate = calls
+        .iter()
+        .find(|call| call["method"] == "eth_estimateGas")
+        .unwrap();
+    let estimate: TransactionRequest =
+        serde_json::from_value(estimate["params"][0].clone()).unwrap();
+    assert_eq!(estimate.from, Some(payer));
+    assert_eq!(estimate.value, Some(amount));
+    assert_eq!(estimate.transaction_type, Some(4));
+    // The stand-in account delegates itself and is the call's target.
+    let [authorization] = estimate.authorization_list.as_deref().unwrap() else {
+        panic!("one delegation");
+    };
+    assert_eq!(*authorization.address(), preparation.delegate());
+    assert_eq!(
+        estimate.to,
+        Some(TxKind::Call(authorization.recover_authority().unwrap()))
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn railway_bnb_quote_route_follows_the_asset() {
+    let (url, server, methods) = logged_fee_endpoint(56, 60_000_000, None, None).await;
+    let mut chain = default_effective_chain(56);
+    chain.rpc_route = RpcChainRoute::new(56, vec![url]);
+    let http = HttpContext::direct_for_tests();
+    let native = quote_public_action_gas_fee_bundle_with_profile(
+        56,
+        &chain,
+        PublicShieldTransactionProfile::Railway,
+        PublicAssetId::Native,
+        &http,
+    )
+    .await
+    .unwrap();
+    // Fee history: floor(5 * 110 / 100) plus the 60th-percentile tip 2.
+    assert_eq!(native.standard.suggested_max_fee_per_gas, 7);
+    assert_eq!(native.standard.suggested_max_priority_fee_per_gas, 2);
+    assert!(
+        !methods
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method == "eth_gasPrice")
+    );
+    let erc20 = quote_public_action_gas_fee_bundle_with_profile(
+        56,
+        &chain,
+        PublicShieldTransactionProfile::Railway,
+        PublicAssetId::Erc20(Address::repeat_byte(7)),
+        &http,
+    )
+    .await
+    .unwrap();
+    assert_eq!(erc20.standard.rpc_gas_price, 55_000_000);
+    assert_eq!(erc20.standard.suggested_max_priority_fee_per_gas, 0);
+    server.abort();
+}
+
+#[test]
+fn native_shield_is_delivered_only_with_its_shield_event() {
+    use alloy::sol_types::SolEvent;
+    use broadcaster_core::contracts::railgun::Shield;
+
+    use super::railway_native::ensure_native_shield_delivered;
+
+    let profile = railway_native_shield_profile(
+        1,
+        &default_effective_chain(1),
+        RailwayNativeShieldPayer::Software,
+    )
+    .unwrap();
+    let shield_log = |address: Address| alloy::rpc::types::Log {
+        inner: alloy::primitives::Log {
+            address,
+            data: Shield {
+                treeNumber: U256::ZERO,
+                startPosition: U256::ZERO,
+                commitments: Vec::new(),
+                shieldCiphertext: Vec::new(),
+                fees: Vec::new(),
+            }
+            .encode_log_data(),
+        },
+        ..Default::default()
+    };
+    let stealth_account = Address::repeat_byte(3);
+    for (logs, delivered) in [
+        (Ok(vec![shield_log(profile.railgun)]), true),
+        // Without Railgun's event the value is at the stealth account.
+        (Ok(vec![shield_log(Address::repeat_byte(2))]), false),
+        (Err(eyre!("logs unavailable")), false),
+    ] {
+        let settled = ensure_native_shield_delivered(&profile, stealth_account, "0x01", logs);
+        assert_eq!(settled.is_ok(), delivered);
+        if let Err(error) = settled {
+            // The failure names the account to recover.
+            assert!(format!("{error:#}").contains(&stealth_account.to_string()));
+        }
+    }
+}
+
+#[test]
+fn railway_native_signing_gas_limit_is_clipped_to_the_reviewed_limit() {
+    let reviewed = 1_200_000;
+    for (raw, signed) in [
+        (900_000, Some(1_080_000)),
+        // The final estimate is slightly above the prepared 1_000_000.
+        (1_000_012, Some(reviewed)),
+        (1_000_000, Some(reviewed)),
+        (reviewed, Some(reviewed)),
+        (reviewed + 1, None),
+    ] {
+        assert_eq!(
+            super::submission::railway_native_signing_gas_limit(raw, reviewed).ok(),
+            signed,
+            "raw estimate {raw}"
+        );
+    }
 }

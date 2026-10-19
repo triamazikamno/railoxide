@@ -620,6 +620,9 @@ impl GatewayView {
                 && ["account", "chain_id", "kind", "mimic_railway"]
                     .iter()
                     .all(|key| form.input[key] == draft.input[key])
+                // A Public quote also follows its asset's fee route.
+                && (form.input.get("account").is_none()
+                    || form.input["asset"] == draft.input["asset"])
         })?;
         Some((
             draft.gas_quote["max_fee_gwei"].as_str()?.to_owned(),
@@ -1214,7 +1217,8 @@ impl GatewayView {
                     ),
                 )
                 .child(
-                    note("Use Railway's transaction profile and fee policy.").whitespace_normal(),
+                    note("Build this shield the way Railway v5.26.1 builds a single-asset shield. A native-token shield goes through a fresh stealth account in one transaction.")
+                        .whitespace_normal(),
                 );
         }
         fields = fields.child(
@@ -1251,6 +1255,12 @@ impl GatewayView {
                 }),
                 MONO,
             ));
+        }
+        if let Some(draft) = ready
+            && !draft.message.is_empty()
+            && !draft.executing()
+        {
+            fields = fields.child(note(draft.message.clone()).whitespace_normal());
         }
         div()
             .flex()

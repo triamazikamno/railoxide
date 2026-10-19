@@ -12,25 +12,29 @@ use wallet_ops::{
     HttpContext, PublicActionGasFeeMode, PublicActionGasFeeQuote, PublicActionGasFeeQuoteBundle,
     PublicActionGasFeeSelection, PublicActionKind, PublicAssetId, PublicBalanceAmount,
     PublicShieldTransactionProfile, PublicTransactionIntent, RAILGUN_PROTOCOL_FEE_BPS,
-    TokenAnchorRateCache, estimate_public_action_gas_cost_with_profile_and_ceiling,
+    RailwayNativeShieldPayer, RailwayNativeShieldPreparation, TokenAnchorRateCache,
+    estimate_public_action_gas_cost_with_profile_and_ceiling,
     gateway::{
         GatewayDraftCommand, GatewayDraftEstimate, GatewayDraftEstimatePayload,
         GatewayDraftExecution, GatewayDraftFee, GatewayDraftGasQuote, GatewayDraftInput,
         GatewayDraftKind, GatewayDraftPayload, GatewayDraftRecipient, GatewayDraftStatus,
         GatewayDraftView,
     },
-    parse_send_amount, public_shield_protocol_fee_amount,
-    quote_public_action_gas_fee_bundle_with_profile, resolve_public_ens_recipient,
+    parse_send_amount, prepare_railway_native_shield, prepare_railway_native_shield_max,
+    public_shield_protocol_fee_amount, public_shield_recipient,
+    quote_public_action_gas_fee_bundle_with_profile, railway_native_shield_profile,
+    resolve_public_ens_recipient,
     settings::{EffectiveChainConfig, EffectiveTokenRegistry},
     vault::{DesktopVaultStore, DesktopViewSession, PublicAccountMetadata, PublicAccountSource},
 };
 
 use super::gas_fee::{format_gwei, parse_gwei_to_wei};
 use super::public_action::{
-    PublicActionFeeDisplay, PublicSendDraft, PublicShieldDraft,
-    authorized_public_action_gas_fee_selection, format_gas_limit,
-    public_action_max_amount_after_reserve, public_action_protocol_fee_label,
-    public_send_authorization_summary, public_shield_authorization_summary,
+    NativeMimicShieldKey, PublicActionFeeDisplay, PublicSendDraft, PublicShieldDraft,
+    authorized_public_action_gas_fee_selection, bind_native_mimic_shield_operation,
+    format_gas_limit, native_mimic_gas_cost_projection, public_action_max_amount_after_reserve,
+    public_action_protocol_fee_label, public_send_authorization_summary,
+    public_shield_authorization_summary, railway_native_shield_payer,
 };
 use super::public_balances::public_asset_icon_path;
 use super::spend_authorization::SpendAuthorizationIntent;
@@ -207,13 +211,12 @@ impl GatewayDraftBook {
             if record.wallet_generation == generation
                 && Arc::ptr_eq(&record.wallet, previous)
                 && record.execution.as_ref().is_some_and(|execution| {
-                    execution.generation().is_some()
-                        || (execution.snapshot().private.is_some()
-                            && execution.has_review_approval())
+                    execution.generation().is_some() || execution.has_review_approval()
                 })
             {
-                // Only the known hardware-profile refresh may carry running progress to its
-                // replacement view. Unsubmitted drafts keep their original authority binding.
+                // Only the known hardware-profile refresh may carry running progress, or an
+                // approved execution (private or public) that has not bound its generation yet,
+                // to its replacement view. Unapproved drafts keep their original authority binding.
                 record.wallet = refreshed.clone();
             }
         }
@@ -343,6 +346,7 @@ impl GatewayDraftBook {
 struct EstimationContext {
     input: GatewayDraftInput,
     account: PublicAccountMetadata,
+    native_payer: RailwayNativeShieldPayer,
     asset: PublicAssetId,
     symbol: String,
     decimals: u8,
@@ -617,6 +621,10 @@ impl WalletRoot {
         };
         Ok(EstimationContext {
             input: input.clone(),
+            native_payer: railway_native_shield_payer(
+                account.source,
+                self.selected_wallet_source().is_hardware_derived(),
+            ),
             account,
             asset,
             symbol: entry.asset.symbol.clone(),
@@ -822,6 +830,27 @@ impl WalletRoot {
         let Some(mut prepared) = record.prepared.take() else {
             return;
         };
+        // Bound before authorization, as the Shield form binds its own.
+        if let PreparedDraft::Shield(draft) = &mut prepared
+            && draft.native_preparation.is_some()
+        {
+            match bind_native_mimic_shield_operation(
+                &mut self.public_form.native_mimic_shield_operation,
+                NativeMimicShieldKey {
+                    wallet_id: self.selected_wallet_id.clone(),
+                    chain_id: draft.chain_id,
+                    public_account_uuid: Arc::clone(&draft.public_account_uuid),
+                    amount: draft.amount,
+                },
+            ) {
+                Ok(operation) => draft.native_operation = Some(operation),
+                Err(error) => {
+                    record.view.message = error.to_string();
+                    record.prepared = Some(prepared);
+                    return;
+                }
+            }
+        }
         let execution = GatewayDraftExecution::default();
         record.execution = Some(execution.clone());
         let (intent, summary, hardware) = match &mut prepared {
@@ -905,7 +934,8 @@ fn retire_record(record: &mut DraftRecord) {
 
 #[derive(PartialEq, Eq)]
 enum DraftGasQuoteIdentity<'a> {
-    Public(&'a str, u64, GatewayDraftKind, bool),
+    /// Account, chain, kind, asset and Mimic: the asset selects a Mimic fee route.
+    Public(&'a str, u64, GatewayDraftKind, &'a str, bool),
     Private(&'a str, u64),
 }
 
@@ -915,6 +945,7 @@ fn quote_identity(input: &GatewayDraftPayload) -> Option<DraftGasQuoteIdentity<'
             input.account.as_str(),
             input.chain_id,
             input.kind,
+            input.asset.as_str(),
             input.mimic_railway,
         )),
         GatewayDraftPayload::Private(input) => {
@@ -956,6 +987,7 @@ fn draft_gas_fee(
     fee: &GatewayDraftFee,
     quote: PublicActionGasFeeQuote,
     profile: PublicShieldTransactionProfile,
+    asset: PublicAssetId,
     chain_id: u64,
 ) -> Result<PublicActionGasFeeSelection, String> {
     let custom = |max_fee_per_gas, max_priority_fee_per_gas| {
@@ -974,6 +1006,7 @@ fn draft_gas_fee(
             PublicActionGasFeeSelection::Auto,
             Some(quote),
             profile,
+            asset,
             chain_id,
         ),
         GatewayDraftFee::Custom {
@@ -995,7 +1028,7 @@ fn draft_gas_fee(
                     .map(|value| value / 4)
                     .ok_or_else(|| "Gas fee is too large".to_owned())
             };
-            if profile.uses_legacy_envelope(chain_id) {
+            if profile.uses_legacy_envelope(chain_id, asset) {
                 return custom(scale(quote.rpc_gas_price)?.max(1), 0);
             }
             let tip = scale(quote.suggested_max_priority_fee_per_gas)?;
@@ -1046,6 +1079,7 @@ async fn estimate_draft(mut context: EstimationContext) -> DraftEstimation {
         context.input.chain_id,
         &context.effective_chain,
         profile,
+        context.asset,
         &context.http,
     )
     .await
@@ -1059,23 +1093,107 @@ async fn estimate_draft(mut context: EstimationContext) -> DraftEstimation {
     };
     // A gas price hint does not depend on a valid amount, recipient, or custom fee.
     // Keep it separate from the prepared transaction and its submission admission.
+    let gas_quote = Some(GatewayDraftGasQuote::new(
+        format_gwei(bundle.standard.suggested_max_fee_per_gas),
+        format_gwei(bundle.standard.suggested_max_priority_fee_per_gas),
+    ));
+    let native_preparation = if context.input.kind == GatewayDraftKind::Shield
+        && profile == PublicShieldTransactionProfile::Railway
+        && context.asset == PublicAssetId::Native
+    {
+        match prepare_native_mimic_draft(&context, &bundle).await {
+            Ok(preparation) => Some(Arc::new(preparation)),
+            Err(message) => {
+                return DraftEstimation {
+                    gas_quote,
+                    result: Err(message),
+                };
+            }
+        }
+    } else {
+        None
+    };
     DraftEstimation {
-        gas_quote: Some(GatewayDraftGasQuote::new(
-            format_gwei(bundle.standard.suggested_max_fee_per_gas),
-            format_gwei(bundle.standard.suggested_max_priority_fee_per_gas),
-        )),
-        result: recipient_error.map_or_else(|| prepare_draft(context, bundle, profile), Err),
+        gas_quote,
+        result: recipient_error.map_or_else(
+            || prepare_draft(context, bundle, profile, native_preparation),
+            Err,
+        ),
     }
+}
+
+/// Prepares a native Mimic shield draft, or explains why the route is unavailable. Ordinary
+/// shielding needs Mimic Railway turned off; it is never substituted.
+async fn prepare_native_mimic_draft(
+    context: &EstimationContext,
+    bundle: &PublicActionGasFeeQuoteBundle,
+) -> Result<RailwayNativeShieldPreparation, String> {
+    let chain_id = context.input.chain_id;
+    railway_native_shield_profile(chain_id, &context.effective_chain, context.native_payer)
+        .map_err(|reason| {
+            format!("Mimic Railway is unavailable for this shield: {reason}. Turn off Mimic Railway to shield with the ordinary route.")
+        })?;
+    let PublicActionGasFeeSelection::Custom {
+        max_fee_per_gas, ..
+    } = draft_gas_fee(
+        &context.input.fee,
+        bundle.standard,
+        PublicShieldTransactionProfile::Railway,
+        PublicAssetId::Native,
+        chain_id,
+    )?
+    else {
+        return Err("Gas fee is unavailable".into());
+    };
+    let recipient = public_shield_recipient(&context.wallet)
+        .map_err(|_| "The private wallet's receive address is unavailable".to_owned())?;
+    let prepared = if context.input.max {
+        prepare_railway_native_shield_max(
+            chain_id,
+            &context.effective_chain,
+            context.native_payer,
+            context.account.address,
+            recipient,
+            context.balance,
+            max_fee_per_gas,
+            &context.http,
+        )
+        .await
+        .map_err(|error| format!("Max is unavailable: {error}"))?
+    } else {
+        let amount = parse_send_amount(&context.input.amount, Some(context.decimals))
+            .map_err(|error| error.to_string())?;
+        if amount.is_zero() {
+            return Err("Amount must be greater than zero".into());
+        }
+        if amount > context.balance {
+            return Err("Amount exceeds the available balance".into());
+        }
+        prepare_railway_native_shield(
+            chain_id,
+            &context.effective_chain,
+            context.native_payer,
+            context.account.address,
+            recipient,
+            amount,
+            &context.http,
+        )
+        .await
+        .map_err(|error| format!("Mimic Railway shield could not be prepared: {error}"))?
+    };
+    Ok(prepared)
 }
 
 fn prepare_draft(
     context: EstimationContext,
     bundle: PublicActionGasFeeQuoteBundle,
     profile: PublicShieldTransactionProfile,
+    native_preparation: Option<Arc<RailwayNativeShieldPreparation>>,
 ) -> Result<(Option<PreparedDraft>, GatewayDraftEstimate), String> {
     let EstimationContext {
         input,
         account,
+        native_payer: _,
         asset,
         symbol,
         decimals,
@@ -1091,7 +1209,7 @@ fn prepare_draft(
         store,
         icon,
     } = context;
-    let gas_fee = draft_gas_fee(&input.fee, bundle.standard, profile, input.chain_id)?;
+    let gas_fee = draft_gas_fee(&input.fee, bundle.standard, profile, asset, input.chain_id)?;
     let gas_fee_mode = if matches!(input.fee, GatewayDraftFee::Normal) {
         PublicActionGasFeeMode::Auto
     } else {
@@ -1106,36 +1224,56 @@ fn prepare_draft(
     } else {
         gas_fee
     };
-    let costs = estimate_public_action_gas_cost_with_profile_and_ceiling(
-        input.chain_id,
-        &effective_chain,
-        if input.kind == GatewayDraftKind::Shield {
-            PublicActionKind::Shield
-        } else {
-            PublicActionKind::Send
-        },
-        asset,
-        profile,
-        gas_fee,
-        Some(bundle.standard),
-        Some(ceiling),
-    )
-    .map_err(|_| "This action cannot be estimated on the selected network.".to_owned())?;
-    let amount = draft_amount(
-        &input,
-        asset,
-        decimals,
-        balance,
-        native_balance,
-        costs.maximum_cost,
-    )?;
+    let unestimable = || "This action cannot be estimated on the selected network.".to_owned();
+    let costs = match &native_preparation {
+        // A native Mimic shield is priced from its own prepared raw and buffered gas.
+        Some(preparation) => native_mimic_gas_cost_projection(
+            input.chain_id,
+            preparation.raw_gas_limit(),
+            preparation.gas_limit(),
+            gas_fee,
+            Some(bundle.standard),
+        )
+        .ok_or_else(unestimable)?,
+        None => estimate_public_action_gas_cost_with_profile_and_ceiling(
+            input.chain_id,
+            &effective_chain,
+            if input.kind == GatewayDraftKind::Shield {
+                PublicActionKind::Shield
+            } else {
+                PublicActionKind::Send
+            },
+            asset,
+            profile,
+            gas_fee,
+            Some(bundle.standard),
+            Some(ceiling),
+        )
+        .map_err(|_| unestimable())?,
+    };
+    let amount = match &native_preparation {
+        Some(preparation) => checked_draft_amount(
+            preparation.amount(),
+            asset,
+            balance,
+            native_balance,
+            costs.maximum_cost,
+        )?,
+        None => draft_amount(
+            &input,
+            asset,
+            decimals,
+            balance,
+            native_balance,
+            costs.maximum_cost,
+        )?,
+    };
     let fee_display = PublicActionFeeDisplay::from_estimate(
         Some(&effective_chain),
         Some(costs),
-        (input.kind == GatewayDraftKind::Shield
-            && asset == PublicAssetId::Native
-            && profile == PublicShieldTransactionProfile::Railway)
-            .then_some(6_000_000),
+        native_preparation
+            .as_ref()
+            .map(|preparation| preparation.gas_limit()),
         (input.kind == GatewayDraftKind::Shield)
             .then(|| (asset, public_shield_protocol_fee_amount(amount))),
         &registry,
@@ -1223,6 +1361,8 @@ fn prepare_draft(
             vault_store: store,
             amount,
             profile,
+            native_preparation,
+            native_operation: None,
             gas_fee,
             gas_fee_mode,
             authorized_fee_ceiling: ceiling,
@@ -1252,6 +1392,16 @@ fn draft_amount(
     } else {
         parse_send_amount(&input.amount, Some(decimals)).map_err(|error| error.to_string())?
     };
+    checked_draft_amount(amount, asset, balance, native_balance, maximum_cost)
+}
+
+fn checked_draft_amount(
+    amount: U256,
+    asset: PublicAssetId,
+    balance: U256,
+    native_balance: U256,
+    maximum_cost: U256,
+) -> Result<U256, String> {
     if amount.is_zero() {
         return Err("Amount must be greater than zero".into());
     }
@@ -1425,6 +1575,47 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
 
+    #[cfg(feature = "hardware")]
+    #[test]
+    fn hardware_refresh_carries_approved_public_executions_before_generation() {
+        let (path, store, wallet) = synthetic_wallet();
+        let refreshed = Arc::new(
+            store
+                .load_view_session("synthetic draft test password", "wallet")
+                .unwrap(),
+        );
+        let input = GatewayDraftPayload::Public(GatewayDraftInput {
+            account: "public".into(),
+            chain_id: 1,
+            kind: GatewayDraftKind::Send,
+            asset: "native".into(),
+            amount: "1".into(),
+            recipient: String::new(),
+            address_book_entry: None,
+            fee: GatewayDraftFee::Normal,
+            mimic_railway: false,
+            max: false,
+        });
+        let mut book = GatewayDraftBook::default();
+        for (peer, approved) in [("approved", true), ("unapproved", false)] {
+            assert!(book.create(peer, "create".into(), input.clone(), wallet.clone(), 1));
+            let execution = GatewayDraftExecution::default();
+            if approved {
+                assert!(execution.approve_review());
+            }
+            book.records.get_mut(peer).unwrap().execution = Some(execution);
+        }
+        book.refresh_hardware_session(&wallet, &refreshed, 1);
+        book.reconcile_wallet(Some(&refreshed), 1);
+        assert!(book.records.contains_key("approved"));
+        assert!(!book.records.contains_key("unapproved"));
+        drop(book);
+        drop(refreshed);
+        drop(wallet);
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
     #[test]
     fn private_gas_quotes_survive_form_edits_but_not_chain_or_delivery_changes() {
         use wallet_ops::gateway::{
@@ -1495,6 +1686,34 @@ mod tests {
     }
 
     #[test]
+    fn public_gas_quotes_follow_the_asset_fee_route() {
+        let native = GatewayDraftInput {
+            account: "account".into(),
+            chain_id: 56,
+            kind: GatewayDraftKind::Shield,
+            asset: "native".into(),
+            amount: "1".into(),
+            recipient: String::new(),
+            address_book_entry: None,
+            fee: GatewayDraftFee::Normal,
+            mimic_railway: true,
+            max: false,
+        };
+        let token = GatewayDraftInput {
+            asset: "0x55d398326f99059fF775485246999027B3197955".into(),
+            ..native.clone()
+        };
+        let edited = GatewayDraftInput {
+            amount: "2".into(),
+            ..native.clone()
+        };
+        let [native, token, edited] = [native, token, edited].map(GatewayDraftPayload::Public);
+        // On BNB the native Mimic quote is type 4 and the ERC-20 one legacy.
+        assert!(quote_identity(&native) != quote_identity(&token));
+        assert!(quote_identity(&native) == quote_identity(&edited));
+    }
+
+    #[test]
     fn max_reserves_the_selected_fee_ceiling_and_token_max_still_requires_native_gas() {
         let input = GatewayDraftInput {
             account: "public".into(),
@@ -1522,8 +1741,14 @@ mod tests {
             GatewayDraftFee::Normal,
             GatewayDraftFee::Fast,
         ] {
-            let fee =
-                draft_gas_fee(&fee, quote, PublicShieldTransactionProfile::Railoxide, 1).unwrap();
+            let fee = draft_gas_fee(
+                &fee,
+                quote,
+                PublicShieldTransactionProfile::Railoxide,
+                PublicAssetId::Native,
+                1,
+            )
+            .unwrap();
             let costs = estimate_public_action_gas_cost_with_profile_and_ceiling(
                 1,
                 &wallet_ops::settings::build_effective_chain_configs(
@@ -1571,6 +1796,7 @@ mod tests {
                 },
                 quote,
                 PublicShieldTransactionProfile::Railoxide,
+                PublicAssetId::Native,
                 1
             )
             .is_err()

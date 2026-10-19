@@ -1511,3 +1511,149 @@ async fn check_balance_resolves_a_lost_reply_operation_after_a_restart() {
     drop(db);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn native_shield_issues_a_delegated_operation_without_inputs_and_records_its_handoff() {
+    let rpc = Rpc::start().await;
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let chain = chain(&rpc);
+    let owner = Arc::new(
+        ExecutorOwner::new(
+            0,
+            db.clone(),
+            view.clone(),
+            chain.clone(),
+            HttpContext::direct_for_tests(),
+        )
+        .unwrap(),
+    );
+    let (_tip, tip_rx) = watch::channel(WalletSyncTip {
+        head_block: Some(10),
+        ..Default::default()
+    });
+    owner.start_tip_observation(tip_rx);
+    let wrapped_native = chain.wrapped_native_token.unwrap();
+    let recipient = crate::public_wallet::public_shield_recipient(&view).unwrap();
+    let request = broadcaster_core::contracts::shield::build_shield_request(
+        recipient.master_public_key,
+        &recipient.viewing_public_key,
+        broadcaster_core::contracts::railgun::TokenData::erc20(wrapped_native),
+        alloy::primitives::aliases::U120::from(5_000_u64),
+        &[3; 32],
+    )
+    .unwrap();
+    let operation = ExecutorOperationId::random().unwrap();
+    let payer = Address::repeat_byte(8);
+    let amount = U256::from(5_000_u64);
+    let issued = owner
+        .issue_native_shield(
+            operation,
+            &view,
+            payer,
+            &crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                TEST_PASSWORD.into(),
+            )),
+            wrapped_native,
+            amount,
+            request.clone(),
+            "Shield",
+        )
+        .await
+        .unwrap();
+    let record = || {
+        owner
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == operation)
+            .unwrap()
+    };
+    let account = record().address().unwrap();
+
+    // The payer sends the amount to the stealth account, which delegates itself.
+    let transaction = issued.transaction();
+    assert_eq!(
+        (transaction.from, transaction.to, transaction.value),
+        (
+            Some(payer),
+            Some(alloy::primitives::TxKind::Call(account)),
+            Some(amount)
+        )
+    );
+    assert_eq!(transaction.transaction_type, Some(4));
+    let [authorization] = transaction.authorization_list.as_deref().unwrap() else {
+        panic!("one delegation");
+    };
+    assert_eq!(
+        *authorization.address(),
+        chain.accepted_executor_profile().unwrap().delegate()
+    );
+    assert_eq!(authorization.recover_authority().unwrap(), account);
+    let call = RelayAdapt7702::executeCall::abi_decode(transaction.input.input().unwrap()).unwrap();
+    assert!(call._transactions.is_empty());
+
+    // The durable payload is an ordinary operation that spends no private inputs.
+    let issued_record = record();
+    let [payload] = issued_record.issued() else {
+        panic!("one payload");
+    };
+    assert_eq!(payload.hash(), issued.payload_hash());
+    assert_eq!(
+        payload.purpose(),
+        crate::vault::ExecutorPayloadPurpose::Operation
+    );
+    assert!(payload.context().inputs().is_empty());
+    assert!(payload.transaction_hashes().is_empty());
+
+    let sent = B256::repeat_byte(9);
+    let mut handoff = owner.native_shield_handoff(&issued).unwrap();
+    handoff(sent, transaction, &[]).unwrap();
+    drop(handoff);
+    assert_eq!(record().issued()[0].transaction_hashes(), [sent]);
+
+    // The attempt was included and reverted: the account is now delegated and its
+    // authorization nonce consumed, while its execution nonce stays unresolved.
+    let delegate = chain.accepted_executor_profile().unwrap().delegate();
+    rpc.state.used.lock().unwrap().insert(account);
+    rpc.set_delegated_account(account, delegate, U256::ZERO);
+    let retried = owner
+        .issue_native_shield(
+            operation,
+            &view,
+            payer,
+            &crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+                TEST_PASSWORD.into(),
+            )),
+            wrapped_native,
+            amount,
+            request,
+            "Shield",
+        )
+        .await
+        .unwrap();
+    // The retry still delegates the same account, at its next authorization nonce.
+    let transaction = retried.transaction();
+    assert_eq!(
+        transaction.to,
+        Some(alloy::primitives::TxKind::Call(account))
+    );
+    assert_eq!(transaction.transaction_type, Some(4));
+    let [authorization] = transaction.authorization_list.as_deref().unwrap() else {
+        panic!("one delegation");
+    };
+    assert_eq!(authorization.recover_authority().unwrap(), account);
+    assert_eq!(*authorization.address(), delegate);
+    assert_eq!(authorization.nonce(), 1);
+
+    owner.shutdown().await;
+    drop(owner);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}

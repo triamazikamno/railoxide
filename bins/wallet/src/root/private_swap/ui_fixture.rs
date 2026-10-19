@@ -13,6 +13,17 @@
 //!   `public_action/root.rs`, submit no action, and have no retry session. Details and Close
 //!   work normally. Public's Add account button becomes Preview Shield failure… so an
 //!   unfunded scratch wallet can open them without an account or asset balance.
+//! - `shield:mimic-prepared`, `shield:mimic-unavailable` and `shield:mimic-pending` show a
+//!   native-token Mimic Railway Shield, also from a Public asset dialog or from Add account,
+//!   which becomes Preview Mimic Railway shield…. These live in
+//!   `public_action/native_shield.rs`. `prepared` opens the Shield form for 0.5 of the native
+//!   token with a stand-in quote and a prepared estimate of 241,380 gas buffered to 289,656.
+//!   `unavailable` opens it with the Mimic Railway checkbox disabled and unchecked; its hover
+//!   tooltip gives the reason a hardware Public account can't use the route. The stand-in
+//!   quote belongs to the Mimic route, so the ordinary route shows no Auto fee, and Shield
+//!   does nothing. `pending` holds the single Shield step broadcast and waiting for confirmation,
+//!   with its transaction hash. Nothing is prepared or sent, and no record is read or
+//!   written. In `prepared`, Max does nothing and Shield stops at the missing preparation.
 //! - `route-error` opens the Public form with a failed Across route lookup and its Retry.
 //! - `form` lets the Buy picker pick a network without private funds there, and gives a new
 //!   destination account a stand-in setup fee in place of an estimate, so a live quote can

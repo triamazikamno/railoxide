@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use alloy::eips::eip7702::Authorization;
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, Signature, U256};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
@@ -163,6 +163,18 @@ pub struct IssuedExecutorTransaction {
     operation: ExecutorOperationId,
     payload_hash: B256,
     transaction: TransactionRequest,
+}
+
+/// The caller-specific part of one execute payload: the hash the executor signs,
+/// the transaction value, the private inputs it spends, and how the signature
+/// becomes the signed call.
+pub(super) struct PayloadToSign<'a> {
+    pub(super) hash: B256,
+    pub(super) value: U256,
+    pub(super) inputs: Vec<ExecutorInputIdentity>,
+    /// Sign an authorization even when this delegate is installed.
+    pub(super) authorize_delegation: bool,
+    pub(super) authorize: Box<dyn FnOnce(Signature) -> Result<TransactionCall> + Send + 'a>,
 }
 
 /// Chain evidence that one paid fee-convergence loop reuses to sign repriced
@@ -588,7 +600,85 @@ impl ExecutorOwner {
         call: &TransactionCall,
         inputs: &[Utxo],
         authorization: &crate::DesktopPrivateSpendAuthorization,
+        retry: Option<&mut IssueRetry>,
+    ) -> Result<IssuedExecutorTransaction> {
+        self.issue_payload(prepared, authorization, retry, |_| {
+            let hash = prepared.context.signing_hash(call)?;
+            // The durable reservation must cover precisely the private inputs whose
+            // nullifiers the signed execute can spend, including every inner transaction.
+            let decoded = RelayAdapt7702::executeCall::abi_decode(&call.data)?;
+            if let Some(recovery) = &prepared.recovery
+                && (decoded._actionData.minGasLimit != U256::ZERO
+                    || decoded._actionData.calls.len() != recovery.calls().len()
+                    || decoded._actionData.calls.iter().zip(recovery.calls()).any(
+                        |(actual, expected)| {
+                            actual.to != expected.to
+                                || actual.value != expected.value
+                                || actual.data != expected.data
+                        },
+                    ))
+            {
+                return Err(eyre!(
+                    "proved recovery calls differ from the reviewed actions"
+                ));
+            }
+            let mut expected = decoded
+                ._transactions
+                .iter()
+                .flat_map(|transaction| {
+                    transaction.nullifiers.iter().map(|nullifier| {
+                        (u32::from(transaction.boundParams.treeNumber), *nullifier)
+                    })
+                })
+                .collect::<Vec<_>>();
+            let nullifying_key = self.view.scan_keys().nullifying_key;
+            let mut supplied = inputs
+                .iter()
+                .map(|input| (input.tree, B256::from(input.nullifier(nullifying_key))))
+                .collect::<Vec<_>>();
+            expected.sort_unstable();
+            supplied.sort_unstable();
+            if expected != supplied || supplied.is_empty() {
+                return Err(eyre!(
+                    "executor input reservations do not match the proved transaction"
+                ));
+            }
+            if self.records()?.iter().any(|other| {
+                other.operation() != prepared.operation
+                    && other
+                        .reserved_inputs()
+                        .iter()
+                        .any(|reserved| inputs.iter().any(|input| reserved.matches(input)))
+            }) {
+                return Err(eyre!(
+                    "private inputs are reserved by another executor operation"
+                ));
+            }
+            Ok(PayloadToSign {
+                hash,
+                value: U256::ZERO,
+                inputs: inputs
+                    .iter()
+                    .map(ExecutorInputIdentity::from_utxo)
+                    .collect(),
+                authorize_delegation: false,
+                authorize: Box::new(move |signature| {
+                    Ok(prepared.context.authorize_call(call, signature)?)
+                }),
+            })
+        })
+        .await
+    }
+
+    /// Issue one execute payload under the shared executor admission, inspection,
+    /// signing and persistence rules. `payload` runs under the activity lock right
+    /// after the preparation is validated and before any chain read.
+    pub(super) async fn issue_payload<'a>(
+        &self,
+        prepared: &PreparedExecutorOperation,
+        authorization: &crate::DesktopPrivateSpendAuthorization,
         mut retry: Option<&mut IssueRetry>,
+        payload: impl FnOnce(&crate::vault::ExecutorRecord) -> Result<PayloadToSign<'a>>,
     ) -> Result<IssuedExecutorTransaction> {
         self.ensure_active()?;
         let _guard = self.lock_activity().await;
@@ -607,58 +697,13 @@ impl ExecutorOwner {
         let profile = chain
             .accepted_executor_profile()
             .ok_or_else(|| eyre!("executor execution is unavailable for this configuration"))?;
-        let hash = prepared.context.signing_hash(call)?;
-        // The durable reservation must cover precisely the private inputs whose
-        // nullifiers the signed execute can spend, including every inner transaction.
-        let decoded = RelayAdapt7702::executeCall::abi_decode(&call.data)?;
-        if let Some(recovery) = &prepared.recovery
-            && (decoded._actionData.minGasLimit != U256::ZERO
-                || decoded._actionData.calls.len() != recovery.calls().len()
-                || decoded._actionData.calls.iter().zip(recovery.calls()).any(
-                    |(actual, expected)| {
-                        actual.to != expected.to
-                            || actual.value != expected.value
-                            || actual.data != expected.data
-                    },
-                ))
-        {
-            return Err(eyre!(
-                "proved recovery calls differ from the reviewed actions"
-            ));
-        }
-        let mut expected = decoded
-            ._transactions
-            .iter()
-            .flat_map(|transaction| {
-                transaction
-                    .nullifiers
-                    .iter()
-                    .map(|nullifier| (u32::from(transaction.boundParams.treeNumber), *nullifier))
-            })
-            .collect::<Vec<_>>();
-        let nullifying_key = self.view.scan_keys().nullifying_key;
-        let mut supplied = inputs
-            .iter()
-            .map(|input| (input.tree, B256::from(input.nullifier(nullifying_key))))
-            .collect::<Vec<_>>();
-        expected.sort_unstable();
-        supplied.sort_unstable();
-        if expected != supplied || supplied.is_empty() {
-            return Err(eyre!(
-                "executor input reservations do not match the proved transaction"
-            ));
-        }
-        if self.records()?.iter().any(|other| {
-            other.operation() != prepared.operation
-                && other
-                    .reserved_inputs()
-                    .iter()
-                    .any(|reserved| inputs.iter().any(|input| reserved.matches(input)))
-        }) {
-            return Err(eyre!(
-                "private inputs are reserved by another executor operation"
-            ));
-        }
+        let PayloadToSign {
+            hash,
+            value,
+            inputs,
+            authorize_delegation: require_authorization,
+            authorize,
+        } = payload(&record)?;
         let initially_unissued = prepared.recovery.is_none() && record.issued().is_empty();
         let reused = match retry.as_deref_mut() {
             Some(retry) if !initially_unissued => {
@@ -762,13 +807,11 @@ impl ExecutorOwner {
             ));
         }
         self.ensure_active()?;
-        let signed_call = prepared
-            .context
-            .authorize_call(call, signer.sign_hash_sync(&hash)?)?;
+        let signed_call = authorize(signer.sign_hash_sync(&hash)?)?;
         let mut transaction = TransactionRequest::default()
             .to(signed_call.to)
             .input(signed_call.data.clone().into())
-            .value(U256::ZERO);
+            .value(value);
         transaction.chain_id = Some(profile.chain_id());
         transaction.from = prepared.delivery.sender();
         authorize_delegation(
@@ -777,18 +820,12 @@ impl ExecutorOwner {
             inspection,
             &signer,
             prepared.recovery.is_some(),
-            matches!(prepared.delivery, ExecutorDelivery::PublicBroadcaster(_)),
+            matches!(prepared.delivery, ExecutorDelivery::PublicBroadcaster(_))
+                || require_authorization,
         )?;
         self.ensure_active()?;
         checked.ensure_valid()?;
-        let payload_context = ExecutorPayloadContext::new(
-            signed_call.data,
-            observed,
-            inputs
-                .iter()
-                .map(ExecutorInputIdentity::from_utxo)
-                .collect(),
-        );
+        let payload_context = ExecutorPayloadContext::new(signed_call.data, observed, inputs);
         let payload = IssuedExecutorPayload::new(
             observed.nonce(),
             profile.delegate(),
@@ -852,7 +889,8 @@ pub(super) fn authorize_delegation(
         .ok_or_else(|| eyre!("executor delegation is unavailable"))?;
     let delegated = matches_executor_delegation(code, profile);
     // SDK broadcaster TX7702 requests require an authorization even when this
-    // delegate is already installed. Native delivery can reuse it without one.
+    // delegate is already installed. Self-broadcast execution reuses an installed
+    // delegate without one unless its payload requires it, as a native shield does.
     if code.is_empty()
         || recovery
             && crate::desktop::executor_discovery::executor_delegation(code).is_some()

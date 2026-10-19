@@ -123,7 +123,11 @@ pub enum PublicShieldTransactionProfile {
 pub(super) enum PublicActionGasLimitStrategy {
     ChainBuffer,
     RailwayEstimate120,
-    RailwayNativeFixed,
+    /// Railway's 120% of the final raw estimate, signed at most at the reviewed native Mimic
+    /// limit and refused only when the raw estimate itself exceeds that limit.
+    RailwayNativePrepared {
+        reviewed_gas_limit: u64,
+    },
 }
 
 impl PublicShieldTransactionProfile {
@@ -135,23 +139,17 @@ impl PublicShieldTransactionProfile {
         }
     }
 
+    /// Railway prices only BNB ERC-20 actions with a legacy envelope; its native shield is type 4.
     #[must_use]
-    pub const fn uses_legacy_envelope(self, chain_id: u64) -> bool {
-        matches!(self, Self::Railway) && chain_id == 56
+    pub const fn uses_legacy_envelope(self, chain_id: u64, asset: PublicAssetId) -> bool {
+        matches!(self, Self::Railway) && chain_id == 56 && matches!(asset, PublicAssetId::Erc20(_))
     }
 
-    pub(super) const fn gas_limit_strategy(
-        self,
-        asset: PublicAssetId,
-    ) -> PublicActionGasLimitStrategy {
-        match (self, asset) {
-            (Self::Railway, PublicAssetId::Native) => {
-                PublicActionGasLimitStrategy::RailwayNativeFixed
-            }
-            (Self::Railway, PublicAssetId::Erc20(_)) => {
-                PublicActionGasLimitStrategy::RailwayEstimate120
-            }
-            (Self::Railoxide, _) => PublicActionGasLimitStrategy::ChainBuffer,
+    /// A native Mimic shield instead signs within its prepared limit.
+    pub(super) const fn gas_limit_strategy(self) -> PublicActionGasLimitStrategy {
+        match self {
+            Self::Railway => PublicActionGasLimitStrategy::RailwayEstimate120,
+            Self::Railoxide => PublicActionGasLimitStrategy::ChainBuffer,
         }
     }
 }
@@ -346,6 +344,11 @@ pub struct PublicShieldRequest {
     pub asset: PublicAssetId,
     pub amount: U256,
     pub profile: PublicShieldTransactionProfile,
+    /// Required by, and only by, a Mimic Railway native shield.
+    pub native_preparation: Option<Arc<super::RailwayNativeShieldPreparation>>,
+    /// The stealth account operation a native shield is sent from. A retry of the same
+    /// shield passes the same one.
+    pub native_operation: Option<crate::vault::ExecutorOperationId>,
     pub gas_fee: PublicActionGasFeeSelection,
     pub gas_fee_mode: PublicActionGasFeeMode,
     pub authorized_fee_ceiling: PublicActionGasFeeSelection,

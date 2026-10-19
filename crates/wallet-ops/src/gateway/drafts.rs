@@ -419,15 +419,14 @@ impl GatewayDraftExecution {
         }
     }
 
-    /// A later hardware prompt may be cancelled after the initial review was approved.
+    /// A hardware prompt after an approved review, private or public, may be cancelled.
     /// The native dialog owner calls this only for an explicit dismissal, before generation.
-    pub fn cancel_private_authorization(&self) {
+    pub fn cancel_authorization(&self) {
         let mut state = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.started
-            || state.private.is_none()
             || matches!(
                 state.status,
                 GatewayDraftStatus::Done | GatewayDraftStatus::Failed
@@ -770,7 +769,7 @@ mod tests {
         let hardware = GatewayDraftExecution::private("hardware-password-approved".into());
         assert!(hardware.approve_review());
         hardware.cancel_review(); // The first password dialog closes to open device approval.
-        hardware.cancel_private_authorization();
+        hardware.cancel_authorization();
         assert!(!hardware.approve_review());
         assert!(!hardware.start());
         assert!(hardware.snapshot().can_retry);
@@ -778,11 +777,19 @@ mod tests {
             hardware.snapshot().private.unwrap().result,
             Some(super::super::GatewayPrivateDraftResult::Cancelled)
         );
+        let public = GatewayDraftExecution::default();
+        assert!(public.approve_review());
+        public.cancel_review();
+        public.cancel_authorization();
+        assert!(!public.approve_review());
+        assert!(!public.start());
+        assert!(public.snapshot().can_retry);
+        assert_eq!(public.snapshot().status, GatewayDraftStatus::Failed);
 
         let running = GatewayDraftExecution::private("hardware-complete".into());
         assert!(running.approve_review());
         assert!(running.start());
-        running.cancel_private_authorization();
+        running.cancel_authorization();
         assert_eq!(running.snapshot().status, GatewayDraftStatus::InProgress);
         duplicate.event(&PublicActionSessionEvent::AttemptHandoff {
             step: PublicActionProgressStep::Send,

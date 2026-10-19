@@ -11,7 +11,7 @@ use super::submission::{
 };
 use super::types::{
     PublicActionGasLimitStrategy, PublicActionProgressStep, PublicActionSessionEvent,
-    PublicShieldTransactionProfile, WalletConnectHardwareTypedDataCapabilityRequest,
+    PublicAssetId, PublicShieldTransactionProfile, WalletConnectHardwareTypedDataCapabilityRequest,
     WalletConnectHardwareTypedDataCapabilityResult,
     WalletConnectHardwareTypedDataHashFallbackConfirmationRequired,
     WalletConnectPersonalSignRequest, WalletConnectSendTransactionRequest,
@@ -312,6 +312,7 @@ pub async fn submit_walletconnect_send_transaction(
                 gas_fee,
                 &chain.gas,
                 PublicShieldTransactionProfile::Railoxide,
+                PublicAssetId::Native,
                 PublicActionGasLimitStrategy::ChainBuffer,
                 reviewed_gas_limit,
                 None,

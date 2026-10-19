@@ -14,8 +14,9 @@ use wallet_ops::{
 use crate::assets::WalletIconSource;
 use crate::root::gas_fee::Eip1559GasFeeEditorState;
 use crate::root::public_action::{
-    PublicActionFeeAuthorizationReview, PublicActionMode, PublicActionProgressLifecycle,
-    PublicActionStepState, PublicSendKind,
+    NativeMimicShieldKey, NativeMimicShieldPreparationState, PublicActionFeeAuthorizationReview,
+    PublicActionMode, PublicActionProgressLifecycle, PublicActionStepState, PublicSendKind,
+    PublicShieldRoute,
 };
 
 use super::hardware::HardwarePublicAccountDerivationStatus;
@@ -37,6 +38,13 @@ pub(in crate::root) struct PublicAccountFormState {
     pub(in crate::root) send_gas_fee: Eip1559GasFeeEditorState,
     pub(in crate::root) shield_gas_fee: Eip1559GasFeeEditorState,
     pub(in crate::root) shield_gas_fee_authorization_ceiling: Option<PublicActionGasFeeSelection>,
+    /// The route the Shield quote was admitted for.
+    pub(in crate::root) shield_gas_fee_route: Option<PublicShieldRoute>,
+    pub(in crate::root) native_mimic_shield: NativeMimicShieldPreparationState,
+    /// The stealth account operation of the last native Mimic shield submitted, which a retry
+    /// with the same inputs reuses.
+    pub(in crate::root) native_mimic_shield_operation:
+        Option<(NativeMimicShieldKey, wallet_ops::vault::ExecutorOperationId)>,
     pub(in crate::root) import_global: bool,
     pub(in crate::root) selected_account_uuid: Option<Arc<str>>,
     pub(in crate::root) editing_account_uuid: Option<Arc<str>>,

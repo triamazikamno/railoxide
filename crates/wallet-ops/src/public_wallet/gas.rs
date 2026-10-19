@@ -32,7 +32,6 @@ pub(super) const PUBLIC_ERC20_SEND_GAS_UNITS: u64 = 65_000;
 pub(super) const PUBLIC_NATIVE_WRAP_GAS_UNITS: u64 = 50_000;
 pub const PUBLIC_NATIVE_UNWRAP_GAS_UNITS: u64 = 40_000;
 pub(super) const PUBLIC_NATIVE_APPROVE_GAS_UNITS: u64 = 65_000;
-pub(super) const PUBLIC_RAILWAY_NATIVE_SHIELD_GAS_UNITS: u64 = 6_000_000;
 const PUBLIC_ACTION_BNB_CHAIN_ID: u64 = 56;
 const RAILWAY_FEE_HISTORY_BLOCKS: u64 = 10;
 const RAILWAY_FEE_HISTORY_REWARD_PERCENTILES: [f64; 4] = [40.0, 60.0, 80.0, 95.0];
@@ -145,9 +144,9 @@ pub fn estimate_public_action_gas_cost_with_profile_and_ceiling(
     authorization_ceiling: Option<PublicActionGasFeeSelection>,
 ) -> Result<Eip1559GasCostProjection> {
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
-    let resolved = resolve_public_action_gas_fee(chain_id, profile, gas_fee, quote)?;
+    let resolved = resolve_public_action_gas_fee(chain_id, profile, asset, gas_fee, quote)?;
     let maximum_resolved = authorization_ceiling.map_or(Ok(resolved), |ceiling| {
-        resolve_public_action_gas_fee(chain_id, profile, ceiling, None)
+        resolve_public_action_gas_fee(chain_id, profile, asset, ceiling, None)
     })?;
     let model = RailgunGasModel::for_chain(chain_id);
     let expected_gas_units = public_action_estimated_gas_usage_units(model, kind, asset);
@@ -157,8 +156,9 @@ pub fn estimate_public_action_gas_cost_with_profile_and_ceiling(
         asset,
         profile,
         chain.gas.gas_limit_buffer,
-    );
-    if public_action_uses_legacy_envelope(chain_id, profile, quote) {
+    )
+    .ok_or_else(|| eyre!("Mimic Railway native shield fees come from its prepared estimate"))?;
+    if public_action_uses_legacy_envelope(chain_id, profile, asset, quote) {
         return Ok(legacy_gas_cost_projection(
             expected_gas_units,
             maximum_gas_units,
@@ -318,6 +318,7 @@ fn legacy_gas_cost_projection(
 pub fn resolve_public_action_gas_fee(
     chain_id: u64,
     profile: PublicShieldTransactionProfile,
+    asset: PublicAssetId,
     gas_fee: PublicActionGasFeeSelection,
     quote: Option<PublicActionGasFeeQuote>,
 ) -> Result<SelfBroadcastResolvedGasFee> {
@@ -333,7 +334,7 @@ pub fn resolve_public_action_gas_fee(
         },
     };
     let resolved = resolve_self_broadcast_gas_fee(gas_fee, quote)?;
-    if !public_action_uses_legacy_envelope(chain_id, profile, Some(quote)) {
+    if !public_action_uses_legacy_envelope(chain_id, profile, asset, Some(quote)) {
         return Ok(resolved);
     }
 
@@ -364,53 +365,51 @@ fn public_action_estimated_gas_units_with_buffer(
     asset: PublicAssetId,
     profile: PublicShieldTransactionProfile,
     gas_limit_buffer: u64,
-) -> u64 {
+) -> Option<u64> {
     match kind {
         PublicActionKind::Send => {
             let gas_units = match asset {
                 PublicAssetId::Native => PUBLIC_NATIVE_SEND_GAS_UNITS,
                 PublicAssetId::Erc20(_) => PUBLIC_ERC20_SEND_GAS_UNITS,
             };
-            gas_units.saturating_add(gas_limit_buffer)
+            Some(gas_units.saturating_add(gas_limit_buffer))
         }
         PublicActionKind::Shield => {
             let (approve, shield) =
-                public_shield_estimated_gas_units(model, asset, profile, gas_limit_buffer);
-            approve.saturating_add(shield)
+                public_shield_estimated_gas_units(model, asset, profile, gas_limit_buffer)?;
+            Some(approve.saturating_add(shield))
         }
     }
 }
 
 /// The approval and Shield portions of the same model used for the displayed fee budget.
+/// A Mimic Railway native shield has no model; its limits come from its preparation.
 pub(super) fn public_shield_estimated_gas_units(
     model: &RailgunGasModel,
     asset: PublicAssetId,
     profile: PublicShieldTransactionProfile,
     gas_limit_buffer: u64,
-) -> (u64, u64) {
-    match asset {
-        PublicAssetId::Native => (
+) -> Option<(u64, u64)> {
+    match (asset, profile) {
+        (PublicAssetId::Native, PublicShieldTransactionProfile::Railway) => None,
+        (PublicAssetId::Native, PublicShieldTransactionProfile::Railoxide) => Some((
             0,
-            match profile {
-                PublicShieldTransactionProfile::Railway => PUBLIC_RAILWAY_NATIVE_SHIELD_GAS_UNITS,
-                PublicShieldTransactionProfile::Railoxide => {
-                    public_native_relay_adapt_shield_gas_units(model, GasEstimateMode::UpperBound)
-                        .saturating_add(gas_limit_buffer)
-                }
-            },
-        ),
-        PublicAssetId::Erc20(_) => {
+            public_native_relay_adapt_shield_gas_units(model, GasEstimateMode::UpperBound)
+                .saturating_add(gas_limit_buffer),
+        )),
+        (PublicAssetId::Erc20(_), PublicShieldTransactionProfile::Railway) => {
             let shield = public_shield_gas_units(model, GasEstimateMode::UpperBound);
-            match profile {
-                PublicShieldTransactionProfile::Railway => (
-                    railway_gas_limit(PUBLIC_NATIVE_APPROVE_GAS_UNITS),
-                    railway_gas_limit(shield),
-                ),
-                PublicShieldTransactionProfile::Railoxide => (
-                    PUBLIC_NATIVE_APPROVE_GAS_UNITS.saturating_add(gas_limit_buffer),
-                    shield.saturating_add(gas_limit_buffer),
-                ),
-            }
+            Some((
+                railway_gas_limit(PUBLIC_NATIVE_APPROVE_GAS_UNITS),
+                railway_gas_limit(shield),
+            ))
+        }
+        (PublicAssetId::Erc20(_), PublicShieldTransactionProfile::Railoxide) => {
+            let shield = public_shield_gas_units(model, GasEstimateMode::UpperBound);
+            Some((
+                PUBLIC_NATIVE_APPROVE_GAS_UNITS.saturating_add(gas_limit_buffer),
+                shield.saturating_add(gas_limit_buffer),
+            ))
         }
     }
 }
@@ -442,56 +441,11 @@ fn public_native_action_gas_reserve_with_buffer(
     steps: &[PublicActionProgressStep],
     gas_limit_buffer: u64,
 ) -> U256 {
-    public_native_action_gas_reserve_with_profile(
-        model,
-        max_fee_per_gas,
-        steps,
-        PublicShieldTransactionProfile::Railoxide,
-        gas_limit_buffer,
-    )
-}
-
-#[must_use]
-pub(super) fn public_native_action_gas_reserve_with_profile(
-    model: &RailgunGasModel,
-    max_fee_per_gas: u128,
-    steps: &[PublicActionProgressStep],
-    profile: PublicShieldTransactionProfile,
-    gas_limit_buffer: u64,
-) -> U256 {
-    U256::from(public_native_action_gas_units_with_profile(
+    U256::from(public_native_action_gas_units_with_buffer(
         model,
         steps,
-        profile,
         gas_limit_buffer,
     )) * U256::from(max_fee_per_gas)
-}
-
-#[must_use]
-fn public_native_action_gas_units_with_profile(
-    model: &RailgunGasModel,
-    steps: &[PublicActionProgressStep],
-    profile: PublicShieldTransactionProfile,
-    gas_limit_buffer: u64,
-) -> u64 {
-    steps.iter().fold(0_u64, |total, step| {
-        let gas_units = if profile == PublicShieldTransactionProfile::Railway
-            && *step == PublicActionProgressStep::Shield
-        {
-            PUBLIC_RAILWAY_NATIVE_SHIELD_GAS_UNITS
-        } else {
-            public_native_step_gas_units(model, *step)
-        };
-        if gas_units == 0 {
-            total
-        } else if profile == PublicShieldTransactionProfile::Railway
-            && *step == PublicActionProgressStep::Shield
-        {
-            total.saturating_add(gas_units)
-        } else {
-            total.saturating_add(gas_units.saturating_add(gas_limit_buffer))
-        }
-    })
 }
 
 #[must_use]
@@ -529,19 +483,27 @@ pub async fn quote_public_action_gas_fee_with_profile(
     chain_id: u64,
     effective_chain: &EffectiveChainConfig,
     profile: PublicShieldTransactionProfile,
+    asset: PublicAssetId,
     http: &HttpContext,
 ) -> Result<PublicActionGasFeeQuote> {
-    Ok(
-        quote_public_action_gas_fee_bundle_with_profile(chain_id, effective_chain, profile, http)
-            .await?
-            .standard,
+    Ok(quote_public_action_gas_fee_bundle_with_profile(
+        chain_id,
+        effective_chain,
+        profile,
+        asset,
+        http,
     )
+    .await?
+    .standard)
 }
 
+/// `asset` selects the profile's route: Mimic Railway prices BNB ERC-20 actions with a legacy
+/// gas price and its native shields with fee history.
 pub async fn quote_public_action_gas_fee_bundle_with_profile(
     chain_id: u64,
     effective_chain: &EffectiveChainConfig,
     profile: PublicShieldTransactionProfile,
+    asset: PublicAssetId,
     http: &HttpContext,
 ) -> Result<PublicActionGasFeeQuoteBundle> {
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
@@ -551,6 +513,7 @@ pub async fn quote_public_action_gas_fee_bundle_with_profile(
         http.network_mode(),
         chain_id,
         profile,
+        asset,
     )
     .await
 }
@@ -578,6 +541,7 @@ pub async fn estimate_public_advanced_transaction(
     let resolved = resolve_public_action_gas_fee(
         request.chain_id,
         PublicShieldTransactionProfile::Railoxide,
+        PublicAssetId::Native,
         request.gas_fee,
         Some(quote),
     )?;
@@ -1057,6 +1021,11 @@ pub async fn estimate_public_native_action_gas_reserve_with_profile_and_ceiling(
     http: &HttpContext,
     authorization_ceiling: Option<PublicActionGasFeeSelection>,
 ) -> Result<U256> {
+    if profile == PublicShieldTransactionProfile::Railway {
+        return Err(eyre!(
+            "Mimic Railway native Max comes from its prepared estimate"
+        ));
+    }
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
     let candidates = public_fee_candidates(http, &chain.rpc_route, None).await?;
     let quote_bundle = public_action_gas_fee_quote_bundle_from_candidates_with_profile(
@@ -1064,19 +1033,25 @@ pub async fn estimate_public_native_action_gas_reserve_with_profile_and_ceiling(
         http.network_mode(),
         chain_id,
         profile,
+        PublicAssetId::Native,
     )
     .await
     .wrap_err("fetch public action gas price")?;
     let quote = quote_bundle.standard;
-    let gas = resolve_public_action_gas_fee(chain_id, profile, gas_fee, Some(quote))?;
+    let gas = resolve_public_action_gas_fee(
+        chain_id,
+        profile,
+        PublicAssetId::Native,
+        gas_fee,
+        Some(quote),
+    )?;
     let maximum_gas = authorization_ceiling.map_or(Ok(gas), |ceiling| {
-        resolve_public_action_gas_fee(chain_id, profile, ceiling, None)
+        resolve_public_action_gas_fee(chain_id, profile, PublicAssetId::Native, ceiling, None)
     })?;
-    Ok(public_native_action_gas_reserve_with_profile(
+    Ok(public_native_action_gas_reserve_with_buffer(
         RailgunGasModel::for_chain(chain_id),
         maximum_gas.max_fee_per_gas,
         steps,
-        profile,
         chain.gas.gas_limit_buffer,
     ))
 }
@@ -1126,12 +1101,14 @@ pub(super) async fn public_action_gas_fee_quote_from_candidates(
         .await
 }
 
+/// Only the Railoxide profile follows the observed fee model; Mimic Railway's route decides.
 pub(super) fn public_action_uses_legacy_envelope(
     chain_id: u64,
     profile: PublicShieldTransactionProfile,
+    asset: PublicAssetId,
     quote: Option<PublicActionGasFeeQuote>,
 ) -> bool {
-    profile.uses_legacy_envelope(chain_id)
+    profile.uses_legacy_envelope(chain_id, asset)
         || (profile == PublicShieldTransactionProfile::Railoxide
             && quote
                 .is_some_and(|quote| quote.observed_fee_model == Some(crate::EvmFeeModel::Legacy)))
@@ -1211,6 +1188,7 @@ pub(super) async fn public_action_gas_fee_quote_from_candidates_with_profile(
     network_mode: crate::WalletNetworkMode,
     chain_id: u64,
     profile: PublicShieldTransactionProfile,
+    asset: PublicAssetId,
 ) -> Result<PublicActionGasFeeQuote> {
     Ok(
         public_action_gas_fee_quote_bundle_from_candidates_with_profile(
@@ -1218,6 +1196,7 @@ pub(super) async fn public_action_gas_fee_quote_from_candidates_with_profile(
             network_mode,
             chain_id,
             profile,
+            asset,
         )
         .await?
         .standard,
@@ -1229,6 +1208,7 @@ pub(super) async fn public_action_gas_fee_quote_bundle_from_candidates_with_prof
     network_mode: crate::WalletNetworkMode,
     chain_id: u64,
     profile: PublicShieldTransactionProfile,
+    asset: PublicAssetId,
 ) -> Result<PublicActionGasFeeQuoteBundle> {
     if profile == PublicShieldTransactionProfile::Railoxide {
         let standard =
@@ -1238,7 +1218,8 @@ pub(super) async fn public_action_gas_fee_quote_bundle_from_candidates_with_prof
     // Ready candidates are tried once each, including endpoints admitted while earlier ones fail.
     let mut tried = HashSet::new();
     while let Some(provider_handle) = candidates.next_untried(&mut tried).await {
-        match railway_gas_fee_quote_from_provider(&provider_handle.provider, chain_id).await {
+        match railway_gas_fee_quote_from_provider(&provider_handle.provider, chain_id, asset).await
+        {
             Ok(quote) => return Ok(quote),
             Err(_) => {
                 tracing::debug!("Railway gas fee quote provider attempt failed");
@@ -1251,11 +1232,13 @@ pub(super) async fn public_action_gas_fee_quote_bundle_from_candidates_with_prof
     Err(eyre!("all Railway gas quote RPC attempts failed"))
 }
 
+/// An unusable response fails only this provider, so the caller can try the next.
 async fn railway_gas_fee_quote_from_provider(
     provider: &impl Provider,
     chain_id: u64,
+    asset: PublicAssetId,
 ) -> Result<PublicActionGasFeeQuoteBundle> {
-    if chain_id == PUBLIC_ACTION_BNB_CHAIN_ID {
+    if PublicShieldTransactionProfile::Railway.uses_legacy_envelope(chain_id, asset) {
         let provider_gas_price = provider
             .get_gas_price()
             .await
@@ -1270,9 +1253,11 @@ async fn railway_gas_fee_quote_from_provider(
         )
         .await
         .wrap_err("fetch Railway fee history")?;
+    // Railway caps BNB's next base fee before its 110% multiplier, for native type-4 shields.
     railway_standard_gas_fee_quote_bundle(
         &fee_history.base_fee_per_gas,
         fee_history.reward.as_deref(),
+        (chain_id == PUBLIC_ACTION_BNB_CHAIN_ID).then_some(RAILWAY_BNB_GAS_PRICE_CAP),
     )
 }
 
@@ -1281,17 +1266,20 @@ pub(super) fn railway_standard_gas_fee_quote(
     base_fee_per_gas: &[u128],
     rewards: Option<&[Vec<u128>]>,
 ) -> Result<PublicActionGasFeeQuote> {
-    Ok(railway_standard_gas_fee_quote_bundle(base_fee_per_gas, rewards)?.standard)
+    Ok(railway_standard_gas_fee_quote_bundle(base_fee_per_gas, rewards, None)?.standard)
 }
 
 pub(super) fn railway_standard_gas_fee_quote_bundle(
     base_fee_per_gas: &[u128],
     rewards: Option<&[Vec<u128>]>,
+    next_base_fee_cap: Option<u128>,
 ) -> Result<PublicActionGasFeeQuoteBundle> {
     let next_base_fee_per_gas = base_fee_per_gas
         .last()
         .copied()
         .ok_or_else(|| eyre!("Railway fee history returned no base fee"))?;
+    let next_base_fee_per_gas =
+        next_base_fee_cap.map_or(next_base_fee_per_gas, |cap| next_base_fee_per_gas.min(cap));
     let rewards = rewards.ok_or_else(|| eyre!("Railway fee history returned no rewards"))?;
     let mut priority_fees = rewards
         .iter()

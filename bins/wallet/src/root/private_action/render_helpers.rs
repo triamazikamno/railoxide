@@ -187,38 +187,47 @@ fn render_private_action_tooltip_icon(
         .rounded_full()
         .text_color(rgb(icon_color))
         .child(Icon::new(icon).with_size(px(14.0)))
-        .tooltip(move |window: &mut Window, cx: &mut App| {
-            let Some(width) =
-                private_action_info_tooltip_width(window.viewport_size().width, window.rem_size())
-            else {
-                return Tooltip::element(|_window, _cx| div())
-                    .m(px(0.0))
-                    .p(px(0.0))
-                    .border_0()
-                    .build(window, cx);
-            };
-            let body = body.clone();
-            Tooltip::element(move |_window, _cx| {
-                div()
-                    .w(width)
-                    .p(px(12.0))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .whitespace_normal()
-                    .text_size(px(12.0))
-                    .line_height(px(18.0))
-                    .text_color(rgb(theme::TEXT))
-                    .child(
-                        div()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(title_color))
-                            .child(title),
-                    )
-                    .child(body())
-            })
-            .build(window, cx)
+        .tooltip(private_action_tooltip(title, title_color, body))
+}
+
+/// A tooltip of `title` and `body`, wrapped to the info tooltip width of the viewport.
+pub(in crate::root) fn private_action_tooltip(
+    title: &'static str,
+    title_color: u32,
+    body: impl Fn() -> gpui::AnyElement + Clone + 'static,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    move |window: &mut Window, cx: &mut App| {
+        let Some(width) =
+            private_action_info_tooltip_width(window.viewport_size().width, window.rem_size())
+        else {
+            return Tooltip::element(|_window, _cx| div())
+                .m(px(0.0))
+                .p(px(0.0))
+                .border_0()
+                .build(window, cx);
+        };
+        let body = body.clone();
+        Tooltip::element(move |_window, _cx| {
+            div()
+                .w(width)
+                .p(px(12.0))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .whitespace_normal()
+                .text_size(px(12.0))
+                .line_height(px(18.0))
+                .text_color(rgb(theme::TEXT))
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(title_color))
+                        .child(title),
+                )
+                .child(body())
         })
+        .build(window, cx)
+    }
 }
 
 pub(in crate::root) fn render_send_result(

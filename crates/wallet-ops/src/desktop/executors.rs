@@ -34,6 +34,7 @@ mod confirmations;
 mod discovery;
 mod execution;
 mod locks;
+mod native_shield;
 mod observation;
 mod public_account;
 mod recovery;
@@ -45,6 +46,7 @@ pub use execution::*;
 pub use locks::{
     ExecutorInputLock, ExecutorInputLockKind, ExecutorInputLockReason, LockedNotes, WalletNoteLocks,
 };
+pub(crate) use native_shield::native_shield_execute_calldata;
 pub use observation::ExecutorTransactionIdentity;
 pub(crate) use public_account::ExecutorPublicSigningGuard;
 pub use recovery::*;

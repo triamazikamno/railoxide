@@ -312,10 +312,16 @@ impl SpendAuthorizationIntent {
                 draft.public_account_source,
                 draft.public_account_uuid.to_string(),
             ),
-            Self::PublicShield(draft) => (
-                draft.public_account_source,
-                draft.public_account_uuid.to_string(),
-            ),
+            Self::PublicShield(draft) => {
+                // Native Mimic signs from a new stealth account, whatever pays.
+                if let Some(operation) = draft.native_operation {
+                    return Some(HardwareExecutorAction::Execute(operation));
+                }
+                (
+                    draft.public_account_source,
+                    draft.public_account_uuid.to_string(),
+                )
+            }
             Self::Governance(draft) => (draft.actor_source, draft.actor_uuid.to_string()),
             Self::WalletConnectRequest {
                 request_key,
@@ -1599,7 +1605,7 @@ impl HardwareSpendAuthorizationDialogContent {
         if let Some(intent) = self.completion.private_intent() {
             self.root.update(cx, |root, cx| {
                 if let Some(execution) = intent.gateway_execution() {
-                    execution.cancel_private_authorization();
+                    execution.cancel_authorization();
                     root.release_gateway_private_form(execution, cx);
                 }
                 root.cancel_spend_authorization(&intent, cx);
@@ -3448,7 +3454,13 @@ impl WalletRoot {
                 | SpendAuthorizationIntent::ExecutorUnshield(key, ..) => Some(*key),
                 _ => None,
             };
-            if let Some(key) = key
+            let payer = if let SpendAuthorizationIntent::PublicShield(draft) = &intent
+                && draft.native_operation.is_some()
+            {
+                // Native Mimic's payer sends the stealth account's execution, as a gas payer
+                // does. The draft admits only a software or imported payer here.
+                Some(draft.public_account_uuid.to_string())
+            } else if let Some(key) = key
                 && let Some(draft) = self.unshield_spend_draft(key, cx)
                 && draft.delivery_mode == DeliveryMode::SelfBroadcast
             {
@@ -3464,7 +3476,11 @@ impl WalletRoot {
                     self.set_unshield_form_error(key, "Select a software or imported gas payer, or a broadcaster, for this executor action.", cx);
                     return;
                 }
-                let payer = payer.public_account_uuid.clone();
+                Some(payer.public_account_uuid.clone())
+            } else {
+                None
+            };
+            if let Some(payer) = payer {
                 self.open_spend_authorization_dialog(
                     SpendAuthorizationIntent::ExecutorGasPassword {
                         intent: Box::new(intent),
