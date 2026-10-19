@@ -1,7 +1,7 @@
-//! Opt-in fork checks of the Public Shield routes: Mimic Railway native shields from a
-//! software wallet's stealth account on each supported chain, the stealth account left
-//! holding the value of one that skipped its delegation, the Mimic ERC-20 reference path and
-//! the ordinary Railoxide native shield. Each test forks its chain with
+//! Opt-in fork checks of the Public Shield routes: native shields from a software wallet's
+//! stealth account in both transaction profiles on each supported chain, the stealth account
+//! left holding the value of one that skipped its delegation, the Mimic ERC-20 reference path
+//! and the Railoxide wrap fallback in both approval modes. Each test forks its chain with
 //! [`ForkChain`] from the RPC its env var names (`ETH_FORK_RPC_URL`, `BNB_FORK_RPC_URL`,
 //! `POLYGON_FORK_RPC_URL`, `ARBITRUM_FORK_RPC_URL`), funds a synthetic Public account only on
 //! that fork, and drives the wallet's own preparation and submission against it.
@@ -24,10 +24,10 @@ use super::cow_fork::{
 };
 use super::helpers::{TEST_MNEMONIC, TEST_PASSWORD, temp_db_root};
 use crate::public_wallet::{
-    PublicActionGasFeeMode, PublicActionGasFeeSelection, PublicAssetId, PublicShieldRequest,
-    PublicShieldTransactionProfile, RailwayNativeShieldPayer, RailwayNativeShieldPreparation,
-    RailwayNativeShieldProfile, RailwayNativeShieldUndelivered, ShieldSendOutput, TxReceiptOutput,
-    prepare_railway_native_shield, public_shield_recipient, railway_native_shield_profile,
+    NativeShieldContracts, NativeShieldPayer, NativeShieldPreparation, NativeShieldUndelivered,
+    PublicActionGasFeeMode, PublicActionGasFeeSelection, PublicAssetId, PublicShieldApprovalMode,
+    PublicShieldRequest, PublicShieldTransactionProfile, ShieldSendOutput, TxReceiptOutput,
+    prepare_native_shield, public_shield_recipient, stealth_native_shield_contracts,
     submit_public_shield,
 };
 use crate::settings::EffectiveChainConfig;
@@ -83,7 +83,7 @@ impl Payer {
         store
             .create_vault_with_params(TEST_PASSWORD, KdfParams::new(1024, 1, 1))
             .expect("create vault");
-        let wallet_id = "railway-native-fork";
+        let wallet_id = "native-shield-fork";
         let metadata = store
             .new_wallet_metadata(TEST_PASSWORD, wallet_id, 0, WalletSource::Imported, "Fork")
             .expect("wallet metadata");
@@ -102,7 +102,7 @@ impl Payer {
                 .load_view_session(TEST_PASSWORD, wallet_id)
                 .expect("view session"),
         );
-        let secret = keccak256(b"railoxide railway native shield fork payer");
+        let secret = keccak256(b"railoxide native shield fork payer");
         let key = PrivateKeySigner::from_bytes(&secret).unwrap();
         let account = store
             .import_public_account(TEST_PASSWORD, &view, &secret.to_string(), None, false)
@@ -157,22 +157,23 @@ impl Payer {
             .unwrap_or_else(|error| panic!("{method}: {error}"));
     }
 
-    fn profile(&self) -> RailwayNativeShieldProfile {
-        railway_native_shield_profile(
-            self.chain_id,
-            &self.chain,
-            RailwayNativeShieldPayer::Software,
-        )
-        .unwrap()
+    fn contracts(&self) -> NativeShieldContracts {
+        stealth_native_shield_contracts(self.chain_id, &self.chain, NativeShieldPayer::Software)
+            .unwrap()
     }
 
     /// The real preparation: the estimate of the complete type-4 request.
-    async fn prepare(&self, amount: U256) -> Arc<RailwayNativeShieldPreparation> {
+    async fn prepare(
+        &self,
+        profile: PublicShieldTransactionProfile,
+        amount: U256,
+    ) -> Arc<NativeShieldPreparation> {
         Arc::new(
-            prepare_railway_native_shield(
+            prepare_native_shield(
                 self.chain_id,
                 &self.chain,
-                RailwayNativeShieldPayer::Software,
+                profile,
+                NativeShieldPayer::Software,
                 self.address,
                 public_shield_recipient(&self.view).unwrap(),
                 amount,
@@ -187,8 +188,9 @@ impl Payer {
         &self,
         asset: PublicAssetId,
         profile: PublicShieldTransactionProfile,
+        approval_mode: PublicShieldApprovalMode,
         amount: U256,
-        native_preparation: Option<Arc<RailwayNativeShieldPreparation>>,
+        native_preparation: Option<Arc<NativeShieldPreparation>>,
     ) -> PublicShieldRequest {
         PublicShieldRequest {
             executor_owner: Some(Arc::clone(&self.owner)),
@@ -204,6 +206,7 @@ impl Payer {
             asset,
             amount,
             profile,
+            approval_mode,
             native_operation: native_preparation
                 .is_some()
                 .then(|| ExecutorOperationId::random().unwrap()),
@@ -220,12 +223,25 @@ impl Payer {
         &self,
         asset: PublicAssetId,
         profile: PublicShieldTransactionProfile,
+        approval_mode: PublicShieldApprovalMode,
         amount: U256,
-        native_preparation: Option<Arc<RailwayNativeShieldPreparation>>,
+        native_preparation: Option<Arc<NativeShieldPreparation>>,
     ) -> eyre::Result<ShieldSendOutput> {
         submit_public_shield(
-            self.request(asset, profile, amount, native_preparation),
+            self.request(asset, profile, approval_mode, amount, native_preparation),
             &self.http,
+        )
+        .await
+    }
+
+    /// `wrapped`'s allowance from the payer to the Railgun contract.
+    async fn allowance(&self, fork: &ForkChain, wrapped: Address) -> U256 {
+        fork.call(
+            wrapped,
+            ForkAllowance::allowanceCall {
+                owner: self.address,
+                spender: self.chain.railgun.as_ref().unwrap().deployment.contract,
+            },
         )
         .await
     }
@@ -309,31 +325,44 @@ fn shielded(receipt: &TransactionReceipt, railgun: Address, token: Address, amou
     value
 }
 
-/// The complete native Mimic route on `chain_id`: real preparation, the payer's type-4
-/// transaction delegating the wallet's stealth account and wrapping and shielding its value,
-/// and the stealth record holding the payload that was sent.
-async fn native_shield_completes(url_env: &str, chain_id: u64) {
+/// The complete stealth route on `chain_id` in `profile`: real preparation with the
+/// profile's buffer, the payer's type-4 transaction delegating the wallet's stealth account and
+/// wrapping and shielding its value, and the stealth record, hidden once settled, holding the
+/// payload that was sent.
+async fn native_shield_completes(
+    url_env: &str,
+    chain_id: u64,
+    profile: PublicShieldTransactionProfile,
+) {
     let fork = ForkChain::start_destination_from(url_env, chain_id).await;
     let payer = Payer::open(&fork, chain_id).await;
-    let profile = payer.profile();
+    let contracts = payer.contracts();
     let amount = U256::from(NATIVE_AMOUNT);
-    let preparation = payer.prepare(amount).await;
+    let preparation = payer.prepare(profile, amount).await;
+    let raw = preparation.raw_gas_limit();
+    let buffered = match profile {
+        PublicShieldTransactionProfile::Railway => raw * 120 / 100,
+        PublicShieldTransactionProfile::Railoxide => raw + payer.chain.gas.gas_limit_buffer,
+    };
+    assert_eq!(preparation.gas_limit(), buffered);
     let held = fork
-        .erc20_balance(profile.wrapped_native, profile.railgun)
+        .erc20_balance(contracts.wrapped_native, contracts.railgun)
         .await;
 
     let output = payer
         .shield(
             PublicAssetId::Native,
-            PublicShieldTransactionProfile::Railway,
+            profile,
+            PublicShieldApprovalMode::Exact,
             amount,
             Some(Arc::clone(&preparation)),
         )
         .await
         .expect("the native shield is delivered");
-    assert!(output.approve.is_none());
+    assert!(output.wrap.is_none() && output.approve.is_none());
     let hash: B256 = output.shield.tx_hash.parse().unwrap();
     let record = payer.stealth_record();
+    assert!(record.is_hidden(), "a settled stealth account is hidden");
     let stealth = record.address().unwrap();
     let [payload] = record.issued() else {
         panic!("one issued payload");
@@ -343,16 +372,16 @@ async fn native_shield_completes(url_env: &str, chain_id: u64) {
     assert_eq!(payload.transaction_hashes(), [hash]);
     let value = shielded(
         &fork.receipt(hash).await,
-        profile.railgun,
-        profile.wrapped_native,
+        contracts.railgun,
+        contracts.wrapped_native,
         amount,
     );
     assert_eq!(
-        fork.erc20_balance(profile.wrapped_native, profile.railgun)
+        fork.erc20_balance(contracts.wrapped_native, contracts.railgun)
             .await,
         held + value
     );
-    assert_eq!(fork.code(stealth).await, delegation(profile.delegate));
+    assert_eq!(fork.code(stealth).await, delegation(contracts.delegate));
     assert_eq!(fork.transaction_count(stealth).await, 1);
     assert_eq!(fork.native_balance(stealth).await, U256::ZERO);
 
@@ -362,47 +391,113 @@ async fn native_shield_completes(url_env: &str, chain_id: u64) {
     let sent = sent.tx().clone();
     assert_eq!(sent.to, stealth);
     assert!(sent.gas_limit <= preparation.gas_limit());
+    eprintln!(
+        "chain {chain_id} {} stealth-route native shield: {} gas used, {} signed limit",
+        profile.display_name(),
+        output.shield.gas_used,
+        sent.gas_limit
+    );
 
     payer.finish();
 }
 
 #[tokio::test]
 #[ignore = "needs ETH_FORK_RPC_URL and anvil"]
-async fn railway_native_shield_fork_completes_on_ethereum() {
-    native_shield_completes(FORK_RPC_URL_ENV, 1).await;
+async fn native_shield_fork_completes_on_ethereum_in_railoxide() {
+    native_shield_completes(
+        FORK_RPC_URL_ENV,
+        1,
+        PublicShieldTransactionProfile::Railoxide,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn native_shield_fork_completes_on_ethereum_with_mimic_railway() {
+    native_shield_completes(FORK_RPC_URL_ENV, 1, PublicShieldTransactionProfile::Railway).await;
 }
 
 #[tokio::test]
 #[ignore = "needs BNB_FORK_RPC_URL and anvil"]
-async fn railway_native_shield_fork_completes_on_bnb_chain() {
-    native_shield_completes(BNB_FORK_RPC_URL_ENV, 56).await;
+async fn native_shield_fork_completes_on_bnb_chain_in_railoxide() {
+    native_shield_completes(
+        BNB_FORK_RPC_URL_ENV,
+        56,
+        PublicShieldTransactionProfile::Railoxide,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs BNB_FORK_RPC_URL and anvil"]
+async fn native_shield_fork_completes_on_bnb_chain_with_mimic_railway() {
+    native_shield_completes(
+        BNB_FORK_RPC_URL_ENV,
+        56,
+        PublicShieldTransactionProfile::Railway,
+    )
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "needs POLYGON_FORK_RPC_URL and anvil"]
-async fn railway_native_shield_fork_completes_on_polygon() {
-    native_shield_completes(POLYGON_FORK_RPC_URL_ENV, 137).await;
+async fn native_shield_fork_completes_on_polygon_in_railoxide() {
+    native_shield_completes(
+        POLYGON_FORK_RPC_URL_ENV,
+        137,
+        PublicShieldTransactionProfile::Railoxide,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs POLYGON_FORK_RPC_URL and anvil"]
+async fn native_shield_fork_completes_on_polygon_with_mimic_railway() {
+    native_shield_completes(
+        POLYGON_FORK_RPC_URL_ENV,
+        137,
+        PublicShieldTransactionProfile::Railway,
+    )
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "needs ARBITRUM_FORK_RPC_URL and anvil"]
-async fn railway_native_shield_fork_completes_on_arbitrum() {
-    native_shield_completes(ARBITRUM_FORK_RPC_URL_ENV, 42161).await;
+async fn native_shield_fork_completes_on_arbitrum_in_railoxide() {
+    native_shield_completes(
+        ARBITRUM_FORK_RPC_URL_ENV,
+        42161,
+        PublicShieldTransactionProfile::Railoxide,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs ARBITRUM_FORK_RPC_URL and anvil"]
+async fn native_shield_fork_completes_on_arbitrum_with_mimic_railway() {
+    native_shield_completes(
+        ARBITRUM_FORK_RPC_URL_ENV,
+        42161,
+        PublicShieldTransactionProfile::Railway,
+    )
+    .await;
 }
 
 /// A delegation whose nonce the stealth account has passed is skipped: the payer's
 /// transaction succeeds, but only moves the value to the stealth account. The shield fails
-/// without its `Shield` event, naming the account, whose record stays for recovery.
+/// without its `Shield` event, naming the account, whose record stays visible for recovery.
 #[tokio::test]
 #[ignore = "needs ETH_FORK_RPC_URL and anvil"]
-async fn railway_native_shield_fork_leaves_a_skipped_delegation_recoverable() {
+async fn native_shield_fork_leaves_a_skipped_delegation_recoverable() {
     let fork = ForkChain::start_destination_from(FORK_RPC_URL_ENV, 1).await;
     let payer = Payer::open(&fork, 1).await;
-    let profile = payer.profile();
+    let contracts = payer.contracts();
+    let profile = PublicShieldTransactionProfile::Railoxide;
     let amount = U256::from(NATIVE_AMOUNT);
-    let preparation = payer.prepare(amount).await;
+    let preparation = payer.prepare(profile, amount).await;
     let held = fork
-        .erc20_balance(profile.wrapped_native, profile.railgun)
+        .erc20_balance(contracts.wrapped_native, contracts.railgun)
         .await;
     // Held in the pool, the shield waits while its stealth account passes the signed
     // delegation's nonce 0.
@@ -436,7 +531,8 @@ async fn railway_native_shield_fork_leaves_a_skipped_delegation_recoverable() {
     let (shielded, stealth) = tokio::join!(
         payer.shield(
             PublicAssetId::Native,
-            PublicShieldTransactionProfile::Railway,
+            profile,
+            PublicShieldApprovalMode::Exact,
             amount,
             Some(preparation),
         ),
@@ -444,26 +540,31 @@ async fn railway_native_shield_fork_leaves_a_skipped_delegation_recoverable() {
     );
     let error = shielded.expect_err("the shield is skipped");
     let undelivered = error
-        .downcast_ref::<RailwayNativeShieldUndelivered>()
+        .downcast_ref::<NativeShieldUndelivered>()
         .expect("an undelivered shield");
     assert_eq!(undelivered.stealth_account, stealth);
     assert!(fork.code(stealth).await.is_empty());
     assert_eq!(fork.native_balance(stealth).await, amount);
     assert_eq!(
-        fork.erc20_balance(profile.wrapped_native, profile.railgun)
+        fork.erc20_balance(contracts.wrapped_native, contracts.railgun)
             .await,
         held
     );
-    assert_eq!(payer.stealth_record().address(), Some(stealth));
+    let record = payer.stealth_record();
+    assert_eq!(record.address(), Some(stealth));
+    assert!(
+        !record.is_hidden(),
+        "an undelivered shield's account stays visible"
+    );
     payer.finish();
 }
 
 /// The Mimic ERC-20 reference path approves the maximum only when the allowance is short,
-/// with 120% estimates, and the ordinary Railoxide native shield still runs through
-/// `RelayAdapt`.
+/// with 120% estimates, even when exact approval was chosen. The Railoxide wrap fallback wraps,
+/// approves by the chosen mode and shields the wrapped token directly.
 #[tokio::test]
 #[ignore = "needs ETH_FORK_RPC_URL and anvil"]
-async fn railway_erc20_and_railoxide_native_shields_fork_still_complete() {
+async fn mimic_erc20_and_wrap_fallback_shields_fork_complete() {
     let fork = ForkChain::start_destination_from(FORK_RPC_URL_ENV, 1).await;
     let payer = Payer::open(&fork, 1).await;
     let deployment = payer.chain.railgun.as_ref().unwrap().deployment;
@@ -476,6 +577,7 @@ async fn railway_erc20_and_railoxide_native_shields_fork_still_complete() {
         .shield(
             PublicAssetId::Erc20(DAI),
             PublicShieldTransactionProfile::Railway,
+            PublicShieldApprovalMode::Exact,
             amount,
             None,
         )
@@ -509,6 +611,7 @@ async fn railway_erc20_and_railoxide_native_shields_fork_still_complete() {
         .shield(
             PublicAssetId::Erc20(DAI),
             PublicShieldTransactionProfile::Railway,
+            PublicShieldApprovalMode::Exact,
             amount,
             None,
         )
@@ -522,24 +625,65 @@ async fn railway_erc20_and_railoxide_native_shields_fork_still_complete() {
         amount,
     );
 
+    // A payer that can't use the stealth route shields without a preparation.
     let native_amount = U256::from(NATIVE_AMOUNT);
     let wrapped = payer.chain.wrapped_native_token.unwrap();
-    let held = fork.erc20_balance(wrapped, railgun).await;
-    let native = payer
+    for (mode, allowance) in [
+        // The exact approval is used up by its shield.
+        (PublicShieldApprovalMode::Exact, U256::ZERO),
+        (PublicShieldApprovalMode::UnlimitedWhenShort, U256::MAX),
+    ] {
+        let held = fork.erc20_balance(wrapped, railgun).await;
+        let native = payer
+            .shield(
+                PublicAssetId::Native,
+                PublicShieldTransactionProfile::Railoxide,
+                mode,
+                native_amount,
+                None,
+            )
+            .await
+            .expect("the wrap fallback shield");
+        let wrap = native.wrap.as_ref().expect("the fallback wraps first");
+        assert_eq!(
+            payer.transaction(wrap.tx_hash.parse().unwrap()).await.to(),
+            Some(wrapped)
+        );
+        assert!(native.approve.is_some(), "{mode:?}");
+        assert_eq!(payer.allowance(&fork, wrapped).await, allowance, "{mode:?}");
+        let hash: B256 = native.shield.tx_hash.parse().unwrap();
+        assert_eq!(payer.transaction(hash).await.to(), Some(railgun));
+        let value = shielded(&fork.receipt(hash).await, railgun, wrapped, native_amount);
+        assert_eq!(fork.erc20_balance(wrapped, railgun).await, held + value);
+        assert_eq!(fork.erc20_balance(wrapped, payer.address).await, U256::ZERO);
+    }
+    payer.finish();
+}
+
+/// A wrap fallback whose Shield step fails, here because every call to the Railgun contract
+/// reverts, leaves the deposited wrapped tokens with the payer.
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL and anvil"]
+async fn wrap_fallback_fork_keeps_the_wrapped_tokens_when_the_shield_fails() {
+    let fork = ForkChain::start_destination_from(FORK_RPC_URL_ENV, 1).await;
+    let payer = Payer::open(&fork, 1).await;
+    let railgun = payer.chain.railgun.as_ref().unwrap().deployment.contract;
+    let wrapped = payer.chain.wrapped_native_token.unwrap();
+    let amount = U256::from(NATIVE_AMOUNT);
+    // PUSH1 0, PUSH1 0, REVERT.
+    fork.set_code(railgun, Bytes::from_static(&[0x60, 0x00, 0x60, 0x00, 0xfd]))
+        .await;
+    let _ = payer
         .shield(
             PublicAssetId::Native,
             PublicShieldTransactionProfile::Railoxide,
-            native_amount,
+            PublicShieldApprovalMode::Exact,
+            amount,
             None,
         )
         .await
-        .expect("the Railoxide native shield");
-    let hash: B256 = native.shield.tx_hash.parse().unwrap();
-    assert_eq!(
-        payer.transaction(hash).await.to(),
-        Some(deployment.relay_adapt_contract)
-    );
-    let value = shielded(&fork.receipt(hash).await, railgun, wrapped, native_amount);
-    assert_eq!(fork.erc20_balance(wrapped, railgun).await, held + value);
+        .expect_err("the Shield step fails");
+    assert_eq!(fork.erc20_balance(wrapped, payer.address).await, amount);
+    assert_eq!(payer.allowance(&fork, wrapped).await, amount);
     payer.finish();
 }

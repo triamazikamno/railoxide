@@ -10,7 +10,7 @@ use broadcaster_core::contracts::railgun::{Call, ShieldRequest, TokenData, shiel
 use broadcaster_core::contracts::shield::build_shield_request;
 use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, eyre};
-use railgun_wallet::tx::RailgunGasModel;
+use railgun_wallet::tx::{GasEstimateMode, RailgunGasModel};
 use zeroize::Zeroizing;
 
 use super::{ExecutorDelivery, ExecutorOwner};
@@ -651,12 +651,26 @@ pub(super) fn recovery_gas_limits(
     // Same execution overhead used by private executor quotes. Final RPC estimation must
     // fit this reviewed ceiling; dependent calls cannot be estimated alone.
     vec![steps.iter().fold(model.executor(), |sum, step| {
-        sum.saturating_add(public_native_action_gas_units_with_buffer(
-            model,
-            &[*step],
-            buffer,
-        ))
+        sum.saturating_add(match step {
+            PublicActionProgressStep::Shield => {
+                recovery_shield_gas_units(model).saturating_add(buffer)
+            }
+            _ => public_native_action_gas_units_with_buffer(model, &[*step], buffer),
+        })
     })]
+}
+
+/// Recovery's Shield ceiling, unchanged since public native shields dropped `RelayAdapt`:
+/// the relay actions of a wrap and a shield, the wrap, and the shield.
+fn recovery_shield_gas_units(model: &RailgunGasModel) -> u64 {
+    model
+        .relay(2)
+        .saturating_add(public_native_action_gas_units_with_buffer(
+            model,
+            &[PublicActionProgressStep::Wrap],
+            0,
+        ))
+        .saturating_add(model.shield(GasEstimateMode::UpperBound, 1))
 }
 
 /// `swap_calls` bounds the calls a swap executor's batch runs before its asset steps.

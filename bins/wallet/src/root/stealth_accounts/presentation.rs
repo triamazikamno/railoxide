@@ -82,20 +82,35 @@ impl StealthAccountsView {
     }
 
     pub(super) fn purpose(id: SharedString, summary: &str, cx: &Context<'_, Self>) -> Div {
-        // Existing encrypted summaries store the recipient after this separator.
-        // Decode that value with Alloy while leaving the stored intent untouched.
+        // Existing encrypted summaries store the recipient after this separator: an EVM
+        // address, or the 0zk address a native shield pays. The stored intent is untouched.
         let recipient = summary.split_once(" → ").and_then(|(intent, recipient)| {
-            let (address, suffix) = recipient.split_once(' ').unwrap_or((recipient, ""));
-            address
-                .parse::<Address>()
-                .ok()
-                .map(|address| (intent, address, suffix))
+            let (recipient, suffix) = recipient.split_once(' ').unwrap_or((recipient, ""));
+            let (value, display) = if let Ok(address) = recipient.parse::<Address>() {
+                (
+                    address.to_checksum(None),
+                    railgun_ui::short_address(&address),
+                )
+            } else if wallet_ops::parse_railgun_recipient(recipient).is_ok() {
+                (
+                    recipient.to_owned(),
+                    crate::root::spend_authorization::spend_authorization_recipient_display(
+                        recipient,
+                    ),
+                )
+            } else {
+                return None;
+            };
+            Some((intent, value, display, suffix))
         });
         let content = div().flex().flex_wrap().items_center().gap_x_1();
-        if let Some((intent, address, suffix)) = recipient {
+        if let Some((intent, value, display, suffix)) = recipient {
             content
                 .child(app_text(format!("{intent} →")))
-                .child(Self::address(id, address, cx).text_color(cx.theme().foreground))
+                .child(
+                    Self::copyable_identifier(id, value, display, "Copy address", cx)
+                        .text_color(cx.theme().foreground),
+                )
                 .child(app_text(suffix.to_owned()).text_xs())
         } else {
             content.child(app_text(summary.to_owned()).whitespace_normal())

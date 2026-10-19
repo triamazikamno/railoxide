@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
 use alloy::network::TransactionBuilder as _;
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::primitives::{Address, U256};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use eyre::{Result, WrapErr, eyre};
 
-use super::contracts::{PublicErc20, PublicRelayAdapt, RelayAdaptCall};
+use super::contracts::{PublicErc20, PublicWrappedNative};
 use super::gas::public_advanced_transaction_payload_fingerprint;
-use super::railway_native::{
-    RailwayNativeShieldPayer, RailwayNativeShieldPreparation, ensure_native_shield_delivered,
-    railway_native_shield_profile,
+use super::native_shield::{
+    NativeShieldPayer, NativeShieldPreparation, ensure_native_shield_delivered,
+    stealth_native_shield_contracts,
 };
 use super::runtime::{
     PublicChainRuntimeConfig, public_shield_token, verified_public_chain_runtime_config,
@@ -28,8 +28,8 @@ use super::types::{
     PublicActionGasLimitStrategy, PublicActionProgressStatus, PublicActionProgressStep,
     PublicActionProgressUpdate, PublicActionSessionEvent, PublicActionSessionEventSender,
     PublicActionStepFeePolicy, PublicAdvancedTransactionAuthorization, PublicAssetId,
-    PublicSendRequest, PublicSendResult, PublicShieldRequest, PublicShieldTransactionProfile,
-    PublicTransactionIntent,
+    PublicSendRequest, PublicSendResult, PublicShieldApprovalMode, PublicShieldRequest,
+    PublicShieldTransactionProfile, PublicTransactionIntent,
 };
 use crate::block_observer::resolve_source_transaction_by_block;
 use crate::settings::EffectiveChainConfig;
@@ -244,6 +244,19 @@ pub async fn submit_public_shield_with_progress(
         return Err(eyre!("amount is required"));
     }
     request.effective_chain.require_railgun()?;
+    let native_prepared = request.native_preparation.is_some();
+    // A native shield without a preparation wraps first, which only Railoxide does. A
+    // reviewed route is never switched here.
+    let wrap_fallback = request.asset == PublicAssetId::Native && !native_prepared;
+    if (native_prepared && request.asset != PublicAssetId::Native)
+        || (wrap_fallback
+            && (request.profile != PublicShieldTransactionProfile::Railoxide
+                || request.effective_chain.wrapped_native_token.is_none()))
+    {
+        return Err(eyre!(
+            "native shielding needs a fresh preparation and review"
+        ));
+    }
     let chain = verified_public_chain_runtime_config(
         request.chain_id,
         &request.effective_chain,
@@ -253,14 +266,7 @@ pub async fn submit_public_shield_with_progress(
     .await?;
     let token = public_shield_token(request.asset, &chain)?;
     let addr_data = public_shield_recipient(&request.view_session)?;
-    let native_mimic = request.profile == PublicShieldTransactionProfile::Railway
-        && request.asset == PublicAssetId::Native;
-    if native_mimic != request.native_preparation.is_some() {
-        return Err(eyre!(
-            "Mimic Railway native shielding needs a fresh preparation and review"
-        ));
-    }
-    let signer = if native_mimic
+    let signer = if native_prepared
         && let Some(authorization @ crate::DesktopPrivateSpendAuthorization::HardwareExecutor(_)) =
             request.authorization.as_ref()
     {
@@ -288,7 +294,7 @@ pub async fn submit_public_shield_with_progress(
         .await?
     };
     if let Some(preparation) = request.native_preparation.clone() {
-        return Box::pin(submit_railway_native_shield(
+        return Box::pin(submit_stealth_native_shield(
             request,
             &preparation,
             signer,
@@ -299,6 +305,9 @@ pub async fn submit_public_shield_with_progress(
         ))
         .await;
     }
+    // The wrap fallback shields the wrapped token it deposits as an ERC-20.
+    let shield_asset = PublicAssetId::Erc20(token);
+    let approval_mode = request.profile.approval_mode(request.approval_mode);
     signer
         .while_active(async {
             let mut nonce = None;
@@ -371,50 +380,7 @@ pub async fn submit_public_shield_with_progress(
             let query_rpc_pool =
                 query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
 
-            let approval_required = if request.asset == PublicAssetId::Native {
-                false
-            } else if request.profile == PublicShieldTransactionProfile::Railoxide {
-                true
-            } else {
-                progress(public_action_progress_update(
-                    PublicActionProgressStep::Approve,
-                    PublicActionProgressStatus::Pending,
-                    None,
-                    None,
-                ));
-                match query_erc20_allowance(
-                    &chain.rpc_route,
-                    http,
-                    request.asset,
-                    from_address,
-                    chain.require_railgun()?.contract,
-                )
-                .await
-                {
-                    Ok(allowance) => {
-                        public_shield_approval_required(request.profile, allowance, request.amount)
-                    }
-                    Err(error) => {
-                        let message = report_chain_string(&error);
-                        progress(public_action_progress_update(
-                            PublicActionProgressStep::Approve,
-                            PublicActionProgressStatus::Error,
-                            None,
-                            Some(message.clone()),
-                        ));
-                        emit_public_action_event(
-                            event_tx.as_ref(),
-                            PublicActionSessionEvent::StepFailed {
-                                step: PublicActionProgressStep::Approve,
-                                message,
-                            },
-                        );
-                        return Err(error).wrap_err("check public shield ERC-20 allowance");
-                    }
-                }
-            };
-
-            let (approval_gas_units, shield_gas_units) =
+            let (wrap_gas_units, approval_gas_units, shield_gas_units) =
                 super::gas::public_shield_estimated_gas_units(
                     railgun_wallet::tx::RailgunGasModel::for_chain(request.chain_id),
                     request.asset,
@@ -422,6 +388,120 @@ pub async fn submit_public_shield_with_progress(
                     chain.gas.gas_limit_buffer,
                 )
                 .ok_or_else(|| eyre!("public shield has no gas model"))?;
+            let wrap_receipt = if wrap_fallback {
+                let wrap_tx = TransactionRequest::default()
+                    .with_chain_id(request.chain_id)
+                    .with_from(from_address)
+                    .with_to(token)
+                    .with_input(PublicWrappedNative::depositCall {}.abi_encode())
+                    .with_value(request.amount)
+                    .with_nonce(0);
+                let wrap_outcome = submit_public_action_step_session(
+                    PublicActionProgressStep::Wrap,
+                    wrap_tx,
+                    request.profile,
+                    request.asset,
+                    request.profile.gas_limit_strategy(),
+                    &signer,
+                    "public-shield-wrap",
+                    query_rpc_pool.clone(),
+                    &chain.rpc_route,
+                    chain.finality_depth,
+                    http,
+                    request.transaction_tracking.as_ref(),
+                    request.chain_id,
+                    from_address,
+                    &chain.gas,
+                    Some(PublicShieldFundingBudget {
+                        gas_units: wrap_gas_units,
+                        remaining_shield_gas_units: approval_gas_units
+                            .saturating_add(shield_gas_units),
+                        remaining_max_fee_per_gas: None,
+                    }),
+                    None,
+                    nonce,
+                    gas_fee,
+                    fee_policy,
+                    Some(request.authorized_fee_ceiling),
+                    &mut command_rx,
+                    event_tx.as_ref(),
+                    None,
+                    PublicActionStepEnd::Receipt,
+                    &mut progress,
+                )
+                .await?
+                .into_receipt()?;
+                let receipt = wrap_outcome.receipt;
+                if !receipt.status {
+                    return Err(eyre!(
+                        "public shield wrap transaction reverted ({})",
+                        receipt.tx_hash
+                    ));
+                }
+                // Only Railoxide wraps, so the later steps carry this step's fee.
+                nonce = Some(wrap_outcome.next_nonce);
+                gas_fee = wrap_outcome.gas_fee;
+                fee_policy = PublicActionStepFeePolicy::Custom;
+                Some(receipt)
+            } else {
+                None
+            };
+
+            let approval_required = if approval_mode == PublicShieldApprovalMode::Exact {
+                true
+            } else {
+                loop {
+                    progress(public_action_progress_update(
+                        PublicActionProgressStep::Approve,
+                        PublicActionProgressStatus::Pending,
+                        None,
+                        None,
+                    ));
+                    match query_erc20_allowance(
+                        &chain.rpc_route,
+                        http,
+                        shield_asset,
+                        from_address,
+                        chain.require_railgun()?.contract,
+                    )
+                    .await
+                    {
+                        Ok(allowance) => {
+                            break public_shield_approval_required(
+                                approval_mode,
+                                allowance,
+                                request.amount,
+                            );
+                        }
+                        Err(error) => {
+                            let message = report_chain_string(&error);
+                            progress(public_action_progress_update(
+                                PublicActionProgressStep::Approve,
+                                PublicActionProgressStatus::Error,
+                                None,
+                                Some(message.clone()),
+                            ));
+                            emit_public_action_event(
+                                event_tx.as_ref(),
+                                PublicActionSessionEvent::StepFailed {
+                                    step: PublicActionProgressStep::Approve,
+                                    message,
+                                },
+                            );
+                            let Some(command) = recv_public_action_command(&mut command_rx).await
+                            else {
+                                return Err(error).wrap_err("check public shield ERC-20 allowance");
+                            };
+                            // An unchanged fee keeps Mimic Auto's captured fee or the Wrap fee.
+                            if command.gas_fee != gas_fee {
+                                gas_fee = command.gas_fee;
+                                fee_policy = PublicActionStepFeePolicy::Custom;
+                            }
+                        }
+                    }
+                }
+            };
+
             let remaining_max_fee_per_gas = if approval_required
                 && request.profile == PublicShieldTransactionProfile::Railway
                 && request.gas_fee_mode == PublicActionGasFeeMode::Auto
@@ -430,7 +510,7 @@ pub async fn submit_public_shield_with_progress(
                     super::gas::resolve_public_action_gas_fee(
                         request.chain_id,
                         request.profile,
-                        request.asset,
+                        shield_asset,
                         request.authorized_fee_ceiling,
                         None,
                     )?
@@ -439,19 +519,8 @@ pub async fn submit_public_shield_with_progress(
             } else {
                 None
             };
-            let approve_receipt = if request.asset == PublicAssetId::Native {
-                None
-            } else if !approval_required {
-                progress(public_action_progress_update(
-                    PublicActionProgressStep::Approve,
-                    PublicActionProgressStatus::Done,
-                    None,
-                    Some("Existing allowance is sufficient".to_string()),
-                ));
-                None
-            } else {
-                let approval_amount =
-                    public_shield_approval_amount(request.profile, request.amount);
+            let approve_receipt = if approval_required {
+                let approval_amount = public_shield_approval_amount(approval_mode, request.amount);
                 let approve_data = broadcaster_core::contracts::shield::build_approve_calldata(
                     chain.require_railgun()?.contract,
                     approval_amount,
@@ -466,7 +535,7 @@ pub async fn submit_public_shield_with_progress(
                     PublicActionProgressStep::Approve,
                     approve_tx,
                     request.profile,
-                    request.asset,
+                    shield_asset,
                     request.profile.gas_limit_strategy(),
                     &signer,
                     "public-shield-approve",
@@ -514,29 +583,27 @@ pub async fn submit_public_shield_with_progress(
                     fee_policy = PublicActionStepFeePolicy::Custom;
                 }
                 Some(receipt)
+            } else {
+                progress(public_action_progress_update(
+                    PublicActionProgressStep::Approve,
+                    PublicActionProgressStatus::Done,
+                    None,
+                    Some("Existing allowance is sufficient".to_string()),
+                ));
+                None
             };
 
-            let shield_tx = if request.asset == PublicAssetId::Native {
-                public_native_shield_transaction_request(
-                    request.chain_id,
-                    from_address,
-                    chain.require_railgun()?.relay_adapt_contract,
-                    request.amount,
-                    shield_data,
-                )
-            } else {
-                TransactionRequest::default()
-                    .with_chain_id(request.chain_id)
-                    .with_from(from_address)
-                    .with_to(chain.require_railgun()?.contract)
-                    .with_input(shield_data)
-                    .with_nonce(0)
-            };
+            let shield_tx = TransactionRequest::default()
+                .with_chain_id(request.chain_id)
+                .with_from(from_address)
+                .with_to(chain.require_railgun()?.contract)
+                .with_input(shield_data)
+                .with_nonce(0);
             let shield_receipt = submit_public_action_step_session(
                 PublicActionProgressStep::Shield,
                 shield_tx,
                 request.profile,
-                request.asset,
+                shield_asset,
                 request.profile.gas_limit_strategy(),
                 &signer,
                 "public-shield",
@@ -575,7 +642,7 @@ pub async fn submit_public_shield_with_progress(
             }
 
             Ok(ShieldSendOutput {
-                wrap: None,
+                wrap: wrap_receipt,
                 approve: approve_receipt,
                 shield: shield_receipt,
             })
@@ -583,11 +650,11 @@ pub async fn submit_public_shield_with_progress(
         .await
 }
 
-/// A Mimic Railway native shield from a stealth account of the selected private wallet,
-/// funded and sent by the admitted payer `signer`.
-async fn submit_railway_native_shield(
+/// A native shield from a stealth account of the selected private wallet, funded and sent by
+/// the admitted payer `signer`, in the transaction profile it was prepared for.
+async fn submit_stealth_native_shield(
     mut request: PublicShieldRequest,
-    preparation: &RailwayNativeShieldPreparation,
+    preparation: &NativeShieldPreparation,
     signer: VaultedPublicSigner,
     chain: &PublicChainRuntimeConfig,
     recipient: &broadcaster_core::crypto::railgun::AddressData,
@@ -597,13 +664,19 @@ async fn submit_railway_native_shield(
     let mut command_rx = request.command_rx.take();
     let event_tx = request.event_tx.take();
     // Checked before the shield key or any transaction is signed.
-    let profile = railway_native_shield_profile(
+    let contracts = stealth_native_shield_contracts(
         request.chain_id,
         &request.effective_chain,
-        RailwayNativeShieldPayer::of(&signer, request.authorization.as_ref()),
+        NativeShieldPayer::of(&signer, request.authorization.as_ref()),
     )?;
     let payer = signer.address();
-    preparation.ensure_matches(&profile, payer, recipient, request.amount)?;
+    preparation.ensure_matches(
+        &contracts,
+        request.profile,
+        payer,
+        recipient,
+        request.amount,
+    )?;
     let owner = request.executor_owner.as_ref().ok_or_else(|| {
         eyre!("Wait for the private wallet's network to load, then shield again.")
     })?;
@@ -611,7 +684,7 @@ async fn submit_railway_native_shield(
         (request.native_operation, request.authorization.as_ref())
     else {
         return Err(eyre!(
-            "Mimic Railway native shielding needs a fresh preparation and review"
+            "native shielding needs a fresh preparation and review"
         ));
     };
     let shield_private_key = signer.derive_shield_private_key().await?;
@@ -642,7 +715,7 @@ async fn submit_railway_native_shield(
             &request.view_session,
             payer,
             authorization,
-            profile.wrapped_native,
+            contracts.wrapped_native,
             request.amount,
             shield_request,
             &purpose_summary,
@@ -674,7 +747,9 @@ async fn submit_railway_native_shield(
     }
     let mut handoff = owner.native_shield_handoff(&issued)?;
     let handoff: &mut PublicActionHandoff<'_> = &mut handoff;
-    let fee_policy = if request.gas_fee_mode == PublicActionGasFeeMode::Auto {
+    let fee_policy = if request.profile == PublicShieldTransactionProfile::Railway
+        && request.gas_fee_mode == PublicActionGasFeeMode::Auto
+    {
         PublicActionStepFeePolicy::Captured
     } else {
         PublicActionStepFeePolicy::Custom
@@ -687,8 +762,9 @@ async fn submit_railway_native_shield(
                 issued.transaction().clone(),
                 request.profile,
                 request.asset,
-                PublicActionGasLimitStrategy::RailwayNativePrepared {
+                PublicActionGasLimitStrategy::NativeShieldPrepared {
                     reviewed_gas_limit: preparation.gas_limit(),
+                    profile: request.profile,
                 },
                 &signer,
                 "public-shield",
@@ -726,7 +802,7 @@ async fn submit_railway_native_shield(
     // The session reported the revert, which returned the value to the payer.
     if !receipt.status {
         return Err(eyre!(
-            "Mimic Railway native shield transaction reverted ({}); prepare and review a new shield to try again",
+            "Native shield transaction reverted ({}); prepare and review a new shield to try again",
             receipt.tx_hash
         ));
     }
@@ -743,7 +819,7 @@ async fn submit_railway_native_shield(
     }
     .await;
     if let Err(error) =
-        ensure_native_shield_delivered(&profile, stealth_account, &receipt.tx_hash, logs)
+        ensure_native_shield_delivered(&contracts, stealth_account, &receipt.tx_hash, logs)
     {
         let error = eyre::Report::new(error);
         let message = report_chain_string(&error);
@@ -768,6 +844,8 @@ async fn submit_railway_native_shield(
         Some(receipt.tx_hash.clone()),
         None,
     ));
+    // A settled account needs no attention; a failed write only leaves its row visible.
+    let _ = owner.set_hidden(operation, true);
     // The shield is proven; a failed read leaves the account to its next reconciliation.
     let _ = owner.reconcile_account(operation).await;
     Ok(ShieldSendOutput {
@@ -790,23 +868,24 @@ pub fn public_shield_recipient(
 }
 
 pub(super) const fn public_shield_approval_amount(
-    profile: PublicShieldTransactionProfile,
+    mode: PublicShieldApprovalMode,
     amount: U256,
 ) -> U256 {
-    match profile {
-        PublicShieldTransactionProfile::Railway => U256::MAX,
-        PublicShieldTransactionProfile::Railoxide => amount,
+    match mode {
+        PublicShieldApprovalMode::UnlimitedWhenShort => U256::MAX,
+        PublicShieldApprovalMode::Exact => amount,
     }
 }
 
+/// An exact approval is signed for every shield, whatever the allowance.
 pub(super) fn public_shield_approval_required(
-    profile: PublicShieldTransactionProfile,
+    mode: PublicShieldApprovalMode,
     allowance: U256,
     amount: U256,
 ) -> bool {
-    match profile {
-        PublicShieldTransactionProfile::Railway => allowance < amount,
-        PublicShieldTransactionProfile::Railoxide => true,
+    match mode {
+        PublicShieldApprovalMode::UnlimitedWhenShort => allowance < amount,
+        PublicShieldApprovalMode::Exact => true,
     }
 }
 
@@ -874,42 +953,6 @@ pub(crate) async fn query_erc20_balance(
         .wrap_err("decode ERC-20 balance")
 }
 
-pub(super) fn public_native_shield_transaction_request(
-    chain_id: u64,
-    from: Address,
-    relay_adapt: Address,
-    amount: U256,
-    shield_data: Vec<u8>,
-) -> TransactionRequest {
-    let calls = vec![
-        RelayAdaptCall {
-            to: relay_adapt,
-            data: PublicRelayAdapt::wrapBaseCall { _amount: amount }
-                .abi_encode()
-                .into(),
-            value: U256::ZERO,
-        },
-        RelayAdaptCall {
-            to: relay_adapt,
-            data: Bytes::from(shield_data),
-            value: U256::ZERO,
-        },
-    ];
-    TransactionRequest::default()
-        .with_chain_id(chain_id)
-        .with_from(from)
-        .with_to(relay_adapt)
-        .with_input(
-            PublicRelayAdapt::multicallCall {
-                _requireSuccess: true,
-                _calls: calls,
-            }
-            .abi_encode(),
-        )
-        .with_value(amount)
-        .with_nonce(0)
-}
-
 pub(super) fn public_send_transaction_request(
     chain_id: u64,
     from: Address,
@@ -972,6 +1015,8 @@ pub(super) fn validate_public_transaction_intent(intent: &PublicTransactionInten
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::Bytes;
+
     use super::*;
 
     #[test]

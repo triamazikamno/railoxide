@@ -1,9 +1,12 @@
-//! Mimic Railway native shields, as Railway v5.26.1 constructs them: a type-4 transaction
-//! from the payer sends the approved value to a fresh stealth account with its delegation,
-//! and the account's signed `RelayAdapt7702` execution atomically wraps and shields it.
+//! Stealth-account native shields, in either transaction profile: a type-4 transaction from
+//! the payer sends the approved value to a fresh stealth account with its delegation, and the
+//! account's signed `RelayAdapt7702` execution atomically wraps and shields it. A payer that
+//! can't send it wraps, approves and shields with plain transactions instead, in the
+//! Railoxide profile only.
 //!
-//! Preparation, before review, fixes the raw and buffered gas of the complete type-4 request,
-//! estimated with a throwaway stand-in account and shield key that are never kept or sent.
+//! Preparation, before review, fixes the raw estimate of the complete type-4 request and the
+//! profile's buffered gas, estimated with a throwaway stand-in account and shield key that are
+//! never kept or sent.
 //! After payer authorization, Public Shield derives the real shield key, and the private
 //! wallet's executor owner reserves the stealth account and signs its execution.
 //!
@@ -34,9 +37,10 @@ use broadcaster_core::deployment::RailgunDeployment;
 use eyre::{Result, WrapErr, eyre};
 use zeroize::Zeroizing;
 
-use super::gas::{public_fee_candidates, railway_gas_limit};
+use super::gas::{native_shield_gas_limit, public_fee_candidates};
 use super::runtime::public_chain_runtime_config;
 use super::signer::VaultedPublicSigner;
+use super::types::{EvmFeeModel, PublicShieldTransactionProfile};
 use crate::desktop::executors::native_shield_execute_calldata;
 use crate::rpc_broker::RpcCandidates;
 use crate::settings::EffectiveChainConfig;
@@ -47,18 +51,19 @@ const MAX_PREPARATION_ATTEMPTS: usize = 3;
 
 static NEXT_PREPARATION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The contracts a stealth-account native shield uses on one chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RailwayNativeShieldProfile {
+pub struct NativeShieldContracts {
     pub chain_id: u64,
     pub railgun: Address,
     pub wrapped_native: Address,
     pub delegate: Address,
 }
 
-/// The payer capability native Mimic needs: a software type-4 signature, from a payer the
-/// private wallet's approval of its stealth account also admits.
+/// The payer capability the stealth-account native shield needs: a software type-4
+/// signature, from a payer the private wallet's approval of its stealth account also admits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RailwayNativeShieldPayer {
+pub enum NativeShieldPayer {
     /// A software or stealth-account payer of a software private wallet, or a software or
     /// imported payer of a Ledger or Trezor private wallet.
     Software,
@@ -70,7 +75,7 @@ pub enum RailwayNativeShieldPayer {
     Hardware,
 }
 
-impl RailwayNativeShieldPayer {
+impl NativeShieldPayer {
     pub(super) const fn of(
         signer: &VaultedPublicSigner,
         authorization: Option<&DesktopPrivateSpendAuthorization>,
@@ -92,62 +97,103 @@ impl RailwayNativeShieldPayer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum RailwayNativeShieldUnavailable {
-    #[error("Mimic Railway doesn't support native-token shields on this network")]
+pub enum NativeShieldUnavailable {
+    #[error("the stealth-account native shield isn't available on this network")]
     UnsupportedChain,
     #[error(
-        "this network's configured RelayAdapt7702 contract differs from the pinned deployment that Mimic Railway delegates to"
+        "this network's configured RelayAdapt7702 contract differs from the pinned deployment that the stealth-account native shield delegates to"
     )]
     IncompatibleContracts,
     #[error(
-        "hardware-wallet Public accounts can't sign the EIP-7702 (type-4) transaction that Mimic Railway uses for native-token shields"
+        "hardware-wallet Public accounts can't sign the EIP-7702 (type-4) transaction of the stealth-account native shield"
     )]
     HardwarePayer,
     #[error(
-        "with a Ledger or Trezor wallet, a stealth Public account can't pay for a Mimic Railway native-token shield, because one device approval can't cover both it and the shield's stealth account; use a software or imported Public account"
+        "with a Ledger or Trezor wallet, a stealth Public account can't pay for a stealth-account native shield, because one device approval can't cover both it and the shield's stealth account; use a software or imported Public account"
     )]
     HardwareWallet,
+    #[error(
+        "this network has no base fee, so it can't carry the EIP-7702 (type-4) transaction of the stealth-account native shield"
+    )]
+    NoBaseFee,
+    #[error("this network has no wrapped native token to shield native tokens through")]
+    NoWrappedNative,
 }
 
-/// The native Mimic profile for `chain_id`, or why the route is unavailable. Checked before
-/// any signing or funding.
-pub fn railway_native_shield_profile(
+/// The stealth-account native shield's contracts for `chain_id`, or why the route is
+/// unavailable. Checked before any signing or funding.
+pub fn stealth_native_shield_contracts(
     chain_id: u64,
     effective_chain: &EffectiveChainConfig,
-    payer: RailwayNativeShieldPayer,
-) -> Result<RailwayNativeShieldProfile, RailwayNativeShieldUnavailable> {
-    let pinned = RailgunDeployment::for_chain(chain_id)
-        .ok_or(RailwayNativeShieldUnavailable::UnsupportedChain)?;
+    payer: NativeShieldPayer,
+) -> Result<NativeShieldContracts, NativeShieldUnavailable> {
+    let pinned =
+        RailgunDeployment::for_chain(chain_id).ok_or(NativeShieldUnavailable::UnsupportedChain)?;
     let (Some(private), Some(wrapped_native)) = (
         effective_chain.railgun.as_ref(),
         effective_chain.wrapped_native_token,
     ) else {
-        return Err(RailwayNativeShieldUnavailable::UnsupportedChain);
+        return Err(NativeShieldUnavailable::UnsupportedChain);
     };
     // The stealth account delegates only to the pinned RelayAdapt7702, never an override.
     if private.deployment.relay_adapt_7702_contract != pinned.relay_adapt_7702_contract {
-        return Err(RailwayNativeShieldUnavailable::IncompatibleContracts);
+        return Err(NativeShieldUnavailable::IncompatibleContracts);
     }
-    let profile = RailwayNativeShieldProfile {
+    let contracts = NativeShieldContracts {
         chain_id,
         railgun: private.deployment.contract,
         wrapped_native,
         delegate: pinned.relay_adapt_7702_contract,
     };
     match payer {
-        RailwayNativeShieldPayer::Software => Ok(profile),
-        RailwayNativeShieldPayer::HardwareWallet => {
-            Err(RailwayNativeShieldUnavailable::HardwareWallet)
-        }
-        RailwayNativeShieldPayer::Hardware => Err(RailwayNativeShieldUnavailable::HardwarePayer),
+        NativeShieldPayer::Software => Ok(contracts),
+        NativeShieldPayer::HardwareWallet => Err(NativeShieldUnavailable::HardwareWallet),
+        NativeShieldPayer::Hardware => Err(NativeShieldUnavailable::HardwarePayer),
     }
 }
 
-/// A prepared native Mimic shield: the inputs it is bound to and the gas of its complete
-/// request.
-pub struct RailwayNativeShieldPreparation {
+/// How a native Public Shield reaches the private wallet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeShieldRoute {
+    /// One prepared type-4 transaction through a fresh stealth account.
+    Stealth(NativeShieldContracts),
+    /// Plain wrap, approve and shield transactions from the payer, in the Railoxide profile.
+    WrapFallback { wrapped_native: Address },
+}
+
+/// The stealth route when the chain, its fee model and `payer` allow it, otherwise the
+/// Railoxide wrap fallback. Mimic Railway has no fallback, so it reports why the stealth route
+/// is unavailable.
+pub fn select_native_shield_route(
+    chain_id: u64,
+    effective_chain: &EffectiveChainConfig,
+    payer: NativeShieldPayer,
+    profile: PublicShieldTransactionProfile,
+    observed_fee_model: Option<EvmFeeModel>,
+) -> Result<NativeShieldRoute, NativeShieldUnavailable> {
+    let reason = match stealth_native_shield_contracts(chain_id, effective_chain, payer) {
+        // A type-4 envelope needs a base fee.
+        Ok(_) if observed_fee_model == Some(EvmFeeModel::Legacy) => {
+            NativeShieldUnavailable::NoBaseFee
+        }
+        Ok(contracts) => return Ok(NativeShieldRoute::Stealth(contracts)),
+        Err(reason) => reason,
+    };
+    if profile == PublicShieldTransactionProfile::Railway || effective_chain.railgun.is_none() {
+        return Err(reason);
+    }
+    effective_chain
+        .wrapped_native_token
+        .map(|wrapped_native| NativeShieldRoute::WrapFallback { wrapped_native })
+        .ok_or(NativeShieldUnavailable::NoWrappedNative)
+}
+
+/// A prepared stealth-account native shield: the inputs and transaction profile it is bound
+/// to and the gas of its complete request.
+pub struct NativeShieldPreparation {
     id: u64,
-    profile: RailwayNativeShieldProfile,
+    contracts: NativeShieldContracts,
+    profile: PublicShieldTransactionProfile,
     payer: Address,
     recipient: AddressData,
     amount: U256,
@@ -155,33 +201,38 @@ pub struct RailwayNativeShieldPreparation {
     gas_limit: u64,
 }
 
-impl fmt::Debug for RailwayNativeShieldPreparation {
+impl fmt::Debug for NativeShieldPreparation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RailwayNativeShieldPreparation")
+        f.debug_struct("NativeShieldPreparation")
             .field("id", &self.id)
-            .field("chain_id", &self.profile.chain_id)
+            .field("chain_id", &self.contracts.chain_id)
+            .field("profile", &self.profile)
             .field("raw_gas_limit", &self.raw_gas_limit)
             .field("gas_limit", &self.gas_limit)
             .finish_non_exhaustive()
     }
 }
 
-impl RailwayNativeShieldPreparation {
+impl NativeShieldPreparation {
+    /// `gas_limit_buffer` is the chain's, which only the Railoxide profile adds.
     pub(super) fn new(
-        profile: RailwayNativeShieldProfile,
+        contracts: NativeShieldContracts,
+        profile: PublicShieldTransactionProfile,
         payer: Address,
         recipient: AddressData,
         amount: U256,
         raw_gas_limit: u64,
+        gas_limit_buffer: u64,
     ) -> Self {
         Self {
             id: NEXT_PREPARATION_ID.fetch_add(1, Ordering::Relaxed),
+            contracts,
             profile,
             payer,
             recipient,
             amount,
             raw_gas_limit,
-            gas_limit: railway_gas_limit(raw_gas_limit),
+            gas_limit: native_shield_gas_limit(profile, raw_gas_limit, gas_limit_buffer),
         }
     }
 
@@ -193,7 +244,13 @@ impl RailwayNativeShieldPreparation {
 
     #[must_use]
     pub const fn chain_id(&self) -> u64 {
-        self.profile.chain_id
+        self.contracts.chain_id
+    }
+
+    /// The transaction profile whose gas buffer and fee policy the preparation follows.
+    #[must_use]
+    pub const fn profile(&self) -> PublicShieldTransactionProfile {
+        self.profile
     }
 
     #[must_use]
@@ -203,7 +260,7 @@ impl RailwayNativeShieldPreparation {
 
     #[must_use]
     pub const fn delegate(&self) -> Address {
-        self.profile.delegate
+        self.contracts.delegate
     }
 
     /// The complete type-4 request's estimate, for the expected cost.
@@ -212,7 +269,7 @@ impl RailwayNativeShieldPreparation {
         self.raw_gas_limit
     }
 
-    /// floor(raw estimate * 120 / 100): the reviewed signing limit and maximum cost.
+    /// The raw estimate with the profile's buffer: the reviewed signing limit and maximum cost.
     #[must_use]
     pub const fn gas_limit(&self) -> u64 {
         self.gas_limit
@@ -221,12 +278,14 @@ impl RailwayNativeShieldPreparation {
     /// Rejects a submission whose bound inputs or route differ from this preparation.
     pub(super) fn ensure_matches(
         &self,
-        profile: &RailwayNativeShieldProfile,
+        contracts: &NativeShieldContracts,
+        profile: PublicShieldTransactionProfile,
         payer: Address,
         recipient: &AddressData,
         amount: U256,
     ) -> Result<()> {
-        if *profile != self.profile
+        if *contracts != self.contracts
+            || profile != self.profile
             || payer != self.payer
             || amount != self.amount
             || recipient.master_public_key != self.recipient.master_public_key
@@ -242,7 +301,7 @@ impl RailwayNativeShieldPreparation {
     /// The shield request of the prepared amount under the payer's real shield key.
     pub(super) fn shield_request(&self, shield_private_key: &[u8; 32]) -> Result<ShieldRequest> {
         native_shield_request(
-            &self.profile,
+            &self.contracts,
             &self.recipient,
             self.amount,
             shield_private_key,
@@ -254,9 +313,9 @@ impl RailwayNativeShieldPreparation {
 /// the stealth account, so a retry must not send to that account again.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "Mimic Railway native shield transaction {tx_hash} succeeded, but {reason}. Check stealth account {stealth_account} on the Stealth accounts screen and recover its value there."
+    "Native shield transaction {tx_hash} succeeded, but {reason}. Check stealth account {stealth_account} on the Stealth accounts screen and recover its value there."
 )]
-pub struct RailwayNativeShieldUndelivered {
+pub struct NativeShieldUndelivered {
     pub tx_hash: String,
     pub stealth_account: Address,
     reason: &'static str,
@@ -265,12 +324,12 @@ pub struct RailwayNativeShieldUndelivered {
 /// Fails a native shield whose transaction succeeded with `logs` unless they hold a Railgun
 /// `Shield` event, which only the shield's own execution can emit in its transaction.
 pub(super) fn ensure_native_shield_delivered(
-    profile: &RailwayNativeShieldProfile,
+    contracts: &NativeShieldContracts,
     stealth_account: Address,
     tx_hash: &str,
     logs: Result<Vec<Log>>,
-) -> Result<(), RailwayNativeShieldUndelivered> {
-    let undelivered = |reason| RailwayNativeShieldUndelivered {
+) -> Result<(), NativeShieldUndelivered> {
+    let undelivered = |reason| NativeShieldUndelivered {
         tx_hash: tx_hash.to_owned(),
         stealth_account,
         reason,
@@ -278,7 +337,7 @@ pub(super) fn ensure_native_shield_delivered(
     let logs = logs.map_err(|_| undelivered("its shield couldn't be verified"))?;
     if !logs
         .iter()
-        .filter(|log| log.inner.address == profile.railgun)
+        .filter(|log| log.inner.address == contracts.railgun)
         .any(|log| Shield::decode_log_data(&log.inner.data).is_ok())
     {
         return Err(undelivered("it has no shield"));
@@ -286,22 +345,23 @@ pub(super) fn ensure_native_shield_delivered(
     Ok(())
 }
 
-/// Prepares a native Mimic shield of `amount` from `payer_address` to `recipient`. The
-/// recipient needs no private-spend authorization.
-pub async fn prepare_railway_native_shield(
+/// Prepares a stealth-account native shield of `amount` from `payer_address` to `recipient`
+/// under `profile`. The recipient needs no private-spend authorization.
+pub async fn prepare_native_shield(
     chain_id: u64,
     effective_chain: &EffectiveChainConfig,
-    payer: RailwayNativeShieldPayer,
+    profile: PublicShieldTransactionProfile,
+    payer: NativeShieldPayer,
     payer_address: Address,
     recipient: AddressData,
     amount: U256,
     http: &HttpContext,
-) -> Result<RailwayNativeShieldPreparation> {
+) -> Result<NativeShieldPreparation> {
     if amount.is_zero() {
         return Err(eyre!("amount is required"));
     }
     effective_chain.require_railgun()?;
-    let profile = railway_native_shield_profile(chain_id, effective_chain, payer)?;
+    let contracts = stealth_native_shield_contracts(chain_id, effective_chain, payer)?;
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
     let candidates = public_fee_candidates(http, &chain.rpc_route, None).await?;
     // The stealth account and shield key need the authorization collected after review; a
@@ -311,7 +371,7 @@ pub async fn prepare_railway_native_shield(
     getrandom::fill(stand_in_key.as_mut_slice()).map_err(|_| eyre!("randomness is unavailable"))?;
     let action = native_shield_action_data(
         stand_in.address(),
-        native_shield_request(&profile, &recipient, amount, &stand_in_key)?,
+        native_shield_request(&contracts, &recipient, amount, &stand_in_key)?,
     )
     .wrap_err("build the native shield execution")?;
     // A fresh account has no code, account nonce 0 and execution nonce 0.
@@ -325,39 +385,43 @@ pub async fn prepare_railway_native_shield(
         ))
         .wrap_err("sign the native shield execution")?;
     let request = native_shield_transaction_request(
-        &profile,
+        &contracts,
         payer_address,
         stand_in.address(),
         amount,
         native_shield_execute_calldata(action, U256::ZERO, signature),
-        native_shield_authorization(&stand_in, &profile, 0)?,
+        native_shield_authorization(&stand_in, &contracts, 0)?,
     );
     let raw_gas_limit = estimate_native_shield_gas(&candidates, &request).await?;
-    Ok(RailwayNativeShieldPreparation::new(
+    Ok(NativeShieldPreparation::new(
+        contracts,
         profile,
         payer_address,
         recipient,
         amount,
         raw_gas_limit,
+        chain.gas.gas_limit_buffer,
     ))
 }
 
-/// Native Mimic Max: prepares the balance less the prepared maximum gas cost at
+/// Native shield Max: prepares the balance less the prepared maximum gas cost at
 /// `max_fee_per_gas`, re-preparing until amount plus that cost fits the balance.
-pub async fn prepare_railway_native_shield_max(
+pub async fn prepare_native_shield_max(
     chain_id: u64,
     effective_chain: &EffectiveChainConfig,
-    payer: RailwayNativeShieldPayer,
+    profile: PublicShieldTransactionProfile,
+    payer: NativeShieldPayer,
     payer_address: Address,
     recipient: AddressData,
     balance: U256,
     max_fee_per_gas: u128,
     http: &HttpContext,
-) -> Result<RailwayNativeShieldPreparation> {
-    fit_railway_native_shield_max(balance, max_fee_per_gas, |amount| {
-        prepare_railway_native_shield(
+) -> Result<NativeShieldPreparation> {
+    fit_native_shield_max(balance, max_fee_per_gas, |amount| {
+        prepare_native_shield(
             chain_id,
             effective_chain,
+            profile,
             payer,
             payer_address,
             recipient,
@@ -368,14 +432,14 @@ pub async fn prepare_railway_native_shield_max(
     .await
 }
 
-pub(super) async fn fit_railway_native_shield_max<F, Fut>(
+pub(super) async fn fit_native_shield_max<F, Fut>(
     balance: U256,
     max_fee_per_gas: u128,
     mut prepare: F,
-) -> Result<RailwayNativeShieldPreparation>
+) -> Result<NativeShieldPreparation>
 where
     F: FnMut(U256) -> Fut,
-    Fut: Future<Output = Result<RailwayNativeShieldPreparation>>,
+    Fut: Future<Output = Result<NativeShieldPreparation>>,
 {
     let mut amount = balance;
     for _ in 0..MAX_PREPARATION_ATTEMPTS {
@@ -397,15 +461,15 @@ where
     ))
 }
 
-/// Delegates `account`, at its account nonce `nonce`, to the profile's delegate.
+/// Delegates `account`, at its account nonce `nonce`, to the chain's delegate.
 pub(super) fn native_shield_authorization(
     account: &PrivateKeySigner,
-    profile: &RailwayNativeShieldProfile,
+    contracts: &NativeShieldContracts,
     nonce: u64,
 ) -> Result<SignedAuthorization> {
     let authorization = Authorization {
-        chain_id: U256::from(profile.chain_id),
-        address: profile.delegate,
+        chain_id: U256::from(contracts.chain_id),
+        address: contracts.delegate,
         nonce,
     };
     let signature = account
@@ -415,7 +479,7 @@ pub(super) fn native_shield_authorization(
 }
 
 fn native_shield_request(
-    profile: &RailwayNativeShieldProfile,
+    contracts: &NativeShieldContracts,
     recipient: &AddressData,
     amount: U256,
     shield_private_key: &[u8; 32],
@@ -425,7 +489,7 @@ fn native_shield_request(
     build_shield_request(
         recipient.master_public_key,
         &recipient.viewing_public_key,
-        TokenData::erc20(profile.wrapped_native),
+        TokenData::erc20(contracts.wrapped_native),
         value,
         shield_private_key,
     )
@@ -433,7 +497,7 @@ fn native_shield_request(
 }
 
 pub(super) fn native_shield_transaction_request(
-    profile: &RailwayNativeShieldProfile,
+    contracts: &NativeShieldContracts,
     payer: Address,
     account: Address,
     amount: U256,
@@ -441,7 +505,7 @@ pub(super) fn native_shield_transaction_request(
     authorization: SignedAuthorization,
 ) -> TransactionRequest {
     let mut request = TransactionRequest::default()
-        .with_chain_id(profile.chain_id)
+        .with_chain_id(contracts.chain_id)
         .with_from(payer)
         .with_to(account)
         .with_value(amount)

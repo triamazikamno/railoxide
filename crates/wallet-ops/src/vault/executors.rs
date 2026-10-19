@@ -520,6 +520,16 @@ impl ExecutorRecord {
     pub fn purpose_summary(&self) -> Option<&str> {
         self.purpose_summary.as_deref()
     }
+    /// What the account was for, without the recipient: the part of
+    /// [`Self::purpose_summary`] before " → ".
+    #[must_use]
+    pub fn purpose_intent(&self) -> Option<&str> {
+        self.purpose_summary().map(|purpose| {
+            purpose
+                .split_once(" → ")
+                .map_or(purpose, |(intent, _)| intent)
+        })
+    }
     #[must_use]
     pub fn assets(&self) -> &[ExecutorAsset] {
         &self.assets

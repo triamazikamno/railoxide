@@ -192,8 +192,11 @@ pub(in crate::root) struct PublicShieldDraft {
     pub(in crate::root) vault_store: Arc<DesktopVaultStore>,
     pub(in crate::root) amount: U256,
     pub(in crate::root) profile: PublicShieldTransactionProfile,
-    /// Required for a native Mimic Railway shield, and bound to this draft's inputs.
-    pub(in crate::root) native_preparation: Option<Arc<RailwayNativeShieldPreparation>>,
+    /// The approval mode the profile signs with: the chosen one, or Mimic Railway's own.
+    pub(in crate::root) approval_mode: PublicShieldApprovalMode,
+    /// Required for a stealth-route native shield, and bound to this draft's inputs. A native
+    /// shield without one takes the Railoxide wrap fallback.
+    pub(in crate::root) native_preparation: Option<Arc<NativeShieldPreparation>>,
     /// The native shield's stealth-account operation, which a Ledger or Trezor wallet
     /// approves before submission.
     pub(in crate::root) native_operation: Option<wallet_ops::vault::ExecutorOperationId>,
@@ -215,25 +218,26 @@ pub(in crate::root) fn public_shield_quote_for_route(
     quote.filter(|_| quoted_route == Some(current_route))
 }
 
-/// Native Mimic needs a software payer. A Ledger or Trezor wallet's stealth-account approval
-/// admits only a software or imported one, as for a self-broadcast executor unshield.
-pub(in crate::root) const fn railway_native_shield_payer(
+/// The stealth route needs a software payer. A Ledger or Trezor wallet's stealth-account
+/// approval admits only a software or imported one, as for a self-broadcast executor unshield.
+pub(in crate::root) const fn native_shield_payer(
     source: PublicAccountSource,
     wallet_is_hardware: bool,
-) -> RailwayNativeShieldPayer {
+) -> NativeShieldPayer {
     match source {
-        PublicAccountSource::HardwareDerived => RailwayNativeShieldPayer::Hardware,
+        PublicAccountSource::HardwareDerived => NativeShieldPayer::Hardware,
         PublicAccountSource::ExecutorDerived(_) if wallet_is_hardware => {
-            RailwayNativeShieldPayer::HardwareWallet
+            NativeShieldPayer::HardwareWallet
         }
-        _ => RailwayNativeShieldPayer::Software,
+        _ => NativeShieldPayer::Software,
     }
 }
 
-/// Expected and maximum cost of a prepared native Mimic shield: its raw estimate and its
-/// buffered signing limit priced with the selected fee.
-pub(in crate::root) fn native_mimic_gas_cost_projection(
+/// Expected and maximum cost of a prepared stealth-route native shield: its raw estimate and
+/// its buffered signing limit priced with the selected fee in `profile`.
+pub(in crate::root) fn native_shield_gas_cost_projection(
     chain_id: u64,
+    profile: PublicShieldTransactionProfile,
     raw_gas_limit: u64,
     gas_limit: u64,
     selection: PublicActionGasFeeSelection,
@@ -248,7 +252,7 @@ pub(in crate::root) fn native_mimic_gas_cost_projection(
     })?;
     let resolved = resolve_public_action_gas_fee(
         chain_id,
-        PublicShieldTransactionProfile::Railway,
+        profile,
         PublicAssetId::Native,
         selection,
         Some(quote),
@@ -272,22 +276,29 @@ pub(in crate::root) fn native_mimic_gas_cost_projection(
     })
 }
 
-/// What a native Mimic preparation is bound to. Any change makes it stale.
+/// What a stealth-route native shield preparation is bound to. Any change makes it stale.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(in crate::root) struct NativeMimicShieldKey {
+pub(in crate::root) struct NativeShieldKey {
     pub(in crate::root) wallet_id: Option<Arc<str>>,
     pub(in crate::root) chain_id: u64,
     pub(in crate::root) public_account_uuid: Arc<str>,
+    pub(in crate::root) profile: PublicShieldTransactionProfile,
     pub(in crate::root) amount: U256,
 }
 
 /// The stealth-account operation of a native shield of `key`, bound in `bound`. A native
-/// shield sent again with the same inputs reuses its stealth account.
-pub(in crate::root) fn bind_native_mimic_shield_operation(
-    bound: &mut Option<(NativeMimicShieldKey, wallet_ops::vault::ExecutorOperationId)>,
-    key: NativeMimicShieldKey,
+/// shield sent again with the same inputs reuses its stealth account, in either profile.
+pub(in crate::root) fn bind_native_shield_operation(
+    bound: &mut Option<(NativeShieldKey, wallet_ops::vault::ExecutorOperationId)>,
+    key: NativeShieldKey,
 ) -> Result<wallet_ops::vault::ExecutorOperationId, wallet_ops::vault::ExecutorStoreError> {
-    let operation = match bound.as_ref().filter(|(current, _)| *current == key) {
+    let same_action = |current: &NativeShieldKey| {
+        NativeShieldKey {
+            profile: key.profile,
+            ..current.clone()
+        } == key
+    };
+    let operation = match bound.as_ref().filter(|(current, _)| same_action(current)) {
         Some((_, operation)) => *operation,
         None => wallet_ops::vault::ExecutorOperationId::random()?,
     };
@@ -295,17 +306,15 @@ pub(in crate::root) fn bind_native_mimic_shield_operation(
     Ok(operation)
 }
 
-/// The current native Mimic preparation of the Shield form. Every start or invalidation
-/// advances the generation, so a late completion of an earlier request is ignored.
-pub(in crate::root) struct NativeMimicShieldPreparationState<
-    T = Arc<RailwayNativeShieldPreparation>,
-> {
+/// The current stealth-route native shield preparation of the Shield form. Every start or
+/// invalidation advances the generation, so a late completion of an earlier request is ignored.
+pub(in crate::root) struct NativeShieldPreparationState<T = Arc<NativeShieldPreparation>> {
     pub(in crate::root) generation: u64,
     pub(in crate::root) pending: bool,
-    outcome: Option<(NativeMimicShieldKey, Result<T, Arc<str>>)>,
+    outcome: Option<(NativeShieldKey, Result<T, Arc<str>>)>,
 }
 
-impl<T> Default for NativeMimicShieldPreparationState<T> {
+impl<T> Default for NativeShieldPreparationState<T> {
     fn default() -> Self {
         Self {
             generation: 0,
@@ -315,7 +324,7 @@ impl<T> Default for NativeMimicShieldPreparationState<T> {
     }
 }
 
-impl<T> NativeMimicShieldPreparationState<T> {
+impl<T> NativeShieldPreparationState<T> {
     pub(in crate::root) fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.pending = false;
@@ -332,8 +341,8 @@ impl<T> NativeMimicShieldPreparationState<T> {
     pub(in crate::root) fn complete(
         &mut self,
         generation: u64,
-        key: NativeMimicShieldKey,
-        current: Option<&NativeMimicShieldKey>,
+        key: NativeShieldKey,
+        current: Option<&NativeShieldKey>,
         result: Result<T, Arc<str>>,
     ) -> bool {
         if generation != self.generation || current != Some(&key) {
@@ -344,17 +353,14 @@ impl<T> NativeMimicShieldPreparationState<T> {
         true
     }
 
-    pub(in crate::root) fn prepared(&self, current: Option<&NativeMimicShieldKey>) -> Option<&T> {
+    pub(in crate::root) fn prepared(&self, current: Option<&NativeShieldKey>) -> Option<&T> {
         match &self.outcome {
             Some((key, Ok(prepared))) if Some(key) == current => Some(prepared),
             _ => None,
         }
     }
 
-    pub(in crate::root) fn error(
-        &self,
-        current: Option<&NativeMimicShieldKey>,
-    ) -> Option<&Arc<str>> {
+    pub(in crate::root) fn error(&self, current: Option<&NativeShieldKey>) -> Option<&Arc<str>> {
         match &self.outcome {
             Some((key, Err(error))) if Some(key) == current => Some(error),
             _ => None,
@@ -587,15 +593,27 @@ pub(in crate::root) fn public_shield_authorization_summary(
         SpendAuthorizationSummaryRow::new("Amount", public_shield_amount_label(draft))
             .with_icon(draft.asset_icon_path.clone()),
         SpendAuthorizationSummaryRow::new("From", draft.public_account_label.clone()),
-        SpendAuthorizationSummaryRow::new("Recipient", "Selected private wallet"),
-        SpendAuthorizationSummaryRow::new("Profile", draft.profile.display_name()),
     ]);
+    // Only an ERC-20 shield or a native wrap fallback may sign an approval.
+    if draft.asset != PublicAssetId::Native || draft.native_preparation.is_none() {
+        rows.push(SpendAuthorizationSummaryRow::new(
+            "Approval",
+            public_shield_approval_label(draft.approval_mode),
+        ));
+    }
     rows.extend(public_action_authorization_fee_rows(&draft.fee_display));
     SpendAuthorizationSummary::new(
         "Public shield",
         public_shield_authorization_detail(draft.public_account_source),
         rows,
     )
+}
+
+const fn public_shield_approval_label(mode: PublicShieldApprovalMode) -> &'static str {
+    match mode {
+        PublicShieldApprovalMode::Exact => "Exact amount",
+        PublicShieldApprovalMode::UnlimitedWhenShort => "Unlimited, only if the allowance is short",
+    }
 }
 
 fn public_action_authorization_fee_rows(

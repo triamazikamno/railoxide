@@ -396,7 +396,8 @@ impl WalletRoot {
         self.public_form.editing_account_uuid = None;
         self.public_form.selected_asset = None;
         self.public_form.mimic_railway_shield = self.mimic_railway_shields_by_default;
-        self.public_form.native_mimic_shield.invalidate();
+        self.public_form.shield_approval_mode = wallet_ops::PublicShieldApprovalMode::Exact;
+        self.public_form.native_shield_preparation.invalidate();
         self.public_form.public_send_kind = PublicSendKind::Transfer;
         self.public_form.advanced_send_estimate = None;
         self.public_form.advanced_send_estimate_invalidated = false;
@@ -607,7 +608,8 @@ impl WalletRoot {
         self.public_form.selected_asset = Some(asset);
         // Selecting a balance starts a fresh shield draft, so restore the configured default.
         self.public_form.mimic_railway_shield = self.mimic_railway_shields_by_default;
-        self.public_form.native_mimic_shield.invalidate();
+        self.public_form.shield_approval_mode = wallet_ops::PublicShieldApprovalMode::Exact;
+        self.public_form.native_shield_preparation.invalidate();
         self.public_form.public_send_kind = PublicSendKind::Transfer;
         self.public_form.advanced_send_estimate = None;
         self.public_form.advanced_send_estimate_invalidated = false;
@@ -1218,7 +1220,7 @@ impl WalletRoot {
                     super::public_action::PublicShieldUiFixture::EstimateError
                     | super::public_action::PublicShieldUiFixture::FundingError,
                 ) => "Preview Shield failure…",
-                _ => "Preview Mimic Railway shield…",
+                _ => "Preview native shield…",
             };
             return app_button("wallet-public-preview-shield-error", label)
                 .small()

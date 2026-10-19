@@ -26,6 +26,16 @@ pub enum GatewayDraftFee {
     },
 }
 
+/// The approval amount of a Railoxide shield that may sign an ERC-20 approval. Mimic Railway
+/// signs its own unlimited policy.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayDraftApproval {
+    #[default]
+    Exact,
+    Unlimited,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayDraftInput {
@@ -39,6 +49,8 @@ pub struct GatewayDraftInput {
     pub address_book_entry: Option<String>,
     pub fee: GatewayDraftFee,
     pub mimic_railway: bool,
+    #[serde(default)]
+    pub approval: GatewayDraftApproval,
     pub max: bool,
 }
 
@@ -684,7 +696,17 @@ mod tests {
             let mut wire = public.clone();
             wire["kind"] = kind.into();
             let parsed: GatewayDraftPayload = serde_json::from_value(wire.clone()).unwrap();
-            assert!(matches!(parsed, GatewayDraftPayload::Public(_)));
+            // An input without an approval choice approves the exact amount.
+            assert_eq!(
+                parsed.public().map(|input| input.approval),
+                Some(GatewayDraftApproval::Exact)
+            );
+            wire["approval"] = "unlimited".into();
+            let parsed: GatewayDraftPayload = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(
+                parsed.public().map(|input| input.approval),
+                Some(GatewayDraftApproval::Unlimited)
+            );
             assert_eq!(serde_json::to_value(parsed).unwrap(), wire);
         }
         let mut private = serde_json::json!({

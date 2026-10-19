@@ -1262,11 +1262,12 @@ async fn reusing_an_account_for_another_pair_does_not_credit_the_old_tokens_shie
     }
     let expired = fixture.observe(31, 20).await;
     assert!(expired.swap().unwrap().admits_attempt());
+    let visible = listed(&fixture.owner, fixture.operation)
+        .expect("an account whose order ended is offered for another swap");
+    assert_eq!(visible.last_pair(), Some((SELL, BUY)));
+    // Hiding it keeps it out of the list; admission below still takes it.
     fixture.store.set_hidden(fixture.operation, true).unwrap();
-    let hidden = listed(&fixture.owner, fixture.operation)
-        .expect("a hidden account whose order ended is offered for another swap");
-    assert!(hidden.is_hidden());
-    assert_eq!(hidden.last_pair(), Some((SELL, BUY)));
+    assert!(listed(&fixture.owner, fixture.operation).is_none());
     fixture.chain.lock().unwrap().rpc_methods.clear();
     let preview = fixture
         .owner

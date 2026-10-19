@@ -41,10 +41,10 @@ mod drafts;
 mod storage;
 mod ui;
 pub use drafts::{
-    GatewayDraftCommand, GatewayDraftEstimate, GatewayDraftEstimatePayload, GatewayDraftExecution,
-    GatewayDraftFee, GatewayDraftGasQuote, GatewayDraftInput, GatewayDraftKind,
-    GatewayDraftPayload, GatewayDraftProgress, GatewayDraftRecipient, GatewayDraftStatus,
-    GatewayDraftView,
+    GatewayDraftApproval, GatewayDraftCommand, GatewayDraftEstimate, GatewayDraftEstimatePayload,
+    GatewayDraftExecution, GatewayDraftFee, GatewayDraftGasQuote, GatewayDraftInput,
+    GatewayDraftKind, GatewayDraftPayload, GatewayDraftProgress, GatewayDraftRecipient,
+    GatewayDraftStatus, GatewayDraftView,
 };
 pub use ui::{
     GatewayAccountBalances, GatewayAssetBalance, GatewayPendingRequest, GatewayPublicCommand,

@@ -7,7 +7,7 @@ mod dapp_reads;
 mod executor_recovery;
 pub(crate) use executor_recovery::submit_executor_recovery_step;
 mod gas;
-mod railway_native;
+mod native_shield;
 mod recipient;
 mod runtime;
 pub use recipient::resolve_public_ens_recipient;
@@ -59,10 +59,10 @@ pub use gas::{
     resolve_public_action_gas_fee, simulate_public_advanced_transaction_with_fee,
     simulate_public_advanced_transaction_with_fee_and_reads,
 };
-pub use railway_native::{
-    RailwayNativeShieldPayer, RailwayNativeShieldPreparation, RailwayNativeShieldProfile,
-    RailwayNativeShieldUnavailable, RailwayNativeShieldUndelivered, prepare_railway_native_shield,
-    prepare_railway_native_shield_max, railway_native_shield_profile,
+pub use native_shield::{
+    NativeShieldContracts, NativeShieldPayer, NativeShieldPreparation, NativeShieldRoute,
+    NativeShieldUnavailable, NativeShieldUndelivered, prepare_native_shield,
+    prepare_native_shield_max, select_native_shield_route, stealth_native_shield_contracts,
 };
 #[cfg(test)]
 pub(crate) use signer::admitted_gas_payer_signer;
@@ -94,8 +94,9 @@ pub use types::{
     PublicAdvancedTransactionEstimateRequest, PublicAdvancedTransactionSimulationError,
     PublicAssetId, PublicBalanceAmount, PublicBalanceAsset, PublicBalanceEntry,
     PublicBalanceRefreshCoordinator, PublicBalanceSnapshot, PublicSendRequest, PublicSendResult,
-    PublicShieldRequest, PublicShieldTransactionProfile, PublicTransactionIntent, ShieldSendOutput,
-    TxReceiptOutput, WalletConnectHardwareTypedDataCapabilityRequest,
+    PublicShieldApprovalMode, PublicShieldRequest, PublicShieldTransactionProfile,
+    PublicTransactionIntent, ShieldSendOutput, TxReceiptOutput,
+    WalletConnectHardwareTypedDataCapabilityRequest,
     WalletConnectHardwareTypedDataCapabilityResult,
     WalletConnectHardwareTypedDataHashFallbackConfirmationRequired,
     WalletConnectPersonalSignRequest, WalletConnectReviewedFee, WalletConnectReviewedTransaction,
@@ -112,9 +113,8 @@ pub use walletconnect::{
 
 #[cfg(test)]
 use actions::{
-    public_native_shield_transaction_request, public_send_authorized_gas_limit,
-    public_send_transaction_request, public_shield_approval_amount,
-    public_shield_approval_required,
+    public_send_authorized_gas_limit, public_send_transaction_request,
+    public_shield_approval_amount, public_shield_approval_required,
 };
 #[cfg(test)]
 use balances::{
@@ -122,12 +122,10 @@ use balances::{
     public_balance_snapshot_from_results,
 };
 #[cfg(test)]
-use contracts::PublicRelayAdapt;
-#[cfg(test)]
 use gas::{
     PUBLIC_ERC20_SEND_GAS_UNITS, PUBLIC_NATIVE_APPROVE_GAS_UNITS, PUBLIC_NATIVE_SEND_GAS_UNITS,
     PUBLIC_NATIVE_WRAP_GAS_UNITS, buffered_advanced_gas_limit, public_action_tip_fallback,
-    public_advanced_transaction_payload_fingerprint, public_native_relay_adapt_shield_gas_units,
+    public_action_uses_legacy_envelope, public_advanced_transaction_payload_fingerprint,
     public_shield_gas_units, railway_bnb_gas_fee_quote, railway_bnb_gas_fee_quote_bundle,
     railway_gas_limit, railway_standard_gas_fee_quote, railway_standard_gas_fee_quote_bundle,
 };

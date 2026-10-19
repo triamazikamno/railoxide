@@ -9,32 +9,33 @@ use alloy::primitives::{Address, U256};
 use gpui::{Context, Window};
 use gpui_component::WindowExt as _;
 use wallet_ops::{
-    HttpContext, PublicActionGasFeeMode, PublicActionGasFeeQuote, PublicActionGasFeeQuoteBundle,
+    EvmFeeModel, HttpContext, NativeShieldPayer, NativeShieldPreparation, NativeShieldRoute,
+    PublicActionGasFeeMode, PublicActionGasFeeQuote, PublicActionGasFeeQuoteBundle,
     PublicActionGasFeeSelection, PublicActionKind, PublicAssetId, PublicBalanceAmount,
-    PublicShieldTransactionProfile, PublicTransactionIntent, RAILGUN_PROTOCOL_FEE_BPS,
-    RailwayNativeShieldPayer, RailwayNativeShieldPreparation, TokenAnchorRateCache,
+    PublicShieldApprovalMode, PublicShieldTransactionProfile, PublicTransactionIntent,
+    RAILGUN_PROTOCOL_FEE_BPS, TokenAnchorRateCache,
     estimate_public_action_gas_cost_with_profile_and_ceiling,
     gateway::{
-        GatewayDraftCommand, GatewayDraftEstimate, GatewayDraftEstimatePayload,
-        GatewayDraftExecution, GatewayDraftFee, GatewayDraftGasQuote, GatewayDraftInput,
-        GatewayDraftKind, GatewayDraftPayload, GatewayDraftRecipient, GatewayDraftStatus,
-        GatewayDraftView,
+        GatewayDraftApproval, GatewayDraftCommand, GatewayDraftEstimate,
+        GatewayDraftEstimatePayload, GatewayDraftExecution, GatewayDraftFee, GatewayDraftGasQuote,
+        GatewayDraftInput, GatewayDraftKind, GatewayDraftPayload, GatewayDraftRecipient,
+        GatewayDraftStatus, GatewayDraftView,
     },
-    parse_send_amount, prepare_railway_native_shield, prepare_railway_native_shield_max,
+    parse_send_amount, prepare_native_shield, prepare_native_shield_max,
     public_shield_protocol_fee_amount, public_shield_recipient,
-    quote_public_action_gas_fee_bundle_with_profile, railway_native_shield_profile,
-    resolve_public_ens_recipient,
+    quote_public_action_gas_fee_bundle_with_profile, resolve_public_ens_recipient,
+    select_native_shield_route,
     settings::{EffectiveChainConfig, EffectiveTokenRegistry},
     vault::{DesktopVaultStore, DesktopViewSession, PublicAccountMetadata, PublicAccountSource},
 };
 
 use super::gas_fee::{format_gwei, parse_gwei_to_wei};
 use super::public_action::{
-    NativeMimicShieldKey, PublicActionFeeDisplay, PublicSendDraft, PublicShieldDraft,
-    authorized_public_action_gas_fee_selection, bind_native_mimic_shield_operation,
-    format_gas_limit, native_mimic_gas_cost_projection, public_action_max_amount_after_reserve,
+    NativeShieldKey, PublicActionFeeDisplay, PublicSendDraft, PublicShieldDraft,
+    authorized_public_action_gas_fee_selection, bind_native_shield_operation, format_gas_limit,
+    native_shield_gas_cost_projection, native_shield_payer, public_action_max_amount_after_reserve,
     public_action_protocol_fee_label, public_send_authorization_summary,
-    public_shield_authorization_summary, railway_native_shield_payer,
+    public_shield_authorization_summary,
 };
 use super::public_balances::public_asset_icon_path;
 use super::spend_authorization::SpendAuthorizationIntent;
@@ -346,7 +347,7 @@ impl GatewayDraftBook {
 struct EstimationContext {
     input: GatewayDraftInput,
     account: PublicAccountMetadata,
-    native_payer: RailwayNativeShieldPayer,
+    native_payer: NativeShieldPayer,
     asset: PublicAssetId,
     symbol: String,
     decimals: u8,
@@ -621,7 +622,7 @@ impl WalletRoot {
         };
         Ok(EstimationContext {
             input: input.clone(),
-            native_payer: railway_native_shield_payer(
+            native_payer: native_shield_payer(
                 account.source,
                 self.selected_wallet_source().is_hardware_derived(),
             ),
@@ -831,19 +832,19 @@ impl WalletRoot {
             return;
         };
         // Bound before authorization, as the Shield form binds its own.
-        if let PreparedDraft::Shield(draft) = &mut prepared
-            && draft.native_preparation.is_some()
-        {
-            match bind_native_mimic_shield_operation(
-                &mut self.public_form.native_mimic_shield_operation,
-                NativeMimicShieldKey {
+        if let PreparedDraft::Shield(draft) = &mut prepared {
+            match bind_draft_native_operation(
+                &mut self.public_form.native_shield_operation,
+                draft.native_preparation.is_some(),
+                NativeShieldKey {
                     wallet_id: self.selected_wallet_id.clone(),
                     chain_id: draft.chain_id,
                     public_account_uuid: Arc::clone(&draft.public_account_uuid),
+                    profile: draft.profile,
                     amount: draft.amount,
                 },
             ) {
-                Ok(operation) => draft.native_operation = Some(operation),
+                Ok(operation) => draft.native_operation = operation,
                 Err(error) => {
                     record.view.message = error.to_string();
                     record.prepared = Some(prepared);
@@ -1098,11 +1099,26 @@ async fn estimate_draft(mut context: EstimationContext) -> DraftEstimation {
         format_gwei(bundle.standard.suggested_max_priority_fee_per_gas),
     ));
     let native_preparation = if context.input.kind == GatewayDraftKind::Shield
-        && profile == PublicShieldTransactionProfile::Railway
         && context.asset == PublicAssetId::Native
     {
-        match prepare_native_mimic_draft(&context, &bundle).await {
-            Ok(preparation) => Some(Arc::new(preparation)),
+        let prepared = match draft_native_shield_route(
+            context.input.chain_id,
+            &context.effective_chain,
+            context.native_payer,
+            profile,
+            bundle.standard.observed_fee_model,
+        ) {
+            Ok(NativeShieldRoute::Stealth(_)) => {
+                prepare_native_shield_draft(&context, &bundle, profile)
+                    .await
+                    .map(|preparation| Some(Arc::new(preparation)))
+            }
+            // The wrap fallback needs no preparation; a draft without one takes it.
+            Ok(NativeShieldRoute::WrapFallback { .. }) => Ok(None),
+            Err(message) => Err(message),
+        };
+        match prepared {
+            Ok(preparation) => preparation,
             Err(message) => {
                 return DraftEstimation {
                     gas_quote,
@@ -1122,23 +1138,39 @@ async fn estimate_draft(mut context: EstimationContext) -> DraftEstimation {
     }
 }
 
-/// Prepares a native Mimic shield draft, or explains why the route is unavailable. Ordinary
-/// shielding needs Mimic Railway turned off; it is never substituted.
-async fn prepare_native_mimic_draft(
+/// A native Shield draft's route, chosen as the Shield form chooses it, or why it is refused.
+/// Mimic Railway is refused rather than switched to the wrap fallback.
+fn draft_native_shield_route(
+    chain_id: u64,
+    effective_chain: &EffectiveChainConfig,
+    payer: NativeShieldPayer,
+    profile: PublicShieldTransactionProfile,
+    observed_fee_model: Option<EvmFeeModel>,
+) -> Result<NativeShieldRoute, String> {
+    select_native_shield_route(chain_id, effective_chain, payer, profile, observed_fee_model)
+        .map_err(|reason| match profile {
+            PublicShieldTransactionProfile::Railway => format!(
+                "Mimic Railway is unavailable for this shield: {reason}. Turn off Mimic Railway to shield in the Railoxide profile."
+            ),
+            PublicShieldTransactionProfile::Railoxide => {
+                format!("Native shielding is unavailable: {reason}.")
+            }
+        })
+}
+
+/// Prepares a stealth-route native shield draft in `profile`.
+async fn prepare_native_shield_draft(
     context: &EstimationContext,
     bundle: &PublicActionGasFeeQuoteBundle,
-) -> Result<RailwayNativeShieldPreparation, String> {
+    profile: PublicShieldTransactionProfile,
+) -> Result<NativeShieldPreparation, String> {
     let chain_id = context.input.chain_id;
-    railway_native_shield_profile(chain_id, &context.effective_chain, context.native_payer)
-        .map_err(|reason| {
-            format!("Mimic Railway is unavailable for this shield: {reason}. Turn off Mimic Railway to shield with the ordinary route.")
-        })?;
     let PublicActionGasFeeSelection::Custom {
         max_fee_per_gas, ..
     } = draft_gas_fee(
         &context.input.fee,
         bundle.standard,
-        PublicShieldTransactionProfile::Railway,
+        profile,
         PublicAssetId::Native,
         chain_id,
     )?
@@ -1148,9 +1180,10 @@ async fn prepare_native_mimic_draft(
     let recipient = public_shield_recipient(&context.wallet)
         .map_err(|_| "The private wallet's receive address is unavailable".to_owned())?;
     let prepared = if context.input.max {
-        prepare_railway_native_shield_max(
+        prepare_native_shield_max(
             chain_id,
             &context.effective_chain,
+            profile,
             context.native_payer,
             context.account.address,
             recipient,
@@ -1169,9 +1202,10 @@ async fn prepare_native_mimic_draft(
         if amount > context.balance {
             return Err("Amount exceeds the available balance".into());
         }
-        prepare_railway_native_shield(
+        prepare_native_shield(
             chain_id,
             &context.effective_chain,
+            profile,
             context.native_payer,
             context.account.address,
             recipient,
@@ -1179,7 +1213,7 @@ async fn prepare_native_mimic_draft(
             &context.http,
         )
         .await
-        .map_err(|error| format!("Mimic Railway shield could not be prepared: {error}"))?
+        .map_err(|error| format!("The native shield could not be prepared: {error}"))?
     };
     Ok(prepared)
 }
@@ -1188,7 +1222,7 @@ fn prepare_draft(
     context: EstimationContext,
     bundle: PublicActionGasFeeQuoteBundle,
     profile: PublicShieldTransactionProfile,
-    native_preparation: Option<Arc<RailwayNativeShieldPreparation>>,
+    native_preparation: Option<Arc<NativeShieldPreparation>>,
 ) -> Result<(Option<PreparedDraft>, GatewayDraftEstimate), String> {
     let EstimationContext {
         input,
@@ -1226,9 +1260,10 @@ fn prepare_draft(
     };
     let unestimable = || "This action cannot be estimated on the selected network.".to_owned();
     let costs = match &native_preparation {
-        // A native Mimic shield is priced from its own prepared raw and buffered gas.
-        Some(preparation) => native_mimic_gas_cost_projection(
+        // A stealth-route native shield is priced from its own prepared raw and buffered gas.
+        Some(preparation) => native_shield_gas_cost_projection(
             input.chain_id,
+            profile,
             preparation.raw_gas_limit(),
             preparation.gas_limit(),
             gas_fee,
@@ -1361,6 +1396,7 @@ fn prepare_draft(
             vault_store: store,
             amount,
             profile,
+            approval_mode: draft_approval_mode(profile, input.approval),
             native_preparation,
             native_operation: None,
             gas_fee,
@@ -1371,6 +1407,30 @@ fn prepare_draft(
         })),
     };
     Ok((Some(prepared), estimate))
+}
+
+/// The approval mode a Shield draft signs with: the extension's choice, or Mimic Railway's own.
+const fn draft_approval_mode(
+    profile: PublicShieldTransactionProfile,
+    approval: GatewayDraftApproval,
+) -> PublicShieldApprovalMode {
+    profile.approval_mode(match approval {
+        GatewayDraftApproval::Exact => PublicShieldApprovalMode::Exact,
+        GatewayDraftApproval::Unlimited => PublicShieldApprovalMode::UnlimitedWhenShort,
+    })
+}
+
+/// The stealth operation a Shield draft binds before authorization: one when it has a
+/// stealth-route native preparation, none for the wrap fallback or an ERC-20 shield.
+fn bind_draft_native_operation(
+    bound: &mut Option<(NativeShieldKey, wallet_ops::vault::ExecutorOperationId)>,
+    native_prepared: bool,
+    key: NativeShieldKey,
+) -> Result<Option<wallet_ops::vault::ExecutorOperationId>, wallet_ops::vault::ExecutorStoreError> {
+    if !native_prepared {
+        return Ok(None);
+    }
+    bind_native_shield_operation(bound, key).map(Some)
 }
 
 fn draft_amount(
@@ -1594,6 +1654,7 @@ mod tests {
             address_book_entry: None,
             fee: GatewayDraftFee::Normal,
             mimic_railway: false,
+            approval: GatewayDraftApproval::Exact,
             max: false,
         });
         let mut book = GatewayDraftBook::default();
@@ -1697,6 +1758,7 @@ mod tests {
             address_book_entry: None,
             fee: GatewayDraftFee::Normal,
             mimic_railway: true,
+            approval: GatewayDraftApproval::Exact,
             max: false,
         };
         let token = GatewayDraftInput {
@@ -1725,6 +1787,7 @@ mod tests {
             address_book_entry: None,
             fee: GatewayDraftFee::Normal,
             mimic_railway: true,
+            approval: GatewayDraftApproval::Exact,
             max: true,
         };
         let quote = PublicActionGasFeeQuote {
@@ -1801,5 +1864,44 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn native_shield_drafts_bind_a_stealth_operation_only_when_prepared() {
+        use PublicShieldTransactionProfile::{Railoxide, Railway};
+
+        let chain = wallet_ops::settings::build_effective_chain_configs(
+            &wallet_ops::settings::WalletSettings::default(),
+        )
+        .unwrap()
+        .get(1)
+        .cloned()
+        .unwrap();
+        let key = |profile| NativeShieldKey {
+            wallet_id: Some(Arc::from("wallet")),
+            chain_id: 1,
+            public_account_uuid: Arc::from("account"),
+            profile,
+            amount: U256::from(1_u64),
+        };
+        // As in estimation, a draft is prepared only on the stealth route.
+        let bind = |bound: &mut _, payer, profile| {
+            let prepared = matches!(
+                draft_native_shield_route(1, &chain, payer, profile, None),
+                Ok(NativeShieldRoute::Stealth(_))
+            );
+            bind_draft_native_operation(bound, prepared, key(profile)).unwrap()
+        };
+        let mut bound = None;
+        for profile in [Railoxide, Railway] {
+            assert!(bind(&mut bound, NativeShieldPayer::Software, profile).is_some());
+        }
+        // A fallback payer's draft has no preparation and leaves the bound operation alone.
+        let software = bound.clone();
+        assert_eq!(
+            bind(&mut bound, NativeShieldPayer::Hardware, Railoxide),
+            None
+        );
+        assert_eq!(bound, software);
     }
 }

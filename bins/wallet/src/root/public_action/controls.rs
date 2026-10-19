@@ -18,12 +18,19 @@ pub(in crate::root) fn public_action_form(
 }
 
 const MIMIC_RAILWAY_TITLE: &str = "Mimic Railway";
-const MIMIC_RAILWAY_INTRO: &str = "Build this shield the way Railway v5.26.1 builds a single-asset shield. A native-token shield goes through a fresh stealth account in one transaction.";
-const MIMIC_RAILWAY_TRADEOFF_ALLOWANCE: &str =
-    "ERC-20 shields may grant the RAILGUN contract an unlimited token allowance.";
-const MIMIC_RAILWAY_TRADEOFF_GAS: &str = "Gas limits and maximum fee estimates may be higher.";
+const MIMIC_RAILWAY_INTRO: &str = "Signs this shield with the fee, gas and approval policy Railway v5.26.1 uses for a single-asset shield. The shield transaction itself is the same one Railoxide sends.";
+const MIMIC_RAILWAY_POLICY_GAS: &str = "Gas limits of 120% of the estimate";
+const MIMIC_RAILWAY_POLICY_FEE: &str =
+    "Railway's Standard fee, with legacy gas pricing for BNB Chain tokens";
+const MIMIC_RAILWAY_POLICY_ALLOWANCE: &str =
+    "Unlimited token approval for the RAILGUN contract, only when the allowance is short";
 const MIMIC_RAILWAY_PUBLIC_VALUES: &str = "Public address, token, or amount";
 const MIMIC_RAILWAY_TIMING: &str = "Transaction timing or later unshield behavior";
+
+const SHIELD_APPROVAL_TITLE: &str = "Token approval";
+const SHIELD_APPROVAL_EXACT: &str = "Exact amount approves only what this shield needs. Every shield then needs its own approval transaction, and no allowance is left afterwards.";
+const SHIELD_APPROVAL_UNLIMITED: &str = "Unlimited when needed approves the maximum amount, only when the current allowance is too small. You sign it once per token, and the RAILGUN contract keeps a standing allowance.";
+const SHIELD_APPROVAL_MIMIC: &str = "Mimic Railway requires unlimited approval.";
 
 fn render_mimic_railway_tooltip_body() -> gpui::AnyElement {
     div()
@@ -36,26 +43,35 @@ fn render_mimic_railway_tooltip_body() -> gpui::AnyElement {
                 .child(MIMIC_RAILWAY_INTRO),
         )
         .child(render_mimic_railway_tooltip_section(
-            "Tradeoffs",
-            [MIMIC_RAILWAY_TRADEOFF_ALLOWANCE, MIMIC_RAILWAY_TRADEOFF_GAS],
+            "Policy",
+            &[
+                MIMIC_RAILWAY_POLICY_GAS,
+                MIMIC_RAILWAY_POLICY_FEE,
+                MIMIC_RAILWAY_POLICY_ALLOWANCE,
+            ],
         ))
         .child(render_mimic_railway_tooltip_section(
             "Does not hide",
-            [MIMIC_RAILWAY_PUBLIC_VALUES, MIMIC_RAILWAY_TIMING],
+            &[MIMIC_RAILWAY_PUBLIC_VALUES, MIMIC_RAILWAY_TIMING],
         ))
         .into_any_element()
 }
 
 fn render_mimic_railway_tooltip_section(
     heading: &'static str,
-    bullets: [&'static str; 2],
+    bullets: &[&'static str],
 ) -> gpui::Div {
     div()
         .flex()
         .flex_col()
         .gap_1()
         .child(app_strong_text(heading))
-        .children(bullets.map(render_mimic_railway_tooltip_bullet))
+        .children(
+            bullets
+                .iter()
+                .copied()
+                .map(render_mimic_railway_tooltip_bullet),
+        )
 }
 
 fn render_mimic_railway_tooltip_bullet(label: &'static str) -> gpui::Div {
@@ -77,7 +93,7 @@ pub(in crate::root) fn render_mimic_railway_shield_control(
     root: Entity<WalletRoot>,
     checked: bool,
     disabled: bool,
-    native_unavailable: Option<RailwayNativeShieldUnavailable>,
+    native_unavailable: Option<NativeShieldUnavailable>,
 ) -> gpui::Div {
     let toggle_root = root;
     // The reason is a lowercase clause for embedding; the tooltip shows it as a sentence.
@@ -98,8 +114,8 @@ pub(in crate::root) fn render_mimic_railway_shield_control(
                 root.public_form.mimic_railway_shield = *checked;
                 root.invalidate_public_action_gas_fee_quote(PublicActionMode::Shield);
                 root.refresh_public_action_gas_fee_quote(PublicActionMode::Shield, cx);
-                root.public_form.native_mimic_shield.invalidate();
-                root.refresh_native_mimic_shield_preparation(cx);
+                root.public_form.native_shield_preparation.invalidate();
+                root.refresh_native_shield_preparation(cx);
                 root.set_public_action_error(PublicActionMode::Shield, None);
                 cx.notify();
             });
@@ -130,6 +146,97 @@ pub(in crate::root) fn render_mimic_railway_shield_control(
             MIMIC_RAILWAY_TITLE,
             render_mimic_railway_tooltip_body,
         ))
+}
+
+fn render_shield_approval_tooltip_body() -> gpui::AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .text_color(rgb(theme::TEXT_MUTED))
+        .child(SHIELD_APPROVAL_EXACT)
+        .child(SHIELD_APPROVAL_UNLIMITED)
+        .into_any_element()
+}
+
+/// The approval amount of a shield that may sign an ERC-20 approval. Mimic Railway locks it to
+/// its own policy.
+pub(in crate::root) fn render_public_shield_approval_control(
+    root: &Entity<WalletRoot>,
+    chosen: PublicShieldApprovalMode,
+    mimic_railway: bool,
+    disabled: bool,
+) -> gpui::Div {
+    let selected = if mimic_railway {
+        PublicShieldTransactionProfile::Railway.approval_mode(chosen)
+    } else {
+        chosen
+    };
+    // Mimic Railway disables only the other choice, so its locked one still reads as selected.
+    let segment = |id: &'static str, label: &'static str, mode: PublicShieldApprovalMode| {
+        let root = root.clone();
+        let mimic_locked = mimic_railway && mode != selected;
+        app_segment_button(id, label, selected == mode, disabled || mimic_locked, None)
+            // A disabled segment in an enabled group keeps the group's bright text.
+            .when(mimic_locked, |button| {
+                button.text_color(rgb(theme::TEXT_SUBTLE))
+            })
+            .on_click(move |_event, _window, cx| {
+                if mimic_railway {
+                    return;
+                }
+                root.update(cx, |root, cx| {
+                    root.public_form.shield_approval_mode = mode;
+                    root.set_public_action_error(PublicActionMode::Shield, None);
+                    cx.notify();
+                });
+            })
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .min_w(px(0.0))
+                        .child(app_muted_text(SHIELD_APPROVAL_TITLE))
+                        .child(render_private_action_info_icon_with_body(
+                            "wallet-public-shield-approval-info".into(),
+                            SHIELD_APPROVAL_TITLE,
+                            render_shield_approval_tooltip_body,
+                        )),
+                )
+                .child(
+                    div().flex_none().child(
+                        ButtonGroup::new("wallet-public-shield-approval")
+                            .outline()
+                            .compact()
+                            .disabled(disabled)
+                            .child(segment(
+                                "wallet-public-shield-approval-exact",
+                                "Exact amount",
+                                PublicShieldApprovalMode::Exact,
+                            ))
+                            .child(segment(
+                                "wallet-public-shield-approval-unlimited",
+                                "Unlimited when needed",
+                                PublicShieldApprovalMode::UnlimitedWhenShort,
+                            )),
+                    ),
+                ),
+        )
+        .when(mimic_railway, |control| {
+            control.child(app_muted_text(SHIELD_APPROVAL_MIMIC))
+        })
 }
 
 pub(in crate::root) fn render_public_action_amount_input(

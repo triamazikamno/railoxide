@@ -459,6 +459,7 @@ fn ui_snapshot_lists_active_accounts_of_the_unlocked_wallet_and_clears_them_on_l
             address_book_entry: None,
             fee: crate::gateway::GatewayDraftFee::Normal,
             mimic_railway: false,
+            approval: crate::gateway::GatewayDraftApproval::Exact,
             max: false,
         }
         .into(),

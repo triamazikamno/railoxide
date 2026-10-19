@@ -8939,14 +8939,24 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
                     .is_none()
             );
             // Native cancellation released both accounts. Neither is retired or stopped, and
-            // each is offered again.
+            // each is admitted again. The source stays hidden, so only the destination is
+            // listed.
             for (store, account) in [(executors, operation), (&polygon_store, existing)] {
                 let record = record_of(store, account);
                 assert_eq!(record.active_swap_use(), None);
                 assert!(record.swap_use(first).unwrap().is_stopped());
                 assert!(!record.is_retired() && !record.is_swap_setup_stopped());
             }
-            assert_eq!(offered(&swaps, cx), (true, true));
+            assert_eq!(offered(&swaps, cx), (false, true));
+            swaps.read_with(cx, |swaps, _| {
+                let owner = swaps.private_owner().unwrap();
+                assert_eq!(
+                    owner
+                        .swap_account_refusal(operation, SwapAccountRole::Source)
+                        .unwrap(),
+                    None
+                );
+            });
 
             // Another preparation sets up a new destination account, whose setup was sent.
             let second = SwapUseId::random().unwrap();

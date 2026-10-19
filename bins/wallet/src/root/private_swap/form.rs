@@ -997,14 +997,14 @@ struct FormAssets {
 }
 
 /// A set-up stealth account as an account select lists it: its operation, index and address,
-/// whether it is hidden, and the sell and buy tokens of its last swap when the select names
-/// them.
+/// the sell and buy tokens of its last swap when the select names them, and what it was set
+/// up for.
 type AccountRow = (
     ExecutorOperationId,
     u32,
     Address,
-    bool,
     Option<(Address, Address)>,
+    Option<String>,
 );
 
 /// A new swap's stealth account: a new one, or a set-up account to use again.
@@ -2583,24 +2583,25 @@ impl PrivateSwapsView {
             self.records
                 .iter()
                 .filter(|record| {
-                    swap_account_refusal(
-                        record,
-                        self.origin_chain_id,
-                        SwapAccountRole::Source,
-                        SwapAccountUse::New,
-                        SwapAdmissionEvidence::Recorded,
-                    )
-                    .is_none()
+                    !record.is_hidden()
+                        && swap_account_refusal(
+                            record,
+                            self.origin_chain_id,
+                            SwapAccountRole::Source,
+                            SwapAccountUse::New,
+                            SwapAdmissionEvidence::Recorded,
+                        )
+                        .is_none()
                 })
                 .filter_map(|record| {
                     Some((
                         record.operation(),
                         record.index(),
                         record.address()?,
-                        record.is_hidden(),
                         record
                             .swap()
                             .map(|swap| (swap.terms().sell_token(), swap.terms().buy_token())),
+                        record.purpose_intent().map(str::to_owned),
                     ))
                 })
                 .collect::<Vec<_>>()
@@ -2614,8 +2615,8 @@ impl PrivateSwapsView {
                         candidate.operation(),
                         candidate.index(),
                         candidate.address(),
-                        candidate.is_hidden(),
                         candidate.last_pair(),
+                        candidate.purpose().map(str::to_owned),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -2630,10 +2631,10 @@ impl PrivateSwapsView {
                 record.operation(),
                 record.index(),
                 address,
-                record.is_hidden(),
                 record
                     .swap()
                     .map(|swap| (swap.terms().sell_token(), swap.terms().buy_token())),
+                record.purpose_intent().map(str::to_owned),
             ));
         }
         self.account_items(accounts, cx)
@@ -2654,8 +2655,8 @@ impl PrivateSwapsView {
                     candidate.operation(),
                     candidate.index(),
                     candidate.address(),
-                    candidate.is_hidden(),
                     None,
+                    candidate.purpose().map(str::to_owned),
                 )
             })
             .collect::<Vec<_>>();
@@ -2664,7 +2665,7 @@ impl PrivateSwapsView {
                 .iter()
                 .any(|(operation, ..)| *operation == chosen.operation)
         {
-            accounts.push((chosen.operation, chosen.index, chosen.address, false, None));
+            accounts.push((chosen.operation, chosen.index, chosen.address, None, None));
         }
         self.account_items(accounts, cx)
     }
@@ -2673,28 +2674,25 @@ impl PrivateSwapsView {
     fn account_items(&self, mut accounts: Vec<AccountRow>, cx: &App) -> Vec<SwapAccountSelectItem> {
         accounts.sort_by_key(|(_, index, ..)| std::cmp::Reverse(*index));
         let mut items = vec![new_account_item()];
-        items.extend(
-            accounts
-                .into_iter()
-                .map(|(operation, index, address, hidden, last_pair)| {
-                    let mut label = vec![format!("#{index}"), railgun_ui::short_address(&address)];
-                    if hidden {
-                        label.push("Hidden".into());
-                    }
-                    if let Some((sell, buy)) = last_pair {
-                        label.push(format!(
-                            "Last used {} → {}",
-                            self.token_symbol(sell, cx),
-                            self.token_symbol(buy, cx)
-                        ));
-                    }
-                    SwapAccountSelectItem {
-                        operation: Some(operation),
-                        address: Some(address),
-                        label: label.join(" · ").into(),
-                    }
-                }),
-        );
+        items.extend(accounts.into_iter().map(
+            |(operation, index, address, last_pair, purpose)| {
+                let mut label = vec![format!("#{index}"), railgun_ui::short_address(&address)];
+                if let Some((sell, buy)) = last_pair {
+                    label.push(format!(
+                        "Last used {} → {}",
+                        self.token_symbol(sell, cx),
+                        self.token_symbol(buy, cx)
+                    ));
+                } else if let Some(purpose) = purpose {
+                    label.push(purpose);
+                }
+                SwapAccountSelectItem {
+                    operation: Some(operation),
+                    address: Some(address),
+                    label: label.join(" · ").into(),
+                }
+            },
+        ));
         items
     }
 

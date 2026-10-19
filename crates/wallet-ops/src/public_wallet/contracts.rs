@@ -1,15 +1,8 @@
 use alloy::sol;
 
 sol! {
-    struct RelayAdaptCall {
-        address to;
-        bytes data;
-        uint256 value;
-    }
-
-    interface PublicRelayAdapt {
-        function multicall(bool _requireSuccess, RelayAdaptCall[] _calls) external payable;
-        function wrapBase(uint256 _amount) external;
+    interface PublicWrappedNative {
+        function deposit() external payable;
     }
 
     interface PublicErc20 {

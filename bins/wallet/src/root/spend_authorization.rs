@@ -313,7 +313,7 @@ impl SpendAuthorizationIntent {
                 draft.public_account_uuid.to_string(),
             ),
             Self::PublicShield(draft) => {
-                // Native Mimic signs from a new stealth account, whatever pays.
+                // A stealth-route native shield signs from a new stealth account, whatever pays.
                 if let Some(operation) = draft.native_operation {
                     return Some(HardwareExecutorAction::Execute(operation));
                 }
@@ -3457,8 +3457,8 @@ impl WalletRoot {
             let payer = if let SpendAuthorizationIntent::PublicShield(draft) = &intent
                 && draft.native_operation.is_some()
             {
-                // Native Mimic's payer sends the stealth account's execution, as a gas payer
-                // does. The draft admits only a software or imported payer here.
+                // A stealth-route native shield's payer sends the stealth account's execution,
+                // as a gas payer does. The draft admits only a software or imported payer here.
                 Some(draft.public_account_uuid.to_string())
             } else if let Some(key) = key
                 && let Some(draft) = self.unshield_spend_draft(key, cx)

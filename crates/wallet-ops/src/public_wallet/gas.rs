@@ -42,18 +42,6 @@ pub(super) const fn public_shield_gas_units(model: &RailgunGasModel, mode: GasEs
     TRANSACTION_INTRINSIC_GAS.saturating_add(model.shield(mode, 1))
 }
 
-/// A native shield through `RelayAdapt`: its wrap and shield actions, the wrap, and the shield.
-/// The wrap's gas units are a standalone transaction's, so they also cover the intrinsic gas.
-pub(super) const fn public_native_relay_adapt_shield_gas_units(
-    model: &RailgunGasModel,
-    mode: GasEstimateMode,
-) -> u64 {
-    model
-        .relay(2)
-        .saturating_add(PUBLIC_NATIVE_WRAP_GAS_UNITS)
-        .saturating_add(model.shield(mode, 1))
-}
-
 #[must_use]
 pub fn public_native_action_gas_units(chain_id: u64, steps: &[PublicActionProgressStep]) -> u64 {
     public_native_action_gas_units_with_buffer(
@@ -157,7 +145,7 @@ pub fn estimate_public_action_gas_cost_with_profile_and_ceiling(
         profile,
         chain.gas.gas_limit_buffer,
     )
-    .ok_or_else(|| eyre!("Mimic Railway native shield fees come from its prepared estimate"))?;
+    .ok_or_else(|| eyre!("a stealth-route native shield's fees come from its prepared estimate"))?;
     if public_action_uses_legacy_envelope(chain_id, profile, asset, quote) {
         return Ok(legacy_gas_cost_projection(
             expected_gas_units,
@@ -375,42 +363,40 @@ fn public_action_estimated_gas_units_with_buffer(
             Some(gas_units.saturating_add(gas_limit_buffer))
         }
         PublicActionKind::Shield => {
-            let (approve, shield) =
+            let (wrap, approve, shield) =
                 public_shield_estimated_gas_units(model, asset, profile, gas_limit_buffer)?;
-            Some(approve.saturating_add(shield))
+            Some(wrap.saturating_add(approve).saturating_add(shield))
         }
     }
 }
 
-/// The approval and Shield portions of the same model used for the displayed fee budget.
-/// A Mimic Railway native shield has no model; its limits come from its preparation.
+/// The wrap, approval and Shield portions of the same model used for the displayed fee
+/// budget; only the Railoxide native wrap fallback wraps. A native shield in Mimic Railway always
+/// takes the stealth route, which has no model; its limits come from its preparation.
 pub(super) fn public_shield_estimated_gas_units(
     model: &RailgunGasModel,
     asset: PublicAssetId,
     profile: PublicShieldTransactionProfile,
     gas_limit_buffer: u64,
-) -> Option<(u64, u64)> {
+) -> Option<(u64, u64, u64)> {
+    let shield = public_shield_gas_units(model, GasEstimateMode::UpperBound);
     match (asset, profile) {
         (PublicAssetId::Native, PublicShieldTransactionProfile::Railway) => None,
         (PublicAssetId::Native, PublicShieldTransactionProfile::Railoxide) => Some((
-            0,
-            public_native_relay_adapt_shield_gas_units(model, GasEstimateMode::UpperBound)
-                .saturating_add(gas_limit_buffer),
+            PUBLIC_NATIVE_WRAP_GAS_UNITS.saturating_add(gas_limit_buffer),
+            PUBLIC_NATIVE_APPROVE_GAS_UNITS.saturating_add(gas_limit_buffer),
+            shield.saturating_add(gas_limit_buffer),
         )),
-        (PublicAssetId::Erc20(_), PublicShieldTransactionProfile::Railway) => {
-            let shield = public_shield_gas_units(model, GasEstimateMode::UpperBound);
-            Some((
-                railway_gas_limit(PUBLIC_NATIVE_APPROVE_GAS_UNITS),
-                railway_gas_limit(shield),
-            ))
-        }
-        (PublicAssetId::Erc20(_), PublicShieldTransactionProfile::Railoxide) => {
-            let shield = public_shield_gas_units(model, GasEstimateMode::UpperBound);
-            Some((
-                PUBLIC_NATIVE_APPROVE_GAS_UNITS.saturating_add(gas_limit_buffer),
-                shield.saturating_add(gas_limit_buffer),
-            ))
-        }
+        (PublicAssetId::Erc20(_), PublicShieldTransactionProfile::Railway) => Some((
+            0,
+            railway_gas_limit(PUBLIC_NATIVE_APPROVE_GAS_UNITS),
+            railway_gas_limit(shield),
+        )),
+        (PublicAssetId::Erc20(_), PublicShieldTransactionProfile::Railoxide) => Some((
+            0,
+            PUBLIC_NATIVE_APPROVE_GAS_UNITS.saturating_add(gas_limit_buffer),
+            shield.saturating_add(gas_limit_buffer),
+        )),
     }
 }
 
@@ -424,13 +410,16 @@ pub(super) const fn public_action_estimated_gas_usage_units(
             PublicAssetId::Native => PUBLIC_NATIVE_SEND_GAS_UNITS,
             PublicAssetId::Erc20(_) => PUBLIC_ERC20_SEND_GAS_UNITS,
         },
-        PublicActionKind::Shield => match asset {
-            PublicAssetId::Native => {
-                public_native_relay_adapt_shield_gas_units(model, GasEstimateMode::Expected)
+        PublicActionKind::Shield => {
+            let approve_and_shield = PUBLIC_NATIVE_APPROVE_GAS_UNITS
+                .saturating_add(public_shield_gas_units(model, GasEstimateMode::Expected));
+            match asset {
+                PublicAssetId::Native => {
+                    PUBLIC_NATIVE_WRAP_GAS_UNITS.saturating_add(approve_and_shield)
+                }
+                PublicAssetId::Erc20(_) => approve_and_shield,
             }
-            PublicAssetId::Erc20(_) => PUBLIC_NATIVE_APPROVE_GAS_UNITS
-                .saturating_add(public_shield_gas_units(model, GasEstimateMode::Expected)),
-        },
+        }
     }
 }
 
@@ -452,6 +441,20 @@ fn public_native_action_gas_reserve_with_buffer(
 pub(super) fn railway_gas_limit(estimated_gas: u64) -> u64 {
     let multiplied = u128::from(estimated_gas) * 120 / 100;
     multiplied.min(u128::from(u64::MAX)) as u64
+}
+
+/// A stealth-account native shield's buffered limit over its raw type-4 estimate: Mimic
+/// Railway's 120%, or the chain's `gas_limit_buffer` in the Railoxide profile.
+#[must_use]
+pub(super) fn native_shield_gas_limit(
+    profile: PublicShieldTransactionProfile,
+    raw_gas_limit: u64,
+    gas_limit_buffer: u64,
+) -> u64 {
+    match profile {
+        PublicShieldTransactionProfile::Railway => railway_gas_limit(raw_gas_limit),
+        PublicShieldTransactionProfile::Railoxide => raw_gas_limit.saturating_add(gas_limit_buffer),
+    }
 }
 
 pub async fn quote_public_action_gas_fee(
@@ -1023,7 +1026,7 @@ pub async fn estimate_public_native_action_gas_reserve_with_profile_and_ceiling(
 ) -> Result<U256> {
     if profile == PublicShieldTransactionProfile::Railway {
         return Err(eyre!(
-            "Mimic Railway native Max comes from its prepared estimate"
+            "a stealth-route native shield's Max comes from its prepared estimate"
         ));
     }
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
@@ -1393,7 +1396,7 @@ const fn public_native_step_gas_units(
         PublicActionProgressStep::Wrap => PUBLIC_NATIVE_WRAP_GAS_UNITS,
         PublicActionProgressStep::Approve => PUBLIC_NATIVE_APPROVE_GAS_UNITS,
         PublicActionProgressStep::Shield => {
-            public_native_relay_adapt_shield_gas_units(model, GasEstimateMode::UpperBound)
+            public_shield_gas_units(model, GasEstimateMode::UpperBound)
         }
         PublicActionProgressStep::ShieldKey
         | PublicActionProgressStep::Sponsor

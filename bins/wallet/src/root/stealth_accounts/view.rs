@@ -375,14 +375,9 @@ impl StealthAccountsView {
                     cx,
                 )
             }));
-        let purpose_text = self.swap_purpose(record, cx).or_else(|| {
-            record.purpose_summary().map(|purpose| {
-                purpose
-                    .split_once(" → ")
-                    .map_or(purpose, |(intent, _)| intent)
-                    .to_owned()
-            })
-        });
+        let purpose_text = self
+            .swap_purpose(record, cx)
+            .or_else(|| record.purpose_intent().map(str::to_owned));
         let purpose = div()
             .w_full()
             .min_w_0()

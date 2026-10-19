@@ -352,17 +352,14 @@ pub(in crate::root) fn public_action_retry_button_id(
     ))
 }
 
-pub(in crate::root) fn public_action_progress_steps(
-    mode: PublicActionMode,
-    asset: PublicAssetId,
-) -> Vec<PublicActionProgressStep> {
-    public_action_progress_steps_for_source(mode, asset, PublicAccountSource::Derived)
-}
-
+/// A native shield takes one stealth-route transaction unless `native_wrap_fallback`, which
+/// wraps and then shields the wrapped token as an ERC-20. Approve is listed even when the
+/// allowance may suffice; wallet-ops completes it without a transaction then.
 pub(in crate::root) fn public_action_progress_steps_for_source(
     mode: PublicActionMode,
     asset: PublicAssetId,
     source: PublicAccountSource,
+    native_wrap_fallback: bool,
 ) -> Vec<PublicActionProgressStep> {
     let mut steps = Vec::new();
     if mode == PublicActionMode::Shield && source == PublicAccountSource::HardwareDerived {
@@ -370,10 +367,13 @@ pub(in crate::root) fn public_action_progress_steps_for_source(
     }
     match mode {
         PublicActionMode::Send => steps.push(PublicActionProgressStep::Send),
-        PublicActionMode::Shield if asset == PublicAssetId::Native => {
+        PublicActionMode::Shield if asset == PublicAssetId::Native && !native_wrap_fallback => {
             steps.push(PublicActionProgressStep::Shield);
         }
         PublicActionMode::Shield => {
+            if asset == PublicAssetId::Native {
+                steps.push(PublicActionProgressStep::Wrap);
+            }
             steps.push(PublicActionProgressStep::Approve);
             steps.push(PublicActionProgressStep::Shield);
         }

@@ -1217,7 +1217,7 @@ impl GatewayView {
                     ),
                 )
                 .child(
-                    note("Build this shield the way Railway v5.26.1 builds a single-asset shield. A native-token shield goes through a fresh stealth account in one transaction.")
+                    note("Signs this shield with the fee, gas and approval policy Railway v5.26.1 uses for a single-asset shield. The shield transaction itself is the same one Railoxide sends.")
                         .whitespace_normal(),
                 );
         }

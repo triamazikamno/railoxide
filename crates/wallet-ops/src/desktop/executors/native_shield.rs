@@ -1,6 +1,6 @@
-//! Mimic Railway native shields from a stealth account. The payer's type-4 transaction sends
-//! the value to the account with its delegation, and the account's signed `execute`, with no
-//! private transactions, wraps that value and shields it.
+//! Native shields from a stealth account, in either transaction profile. The payer's type-4
+//! transaction sends the value to the account with its delegation, and the account's signed
+//! `execute`, with no private transactions, wraps that value and shields it.
 
 use alloy::primitives::{Address, B256, Bytes, Signature, U256};
 use alloy::rpc::types::TransactionRequest;
@@ -78,8 +78,8 @@ impl ExecutorOwner {
                 hash,
                 value: amount,
                 inputs: Vec::new(),
-                // Railway's native shield is always type 4 with the account's
-                // authorization, retries included.
+                // The native shield is always type 4 with the account's authorization,
+                // retries included.
                 authorize_delegation: true,
                 authorize: Box::new(move |signature| {
                     Ok(TransactionCall {

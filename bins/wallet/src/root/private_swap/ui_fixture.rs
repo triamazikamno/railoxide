@@ -13,17 +13,22 @@
 //!   `public_action/root.rs`, submit no action, and have no retry session. Details and Close
 //!   work normally. Public's Add account button becomes Preview Shield failure… so an
 //!   unfunded scratch wallet can open them without an account or asset balance.
-//! - `shield:mimic-prepared`, `shield:mimic-unavailable` and `shield:mimic-pending` show a
-//!   native-token Mimic Railway Shield, also from a Public asset dialog or from Add account,
-//!   which becomes Preview Mimic Railway shield…. These live in
-//!   `public_action/native_shield.rs`. `prepared` opens the Shield form for 0.5 of the native
-//!   token with a stand-in quote and a prepared estimate of 241,380 gas buffered to 289,656.
-//!   `unavailable` opens it with the Mimic Railway checkbox disabled and unchecked; its hover
-//!   tooltip gives the reason a hardware Public account can't use the route. The stand-in
-//!   quote belongs to the Mimic route, so the ordinary route shows no Auto fee, and Shield
-//!   does nothing. `pending` holds the single Shield step broadcast and waiting for confirmation,
-//!   with its transaction hash. Nothing is prepared or sent, and no record is read or
-//!   written. In `prepared`, Max does nothing and Shield stops at the missing preparation.
+//! - `shield:mimic-prepared`, `shield:native-prepared`, `shield:mimic-unavailable`,
+//!   `shield:fallback`, `shield:native-pending` and `shield:fallback-pending` show a
+//!   native-token Shield, also from a Public asset dialog or from Add account, which becomes
+//!   Preview native shield…. These live in `public_action/native_shield.rs`. The forms are
+//!   for 0.5 of the native token with a stand-in quote. `mimic-prepared` and
+//!   `native-prepared` open the stealth route of a software payer, in Mimic Railway and in
+//!   Railoxide, with a prepared estimate of 241,380 gas buffered to 289,656.
+//!   `mimic-unavailable` and `fallback` open a hardware Public account's wrap fallback, with
+//!   the Mimic Railway preference on and off: the checkbox is disabled and unchecked, its
+//!   hover tooltip gives the reason, and the Token approval switch and its hint show. The fee
+//!   card sums the wrap, approval and shield maximums. `native-pending` holds the single
+//!   stealth-route Shield step broadcast and waiting for confirmation, with its transaction
+//!   hash. `fallback-pending` holds a hardware payer's wrap fallback with Wrap done, Approve
+//!   waiting for confirmation and Shield not started. Nothing is prepared or sent, and no
+//!   record is read or written. Shield does nothing in the forms, and neither does Max on the
+//!   stealth route.
 //! - `route-error` opens the Public form with a failed Across route lookup and its Retry.
 //! - `form` lets the Buy picker pick a network without private funds there, and gives a new
 //!   destination account a stand-in setup fee in place of an estimate, so a live quote can
@@ -52,11 +57,12 @@
 //!   approval transaction, and `permit-used-up` is that order with the warning that its
 //!   signed approval was used up.
 //!   The detail's actions do nothing.
-//! - `accounts` shows two synthesized accounts in Stealth accounts in place of the wallet's
+//! - `accounts` shows three synthesized accounts in Stealth accounts in place of the wallet's
 //!   own. Account #7 is a swap account whose inspector shows each result tag: an executed
 //!   setup, a pre-hook that executed with the cancellation it superseded at the same nonce,
 //!   a consumed nonce that names neither of two recoveries, and an unconfirmed recovery.
-//!   Account #8 holds one executed operation. The wallet holds neither account, so Check
+//!   Account #8 holds one executed operation, and account #9 a settled native shield to a
+//!   0zk address, which is hidden until Show hidden. The wallet holds none, so Check
 //!   balances and the other actions fail.
 //! - `refund:<case>` opens the refund dialog of a synthesized blocked Shield in place of
 //!   Stealth accounts, the first time they are opened. Later openings show Stealth accounts,
@@ -64,7 +70,7 @@
 //!   check. `available` is a refund that goes back to a Public account labelled Savings, and
 //!   its Refund… only closes the dialog. The other cases can't be refunded: the origin of
 //!   `unknown` is an account the wallet doesn't hold, that of `stealth` is account #7 of the
-//!   `accounts` mode, whose two accounts Stealth accounts then shows, and that of `inactive`
+//!   `accounts` mode, whose accounts Stealth accounts then shows, and that of `inactive`
 //!   is an inactive Public account labelled Savings. `unresolved` is a Shield transaction
 //!   that couldn't be read, which has no origin.
 //! - `utxos` shows nine synthesized rows in the UTXO table of Wallet activity in place of the
@@ -2303,7 +2309,7 @@ pub(in crate::root) fn stealth_accounts() -> Option<Vec<ExecutorRecord>> {
         ACCOUNTS
             .get_or_init(|| {
                 let accounts = staged_accounts();
-                if accounts.len() != 2 {
+                if accounts.len() != 3 {
                     tracing::warn!("the debug UI fixture couldn't synthesize its stealth accounts");
                 }
                 accounts
@@ -2342,7 +2348,7 @@ fn staged_payload(
     Some(payload)
 }
 
-/// The two accounts of the `accounts` mode, decoded from the JSON a stored record has. An
+/// The accounts of the `accounts` mode, decoded from the JSON a stored record has. An
 /// account that fails to decode is left out.
 fn staged_accounts() -> Vec<ExecutorRecord> {
     use ExecutorPayloadPurpose::{Operation, Recovery, SwapPreHook};
@@ -2423,7 +2429,21 @@ fn staged_accounts() -> Vec<ExecutorRecord> {
         ));
         Some(operation)
     };
-    [swap(), operation()]
+    // A settled native shield, hidden as one is once its Shield event is proven.
+    let native_shield = || {
+        let mut shield = account(
+            9,
+            0x3d,
+            1,
+            vec![staged_payload(0, 0xa1, Operation, Some(0xc9))],
+        )?;
+        shield["purpose_summary"] = serde_json::json!(
+            "Shield 0.01 ETH → 0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp"
+        );
+        shield["hidden"] = serde_json::json!(true);
+        Some(shield)
+    };
+    [swap(), operation(), native_shield()]
         .into_iter()
         .flatten()
         .filter_map(|account| serde_json::from_value(account).ok())

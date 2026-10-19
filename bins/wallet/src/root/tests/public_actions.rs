@@ -3,13 +3,15 @@ use std::sync::Arc;
 use alloy::primitives::{Bytes, U256, address, keccak256};
 use wallet_ops::vault::PublicAccountSource;
 use wallet_ops::{
-    PublicActionGasFeeMode, PublicActionGasFeeQuote, PublicActionGasFeeSelection, PublicAssetId,
-    PublicShieldTransactionProfile, PublicTransactionIntent, RailwayNativeShieldPayer,
+    NativeShieldPayer, PublicActionGasFeeMode, PublicActionGasFeeQuote,
+    PublicActionGasFeeSelection, PublicAssetId, PublicShieldTransactionProfile,
+    PublicTransactionIntent,
 };
 
 use super::*;
 use crate::root::public_action::{
-    NativeMimicShieldKey, NativeMimicShieldPreparationState, railway_native_shield_payer,
+    NativeShieldKey, NativeShieldPreparationState, bind_native_shield_operation,
+    native_shield_payer,
 };
 
 #[test]
@@ -217,14 +219,16 @@ fn explicit_review_summaries_cannot_use_cached_password() {
 }
 
 #[test]
-fn stale_native_mimic_preparation_cannot_establish_readiness() {
-    let key = |amount: u64| NativeMimicShieldKey {
+fn stale_native_shield_preparation_cannot_establish_readiness() {
+    let key_in = |profile, amount: u64| NativeShieldKey {
         wallet_id: Some(Arc::from("wallet")),
         chain_id: 56,
         public_account_uuid: Arc::from("account"),
+        profile,
         amount: U256::from(amount),
     };
-    let mut preparation = NativeMimicShieldPreparationState::<u64>::default();
+    let key = |amount| key_in(PublicShieldTransactionProfile::Railoxide, amount);
+    let mut preparation = NativeShieldPreparationState::<u64>::default();
     let earlier = preparation.begin();
     let current = preparation.begin();
     assert!(!preparation.complete(earlier, key(1), Some(&key(1)), Ok(1)));
@@ -234,12 +238,26 @@ fn stale_native_mimic_preparation_cannot_establish_readiness() {
     assert!(preparation.complete(current, key(2), Some(&key(2)), Ok(2)));
     assert_eq!(preparation.prepared(Some(&key(2))), Some(&2));
     assert!(preparation.prepared(Some(&key(3))).is_none());
+    // Toggling Mimic Railway changes the gas buffer and fee bounds, so it prepares again.
+    let mimic = key_in(PublicShieldTransactionProfile::Railway, 2);
+    assert!(preparation.prepared(Some(&mimic)).is_none());
+    // Preparing again in the other profile is the same action, with the same stealth account.
+    let mut bound = None;
+    let operation = bind_native_shield_operation(&mut bound, key(2)).unwrap();
+    assert_eq!(
+        bind_native_shield_operation(&mut bound, mimic).unwrap(),
+        operation
+    );
+    assert_ne!(
+        bind_native_shield_operation(&mut bound, key(3)).unwrap(),
+        operation
+    );
     preparation.invalidate();
     assert!(preparation.prepared(Some(&key(2))).is_none());
 }
 
 #[test]
-fn native_mimic_payer_follows_the_account_source() {
+fn native_shield_payer_follows_the_account_source() {
     let executor = serde_json::from_value(serde_json::json!({
         "chain_id": 1,
         "index": 5,
@@ -250,28 +268,25 @@ fn native_mimic_payer_follows_the_account_source() {
         (
             PublicAccountSource::HardwareDerived,
             true,
-            RailwayNativeShieldPayer::Hardware,
+            NativeShieldPayer::Hardware,
         ),
         // A Ledger or Trezor wallet approves its stealth account with a software payer only.
         (
             PublicAccountSource::Imported,
             true,
-            RailwayNativeShieldPayer::Software,
+            NativeShieldPayer::Software,
         ),
         (
             PublicAccountSource::ExecutorDerived(executor),
             true,
-            RailwayNativeShieldPayer::HardwareWallet,
+            NativeShieldPayer::HardwareWallet,
         ),
         (
             PublicAccountSource::ExecutorDerived(executor),
             false,
-            RailwayNativeShieldPayer::Software,
+            NativeShieldPayer::Software,
         ),
     ] {
-        assert_eq!(
-            railway_native_shield_payer(source, wallet_is_hardware),
-            payer
-        );
+        assert_eq!(native_shield_payer(source, wallet_is_hardware), payer);
     }
 }
