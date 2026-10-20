@@ -520,7 +520,15 @@ mod tests {
         .cloned()
         .unwrap();
         let address = Address::repeat_byte(1);
-        let delegate = chain.accepted_executor_profile().unwrap().delegate();
+        // An account on the earlier listed delegate is read like one on the primary.
+        let delegate = broadcaster_core::deployment::RailgunDeployment::for_chain(1)
+            .unwrap()
+            .relay_adapt_7702_delegates[0]
+            .address;
+        assert_ne!(
+            delegate,
+            chain.accepted_executor_profile().unwrap().delegate()
+        );
         let designator = alloy::eips::eip7702::constants::EIP7702_DELEGATION_DESIGNATOR;
         let code = Bytes::from([&designator[..], delegate.as_slice()].concat());
         let confirmed_tip = 50;

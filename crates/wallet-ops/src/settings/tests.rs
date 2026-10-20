@@ -1673,6 +1673,49 @@ fn native_eth_presets_show_the_ethereum_mark() {
 }
 
 #[test]
+fn executor_profiles_accept_every_listed_delegate_with_the_newest_as_primary() {
+    use alloy::primitives::address;
+
+    let configs = build_effective_chain_configs(&WalletSettings::default()).unwrap();
+    for (chain_ids, delegates) in [
+        (
+            &[1][..],
+            [
+                address!("05aE73C5925d843864AE6f261f3175dE2ebCd963"),
+                address!("1F74b4339990Db761bC0168F20D294A3a141497e"),
+            ],
+        ),
+        (
+            &[56, 137, 42161][..],
+            [
+                address!("48cf4b897f64D81212c1423D78a05E828d0cE19d"),
+                address!("a2BFd382c54bb33DF6A13f21acd8770dc1e67D4D"),
+            ],
+        ),
+    ] {
+        for &chain_id in chain_ids {
+            for delegate in delegates {
+                let profile = super::ExecutorProfile::accepted(chain_id, delegate).unwrap();
+                assert_eq!(profile.delegate(), delegate);
+                assert_eq!(
+                    profile.capability(),
+                    super::ExecutorCapability::NonceBearingV1
+                );
+            }
+            assert!(
+                super::ExecutorProfile::accepted(chain_id, Address::repeat_byte(0x11)).is_none()
+            );
+            let primary = configs
+                .get(chain_id)
+                .unwrap()
+                .accepted_executor_profile()
+                .unwrap();
+            assert_eq!(primary.delegate(), delegates[1]);
+        }
+    }
+}
+
+#[test]
 fn public_presets_resolve_without_railgun_and_reject_railgun_overrides() {
     let mut settings = WalletSettings::default();
     let configs = build_effective_chain_configs(&settings).expect("build effective configs");

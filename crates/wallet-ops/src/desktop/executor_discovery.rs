@@ -309,8 +309,8 @@ pub(super) async fn execution_nonce_with_code(
     code: Option<&[u8]>,
     recovery: bool,
 ) -> Option<U256> {
-    // Ordinary inspection never interprets another delegate's storage. Recovery
-    // explicitly installs this supported profile and must preserve its stored nonce.
+    // Ordinary inspection never interprets the storage of a delegate of another capability.
+    // Recovery explicitly installs this supported profile and must preserve its stored nonce.
     let profile = chain.railgun.as_ref().and_then(|railgun| {
         ExecutorProfile::accepted(chain.chain_id, railgun.deployment.relay_adapt_7702_contract)
     });
@@ -525,9 +525,9 @@ pub(super) fn executor_delegation(code: &[u8]) -> Option<Address> {
 }
 
 pub(crate) fn matches_executor_delegation(code: &[u8], profile: ExecutorProfile) -> bool {
-    // Alloy 2.3 provides the designator constant but no account-code decoder.
-    // Compare the accepted EIP-7702 code directly; do not accept arbitrary code as delegation.
-    code.strip_prefix(&EIP7702_DELEGATION_DESIGNATOR) == Some(profile.delegate().as_slice())
+    // Recognize EIP-7702 code designating any listed delegate of this profile's capability;
+    // do not accept arbitrary code as delegation.
+    executor_delegation(code).is_some_and(|delegate| profile.interchangeable(delegate).is_some())
 }
 
 #[cfg(test)]
@@ -677,7 +677,13 @@ mod tests {
             .erased();
         let address = Address::repeat_byte(1);
         let block = BlockNumHash::new(10, B256::repeat_byte(10));
-        for delegate in [profile.delegate(), Address::repeat_byte(2)] {
+        // An account on the earlier listed delegate keeps its nonce readable.
+        let earlier = broadcaster_core::deployment::RailgunDeployment::for_chain(1)
+            .unwrap()
+            .relay_adapt_7702_delegates[0]
+            .address;
+        for delegate in [profile.delegate(), earlier, Address::repeat_byte(2)] {
+            let listed = delegate != Address::repeat_byte(2);
             responses.push_success(&"0x2");
             responses.push_success(&Bytes::from(
                 [
@@ -687,7 +693,7 @@ mod tests {
                 .concat(),
             ));
             responses.push_success(&"0x0");
-            if delegate == profile.delegate() {
+            if listed {
                 responses.push_success(&Bytes::from(
                     RelayAdapt7702::nonceCall::abi_encode_returns(&U256::from(8)),
                 ));
@@ -697,7 +703,7 @@ mod tests {
             assert_eq!(inspection.account_nonce(), Some(2));
             assert_eq!(
                 inspection.execution_nonce(),
-                (delegate == profile.delegate()).then_some(U256::from(8))
+                listed.then_some(U256::from(8))
             );
         }
         // A historical executor can retain a consumed nonce with no delegation.

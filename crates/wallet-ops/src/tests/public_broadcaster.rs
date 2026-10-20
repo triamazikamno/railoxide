@@ -111,6 +111,40 @@ fn executor_submission_keeps_the_reserved_quote_when_advertisements_refresh() {
 }
 
 #[test]
+fn executor_delivery_targets_the_broadcasters_listed_delegate() {
+    let primary =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .accepted_executor_profile()
+            .unwrap();
+    let earlier = broadcaster_core::deployment::RailgunDeployment::for_chain(1)
+        .unwrap()
+        .relay_adapt_7702_delegates[0]
+        .address;
+    assert_ne!(earlier, primary.delegate());
+    let (mut candidate, _) = sample_public_broadcaster_candidate(12);
+    for (advertised, target) in [
+        (primary.delegate(), Some(primary.delegate())),
+        (earlier, Some(earlier)),
+        (address(0x23), None),
+    ] {
+        candidate.relay_adapt_7702 = Some(advertised);
+        let admitted = crate::ExecutorDelivery::PublicBroadcaster(Box::new(candidate.clone()))
+            .admit(primary)
+            .ok()
+            .map(crate::settings::ExecutorProfile::delegate);
+        assert_eq!(admitted, target);
+    }
+    let self_broadcast = crate::ExecutorDelivery::SelfBroadcast {
+        sender: address(0x24),
+        sponsored: false,
+    };
+    assert_eq!(self_broadcast.admit(primary).unwrap(), primary);
+}
+
+#[test]
 fn public_broadcaster_candidates_are_keyed_by_selected_fee_token() {
     let action_token = address(0x43);
     let fee_token = address(0x44);

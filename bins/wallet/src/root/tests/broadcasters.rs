@@ -196,9 +196,15 @@ fn fee_token_options_and_selection_follow_execution_route() {
         .unwrap()
         .accepted_executor_profile()
         .unwrap();
+    // A broadcaster still advertising the earlier listed delegate stays eligible.
+    let earlier = broadcaster_core::deployment::RailgunDeployment::for_chain(1)
+        .unwrap()
+        .relay_adapt_7702_delegates[0]
+        .address;
     let trust = wallet_ops::PublicBroadcasterTrustFilter::default();
     for (version, delegate, expected_count) in [
         ("8.2.3", Some(profile.delegate()), 1),
+        ("8.2.3", Some(earlier), 1),
         ("8.4.0", Some(profile.delegate()), 1),
         ("9.0.0", Some(profile.delegate()), 0),
         ("8.2.3", None, 0),

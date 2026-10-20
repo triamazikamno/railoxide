@@ -334,8 +334,7 @@ impl WalletSessionStore {
         request: ViewWalletChainSessionRequest,
         http: &HttpContext,
     ) -> Result<WalletSession> {
-        self.start_view_wallet_session_with_wait(request, http, true)
-            .await
+        Box::pin(self.start_view_wallet_session_with_wait(request, http, true)).await
     }
 
     pub async fn start_view_wallet_session_immediate(
@@ -343,8 +342,7 @@ impl WalletSessionStore {
         request: ViewWalletChainSessionRequest,
         http: &HttpContext,
     ) -> Result<WalletSession> {
-        self.start_view_wallet_session_with_wait(request, http, false)
-            .await
+        Box::pin(self.start_view_wallet_session_with_wait(request, http, false)).await
     }
 
     pub async fn reset_public_sync_caches(&self) -> Result<PublicSyncCachesResetReport> {

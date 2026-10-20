@@ -924,15 +924,23 @@ impl ExecutorStore {
                         outcome: None,
                         ..destination
                     });
-            return if existing.delegate == delegate
-                && existing.origin == ExecutorRecordOrigin::Reserved
-                && existing.destination_operation() == destination_operation
-                && existing_destination == swap_destination
+            if existing.origin != ExecutorRecordOrigin::Reserved
+                || existing.destination_operation() != destination_operation
+                || existing_destination != swap_destination
             {
-                Ok(existing)
-            } else {
-                Err(ExecutorStoreError::OperationMismatch)
-            };
+                return Err(ExecutorStoreError::OperationMismatch);
+            }
+            if existing.delegate == delegate {
+                return Ok(existing);
+            }
+            let mut existing = existing;
+            self.retarget(&mut existing, delegate)?;
+            self.vault.db.put_desktop_wallet_vault_records(&[self.seal(
+                RecordKind::ExecutorOperation,
+                self.operation_key(operation),
+                &existing,
+            )?])?;
+            return Ok(existing);
         }
         // A swap's reservation is its account's first use. Both accounts of a private Bridge
         // swap take the origin's identity for it.
@@ -969,6 +977,36 @@ impl ExecutorStore {
         )?;
         self.vault.db.put_desktop_wallet_vault_records(&updates)?;
         Ok(record)
+    }
+
+    /// Move `operation`'s account to `delegate`, a listed delegate of its record's capability,
+    /// before an authorization targets it. Equal delegates leave the record unchanged.
+    pub fn retarget_delegate(
+        &self,
+        operation: ExecutorOperationId,
+        delegate: Address,
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        self.update(operation, |record| self.retarget(record, delegate))
+    }
+
+    fn retarget(
+        &self,
+        record: &mut ExecutorRecord,
+        delegate: Address,
+    ) -> Result<(), ExecutorStoreError> {
+        if !self.interchangeable(record.delegate, delegate) {
+            return Err(ExecutorStoreError::OperationMismatch);
+        }
+        record.delegate = delegate;
+        Ok(())
+    }
+
+    /// An account on `stored` keeps its nonce and payloads on `delegate`.
+    fn interchangeable(&self, stored: Address, delegate: Address) -> bool {
+        stored == delegate
+            || crate::settings::ExecutorProfile::accepted(self.chain_id, stored)
+                .and_then(|profile| profile.interchangeable(delegate))
+                .is_some()
     }
 
     /// Allocate a fresh account for `operation`, which has no record yet, and append its
@@ -1049,7 +1087,7 @@ impl ExecutorStore {
         &self,
         index: u32,
         address: Address,
-        delegate: Address,
+        mut delegate: Address,
         assets: &[ExecutorAsset],
     ) -> Result<ExecutorRecord, ExecutorStoreError> {
         if index >= INDEX_LIMIT {
@@ -1065,8 +1103,9 @@ impl ExecutorStore {
             .into_iter()
             .find(|record| record.index == index)
         {
+            // Restoration authorizes nothing, so an existing record keeps its delegate.
             if existing.address.is_some_and(|known| known != address)
-                || existing.delegate != delegate
+                || !self.interchangeable(existing.delegate, delegate)
             {
                 return Err(ExecutorStoreError::OperationMismatch);
             }
@@ -1099,9 +1138,12 @@ impl ExecutorStore {
                 .spare
                 .take()
                 .ok_or(ExecutorStoreError::InvalidRecord)?;
-            if spare.address.is_some_and(|known| known != address) || spare.delegate != delegate {
+            if spare.address.is_some_and(|known| known != address)
+                || !self.interchangeable(spare.delegate, delegate)
+            {
                 return Err(ExecutorStoreError::OperationMismatch);
             }
+            delegate = spare.delegate;
         } else if allocation
             .spare
             .as_ref()

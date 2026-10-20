@@ -1938,11 +1938,21 @@ async fn swap_setup_completes_only_with_observed_delegation_and_consumed_nonce()
         Some(ExecutorPayloadState::Pending)
     );
     assert_eq!(pass(22).await.0, SwapSetupStatus::Pending);
+    // A retry through a broadcaster advertising the earlier listed delegate moves the record
+    // to it; the account the first setup delegated to the primary is still recognized below.
+    let earlier = broadcaster_core::deployment::RailgunDeployment::for_chain(1)
+        .unwrap()
+        .relay_adapt_7702_delegates[0]
+        .address;
     let retried = owner
-        .resume_swap_setup(operation, broadcaster(delegate), &password())
+        .resume_swap_setup(operation, broadcaster(earlier), &password())
         .await
         .unwrap();
     assert_eq!(retried.context().executor, executor);
+    assert_eq!(
+        (retried.context().delegate, record().delegate()),
+        (earlier, earlier)
+    );
 
     // The nonce is past the setup and the account has no code: the delegation is missing.
     rpc.state.used.lock().unwrap().insert(executor);
@@ -1972,7 +1982,7 @@ async fn swap_setup_completes_only_with_observed_delegation_and_consumed_nonce()
             &record(),
             BlockNumHash::new(22, B256::repeat_byte(22)),
             &code,
-            profile
+            crate::settings::ExecutorProfile::accepted(1, earlier).unwrap()
         ),
         SwapSetupStatus::Pending
     );

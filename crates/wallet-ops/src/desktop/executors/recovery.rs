@@ -279,12 +279,13 @@ impl ExecutorOwner {
             .ok_or_else(|| eyre!("derive this historical account before recovery"))?;
         let profile = ExecutorProfile::accepted(self.chain.chain_id, record.delegate())
             .ok_or_else(|| eyre!("this historical account has no supported recovery profile"))?;
+        let mut target = profile;
         if let ExecutorRecoveryFunding::PublicBroadcaster {
             candidate,
             maximum_private_fee,
         } = &funding
         {
-            ExecutorDelivery::PublicBroadcaster(candidate.clone()).admit(profile)?;
+            target = ExecutorDelivery::PublicBroadcaster(candidate.clone()).admit(profile)?;
             if maximum_private_fee.is_zero() {
                 return Err(eyre!("review a private fee limit for broadcaster recovery"));
             }
@@ -458,6 +459,10 @@ impl ExecutorOwner {
         } else {
             self.recovery_record(operation)?
         };
+        if target.delegate() != record.delegate() {
+            self.store.retarget_delegate(operation, target.delegate())?;
+            self.notify_change();
+        }
         let recovery = ExecutorOperationId::random()?;
         if let DesktopPrivateSpendAuthorization::HardwareExecutor(hardware) = authorization {
             hardware.bind_recovery(recovery)?;
@@ -469,7 +474,7 @@ impl ExecutorOwner {
             generation: self.generation,
             owner: self.closed.clone(),
             source,
-            delegate: profile.delegate(),
+            delegate: target.delegate(),
             current_delegate,
             account_nonce,
             recipient,

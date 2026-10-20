@@ -39,6 +39,10 @@ fn executor_records_saved_before_display_metadata_remain_readable() {
         Operation,
         Recovery,
     }
+    #[derive(serde::Serialize)]
+    enum EarlierCapability {
+        NonceBearingV1,
+    }
     let earlier = EarlierRecord {
         version: 1,
         derivation: ExecutorDerivationScheme::Railgun7702V1,
@@ -74,6 +78,14 @@ fn executor_records_saved_before_display_metadata_remain_readable() {
             purpose
         );
     }
+    // The capability type moved to railgun-rust and keeps the released encoding.
+    assert_eq!(
+        rmp_serde::from_slice::<crate::settings::ExecutorCapability>(
+            &rmp_serde::to_vec_named(&EarlierCapability::NonceBearingV1).unwrap()
+        )
+        .unwrap(),
+        crate::settings::ExecutorCapability::NonceBearingV1
+    );
     assert_eq!(
         rmp_serde::from_slice::<ExecutorRecord>(&rmp_serde::to_vec_named(&record).unwrap(),)
             .unwrap(),
@@ -137,6 +149,23 @@ async fn executor_discovery_restores_unknown_high_indices_without_lowering_the_a
     assert_eq!(records.next_index().unwrap(), 5_000_002);
     owner.shutdown().await;
     drop(owner);
+    // An account recorded on the earlier listed delegate is rediscovered under the primary
+    // and keeps its delegate. An unlisted delegate is no target.
+    let earlier = broadcaster_core::deployment::RailgunDeployment::for_chain(1)
+        .unwrap()
+        .relay_adapt_7702_delegates[0]
+        .address;
+    assert_eq!(
+        records
+            .retarget_delegate(identities[0].0, earlier)
+            .unwrap()
+            .delegate(),
+        earlier
+    );
+    assert!(matches!(
+        records.retarget_delegate(identities[0].0, Address::repeat_byte(2)),
+        Err(ExecutorStoreError::OperationMismatch)
+    ));
 
     let owner = ExecutorOwner::new(
         1,
@@ -156,6 +185,7 @@ async fn executor_discovery_restores_unknown_high_indices_without_lowering_the_a
     assert_eq!(restored.unavailable(), 1);
     let restored = records.records().unwrap();
     assert_eq!(restored[0].operation(), identities[0].0);
+    assert_eq!(restored[0].delegate(), earlier);
     assert_eq!(restored[0].restored_at(), restored_at);
     assert!(restored[0].assets().is_empty());
     let authorization = crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(

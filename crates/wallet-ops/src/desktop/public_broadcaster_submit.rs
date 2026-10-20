@@ -1060,14 +1060,8 @@ pub(crate) fn public_broadcaster_transact_params(
                 settings::ExecutorProfile::accepted(broadcaster.chain_id, delegate)
             })
             .ok_or_else(|| eyre!("broadcaster executor profile is unavailable"))?;
-        if !public_broadcaster_protocol::supports_nonce_bearing_executor(
-            broadcaster.relay_adapt_7702,
-            profile.delegate(),
-        ) {
-            return Err(eyre!(
-                "broadcaster does not advertise the required executor format"
-            ));
-        }
+        // The call decoded above is the nonce-bearing v1 ABI; a new capability must be handled here.
+        let settings::ExecutorCapability::NonceBearingV1 = profile.capability();
         let authorization = authorization.as_ref().ok_or_else(|| {
             eyre!("executor broadcaster delivery requires a fresh delegation authorization")
         })?;

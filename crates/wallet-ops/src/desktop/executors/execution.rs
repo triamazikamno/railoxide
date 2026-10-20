@@ -10,7 +10,6 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolCall;
 use broadcaster_core::contracts::railgun::RelayAdapt7702;
 use eyre::{Result, eyre};
-use public_broadcaster_protocol::supports_nonce_bearing_executor;
 use railgun_wallet::tx::ExecutorContext;
 use railgun_wallet::{TransactionCall, Utxo};
 
@@ -35,27 +34,28 @@ pub enum ExecutorDelivery {
 }
 
 impl ExecutorDelivery {
-    pub fn admit(&self, profile: ExecutorProfile) -> Result<()> {
+    /// Admit this delivery for an operation needing `profile`'s capability. Returns the
+    /// profile its delegation authorization targets: a broadcaster's advertised delegate.
+    pub fn admit(&self, profile: ExecutorProfile) -> Result<ExecutorProfile> {
         match self {
             Self::PublicBroadcaster(candidate) => {
-                if candidate.chain_id != profile.chain_id()
-                    || candidate.available_wallets == 0
-                    || candidate.fee_expiration <= std::time::SystemTime::now()
-                    || !supports_nonce_bearing_executor(
-                        candidate.relay_adapt_7702,
-                        profile.delegate(),
-                    )
-                {
-                    return Err(eyre!(
-                        "selected broadcaster does not support this executor operation"
-                    ));
-                }
+                let target = candidate
+                    .relay_adapt_7702
+                    .and_then(|advertised| profile.interchangeable(advertised))
+                    .filter(|_| {
+                        candidate.chain_id == profile.chain_id()
+                            && candidate.available_wallets != 0
+                            && candidate.fee_expiration > std::time::SystemTime::now()
+                    })
+                    .ok_or_else(|| {
+                        eyre!("selected broadcaster does not support this executor operation")
+                    })?;
                 candidate.parsed_required_poi_list_keys()?;
-                Ok(())
+                Ok(target)
             }
             Self::SelfBroadcast {
                 sponsored: false, ..
-            } => Ok(()),
+            } => Ok(profile),
             Self::SelfBroadcast {
                 sponsored: true, ..
             } => Err(eyre!(
@@ -335,6 +335,7 @@ impl ExecutorOwner {
             .chain
             .accepted_executor_profile()
             .ok_or_else(|| eyre!("executor execution is unavailable for this configuration"))?;
+        let profile = prepared.delivery.admit(profile)?;
         if !self.closed.same_channel(&prepared.owner)
             || prepared.generation != self.generation
             || prepared.wallet_id != self.view.wallet_id()
@@ -345,7 +346,6 @@ impl ExecutorOwner {
                 "executor preparation belongs to a different wallet session"
             ));
         }
-        prepared.delivery.admit(profile)?;
         let record = self
             .store
             .records()?
@@ -475,7 +475,7 @@ impl ExecutorOwner {
             .chain
             .accepted_executor_profile()
             .ok_or_else(|| eyre!("executor execution is unavailable for this configuration"))?;
-        delivery.admit(profile)?;
+        let profile = delivery.admit(profile)?;
         if let ExecutorDelivery::SelfBroadcast { sender, .. } = &delivery
             && self
                 .vault
@@ -729,8 +729,7 @@ impl ExecutorOwner {
             self.chain.clone()
         };
         let chain = Box::new(chain);
-        let profile = chain
-            .accepted_executor_profile()
+        let profile = ExecutorProfile::accepted(chain.chain_id, record.delegate())
             .ok_or_else(|| eyre!("executor execution is unavailable for this configuration"))?;
         let PayloadToSign {
             hash,
@@ -922,14 +921,15 @@ pub(super) fn authorize_delegation(
     let code = inspection
         .code()
         .ok_or_else(|| eyre!("executor delegation is unavailable"))?;
-    let delegated = matches_executor_delegation(code, profile);
+    let installed = crate::desktop::executor_discovery::executor_delegation(code);
+    let delegated = installed == Some(profile.delegate());
     // SDK broadcaster TX7702 requests require an authorization even when this
     // delegate is already installed. Self-broadcast execution reuses an installed
     // delegate without one unless its payload requires it, as a native shield does.
+    // An account on another delegate of this capability moves to the delivery's delegate.
     if code.is_empty()
-        || recovery
-            && crate::desktop::executor_discovery::executor_delegation(code).is_some()
-            && !delegated
+        || !delegated
+            && (recovery && installed.is_some() || matches_executor_delegation(code, profile))
         || require_authorization && delegated
     {
         let account_nonce = inspection
@@ -1015,6 +1015,83 @@ mod tests {
             if let Some(route) = expected {
                 assert_eq!(unshield_executor_route(owner, chain), route);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_authorization_moves_an_account_to_the_delivery_delegate() {
+        use alloy::eips::BlockNumHash;
+        use alloy::eips::eip7702::constants::EIP7702_DELEGATION_DESIGNATOR;
+        use alloy::primitives::Bytes;
+        use alloy::providers::{Provider, ProviderBuilder};
+        use alloy::transports::mock::Asserter;
+
+        let chain = build_effective_chain_configs(&WalletSettings::default())
+            .unwrap()
+            .get(1)
+            .cloned()
+            .unwrap();
+        let primary = chain.accepted_executor_profile().unwrap();
+        let earlier = broadcaster_core::deployment::RailgunDeployment::for_chain(1)
+            .unwrap()
+            .relay_adapt_7702_delegates[0]
+            .address;
+        let earlier = ExecutorProfile::accepted(1, earlier).unwrap();
+        let signer = PrivateKeySigner::from_bytes(&B256::repeat_byte(7)).unwrap();
+        let responses = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(responses.clone())
+            .erased();
+        // (installed delegate, delivery's target, broadcaster delivery, authorized delegate)
+        for (installed, target, broadcaster, authorized) in [
+            // Self-broadcast moves an account on the earlier delegate to the primary.
+            (earlier.delegate(), primary, false, Some(primary.delegate())),
+            (primary.delegate(), primary, false, None),
+            // A broadcaster advertising the earlier delegate moves the account to it.
+            (primary.delegate(), earlier, true, Some(earlier.delegate())),
+            (Address::repeat_byte(2), primary, false, None),
+        ] {
+            let listed = installed != Address::repeat_byte(2);
+            responses.push_success(&"0x2");
+            responses.push_success(&Bytes::from(
+                [
+                    EIP7702_DELEGATION_DESIGNATOR.as_slice(),
+                    installed.as_slice(),
+                ]
+                .concat(),
+            ));
+            responses.push_success(&"0x0");
+            if listed {
+                responses.push_success(&Bytes::from(
+                    RelayAdapt7702::nonceCall::abi_encode_returns(&U256::ZERO),
+                ));
+            }
+            let inspection = crate::desktop::executor_discovery::inspect_at(
+                &provider,
+                &chain,
+                signer.address(),
+                &[],
+                BlockNumHash::new(10, B256::repeat_byte(10)),
+                false,
+            )
+            .await;
+            let mut transaction = TransactionRequest::default();
+            let result = authorize_delegation(
+                &mut transaction,
+                target,
+                &inspection,
+                &signer,
+                false,
+                broadcaster,
+            );
+            // An unlisted delegation is never authorized away outside recovery.
+            assert_eq!(result.is_ok(), listed);
+            assert_eq!(
+                transaction
+                    .authorization_list
+                    .map(|list| list[0].inner().address),
+                authorized
+            );
         }
     }
 }

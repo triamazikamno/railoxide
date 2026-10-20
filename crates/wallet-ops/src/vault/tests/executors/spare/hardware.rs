@@ -600,6 +600,12 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
         view.receive_address().unwrap().as_str(),
     ))
     .unwrap();
+    // A broadcaster advertising the other listed delegate moves the account to it.
+    let earlier = broadcaster_core::deployment::RailgunDeployment::for_chain(1)
+        .unwrap()
+        .relay_adapt_7702_delegates[0]
+        .address;
+    assert_ne!(earlier, record.delegate());
     let candidate = crate::PublicBroadcasterCandidate {
         chain_id: 1,
         railgun_address: view.receive_address().unwrap(),
@@ -612,7 +618,7 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
         available_wallets: 1,
         version: "test".into(),
         relay_adapt: record.delegate(),
-        relay_adapt_7702: Some(record.delegate()),
+        relay_adapt_7702: Some(earlier),
         required_poi_list_keys: Vec::new(),
         viewing_public_key: address_data.viewing_public_key,
         address_data,
@@ -635,6 +641,11 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
         paid.execution(),
         crate::ExecutorRecoveryExecution::PaidExecute { .. }
     ));
+    assert_eq!(
+        (paid.delegate(), owner.records().unwrap()[0].delegate()),
+        (earlier, earlier)
+    );
+    assert!(owner.validate_recovery(&paid).is_ok());
     assert!(fresh.signer(&vault, &view, "recovery private fee").is_ok());
     owner.shutdown().await;
     drop(owner);
