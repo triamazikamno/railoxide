@@ -118,7 +118,7 @@ pub fn build_effective_chain_configs(
             .unwrap_or(deployment.contract);
         deployment.relay_adapt_contract =
             parse_address(private.contracts.relay_adapt_contract.as_deref())
-                .unwrap_or(deployment.relay_adapt_contract);
+                .or(deployment.relay_adapt_contract);
         deployment.relay_adapt_7702_contract =
             parse_address(private.contracts.relay_adapt_7702_contract.as_deref())
                 .unwrap_or(deployment.relay_adapt_7702_contract);
@@ -600,15 +600,4 @@ fn price_anchor_from_static_source(
             scale_decimals: *scale_decimals,
         }),
     }
-}
-
-#[must_use]
-pub fn default_railgun_contract_settings(chain_id: u64) -> Option<super::RailgunContractSettings> {
-    let deployment = super::RailgunDeployment::for_chain(chain_id)?;
-    Some(super::RailgunContractSettings {
-        railgun_contract: Some(deployment.contract.to_string()),
-        relay_adapt_contract: Some(deployment.relay_adapt_contract.to_string()),
-        relay_adapt_7702_contract: Some(deployment.relay_adapt_7702_contract.to_string()),
-        coinbase_payer: default_coinbase_payer(chain_id).map(|address| address.to_string()),
-    })
 }

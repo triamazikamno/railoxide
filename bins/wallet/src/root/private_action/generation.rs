@@ -1017,9 +1017,13 @@ impl WalletRoot {
         let Some(draft) = self.unshield_spend_draft(key, cx) else {
             return;
         };
-        if self.unshield_requires_executor(&draft) {
+        if Self::unshield_requires_executor(&draft) {
             if draft.delivery_mode == DeliveryMode::ManualCalldata {
                 self.set_unshield_form_error(key, "External-wallet export is unavailable for this stealth-account action. Select a supported delivery method.", cx);
+                return;
+            }
+            if let Err(reason) = self.unshield_draft_executor_route(&draft) {
+                self.set_unshield_form_error(key, reason.to_string(), cx);
                 return;
             }
             self.request_executor_unshield_authorization(key, &draft, window, cx);
@@ -1452,7 +1456,7 @@ impl WalletRoot {
             return;
         };
         draft.sponsored_authorization_limit = authorization_limit;
-        let requires_executor = self.unshield_requires_executor(&draft);
+        let requires_executor = Self::unshield_requires_executor(&draft);
         if (requires_executor && draft.executor_review.is_none())
             || draft
                 .executor_review

@@ -158,7 +158,6 @@ const fn builder() -> railgun_wallet::TransactionBuilder {
         chain_type: 0,
         chain_id: 1,
         railgun_contract: Address::repeat_byte(4),
-        relay_adapt_contract: Address::repeat_byte(5),
     }
 }
 

@@ -7,7 +7,7 @@ pub(super) struct EffectiveDesktopChainConfig {
     /// The resolved route, whose clones share its endpoint identity checks.
     pub(super) rpc_route: RpcChainRoute,
     pub(super) railgun_contract: Address,
-    pub(super) relay_adapt_contract: Address,
+    pub(super) relay_adapt_contract: Option<Address>,
     pub(super) wrapped_native_token: Option<Address>,
     pub(super) finality_depth: u64,
     pub(super) gas: settings::EffectiveChainGasSettings,

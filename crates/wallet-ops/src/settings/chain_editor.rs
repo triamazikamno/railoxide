@@ -282,7 +282,7 @@ fn inherited_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, Str
         ),
         (
             ChainField::RelayAdaptContract,
-            Some(private.deployment.relay_adapt_contract),
+            private.deployment.relay_adapt_contract,
         ),
         (
             ChainField::RelayAdapt7702Contract,

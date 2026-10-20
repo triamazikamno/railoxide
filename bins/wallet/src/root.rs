@@ -253,7 +253,7 @@ use public_balances::{public_asset_icon_path, public_balance_usd_label};
 #[cfg(test)]
 use public_broadcaster::{
     fee_token_option_has_eligible_broadcaster, highest_value_public_broadcaster_fee_token,
-    public_broadcaster_fee_token_options_from_snapshot, required_relay_adapt_for_unshield,
+    public_broadcaster_fee_token_options_from_snapshot,
     resolve_selected_public_broadcaster_fee_token,
 };
 #[cfg(test)]

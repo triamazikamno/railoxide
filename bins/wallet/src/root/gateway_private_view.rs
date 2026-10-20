@@ -100,7 +100,9 @@ impl WalletRoot {
             }
         }
         presentation.selected_chain = Some(self.selected_chain);
-        if self.unwrap_unshields_by_default {
+        if self.unwrap_unshields_by_default
+            && self.unshield_executor_route(self.selected_chain).is_ok()
+        {
             presentation.default_unwrap_asset = self
                 .effective_chain_configs
                 .get(self.selected_chain)

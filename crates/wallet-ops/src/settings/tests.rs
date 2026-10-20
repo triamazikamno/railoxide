@@ -2220,6 +2220,65 @@ fn effective_chain_configs_apply_supported_overrides_in_order() {
 }
 
 #[test]
+fn chain_editor_relay_adapt_field_saves_overrides_and_inherits_the_built_in_contract() {
+    use railgun_ui::chain_editor::{ChainEditorCommand, ChainField};
+
+    let settings = WalletSettings::default();
+    let built_in = broadcaster_core::deployment::RailgunDeployment::for_chain(1)
+        .unwrap()
+        .relay_adapt_contract
+        .expect("ethereum relay adapt");
+    let save = |draft: &railgun_ui::chain_editor::ChainDraft| {
+        let saved = super::chain_editor_mutation(
+            &settings,
+            &ChainEditorCommand::Save {
+                draft: draft.clone(),
+                existing: settings.chains.contains(1),
+            },
+        )
+        .expect("chain mutation")
+        .prepare(&settings)
+        .expect("prepared settings");
+        let effective = build_effective_chain_configs(&saved)
+            .expect("effective chains")
+            .get(1)
+            .expect("ethereum config")
+            .require_railgun()
+            .unwrap()
+            .deployment
+            .relay_adapt_contract;
+        (
+            saved.chains.per_chain[&1]
+                .railgun
+                .contracts
+                .relay_adapt_contract
+                .clone(),
+            effective,
+        )
+    };
+
+    let mut draft = super::chain_editor_draft(&settings, 1).expect("ethereum draft");
+    assert_eq!(
+        draft.value(ChainField::RelayAdaptContract),
+        built_in.to_string()
+    );
+    // An unchanged or cleared field stores no override, so the built-in contract applies.
+    for value in [built_in.to_string(), String::new()] {
+        draft.fields.insert(ChainField::RelayAdaptContract, value);
+        assert_eq!(save(&draft), (None, Some(built_in)));
+    }
+    let override_contract = Address::repeat_byte(0x44);
+    draft.fields.insert(
+        ChainField::RelayAdaptContract,
+        override_contract.to_string(),
+    );
+    assert_eq!(
+        save(&draft),
+        (Some(override_contract.to_string()), Some(override_contract))
+    );
+}
+
+#[test]
 fn custom_railgun_contract_requires_deployment_metadata() {
     let mut settings = WalletSettings::default();
     settings

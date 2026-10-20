@@ -17,7 +17,7 @@ fn candidate_with_fee_policy(
     let token = Address::from([0x91; 20]);
     let mut row = fee_row(1, token, "picker-status");
     row.fee = fee;
-    public_broadcaster_candidates_for_asset(&[row], 1, token, None, policy, anchor)
+    public_broadcaster_candidates_for_asset(&[row], 1, token, policy, anchor)
         .expect("picker candidate")
         .remove(0)
 }

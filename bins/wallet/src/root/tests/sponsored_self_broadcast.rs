@@ -124,6 +124,21 @@ fn sponsored_funding_reports_each_static_prerequisite() {
     );
     chain.railgun.as_mut().unwrap().coinbase_payer = None;
     assert!(sponsored_self_broadcast_availability_reason(Some(&chain)).is_some());
+    chain = build_effective_chain_configs(&settings)
+        .expect("effective settings")
+        .get(1)
+        .cloned()
+        .expect("Ethereum config");
+    chain
+        .railgun
+        .as_mut()
+        .unwrap()
+        .deployment
+        .relay_adapt_contract = None;
+    assert_eq!(
+        sponsored_self_broadcast_availability_reason(Some(&chain)),
+        Some("This chain has no legacy RelayAdapt contract.")
+    );
 }
 
 #[test]

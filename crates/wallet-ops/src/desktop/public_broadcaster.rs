@@ -386,7 +386,6 @@ pub fn eligible_public_broadcasters_for_asset(
     rows: &[FeeRow],
     chain_id: u64,
     token: Address,
-    required_relay_adapt: Option<Address>,
 ) -> Result<Vec<PublicBroadcasterCandidate>> {
     broadcaster_core::deployment::RailgunDeployment::for_chain(chain_id)
         .ok_or_else(|| eyre!("chain {chain_id} has no Railgun deployment"))?;
@@ -394,7 +393,6 @@ pub fn eligible_public_broadcasters_for_asset(
         rows,
         chain_id,
         token,
-        required_relay_adapt,
         SystemTime::now(),
     ))
 }
@@ -403,7 +401,6 @@ pub fn public_broadcaster_candidates_for_asset(
     rows: &[FeeRow],
     chain_id: u64,
     token: Address,
-    required_relay_adapt: Option<Address>,
     policy: BroadcasterFeePolicy,
     anchor_rate: Option<U256>,
 ) -> Result<Vec<PublicBroadcasterCandidate>> {
@@ -413,7 +410,6 @@ pub fn public_broadcaster_candidates_for_asset(
         rows,
         chain_id,
         token,
-        required_relay_adapt,
         SystemTime::now(),
         policy,
         anchor_rate,
@@ -425,7 +421,6 @@ pub fn eligible_public_broadcasters(
     rows: &[FeeRow],
     chain_id: u64,
     token: Address,
-    required_relay_adapt: Option<Address>,
     now: SystemTime,
 ) -> Vec<PublicBroadcasterCandidate> {
     let candidates = rows
@@ -436,7 +431,6 @@ pub fn eligible_public_broadcasters(
         .filter(|row| row.fee_expiration > now)
         .filter(|row| row.available_wallets > 0)
         .filter(|row| supported_broadcaster_version(&row.version))
-        .filter(|row| required_relay_adapt.is_none_or(|relay| row.relay_adapt == relay))
         .filter_map(PublicBroadcasterCandidate::from_fee_row)
         .collect::<Vec<_>>();
     deduplicate_public_broadcasters(candidates)
@@ -447,7 +441,6 @@ pub fn public_broadcaster_candidates(
     rows: &[FeeRow],
     chain_id: u64,
     token: Address,
-    required_relay_adapt: Option<Address>,
     now: SystemTime,
     policy: BroadcasterFeePolicy,
     anchor_rate: Option<U256>,
@@ -460,7 +453,6 @@ pub fn public_broadcaster_candidates(
         .filter(|row| row.fee_expiration > now)
         .filter(|row| row.available_wallets > 0)
         .filter(|row| supported_broadcaster_version(&row.version))
-        .filter(|row| required_relay_adapt.is_none_or(|relay| row.relay_adapt == relay))
         .filter_map(|row| {
             PublicBroadcasterCandidate::from_fee_row_with_policy_status(
                 row,
@@ -1040,7 +1032,6 @@ pub(crate) fn public_broadcaster_for_request(
     fee_rows: &[FeeRow],
     chain_id: u64,
     token: Address,
-    required_relay_adapt: Option<Address>,
     selection: &PublicBroadcasterSelection,
     policy: BroadcasterFeePolicy,
     trust_filter: &PublicBroadcasterTrustFilter,
@@ -1067,7 +1058,6 @@ pub(crate) fn public_broadcaster_for_request(
             fee_rows,
             chain_id,
             token,
-            required_relay_adapt,
             SystemTime::now(),
             policy,
             anchor_rate,
@@ -1083,7 +1073,6 @@ pub(super) async fn public_broadcaster_setup(
     token: Address,
     fee_rows: &[FeeRow],
     selection: &PublicBroadcasterSelection,
-    require_relay_adapt: bool,
     executor_delivery: Option<&ExecutorDelivery>,
     policy: BroadcasterFeePolicy,
     trust_filter: &PublicBroadcasterTrustFilter,
@@ -1096,11 +1085,6 @@ pub(super) async fn public_broadcaster_setup(
         fee_rows,
         chain_id,
         token,
-        if require_relay_adapt {
-            Some(chain.relay_adapt_contract)
-        } else {
-            None
-        },
         selection,
         policy,
         trust_filter,

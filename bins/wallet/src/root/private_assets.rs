@@ -791,7 +791,14 @@ impl WalletRoot {
             .find_map(|asset| build_send_asset(snapshot, asset));
         let unshield_asset = assets
             .iter()
-            .find_map(|asset| build_unshield_asset(snapshot, asset));
+            .find_map(|asset| build_unshield_asset(snapshot, asset))
+            .or_else(|| {
+                let wrapped_native = self
+                    .effective_chain_configs
+                    .get(self.selected_chain)?
+                    .wrapped_native_token?;
+                super::private_swap::ui_fixture_unshield_asset(self.selected_chain, wrapped_native)
+            });
         let pending_summary = self.private_pending_summary_from_snapshot(snapshot, assets);
         let swap_profile = self.private_swap_profile();
         // Unfinished swaps share the pending-status slot, directly below the header.
@@ -816,7 +823,11 @@ impl WalletRoot {
                     "Available after wallet session starts"
                 })
         });
-        if assets.is_empty() {
+        // The `unshield` UI fixture offers a stand-in asset without private funds.
+        let total_balance = total_balance.or_else(|| {
+            (assets.is_empty() && unshield_asset.is_some()).then(|| "$0.00".to_owned())
+        });
+        if assets.is_empty() && unshield_asset.is_none() {
             let message = if syncing {
                 loading_summary(progress)
             } else {

@@ -2511,7 +2511,7 @@ fn effective_public_chain_config_uses_settings_overrides() {
     let private = effective.railgun.as_mut().unwrap();
     private.deployment.contract = address!("0x0000000000000000000000000000000000000001");
     private.deployment.relay_adapt_contract =
-        address!("0x0000000000000000000000000000000000000004");
+        Some(address!("0x0000000000000000000000000000000000000004"));
     effective.wrapped_native_token = Some(address!("0x0000000000000000000000000000000000000002"));
 
     let config = public_chain_runtime_config(1, &effective).expect("effective config");
@@ -2527,7 +2527,7 @@ fn effective_public_chain_config_uses_settings_overrides() {
     );
     assert_eq!(
         config.require_railgun().unwrap().relay_adapt_contract,
-        address!("0x0000000000000000000000000000000000000004")
+        Some(address!("0x0000000000000000000000000000000000000004"))
     );
     assert_eq!(
         config.wrapped_native_token,

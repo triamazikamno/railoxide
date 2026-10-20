@@ -31,7 +31,8 @@ fn funding_account(logs: &[Log], from: Address) -> Option<Address> {
         address(TOKEN),
         uint!(5_U256),
         address(RAILGUN),
-        &[address(RELAY_ADAPT), address(HISTORICAL_RELAY_ADAPT)],
+        Some(address(RELAY_ADAPT)),
+        &[address(HISTORICAL_RELAY_ADAPT)],
         from,
     )
 }
@@ -72,6 +73,26 @@ fn shield_funding_account_is_the_sender_through_a_shared_relay_adapt() {
 
         assert_eq!(funding_account(&logs, sender), Some(sender));
     }
+
+    // A chain without a current contract still attributes through its history.
+    let historical = [transfer_log(
+        address(TOKEN),
+        address(HISTORICAL_RELAY_ADAPT),
+        address(RAILGUN),
+        5,
+    )];
+    assert_eq!(
+        crate::shield_funding_account(
+            &historical,
+            address(TOKEN),
+            uint!(5_U256),
+            address(RAILGUN),
+            None,
+            &[address(HISTORICAL_RELAY_ADAPT)],
+            sender,
+        ),
+        Some(sender)
+    );
 }
 
 #[test]

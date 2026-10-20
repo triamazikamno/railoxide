@@ -51,6 +51,7 @@ mod ui_fixture;
 pub(super) use ui_fixture::refund_dialog_state as ui_fixture_refund_dialog_state;
 pub(super) use ui_fixture::shows_utxos as ui_fixture_shows_utxos;
 pub(super) use ui_fixture::stealth_accounts as ui_fixture_stealth_accounts;
+pub(super) use ui_fixture::unshield_asset as ui_fixture_unshield_asset;
 pub(super) use ui_fixture::utxo_finality_context as ui_fixture_utxo_finality_context;
 pub(super) use ui_fixture::utxo_rows as ui_fixture_utxo_rows;
 /// The debug UI fixture's queries in a release build, which has no fixture.
@@ -78,6 +79,13 @@ mod ui_fixture {
     pub(in crate::root) const fn utxo_rows(
         _chain_id: u64,
     ) -> Option<Vec<crate::root::utxo::UtxoDisplayRow>> {
+        None
+    }
+
+    pub(in crate::root) const fn unshield_asset(
+        _chain_id: u64,
+        _wrapped_native: alloy::primitives::Address,
+    ) -> Option<crate::root::UnshieldAsset> {
         None
     }
 
@@ -3662,7 +3670,6 @@ impl PrivateSwapsView {
                 &root.monitor_fee_rows(),
                 chain_id,
                 fee_token,
-                None,
                 Some(profile),
                 policy,
                 root.public_broadcaster_anchor_cache

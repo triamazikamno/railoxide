@@ -649,9 +649,22 @@ impl WalletRoot {
             return;
         };
         let gas_limit_buffer = chain.gas.gas_limit_buffer;
-        let executor = (unwrap || native_top_up.is_some())
-            && session.executor_owner().is_some()
-            && chain.accepted_executor_profile().is_some();
+        // Public-balance funding is never private sponsorship.
+        let executor =
+            wallet_ops::unshield_requires_executor(unwrap, native_top_up.is_some(), false);
+        if executor
+            && wallet_ops::unshield_executor_route(session.executor_owner().is_some(), chain)
+                .is_err()
+        {
+            self.set_public_balance_estimate_if_current(
+                DeliveryFormKind::Unshield,
+                key,
+                estimate_id,
+                SponsoredFundingEstimateState::PublicBalanceUnavailable,
+                cx,
+            );
+            return;
+        }
         let join = self.runtime.spawn_blocking(move || {
             estimate_desktop_unshield_self_broadcast_cost(
                 asset.chain_id,
@@ -1466,6 +1479,9 @@ pub(in crate::root) const fn sponsored_self_broadcast_availability_reason(
     }
     if private.coinbase_payer.is_none() {
         return Some("This chain has no configured reviewed coinbase payer.");
+    }
+    if private.deployment.relay_adapt_contract.is_none() {
+        return Some("This chain has no legacy RelayAdapt contract.");
     }
     None
 }

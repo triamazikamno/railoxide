@@ -5150,7 +5150,7 @@ fn proposal_known_address_label(
         ),
         (
             "Relay Adapt",
-            private.map(|private| private.deployment.relay_adapt_contract),
+            private.and_then(|private| private.deployment.relay_adapt_contract),
         ),
         (
             "Relay Adapt 7702",

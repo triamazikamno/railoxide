@@ -14,6 +14,11 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
             request.chain_id
         ));
     }
+    require_unshield_executor(
+        request.unwrap,
+        request.native_top_up.is_some(),
+        request.executor.is_some(),
+    )?;
     let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain)?;
     let executor = validate_desktop_executor_preparation(request.session, request.executor)?;
     if request.unwrap && !is_effective_wrapped_native_token(request.chain_id, request.token, &chain)
@@ -37,17 +42,11 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
     } else {
         request.session.unspent_utxos()
     };
-    let mode = if request.unwrap {
-        UnshieldMode::UnwrapBase
-    } else {
-        UnshieldMode::Token
-    };
     let receiver_amount = unshield_receiver_amount_for_fee_mode(request.amount, request.fee_mode)?;
     let unshield_request = RailgunUnshieldRequest {
         token_address: request.token,
         amount: receiver_amount,
         recipient: request.recipient,
-        mode,
         verify_proof: request.verify_proof,
         spend_up_to: false,
         broadcaster_fee: None,
@@ -75,7 +74,6 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
         chain_type: 0,
         chain_id: request.chain_id,
         railgun_contract: chain.railgun_contract,
-        relay_adapt_contract: chain.relay_adapt_contract,
     };
 
     update_transaction_generation_stage(
@@ -181,6 +179,20 @@ pub(super) async fn issue_desktop_executor_plan(
     Ok(Some(issued.transaction().clone()))
 }
 
+/// Outside private sponsorship, unwrap and native top-up have no legacy `RelayAdapt` route.
+pub(crate) fn require_unshield_executor(
+    unwrap: bool,
+    native_top_up: bool,
+    has_executor: bool,
+) -> Result<()> {
+    if (unwrap || native_top_up) && !has_executor {
+        return Err(eyre!(
+            "unwrap-to-native and native top-up need the executor route"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn desktop_composite_unshield_request(
     token: Address,
     receiver_amount: U256,
@@ -190,6 +202,10 @@ pub(crate) fn desktop_composite_unshield_request(
     native_top_up: Option<&DesktopNativeTopUpPlan>,
     executor: Option<railgun_wallet::tx::ExecutorContext>,
 ) -> Result<Option<CompositeUnshieldRequest>> {
+    require_unshield_executor(unwrap, native_top_up.is_some(), executor.is_some())?;
+    let Some(executor) = executor else {
+        return Ok(None);
+    };
     if let Some(top_up) = native_top_up {
         let mut request = native_top_up_composite_unshield_request(
             token,
@@ -199,18 +215,15 @@ pub(crate) fn desktop_composite_unshield_request(
             verify_proof,
             top_up,
         )?;
-        request.executor = executor;
+        request.adapter = Some(CompositeAdapter::Executor(executor));
         return Ok(Some(request));
     }
-    let Some(executor) = executor else {
-        return Ok(None);
-    };
     if !unwrap {
         return Err(eyre!("this direct unshield does not require an executor"));
     }
     let net = native_top_up_net_after_protocol_fee(receiver_amount);
     Ok(Some(CompositeUnshieldRequest {
-        executor: Some(executor),
+        adapter: Some(CompositeAdapter::Executor(executor)),
         legs: vec![CompositeUnshieldLeg {
             token_address: token,
             amount: receiver_amount,
@@ -393,7 +406,7 @@ pub(crate) fn native_top_up_composite_unshield_request(
     };
 
     Ok(CompositeUnshieldRequest {
-        executor: None,
+        adapter: None,
         legs,
         relay_actions: Some(CompositeRelayActions {
             min_gas_limit: U256::ZERO,
@@ -528,13 +541,11 @@ pub(super) async fn prepare_blocked_shield_rescue_plan(
         chain_type: 0,
         chain_id: request.chain_id,
         railgun_contract: chain.railgun_contract,
-        relay_adapt_contract: chain.relay_adapt_contract,
     };
     let unshield_request = RailgunUnshieldRequest {
         token_address: token,
         amount,
         recipient: origin_address,
-        mode: UnshieldMode::Token,
         verify_proof: request.verify_proof,
         spend_up_to: false,
         broadcaster_fee: None,
@@ -698,7 +709,6 @@ pub(super) async fn prepare_desktop_send_plan_without_broadcaster_fee(
         chain_type: 0,
         chain_id: request.chain_id,
         railgun_contract: chain.railgun_contract,
-        relay_adapt_contract: chain.relay_adapt_contract,
     };
 
     update_transaction_generation_stage(
@@ -1088,12 +1098,16 @@ impl SponsoredPrivateIntent {
                 authorization.wrapped_native_token,
             )?;
         }
+        // A zero builder payment can leave a direct plan, which must not name an adapter.
+        let adapter = (!calls.is_empty()).then_some(CompositeAdapter::RelayAdapt(
+            authorization.relay_adapt_contract,
+        ));
         let relay_actions = (!calls.is_empty()).then_some(CompositeRelayActions {
             min_gas_limit: U256::ZERO,
             calls,
         });
         Ok(MixedPrivateActionRequest {
-            executor: None,
+            adapter,
             executor_calls: Vec::new(),
             private_sends,
             public_unshields,
@@ -1241,6 +1255,7 @@ fn sponsored_provisional_payment_for_intent(
     utxos: &[Utxo],
     wrapped_native: Address,
     payer: Address,
+    relay_adapt: Address,
     signer: Address,
     intent: SponsoredPrivateIntent,
     native_top_up: Option<&DesktopNativeTopUpPlan>,
@@ -1254,7 +1269,6 @@ fn sponsored_provisional_payment_for_intent(
         chain_type: 0,
         chain_id,
         railgun_contract: chain.railgun_contract,
-        relay_adapt_contract: chain.relay_adapt_contract,
     };
     let poi_spendable_wrapped_native = poi_spendable_token_balance(utxos, wrapped_native);
     let gas_model = RailgunGasModel::for_chain(chain_id);
@@ -1263,7 +1277,7 @@ fn sponsored_provisional_payment_for_intent(
             intent.action(),
             wrapped_native,
             payer,
-            chain.relay_adapt_contract,
+            relay_adapt,
             payment,
             max_fee_per_gas,
             max_priority_fee_per_gas,
@@ -1338,6 +1352,9 @@ fn quote_sponsored_authorization_limit(
         .require_railgun()?
         .coinbase_payer
         .ok_or(SponsorshipError::MissingCoinbasePayer)?;
+    let relay_adapt = chain
+        .relay_adapt_contract
+        .ok_or(SponsorshipError::MissingRelayAdapt)?;
     if effective_chain
         .require_railgun()?
         .sponsored_bundle_relays
@@ -1352,6 +1369,7 @@ fn quote_sponsored_authorization_limit(
             utxos,
             wrapped_native,
             payer,
+            relay_adapt,
             signer,
             intent,
             native_top_up,
@@ -1391,7 +1409,7 @@ fn quote_sponsored_authorization_limit(
         intent.action(),
         wrapped_native,
         payer,
-        chain.relay_adapt_contract,
+        relay_adapt,
         ceiling_payment,
         max_fee_per_gas,
         max_priority_fee_per_gas,
@@ -1416,7 +1434,7 @@ fn quote_sponsored_authorization_limit(
         intent.action(),
         wrapped_native,
         payer,
-        chain.relay_adapt_contract,
+        relay_adapt,
         max_fee_per_gas,
         max_priority_fee_per_gas,
         signer_native_balance_snapshot,
@@ -1693,6 +1711,9 @@ async fn prepare_desktop_sponsored_calldata(
         .require_railgun()?
         .coinbase_payer
         .ok_or(SponsorshipError::MissingCoinbasePayer)?;
+    let relay_adapt = chain
+        .relay_adapt_contract
+        .ok_or(SponsorshipError::MissingRelayAdapt)?;
     let signer_address = self_broadcast_gas_payer(vault_store, view_session, public_account_uuid)?;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
 
@@ -1737,6 +1758,7 @@ async fn prepare_desktop_sponsored_calldata(
             .is_empty(),
         wrapped_native_token: Some(wrapped_native),
         coinbase_payer: Some(payer),
+        relay_adapt_contract: chain.relay_adapt_contract,
         payer_verified: true,
         signer_eligible: true,
         poi_spendable_wrapped_native,
@@ -1771,7 +1793,7 @@ async fn prepare_desktop_sponsored_calldata(
         || authorization_limit.action != intent.action()
         || authorization_limit.wrapped_native_token != wrapped_native
         || authorization_limit.coinbase_payer != payer
-        || authorization_limit.relay_adapt_contract != chain.relay_adapt_contract
+        || authorization_limit.relay_adapt_contract != relay_adapt
         || authorization_limit.max_fee_per_gas != resolved_fee.max_fee_per_gas
         || authorization_limit.max_priority_fee_per_gas != resolved_fee.max_priority_fee_per_gas
         || authorization_limit.incentive != incentive
@@ -1786,6 +1808,7 @@ async fn prepare_desktop_sponsored_calldata(
         &utxos,
         wrapped_native,
         payer,
+        relay_adapt,
         signer_address,
         intent,
         native_top_up.as_ref(),
@@ -1799,7 +1822,7 @@ async fn prepare_desktop_sponsored_calldata(
         intent.action(),
         wrapped_native,
         payer,
-        chain.relay_adapt_contract,
+        relay_adapt,
         provisional_payment,
         resolved_fee.max_fee_per_gas,
         resolved_fee.max_priority_fee_per_gas,
@@ -1821,7 +1844,6 @@ async fn prepare_desktop_sponsored_calldata(
         chain_type: 0,
         chain_id,
         railgun_contract: chain.railgun_contract,
-        relay_adapt_contract: chain.relay_adapt_contract,
     };
     update_transaction_generation_stage(
         progress_tx,
@@ -1874,7 +1896,7 @@ async fn prepare_desktop_sponsored_calldata(
                 intent.action(),
                 wrapped_native,
                 payer,
-                chain.relay_adapt_contract,
+                relay_adapt,
                 first_required_payment,
                 resolved_fee.max_fee_per_gas,
                 resolved_fee.max_priority_fee_per_gas,
@@ -1933,7 +1955,7 @@ async fn prepare_desktop_sponsored_calldata(
                 intent.action(),
                 wrapped_native,
                 payer,
-                chain.relay_adapt_contract,
+                relay_adapt,
                 payment,
                 resolved_fee.max_fee_per_gas,
                 resolved_fee.max_priority_fee_per_gas,
@@ -2213,11 +2235,18 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
     let chain = effective_desktop_chain_config(request.chain_id, &request.effective_chain)?;
     validate_desktop_executor_preparation(&request.session, request.executor.as_deref())?;
     // The first approval needs the executor gas budget before seed access and allocation.
-    let executor_profile = request.effective_chain.accepted_executor_profile();
-    let uses_executor = request.executor.is_some()
-        || ((request.unwrap || request.native_top_up.is_some())
-            && request.session.executor_owner().is_some()
-            && executor_profile.is_some());
+    // Public broadcaster delivery is never privately sponsored.
+    let executor_profile = if request.executor.is_none()
+        && unshield_requires_executor(request.unwrap, request.native_top_up.is_some(), false)
+    {
+        Some(unshield_executor_route(
+            request.session.executor_owner().is_some(),
+            &request.effective_chain,
+        )?)
+    } else {
+        None
+    };
+    let uses_executor = request.executor.is_some() || executor_profile.is_some();
     if request.unwrap && !is_effective_wrapped_native_token(request.chain_id, request.token, &chain)
     {
         return Err(eyre!("selected token does not support unwrap-to-native"));
@@ -2229,15 +2258,11 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
         request.chain_id,
         request.fee_token,
     );
-    let broadcaster = if uses_executor
-        && request.executor.is_none()
-        && let Some(profile) = executor_profile
-    {
+    let broadcaster = if let Some(profile) = executor_profile {
         let candidates = public_broadcaster_candidates(
             &request.fee_rows,
             request.chain_id,
             request.fee_token,
-            None,
             SystemTime::now(),
             policy,
             anchor_rate,
@@ -2260,11 +2285,6 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
             &request.fee_rows,
             request.chain_id,
             request.fee_token,
-            if !uses_executor && (request.unwrap || request.native_top_up.is_some()) {
-                Some(chain.relay_adapt_contract)
-            } else {
-                None
-            },
             &request.selection,
             policy,
             &request.trust_filter,
@@ -2458,7 +2478,7 @@ pub fn estimate_desktop_unshield_self_broadcast_cost(
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
 ) -> Result<DesktopSelfBroadcastCostEstimate> {
-    if executor && !unwrap && native_top_up.is_none() {
+    if executor != (unwrap || native_top_up.is_some()) {
         return Err(eyre!("executor quote does not match the selected action"));
     }
     let receiver_amount = unshield_receiver_amount_for_fee_mode(entered_amount, fee_mode)?;
@@ -2576,7 +2596,6 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
         &request.fee_rows,
         request.chain_id,
         request.fee_token,
-        None,
         SystemTime::now(),
         policy,
         anchor_rate,
@@ -3126,6 +3145,12 @@ mod tests {
         .mixed_request(&authorization, None, false, None)
         .expect("sponsored send request");
 
+        assert_eq!(
+            request.adapter,
+            Some(CompositeAdapter::RelayAdapt(
+                authorization.relay_adapt_contract
+            ))
+        );
         assert_eq!(request.private_sends.len(), 1);
         assert_eq!(request.public_unshields.len(), 1);
         assert_eq!(
@@ -3174,6 +3199,7 @@ mod tests {
         assert_eq!(request.private_sends.len(), 1);
         assert!(request.public_unshields.is_empty());
         assert!(request.relay_actions.is_none());
+        assert_eq!(request.adapter, None);
     }
 
     #[test]
@@ -3620,7 +3646,7 @@ mod tests {
         EffectiveDesktopChainConfig {
             rpc_route: RpcChainRoute::new(1, Vec::<Url>::new()),
             railgun_contract: Address::ZERO,
-            relay_adapt_contract: Address::ZERO,
+            relay_adapt_contract: Some(Address::ZERO),
             wrapped_native_token: Some(wrapped_native),
             finality_depth: 1,
             gas: settings::EffectiveChainGasSettings {
@@ -3668,6 +3694,7 @@ mod tests {
                 &utxos,
                 wrapped_native,
                 payer,
+                Address::ZERO,
                 signer,
                 intent,
                 None,
@@ -3718,7 +3745,8 @@ mod tests {
                 .require_railgun()
                 .unwrap()
                 .deployment
-                .relay_adapt_contract,
+                .relay_adapt_contract
+                .expect("ethereum relay adapt"),
             sponsorship_payment(
                 exact_gas_limit,
                 quote.max_fee_per_gas,
@@ -3973,6 +4001,50 @@ mod tests {
     }
 
     #[test]
+    fn sponsored_quote_requires_a_legacy_relay_adapt() {
+        let wrapped_native =
+            crate::amounts::wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
+        let mut effective_chain =
+            settings::build_effective_chain_configs(&settings::WalletSettings::default())
+                .expect("effective chains")
+                .get(1)
+                .cloned()
+                .expect("ethereum config");
+        effective_chain
+            .railgun
+            .as_mut()
+            .expect("ethereum railgun")
+            .deployment
+            .relay_adapt_contract = None;
+        let utxos = vec![test_utxo(
+            wrapped_native,
+            U256::from(10_000_000_000_000_000_000_u128),
+        )];
+
+        let error = quote_sponsored_unshield_authorization_limit(
+            1,
+            &effective_chain,
+            &utxos,
+            wrapped_native,
+            U256::from(20_000_000_000_000_000_u128),
+            FeeHandlingMode::DeductFromAmount,
+            Address::from([0x84; 20]),
+            false,
+            None,
+            150_000_000,
+            10_000_000,
+            U256::ZERO,
+            SponsoredIncentive::Economy,
+            Address::from([0x85; 20]),
+        )
+        .expect_err("a chain without the legacy contract cannot be sponsored");
+        assert_eq!(
+            error.downcast_ref::<SponsorshipError>(),
+            Some(&SponsorshipError::MissingRelayAdapt)
+        );
+    }
+
+    #[test]
     fn sponsored_wrapped_native_quote_binds_canonical_coalesced_total() {
         let wrapped_native =
             crate::amounts::wrapped_native_token_for_chain(1).expect("ethereum wrapped native");
@@ -3991,7 +4063,8 @@ mod tests {
             .require_railgun()
             .unwrap()
             .deployment
-            .relay_adapt_contract;
+            .relay_adapt_contract
+            .expect("ethereum relay adapt");
         let signer = Address::from([0x71; 20]);
         let recipient = Address::from([0x72; 20]);
         let entered_amount = U256::from(1_596_000_000_000_211_u128);

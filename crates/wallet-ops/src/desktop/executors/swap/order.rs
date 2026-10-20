@@ -42,11 +42,11 @@ use broadcaster_core::contracts::shield::{build_shield_request, derive_shield_pr
 use eyre::{Result, eyre};
 use local_db::PendingOutputPoiContextRecord;
 use railgun_wallet::tx::{
-    BuildError, CompositeExecution, CompositeUnshieldLeg, CompositeUnshieldLegRole,
-    CompositeUnshieldRecipient, ExecutorContext, GasEstimateMode, MAX_BATCH_TRANSACTIONS,
-    MAX_CIRCUIT_INPUTS, MixedPrivateActionRebuildConstraint, MixedPrivateActionRequest,
-    MixedPrivateOutputRole, RailgunGasModel, SelectedInputIdentity, SwapAmountCheck,
-    SwapAppDataTemplate, SwapPostHookTemplate, SwapPreHookSize, TransactionShape,
+    BuildError, CompositeAdapter, CompositeExecution, CompositeUnshieldLeg,
+    CompositeUnshieldLegRole, CompositeUnshieldRecipient, ExecutorContext, GasEstimateMode,
+    MAX_BATCH_TRANSACTIONS, MAX_CIRCUIT_INPUTS, MixedPrivateActionRebuildConstraint,
+    MixedPrivateActionRequest, MixedPrivateOutputRole, RailgunGasModel, SelectedInputIdentity,
+    SwapAmountCheck, SwapAppDataTemplate, SwapPostHookTemplate, SwapPreHookSize, TransactionShape,
 };
 use railgun_wallet::{ProverService, TransactionBuilder, TransactionCall, Utxo};
 use reqwest::Url;
@@ -764,7 +764,6 @@ impl SwapReview {
             chain_type: 0,
             chain_id: profile.chain_id(),
             railgun_contract: Address::repeat_byte(4),
-            relay_adapt_contract: Address::repeat_byte(5),
         };
         let note = Utxo::new(
             railgun_wallet::Note::new_change(U256::ONE, sell_token, amount, [0; 16]),
@@ -1765,7 +1764,6 @@ impl ExecutorOwner {
             chain_type: 0,
             chain_id: self.chain.chain_id,
             railgun_contract: chain.railgun_contract,
-            relay_adapt_contract: chain.relay_adapt_contract,
         };
         let profile_budget = profile.app_data_byte_budget();
         let byte_budget = request
@@ -1855,7 +1853,6 @@ impl ExecutorOwner {
             chain_type: 0,
             chain_id: self.chain.chain_id,
             railgun_contract: chain.railgun_contract,
-            relay_adapt_contract: chain.relay_adapt_contract,
         };
         plan_swap_speed_up_inputs(
             &builder,
@@ -2349,7 +2346,6 @@ impl ExecutorOwner {
             chain_type: 0,
             chain_id: self.chain.chain_id,
             railgun_contract: chain.railgun_contract,
-            relay_adapt_contract: chain.relay_adapt_contract,
         };
         let mut request = plan.proof_request(&profile)?;
         request.verify_proof = verify_proof;
@@ -4634,7 +4630,7 @@ fn pre_hook_request(
     calls: Vec<Call>,
 ) -> MixedPrivateActionRequest {
     MixedPrivateActionRequest {
-        executor: Some(context),
+        adapter: Some(CompositeAdapter::Executor(context)),
         executor_calls: calls,
         private_sends: Vec::new(),
         public_unshields: vec![CompositeUnshieldLeg {

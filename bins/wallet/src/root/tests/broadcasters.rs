@@ -40,7 +40,6 @@ fn fee_token_options_use_poi_spendable_balances_and_broadcaster_counts() {
         &snapshot,
         &fee_rows,
         None,
-        None,
         BroadcasterFeePolicy::default(),
         &wallet_ops::PublicBroadcasterTrustFilter::default(),
         None,
@@ -88,7 +87,6 @@ fn fee_token_options_use_fee_only_transaction_spend_limit() {
         &snapshot,
         &fee_rows,
         None,
-        None,
         BroadcasterFeePolicy::default(),
         &wallet_ops::PublicBroadcasterTrustFilter::default(),
         None,
@@ -123,7 +121,6 @@ fn fee_token_options_include_known_token_icons() {
     let options = public_broadcaster_fee_token_options_from_snapshot(
         &snapshot,
         &fee_rows,
-        None,
         None,
         BroadcasterFeePolicy::default(),
         &wallet_ops::PublicBroadcasterTrustFilter::default(),
@@ -174,7 +171,6 @@ fn ethereum_weth_public_broadcaster_count_is_zero_without_available_broadcasters
 #[test]
 fn fee_token_options_and_selection_follow_execution_route() {
     let token = Address::from([0x39; 20]);
-    let required_relay = Address::from([0x40; 20]);
     let other_relay = Address::from([0x41; 20]);
     let snapshot = ListUtxosOutput {
         chain_id: 1,
@@ -193,31 +189,6 @@ fn fee_token_options_and_selection_follow_execution_route() {
         }],
     };
     let mut row = fee_row(1, token, "custom-relay");
-    row.relay_adapt = required_relay;
-
-    let matching = public_broadcaster_fee_token_options_from_snapshot(
-        &snapshot,
-        &[row.clone()],
-        Some(required_relay),
-        None,
-        BroadcasterFeePolicy::default(),
-        &wallet_ops::PublicBroadcasterTrustFilter::default(),
-        None,
-        |_| None,
-    );
-    let mismatched = public_broadcaster_fee_token_options_from_snapshot(
-        &snapshot,
-        &[row.clone()],
-        Some(other_relay),
-        None,
-        BroadcasterFeePolicy::default(),
-        &wallet_ops::PublicBroadcasterTrustFilter::default(),
-        None,
-        |_| None,
-    );
-
-    assert_eq!(matching[0].eligible_broadcaster_count, 1);
-    assert_eq!(mismatched[0].eligible_broadcaster_count, 0);
 
     let profile = build_effective_chain_configs(&WalletSettings::default())
         .unwrap()
@@ -240,7 +211,6 @@ fn fee_token_options_and_selection_follow_execution_route() {
         let options = public_broadcaster_fee_token_options_from_snapshot(
             &snapshot,
             &rows,
-            Some(other_relay),
             Some(profile),
             policy,
             &trust,
@@ -251,7 +221,6 @@ fn fee_token_options_and_selection_follow_execution_route() {
             &rows,
             1,
             token,
-            Some(other_relay),
             Some(profile),
             policy,
             None,
@@ -268,27 +237,13 @@ fn fee_token_options_and_selection_follow_execution_route() {
 
 #[test]
 fn effective_chain_overrides_drive_unwrap_ui_filters() {
-    let relay = Address::from([0x42; 20]);
     let wrapped = Address::from([0x43; 20]);
     let other = Address::from([0x44; 20]);
     let mut settings = WalletSettings::default();
     let chain = settings.chains.per_chain.entry(1).or_default();
-    chain.railgun.contracts.relay_adapt_contract = Some(relay.to_string());
     chain.contracts.wrapped_native_token = Some(wrapped.to_string());
     let configs = build_effective_chain_configs(&settings).expect("effective chains");
 
-    assert_eq!(
-        required_relay_adapt_for_unshield(&configs, 1, true, false),
-        Some(relay)
-    );
-    assert_eq!(
-        required_relay_adapt_for_unshield(&configs, 1, false, true),
-        Some(relay)
-    );
-    assert_eq!(
-        required_relay_adapt_for_unshield(&configs, 1, false, false),
-        None
-    );
     assert!(is_effective_wrapped_native_token(&configs, 1, wrapped));
     assert!(!is_effective_wrapped_native_token(&configs, 1, other));
 }
@@ -491,12 +446,12 @@ fn unsupported_specific_broadcaster_is_detected_for_fee_token_change() {
     let other = Address::from([0x62; 20]);
     let policy = BroadcasterFeePolicy::default();
     let row = fee_row(1, token, "supported");
-    let candidates = public_broadcaster_candidates_for_asset(&[row], 1, token, None, policy, None)
+    let candidates = public_broadcaster_candidates_for_asset(&[row], 1, token, policy, None)
         .expect("candidates");
     let choice = BroadcasterChoice::Specific {
         railgun_address: candidates[0].railgun_address.clone(),
     };
-    let unsupported = public_broadcaster_candidates_for_asset(&[], 1, other, None, policy, None)
+    let unsupported = public_broadcaster_candidates_for_asset(&[], 1, other, policy, None)
         .expect("empty candidates");
 
     assert!(broadcaster_choice_supported_by_candidates(
@@ -561,7 +516,6 @@ fn random_submission_selection_uses_estimated_broadcaster() {
         &[fee_row(1, token, "estimated")],
         1,
         token,
-        None,
         policy,
         None,
     )
@@ -588,7 +542,6 @@ fn picker_estimated_fee_uses_exact_estimate_fee_for_matching_broadcaster() {
         &[fee_row(1, token, "estimated")],
         1,
         token,
-        None,
         policy,
         None,
     )
@@ -619,7 +572,6 @@ fn specific_submission_selection_ignores_estimate() {
         &[fee_row(1, token, "estimated")],
         1,
         token,
-        None,
         policy,
         None,
     )

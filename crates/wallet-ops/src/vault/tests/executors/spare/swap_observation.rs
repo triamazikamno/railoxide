@@ -1092,7 +1092,6 @@ async fn recorded_swap_quote_defers_nonce_and_reorg_checks_until_preparation() {
         chain_type: 0,
         chain_id: 1,
         railgun_contract: fixture.railgun,
-        relay_adapt_contract: Address::repeat_byte(5),
     };
     let amount = U256::from(1_000_000);
     let input = Utxo::new(
@@ -1196,7 +1195,11 @@ async fn recorded_swap_quote_defers_nonce_and_reorg_checks_until_preparation() {
         Err(railgun_wallet::tx::BuildError::PinnedInputUnavailable { .. })
     ));
     let mut changed_nonce = request;
-    changed_nonce.executor.as_mut().unwrap().execution_nonce += U256::ONE;
+    let Some(railgun_wallet::tx::CompositeAdapter::Executor(context)) = &mut changed_nonce.adapter
+    else {
+        panic!("the pre-hook request names its executor");
+    };
+    context.execution_nonce += U256::ONE;
     assert!(matches!(
         builder.preview_mixed_private_action_plan(&[input], &changed_nonce),
         Err(railgun_wallet::tx::BuildError::CompositePlanShapeChanged { .. })
@@ -3129,11 +3132,10 @@ async fn cancellation_fee_selection_excludes_the_swaps_reserved_notes() {
         chain_type: 0,
         chain_id: 1,
         railgun_contract: fixture.railgun,
-        relay_adapt_contract: Address::repeat_byte(5),
     };
     // The broadcaster fee is paid in the swap's sell token.
     let fee = MixedPrivateActionRequest {
-        executor: None,
+        adapter: None,
         executor_calls: Vec::new(),
         private_sends: vec![MixedPrivateSend {
             token_address: SELL,

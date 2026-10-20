@@ -1589,6 +1589,7 @@ impl WalletRoot {
                 asset.chain_id,
                 asset.token,
             )
+            && self.unshield_executor_route(asset.chain_id).is_ok()
     }
 
     pub(in crate::root) fn initialize_unshield_form(
@@ -1830,7 +1831,7 @@ impl WalletRoot {
                 &self.effective_chain_configs,
                 form.asset.chain_id,
                 form.asset.token,
-            )
+            ) && (!unwrap || self.unshield_form_executor_unavailable(form).is_none())
         });
         let Some(form) = self.unshield_forms.get_mut(&key) else {
             return;

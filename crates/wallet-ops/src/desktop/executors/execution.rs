@@ -18,7 +18,7 @@ use super::{
     ExecutorOwner, ExecutorRecoveryExecution, ExecutorRecoveryFunding, PreparedExecutorRecovery,
 };
 use crate::desktop::executor_discovery::{inspect_for_signing, matches_executor_delegation};
-use crate::settings::ExecutorProfile;
+use crate::settings::{EffectiveChainConfig, ExecutorProfile};
 use crate::vault::{
     ExecutorInputIdentity, ExecutorOperationId, ExecutorPayloadContext, ExecutorPayloadPurpose,
     IssuedExecutorPayload,
@@ -73,6 +73,43 @@ impl ExecutorDelivery {
             Self::PublicBroadcaster(_) | Self::ManualExport => None,
         }
     }
+}
+
+/// Outside private sponsorship, unwrap-to-native and native top-up Unshields run only
+/// through the executor; there is no legacy `RelayAdapt` fallback.
+#[must_use]
+pub const fn unshield_requires_executor(
+    unwrap: bool,
+    native_top_up: bool,
+    sponsored: bool,
+) -> bool {
+    (unwrap || native_top_up) && !sponsored
+}
+
+/// Why an Unshield that requires the executor cannot use it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ExecutorRouteUnavailable {
+    #[error(
+        "Unwrap and gas top-up need this wallet's stealth account, which this session doesn't have."
+    )]
+    NoExecutorOwner,
+    #[error(
+        "Unwrap and gas top-up need the accepted RelayAdapt7702 contract on this network. Check the network's Relay adapter 7702 setting."
+    )]
+    NoAcceptedProfile,
+}
+
+/// The executor route for an Unshield that requires it.
+pub fn unshield_executor_route(
+    has_executor_owner: bool,
+    chain: &EffectiveChainConfig,
+) -> std::result::Result<ExecutorProfile, ExecutorRouteUnavailable> {
+    if !has_executor_owner {
+        return Err(ExecutorRouteUnavailable::NoExecutorOwner);
+    }
+    chain
+        .accepted_executor_profile()
+        .ok_or(ExecutorRouteUnavailable::NoAcceptedProfile)
 }
 
 /// A newly reserved account that was found used before it issued anything. It is retired.
@@ -922,4 +959,54 @@ pub(super) fn authorize_delegation(
         transaction.nonce = inspection.account_nonce();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::{WalletSettings, build_effective_chain_configs};
+
+    #[test]
+    fn unwrap_and_top_up_route_through_the_executor_or_are_unavailable() {
+        let chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
+        let accepted = chains.get(1).unwrap().clone();
+        let profile = accepted.accepted_executor_profile().unwrap();
+        let mut unaccepted = accepted.clone();
+        unaccepted
+            .railgun
+            .as_mut()
+            .unwrap()
+            .deployment
+            .relay_adapt_7702_contract = Address::repeat_byte(7);
+        // (unwrap, top-up, sponsored, executor owner, chain, route when required)
+        let cases = [
+            (true, false, false, true, &accepted, Some(Ok(profile))),
+            (false, true, false, true, &accepted, Some(Ok(profile))),
+            (
+                true,
+                false,
+                false,
+                false,
+                &accepted,
+                Some(Err(ExecutorRouteUnavailable::NoExecutorOwner)),
+            ),
+            (
+                false,
+                true,
+                false,
+                true,
+                &unaccepted,
+                Some(Err(ExecutorRouteUnavailable::NoAcceptedProfile)),
+            ),
+            (true, true, true, false, &unaccepted, None),
+            (false, false, false, true, &accepted, None),
+        ];
+        for (unwrap, top_up, sponsored, owner, chain, expected) in cases {
+            let required = unshield_requires_executor(unwrap, top_up, sponsored);
+            assert_eq!(required, expected.is_some());
+            if let Some(route) = expected {
+                assert_eq!(unshield_executor_route(owner, chain), route);
+            }
+        }
+    }
 }

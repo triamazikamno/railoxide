@@ -579,12 +579,16 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         self.refresh_unshield_native_top_up_state(key, cx);
+        let route_unavailable = self
+            .unshield_forms
+            .get(&key)
+            .is_some_and(|form| self.unshield_form_executor_unavailable(form).is_some());
         let Some(form) = self.unshield_forms.get_mut(&key) else {
             return;
         };
         if form.generating
             || form.native_top_up_enabled == enabled
-            || (enabled && form.native_top_up.is_none())
+            || (enabled && (form.native_top_up.is_none() || route_unavailable))
         {
             return;
         }

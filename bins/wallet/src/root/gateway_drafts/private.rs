@@ -108,6 +108,18 @@ impl PreparedPrivateDraft {
     }
 }
 
+const fn gateway_private_sponsored(input: &GatewayPrivateDraftInput) -> bool {
+    matches!(
+        input.delivery,
+        GatewayPrivateDelivery::SelfBroadcast {
+            delivery: GatewayPrivateSelfBroadcastInput::SelfBroadcast {
+                funding: GatewayPrivateFunding::Sponsorship { .. },
+                ..
+            },
+        }
+    )
+}
+
 pub(super) fn valid_private_input_size(input: &GatewayPrivateDraftInput) -> bool {
     let delivery_valid = match &input.delivery {
         GatewayPrivateDelivery::Broadcaster(delivery) => {
@@ -298,6 +310,14 @@ impl WalletRoot {
                 {
                     return Err("This asset cannot be unwrapped.".into());
                 }
+                if wallet_ops::unshield_requires_executor(
+                    input.unwrap,
+                    input.native_top_up,
+                    gateway_private_sponsored(input),
+                ) && let Err(reason) = self.unshield_executor_route(input.chain_id)
+                {
+                    return Err(reason.to_string());
+                }
                 let native_top_up = if input.native_top_up {
                     let recipient = recipient
                         .parse::<Address>()
@@ -418,11 +438,19 @@ impl WalletRoot {
         options.show_fee_mode &= input.delivery.broadcaster().is_some()
             || input.kind == GatewayPrivateDraftKind::Unshield;
         if input.kind == GatewayPrivateDraftKind::Unshield {
-            if is_effective_wrapped_native_token(
+            // Without an executor route, unwrap and top-up are offered only to switch them off,
+            // and the reason is shown whenever either would apply.
+            let executor_unavailable = if gateway_private_sponsored(input) {
+                None
+            } else {
+                self.unshield_executor_route(input.chain_id).err()
+            };
+            let wrapped_native = is_effective_wrapped_native_token(
                 &self.effective_chain_configs,
                 input.chain_id,
                 asset.token,
-            ) {
+            );
+            if wrapped_native && (input.unwrap || executor_unavailable.is_none()) {
                 options.unwrap_labels = crate::root::native_wrapped_output_labels(input.chain_id)
                     .map(|(native, wrapped)| [native.to_owned(), wrapped.to_owned()]);
             }
@@ -447,7 +475,7 @@ impl WalletRoot {
             } else {
                 wallet_ops::parse_unshield_amount(&input.amount, asset.decimals)
             };
-            if let (Ok(recipient), Ok(amount)) = (recipient, amount) {
+            let top_up_plan = if let (Ok(recipient), Ok(amount)) = (recipient, amount) {
                 let fee_mode = match input.fee_mode {
                     GatewayPrivateFeeMode::Deduct => FeeHandlingMode::DeductFromAmount,
                     GatewayPrivateFeeMode::AddOnTop => FeeHandlingMode::AddToAmount,
@@ -458,37 +486,45 @@ impl WalletRoot {
                     fee_token,
                     fee_mode,
                 );
-                if let Some(plan) = self
-                    .unshield_native_top_up_state(
+                self.unshield_native_top_up_state(
+                    input.chain_id,
+                    recipient,
+                    asset.token,
+                    input.unwrap,
+                    amount,
+                    fee_mode,
+                )
+                .plan
+            } else {
+                None
+            };
+            if let Some(reason) = &executor_unavailable
+                && (wrapped_native || top_up_plan.is_some())
+            {
+                options.warnings.push(reason.to_string());
+            }
+            if let Some(plan) = top_up_plan
+                && (input.native_top_up || executor_unavailable.is_none())
+            {
+                let mut top_up = GatewayPrivateTopUpOption::default();
+                top_up.label = format!(
+                    "Also send {} for gas",
+                    crate::root::native_token_display_label(input.chain_id)
+                );
+                top_up.funding_detail = format!(
+                    "Recipient receives {}; funded from private {}.",
+                    crate::root::format_native_token_amount_for_display(
                         input.chain_id,
-                        recipient,
-                        asset.token,
-                        input.unwrap,
-                        amount,
-                        fee_mode,
+                        plan.native_amount
+                    ),
+                    crate::root::format_token_amount_for_display(
+                        input.chain_id,
+                        plan.wrapped_native_token,
+                        plan.wrapped_native_amount,
+                        Some(&self.effective_token_registry)
                     )
-                    .plan
-                {
-                    let mut top_up = GatewayPrivateTopUpOption::default();
-                    top_up.label = format!(
-                        "Also send {} for gas",
-                        crate::root::native_token_display_label(input.chain_id)
-                    );
-                    top_up.funding_detail = format!(
-                        "Recipient receives {}; funded from private {}.",
-                        crate::root::format_native_token_amount_for_display(
-                            input.chain_id,
-                            plan.native_amount
-                        ),
-                        crate::root::format_token_amount_for_display(
-                            input.chain_id,
-                            plan.wrapped_native_token,
-                            plan.wrapped_native_amount,
-                            Some(&self.effective_token_registry)
-                        )
-                    );
-                    options.native_top_up = Some(top_up);
-                }
+                );
+                options.native_top_up = Some(top_up);
             }
         }
         let Some(delivery) = input.delivery.broadcaster() else {
@@ -1327,6 +1363,96 @@ fn private_estimate_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn unwrap_without_an_executor_route_is_refused_before_authorization(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let path = std::env::temp_dir().join(format!(
+            "gateway-private-executor-route-{:032x}",
+            rand::random::<u128>()
+        ));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let entered = runtime.enter();
+        cx.update(gpui_component::init);
+        let mut root = None;
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let wallet =
+                crate::root::tests::public_accounts::fixture_root(&path, &runtime, window, cx);
+            root = Some(wallet.clone());
+            gpui_component::Root::new(wallet, window, cx)
+        });
+        let root = root.unwrap();
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                // The fixture has no ready session, so no executor owner.
+                let asset = UnshieldAsset {
+                    chain_id: 1,
+                    token: root
+                        .effective_chain_configs
+                        .get(1)
+                        .unwrap()
+                        .wrapped_native_token
+                        .unwrap(),
+                    label: "WETH".into(),
+                    decimals: Some(18),
+                    total: U256::from(1_000),
+                    poi_verified_total: U256::from(1_000),
+                    max_batched: U256::from(1_000),
+                    icon_path: None,
+                };
+                let key = crate::root::UnshieldAssetKey::from_asset(&asset);
+                root.initialize_unshield_form(asset.clone(), window, cx);
+                root.set_unshield_unwrap(key, true, cx);
+                assert!(!root.unshield_forms[&key].unwrap);
+
+                let mut input = GatewayPrivateDraftInput::default();
+                input.chain_id = 1;
+                input.kind = GatewayPrivateDraftKind::Unshield;
+                input.unwrap = true;
+                let recipient = Address::repeat_byte(1).to_string();
+                let output = |root: &WalletRoot, input: &GatewayPrivateDraftInput| {
+                    root.private_draft_output(
+                        input,
+                        &asset,
+                        &recipient,
+                        FeeHandlingMode::DeductFromAmount,
+                    )
+                };
+                assert_eq!(
+                    output(root, &input).err(),
+                    Some(wallet_ops::ExecutorRouteUnavailable::NoExecutorOwner.to_string())
+                );
+                // Private sponsorship keeps its legacy RelayAdapt route.
+                input.delivery = GatewayPrivateDelivery::SelfBroadcast {
+                    delivery: GatewayPrivateSelfBroadcastInput::SelfBroadcast {
+                        signer: None,
+                        funding: GatewayPrivateFunding::Sponsorship {
+                            incentive: GatewayPrivateIncentive::Standard {},
+                        },
+                        fee: GatewayPrivateGasFee::Auto {},
+                    },
+                };
+                assert!(matches!(
+                    output(root, &input),
+                    Ok(PrivateEstimateOutput::Unshield {
+                        unwrap: true,
+                        native_top_up: None
+                    })
+                ));
+            });
+        });
+        cx.update(|window, _| window.remove_window());
+        drop(host);
+        drop(root);
+        cx.run_until_parked();
+        drop(entered);
+        drop(runtime);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     #[tokio::test]
     async fn retiring_a_picker_aborts_its_pending_estimate() {

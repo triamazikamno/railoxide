@@ -185,7 +185,6 @@ fn public_broadcaster_cost_display_uses_shared_amount_precision() {
         &[fee_row(1, dai, "formatted-amounts")],
         1,
         dai,
-        None,
         BroadcasterFeePolicy::default(),
         None,
     )
@@ -211,7 +210,6 @@ fn public_broadcaster_cost_display_filters_only_redundant_usd_values() {
         &[fee_row(1, dai, "usd-values")],
         1,
         dai,
-        None,
         BroadcasterFeePolicy::default(),
         None,
     )
@@ -294,7 +292,6 @@ fn public_broadcaster_cost_display_uses_effective_token_metadata() {
         &[fee_row(1, token, "custom-token-formatting")],
         1,
         token,
-        None,
         BroadcasterFeePolicy::default(),
         None,
     )
@@ -317,7 +314,6 @@ fn native_top_up_plan_display_and_request_use_fixed_native_amount() {
         &[fee_row(1, token, "native-top-up")],
         1,
         token,
-        None,
         BroadcasterFeePolicy::default(),
         None,
     )

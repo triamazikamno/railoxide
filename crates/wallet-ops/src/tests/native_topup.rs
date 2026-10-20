@@ -455,4 +455,41 @@ fn executor_unwrap_keeps_protocol_fee_and_existing_dust_out_of_transfer() {
         .unwrap()
         .is_none()
     );
+
+    // Unwrap and top-up have no legacy RelayAdapt composite without an executor.
+    let top_up = DesktopNativeTopUpPlan {
+        recipient,
+        wrapped_native_token: token,
+        native_amount: uint!(1_000_U256),
+        wrapped_native_amount: native_top_up_wrapped_native_amount(uint!(1_000_U256)),
+    };
+    for (unwrap, native_top_up) in [(true, None), (false, Some(&top_up))] {
+        assert!(
+            crate::desktop::desktop_composite_unshield_request(
+                token,
+                gross,
+                recipient,
+                unwrap,
+                false,
+                native_top_up,
+                None,
+            )
+            .is_err()
+        );
+    }
+    let top_up_request = crate::desktop::desktop_composite_unshield_request(
+        token,
+        gross,
+        recipient,
+        false,
+        false,
+        Some(&top_up),
+        Some(context),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        top_up_request.adapter,
+        Some(railgun_wallet::tx::CompositeAdapter::Executor(context))
+    );
 }

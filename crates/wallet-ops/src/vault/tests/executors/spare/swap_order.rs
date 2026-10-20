@@ -366,7 +366,6 @@ async fn swap_quote_uses_background_prices_without_fee_or_anchor_reads() {
         chain_type: 0,
         chain_id: 1,
         railgun_contract: Address::repeat_byte(4),
-        relay_adapt_contract: Address::repeat_byte(5),
     };
     let SwapAmountPlan::Fits(plan) = crate::plan_swap_inputs(
         &builder,
@@ -681,7 +680,6 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
         chain_type: 0,
         chain_id: 1,
         railgun_contract: Address::repeat_byte(4),
-        relay_adapt_contract: Address::repeat_byte(5),
     };
     let SwapAmountPlan::Fits(plan) = crate::plan_swap_inputs(
         &builder,
@@ -1347,7 +1345,6 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
         chain_type: 0,
         chain_id: 1,
         railgun_contract: Address::repeat_byte(4),
-        relay_adapt_contract: Address::repeat_byte(5),
     };
     let SwapAmountPlan::Fits(plan) = crate::plan_swap_inputs(
         &builder,
@@ -1700,7 +1697,6 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         chain_type: 0,
         chain_id: 1,
         railgun_contract: Address::repeat_byte(4),
-        relay_adapt_contract: Address::repeat_byte(5),
     };
     let quote: CowQuote = serde_json::from_value(json!({
         "quote": {
@@ -2346,7 +2342,6 @@ impl BridgeOrderFixture {
             chain_type: 0,
             chain_id: 1,
             railgun_contract: Address::repeat_byte(4),
-            relay_adapt_contract: Address::repeat_byte(5),
         };
         let SwapAmountPlan::Fits(plan) = crate::plan_swap_inputs(
             &builder,
@@ -2534,7 +2529,6 @@ fn speed_up_plan(
         chain_type: 0,
         chain_id: 1,
         railgun_contract: Address::repeat_byte(4),
-        relay_adapt_contract: Address::repeat_byte(5),
     };
     match crate::plan_swap_speed_up_inputs(
         &builder,
@@ -3239,7 +3233,6 @@ async fn a_speed_up_signs_a_second_order_at_the_open_orders_nonce() {
         chain_type: 0,
         chain_id: 1,
         railgun_contract: Address::repeat_byte(4),
-        relay_adapt_contract: Address::repeat_byte(5),
     };
     let SwapAmountPlan::Fits(first_plan) = crate::plan_swap_inputs(
         &builder,
@@ -3744,7 +3737,6 @@ async fn an_order_on_an_included_setup_signs_after_it_on_a_fresh_latest_read() {
         chain_type: 0,
         chain_id: 1,
         railgun_contract: Address::repeat_byte(4),
-        relay_adapt_contract: Address::repeat_byte(5),
     };
     let SwapAmountPlan::Fits(plan) = crate::plan_swap_inputs(
         &builder,

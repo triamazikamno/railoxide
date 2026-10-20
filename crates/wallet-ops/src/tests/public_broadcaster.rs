@@ -5,7 +5,6 @@ use railgun_wallet::tx::{ETHEREUM_GAS_MODEL, GasEstimateMode, POLYGON_GAS_MODEL}
 #[test]
 fn public_broadcaster_candidates_filter_unsupported_rows_and_allow_valid_poi_required() {
     let token = address(0x21);
-    let relay_adapt = address(0x44);
     let mut rows = vec![fee_row(1, token, 10, 0.9, "ok")];
 
     let mut invalid_signature = fee_row(1, token, 10, 0.9, "invalid-signature");
@@ -31,12 +30,7 @@ fn public_broadcaster_candidates_filter_unsupported_rows_and_allow_valid_poi_req
     rows.push(fee_row(2, token, 10, 0.9, "chain"));
     rows.push(fee_row(1, address(0x22), 10, 0.9, "token"));
 
-    let mut relay_mismatch = fee_row(1, token, 10, 0.9, "relay");
-    relay_mismatch.relay_adapt = address(0x55);
-    rows.push(relay_mismatch);
-
-    let candidates =
-        eligible_public_broadcasters(&rows, 1, token, Some(relay_adapt), SystemTime::now());
+    let candidates = eligible_public_broadcasters(&rows, 1, token, SystemTime::now());
 
     assert_eq!(candidates.len(), 2);
     assert_eq!(candidates[0].fees_id, "ok");
@@ -72,7 +66,6 @@ fn executor_submission_keeps_the_reserved_quote_when_advertisements_refresh() {
             &rows,
             1,
             reserved.token,
-            None,
             selection,
             policy,
             trust,
@@ -128,7 +121,6 @@ fn public_broadcaster_candidates_are_keyed_by_selected_fee_token() {
         ],
         1,
         fee_token,
-        None,
         SystemTime::now(),
         BroadcasterFeePolicy::default(),
         None,
@@ -155,7 +147,6 @@ fn specific_public_broadcaster_fails_when_not_available_for_fee_token() {
         )],
         1,
         fee_token,
-        None,
         SystemTime::now(),
         BroadcasterFeePolicy::default(),
         None,
@@ -182,7 +173,6 @@ fn public_broadcaster_selection_sorts_by_fee_then_seeded_tie_breaker() {
         ],
         1,
         token,
-        None,
         SystemTime::now(),
     );
     let sort_seed = (0_u8..=u8::MAX)
@@ -236,7 +226,6 @@ fn public_broadcaster_seeded_tie_breaker_replaces_lexical_address_order() {
         ],
         1,
         token,
-        None,
         SystemTime::now(),
     );
     let mut lexical = candidates.clone();
@@ -283,7 +272,6 @@ fn random_public_broadcaster_pool_includes_valid_poi_candidates_only_after_filte
         ],
         1,
         token,
-        None,
         SystemTime::now(),
         BroadcasterFeePolicy::default(),
         Some(U256::from(10)),
@@ -330,7 +318,7 @@ fn public_broadcaster_deduplication_keeps_freshest_parsed_identity() {
     fresher.identifier = Some(Arc::from("fresh-identifier"));
     fresher.fee_expiration = now + Duration::from_secs(20);
 
-    let candidates = eligible_public_broadcasters(&[older, fresher], 1, token, None, now);
+    let candidates = eligible_public_broadcasters(&[older, fresher], 1, token, now);
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].fees_id, "fresh-fees");
     assert_eq!(
@@ -375,7 +363,6 @@ fn public_broadcaster_specific_selection_survives_fees_id_refresh() {
         )],
         1,
         token,
-        None,
         SystemTime::now(),
     );
 
@@ -398,7 +385,6 @@ fn public_broadcaster_trust_filter_gives_banned_precedence() {
         ],
         1,
         token,
-        None,
         SystemTime::now(),
         BroadcasterFeePolicy::default(),
         None,
@@ -427,7 +413,6 @@ fn public_broadcaster_trust_filter_supports_favorites_only_selection() {
         ],
         1,
         token,
-        None,
         SystemTime::now(),
         BroadcasterFeePolicy::default(),
         None,
@@ -475,7 +460,6 @@ fn public_broadcaster_trust_filter_rejects_stale_estimated_broadcaster() {
         )],
         1,
         token,
-        None,
         SystemTime::now(),
         BroadcasterFeePolicy::default(),
         None,
@@ -512,7 +496,6 @@ fn public_broadcaster_fee_policy_classifies_anchor_bounds() {
         ],
         1,
         token,
-        None,
         SystemTime::now(),
         policy,
         Some(uint!(100_U256)),
@@ -557,7 +540,6 @@ fn public_broadcaster_fee_policy_allows_unknown_anchor_rows() {
         &[fee_row(1, token, 1_000_000, 0.9, "raw")],
         1,
         token,
-        None,
         SystemTime::now(),
         policy,
         None,
@@ -633,7 +615,6 @@ fn public_broadcaster_fee_policy_override_includes_suspicious_rows() {
         &[fee_row(1, token, 151, 0.9, "above")],
         1,
         token,
-        None,
         SystemTime::now(),
         policy,
         Some(uint!(100_U256)),
@@ -668,7 +649,6 @@ fn specific_public_broadcaster_drift_rechecks_latest_fee_policy() {
         )],
         1,
         token,
-        None,
         SystemTime::now(),
         policy,
         Some(uint!(100_U256)),
@@ -682,7 +662,6 @@ fn specific_public_broadcaster_drift_rechecks_latest_fee_policy() {
         )],
         1,
         token,
-        None,
         SystemTime::now(),
         policy,
         Some(uint!(100_U256)),
@@ -905,7 +884,6 @@ fn executor_quote_refresh_keeps_payment_separate_from_approval_allowance() {
             )],
             1,
             fee_token,
-            None,
             SystemTime::now(),
         )
         .remove(0);
@@ -1002,7 +980,6 @@ fn custom_broadcaster_fee_drives_note_selection_and_recipient_amounts() {
             )],
             1,
             fee_token,
-            None,
             SystemTime::now(),
         )
         .remove(0);
@@ -1203,7 +1180,6 @@ fn public_broadcaster_estimate_preserves_fee_handling_amount_split() {
         )],
         1,
         token,
-        None,
         SystemTime::now(),
     )
     .into_iter()
@@ -1278,7 +1254,6 @@ fn public_broadcaster_estimate_reports_separate_fee_token_amounts() {
         )],
         1,
         fee_token,
-        None,
         SystemTime::now(),
     )
     .into_iter()
@@ -1352,7 +1327,6 @@ fn public_broadcaster_unshield_estimate_includes_protocol_fee() {
         )],
         1,
         token,
-        None,
         SystemTime::now(),
     )
     .into_iter()
@@ -1445,7 +1419,6 @@ fn public_broadcaster_fee_quote_includes_the_gas_limit_buffer_once() {
         &[fee_row(1, token, 1_000_000_000_000_000_000, 0.9, "buffer")],
         1,
         token,
-        None,
         SystemTime::now(),
     )
     .remove(0);

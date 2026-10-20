@@ -148,7 +148,6 @@ impl StealthAccountsView {
                         public_broadcaster_fee_token_options_from_snapshot(
                             snapshot,
                             &rows,
-                            None,
                             Some(profile),
                             policy,
                             &trust,
@@ -184,7 +183,6 @@ impl StealthAccountsView {
                         &rows,
                         self.session.chain_id,
                         token,
-                        None,
                         Some(profile),
                         policy,
                         root.public_broadcaster_anchor_cache

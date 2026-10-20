@@ -23,7 +23,7 @@ use wallet_ops::{
     estimate_desktop_unshield_self_broadcast_cost, expected_eip1559_fee_per_gas,
     parse_railgun_recipient, quote_desktop_self_broadcast_gas_fee,
     quote_sponsored_send_authorization_limit, quote_sponsored_unshield_authorization_limit,
-    unshield_protocol_fee_amount_for_fee_mode,
+    unshield_executor_route, unshield_protocol_fee_amount_for_fee_mode, unshield_requires_executor,
 };
 
 #[derive(Clone)]
@@ -117,22 +117,34 @@ impl PreparedSelfBroadcastDraft {
                 PrivateEstimateOutput::Unshield {
                     unwrap,
                     native_top_up,
-                } => estimate_desktop_unshield_self_broadcast_cost(
-                    self.raw.chain_id,
-                    self.effective_chain.gas.gas_limit_buffer,
-                    (*unwrap || native_top_up.is_some())
-                        && session.executor_owner().is_some()
-                        && self.effective_chain.accepted_executor_profile().is_some(),
-                    &utxos,
-                    self.asset.token,
-                    self.amount,
-                    self.fee_mode,
-                    *unwrap,
-                    native_top_up.as_ref(),
-                    quote,
-                    max_fee,
-                    tip,
-                ),
+                } => {
+                    // Public-balance funding is never private sponsorship.
+                    let executor =
+                        unshield_requires_executor(*unwrap, native_top_up.is_some(), false);
+                    if executor
+                        && let Err(reason) = unshield_executor_route(
+                            session.executor_owner().is_some(),
+                            &self.effective_chain,
+                        )
+                    {
+                        Err(reason.into())
+                    } else {
+                        estimate_desktop_unshield_self_broadcast_cost(
+                            self.raw.chain_id,
+                            self.effective_chain.gas.gas_limit_buffer,
+                            executor,
+                            &utxos,
+                            self.asset.token,
+                            self.amount,
+                            self.fee_mode,
+                            *unwrap,
+                            native_top_up.as_ref(),
+                            quote,
+                            max_fee,
+                            tip,
+                        )
+                    }
+                }
             };
             self.estimate = cost.map_or(
                 SponsoredFundingEstimateState::PublicBalanceUnavailable,

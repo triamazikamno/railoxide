@@ -262,7 +262,6 @@ mod tests {
                 &[crate::root::tests::fee_row(1, input.fee_token, "available")],
                 1,
                 input.fee_token,
-                None,
                 policy,
                 None,
             )

@@ -5619,7 +5619,6 @@ impl PrivateSwapsView {
                 public_broadcaster_fee_token_options_from_snapshot(
                     snapshot,
                     &rows,
-                    None,
                     Some(profile),
                     policy,
                     &trust,
@@ -13395,7 +13394,6 @@ fn destination_setup_funds(root: &WalletRoot, chain: &EffectiveChainConfig) -> S
     let funded = public_broadcaster_fee_token_options_from_snapshot(
         snapshot,
         &rows,
-        None,
         Some(profile),
         root.public_broadcaster_fee_policy(false),
         &root.public_broadcaster_trust_filter(false),

@@ -1,10 +1,11 @@
 use super::*;
 use std::time::Instant;
+use wallet_ops::settings::ExecutorProfile;
 use wallet_ops::{
     DesktopUnshieldPublicBroadcasterEstimateRequest, ExecutorAsset, ExecutorDelivery,
-    PreparedExecutorOperation, PublicBroadcasterApprovalBounds, PublicBroadcasterSelection,
-    default_public_broadcaster_fee_limit, estimate_desktop_unshield_public_broadcaster_cost,
-    vault::ExecutorOperationId,
+    ExecutorRouteUnavailable, PreparedExecutorOperation, PublicBroadcasterApprovalBounds,
+    PublicBroadcasterSelection, default_public_broadcaster_fee_limit,
+    estimate_desktop_unshield_public_broadcaster_cost, vault::ExecutorOperationId,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -283,15 +284,65 @@ impl WalletRoot {
         );
     }
 
-    pub(in crate::root) fn unshield_requires_executor(&self, draft: &UnshieldSpendDraft) -> bool {
-        (draft.unwrap || draft.native_top_up.is_some())
-            && draft.session.executor_owner().is_some()
-            && draft.self_broadcast_funding != SelfBroadcastFundingMode::PrivateSponsorship
-            && self
-                .effective_chain_configs
-                .get(draft.asset.chain_id)
-                .and_then(wallet_ops::settings::EffectiveChainConfig::accepted_executor_profile)
-                .is_some()
+    pub(in crate::root) const fn unshield_requires_executor(draft: &UnshieldSpendDraft) -> bool {
+        wallet_ops::unshield_requires_executor(
+            draft.unwrap,
+            draft.native_top_up.is_some(),
+            matches!(
+                draft.self_broadcast_funding,
+                SelfBroadcastFundingMode::PrivateSponsorship
+            ),
+        )
+    }
+
+    pub(in crate::root) fn unshield_draft_executor_route(
+        &self,
+        draft: &UnshieldSpendDraft,
+    ) -> Result<ExecutorProfile, ExecutorRouteUnavailable> {
+        self.executor_route_with_owner(
+            draft.asset.chain_id,
+            draft.session.executor_owner().is_some(),
+        )
+    }
+
+    /// The executor route from the chain's ready session.
+    pub(in crate::root) fn unshield_executor_route(
+        &self,
+        chain_id: u64,
+    ) -> Result<ExecutorProfile, ExecutorRouteUnavailable> {
+        let has_owner = matches!(
+            self.chain_states.get(&chain_id),
+            Some(ChainUtxoState::Ready { session, .. }) if session.executor_owner().is_some()
+        );
+        self.executor_route_with_owner(chain_id, has_owner)
+    }
+
+    fn executor_route_with_owner(
+        &self,
+        chain_id: u64,
+        has_owner: bool,
+    ) -> Result<ExecutorProfile, ExecutorRouteUnavailable> {
+        let chain = self
+            .effective_chain_configs
+            .get(chain_id)
+            .ok_or(ExecutorRouteUnavailable::NoAcceptedProfile)?;
+        wallet_ops::unshield_executor_route(has_owner, chain)
+    }
+
+    /// Why unwrap and gas top-up are unavailable on this form, outside private sponsorship.
+    pub(in crate::root) fn unshield_form_executor_unavailable(
+        &self,
+        form: &UnshieldFormState,
+    ) -> Option<ExecutorRouteUnavailable> {
+        let funding = effective_delivery_funding_mode(
+            form.delivery_mode,
+            self.effective_chain_configs.get(form.asset.chain_id),
+            form.self_broadcast_funding,
+        );
+        if funding == SelfBroadcastFundingMode::PrivateSponsorship {
+            return None;
+        }
+        self.unshield_executor_route(form.asset.chain_id).err()
     }
 
     pub(in crate::root) fn prepare_executor_unshield_review(
@@ -307,7 +358,7 @@ impl WalletRoot {
         let Some(draft) = self.unshield_spend_draft(key, cx) else {
             return;
         };
-        if !self.unshield_requires_executor(&draft)
+        if !Self::unshield_requires_executor(&draft)
             || !approval.matches(&draft)
             || self
                 .unshield_forms
@@ -366,11 +417,14 @@ impl WalletRoot {
         let Some(chain) = self.effective_chain_configs.get(key.chain_id).cloned() else {
             return;
         };
-        if let Err(error) = delivery.admit(
-            chain
-                .accepted_executor_profile()
-                .expect("executor profile checked"),
-        ) {
+        let profile = match self.unshield_draft_executor_route(&draft) {
+            Ok(profile) => profile,
+            Err(reason) => {
+                self.set_unshield_form_error(key, reason.to_string(), cx);
+                return;
+            }
+        };
+        if let Err(error) = delivery.admit(profile) {
             self.set_unshield_form_error(key, error.to_string(), cx);
             return;
         }

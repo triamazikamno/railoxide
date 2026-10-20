@@ -3,15 +3,13 @@ use std::time::Duration;
 use alloy::primitives::{Address, U256, address};
 use gpui::Context;
 use wallet_ops::{
-    BroadcasterFeePolicy, BroadcasterFeePolicyStatus, FeeHandlingMode, ListUtxosOutput,
-    PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterTrustFilter,
-    RAILGUN_PROTOCOL_FEE_BPS, eligible_public_broadcasters_for_asset,
+    BroadcasterFeePolicy, BroadcasterFeePolicyStatus, ExecutorRouteUnavailable, FeeHandlingMode,
+    ListUtxosOutput, PublicBroadcasterCandidate, PublicBroadcasterCostEstimate,
+    PublicBroadcasterTrustFilter, RAILGUN_PROTOCOL_FEE_BPS, eligible_public_broadcasters_for_asset,
     fee_policy_eligible_public_broadcasters, filter_public_broadcasters_by_trust,
     max_broadcaster_fee_token_amount_from_outputs as planner_max_broadcaster_fee_token_amount_from_outputs,
     public_broadcaster_candidates_for_asset,
-    settings::{
-        EffectiveChainConfig, EffectiveChainRegistry, EffectiveTokenRegistry, ExecutorProfile,
-    },
+    settings::{EffectiveTokenRegistry, ExecutorProfile},
 };
 
 use crate::assets::WalletIconSource;
@@ -66,17 +64,16 @@ impl WalletRoot {
         favorites_only: bool,
         policy: BroadcasterFeePolicy,
     ) -> Vec<PublicBroadcasterCandidate> {
+        let Ok(executor_profile) =
+            self.public_broadcaster_executor_profile(chain_id, unwrap, native_top_up)
+        else {
+            return Vec::new();
+        };
         public_broadcaster_candidates_for_route(
             &self.monitor_fee_rows(),
             chain_id,
             token,
-            required_relay_adapt_for_unshield(
-                &self.effective_chain_configs,
-                chain_id,
-                unwrap,
-                native_top_up,
-            ),
-            self.public_broadcaster_executor_profile(chain_id, unwrap, native_top_up),
+            executor_profile,
             policy,
             self.public_broadcaster_anchor_cache
                 .cached_rate(chain_id, token),
@@ -89,14 +86,12 @@ impl WalletRoot {
         chain_id: u64,
         unwrap: bool,
         native_top_up: bool,
-    ) -> Option<ExecutorProfile> {
-        if unwrap || native_top_up {
-            self.effective_chain_configs
-                .get(chain_id)
-                .and_then(EffectiveChainConfig::accepted_executor_profile)
-        } else {
-            None
+    ) -> Result<Option<ExecutorProfile>, ExecutorRouteUnavailable> {
+        // Public broadcaster delivery is never privately sponsored.
+        if !wallet_ops::unshield_requires_executor(unwrap, native_top_up, false) {
+            return Ok(None);
         }
+        self.unshield_executor_route(chain_id).map(Some)
     }
 
     pub(super) fn current_public_broadcaster_fee_token_options(
@@ -114,18 +109,16 @@ impl WalletRoot {
         else {
             return Vec::new();
         };
+        let Ok(executor_profile) =
+            self.public_broadcaster_executor_profile(chain_id, unwrap, native_top_up)
+        else {
+            return Vec::new();
+        };
         let fee_rows = self.monitor_fee_rows();
-        let required_relay_adapt = required_relay_adapt_for_unshield(
-            &self.effective_chain_configs,
-            chain_id,
-            unwrap,
-            native_top_up,
-        );
         public_broadcaster_fee_token_options_from_snapshot(
             snapshot,
             &fee_rows,
-            required_relay_adapt,
-            self.public_broadcaster_executor_profile(chain_id, unwrap, native_top_up),
+            executor_profile,
             policy,
             &self.public_broadcaster_trust_filter(favorites_only),
             Some(&self.effective_token_registry),
@@ -277,21 +270,14 @@ pub(super) fn public_broadcaster_candidates_for_route(
     fee_rows: &[broadcaster_monitor::FeeRow],
     chain_id: u64,
     token: Address,
-    required_relay_adapt: Option<Address>,
     executor_profile: Option<ExecutorProfile>,
     policy: BroadcasterFeePolicy,
     anchor_rate: Option<U256>,
     trust_filter: &PublicBroadcasterTrustFilter,
 ) -> Vec<PublicBroadcasterCandidate> {
-    let mut candidates = public_broadcaster_candidates_for_asset(
-        fee_rows,
-        chain_id,
-        token,
-        required_relay_adapt.filter(|_| executor_profile.is_none()),
-        policy,
-        anchor_rate,
-    )
-    .unwrap_or_default();
+    let mut candidates =
+        public_broadcaster_candidates_for_asset(fee_rows, chain_id, token, policy, anchor_rate)
+            .unwrap_or_default();
     if let Some(profile) = executor_profile {
         candidates.retain(|candidate| {
             wallet_ops::ExecutorDelivery::PublicBroadcaster(Box::new(candidate.clone()))
@@ -305,7 +291,6 @@ pub(super) fn public_broadcaster_candidates_for_route(
 pub(super) fn public_broadcaster_fee_token_options_from_snapshot(
     snapshot: &ListUtxosOutput,
     fee_rows: &[broadcaster_monitor::FeeRow],
-    required_relay_adapt: Option<Address>,
     executor_profile: Option<ExecutorProfile>,
     policy: BroadcasterFeePolicy,
     trust_filter: &PublicBroadcasterTrustFilter,
@@ -328,7 +313,6 @@ pub(super) fn public_broadcaster_fee_token_options_from_snapshot(
                 fee_rows,
                 snapshot.chain_id,
                 token,
-                required_relay_adapt,
                 executor_profile,
                 policy,
                 anchor_rate_for_token(token),
@@ -360,7 +344,7 @@ pub(super) fn fee_token_option_has_eligible_broadcaster(
 pub(super) fn ethereum_weth_public_broadcaster_count(
     fee_rows: &[broadcaster_monitor::FeeRow],
 ) -> usize {
-    eligible_public_broadcasters_for_asset(fee_rows, ETHEREUM_CHAIN_ID, ETHEREUM_WETH_TOKEN, None)
+    eligible_public_broadcasters_for_asset(fee_rows, ETHEREUM_CHAIN_ID, ETHEREUM_WETH_TOKEN)
         .map_or(0, |candidates| candidates.len())
 }
 
@@ -473,22 +457,4 @@ pub(super) fn should_show_fee_mode_toggle(
     fee_token: Address,
 ) -> bool {
     matches!(kind, DeliveryFormKind::Unshield) || action_token == fee_token
-}
-
-pub(super) fn required_relay_adapt_for_unshield(
-    effective_chain_configs: &EffectiveChainRegistry,
-    chain_id: u64,
-    unwrap: bool,
-    native_top_up: bool,
-) -> Option<Address> {
-    (unwrap || native_top_up)
-        .then(|| {
-            effective_chain_configs.get(chain_id).and_then(|chain| {
-                chain
-                    .railgun
-                    .as_ref()
-                    .map(|private| private.deployment.relay_adapt_contract)
-            })
-        })
-        .flatten()
 }

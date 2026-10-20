@@ -6,8 +6,8 @@ use alloy::primitives::{Address, B256, U256};
 use broadcaster_core::contracts::railgun::Call;
 use eyre::{Result, eyre};
 use railgun_wallet::tx::{
-    BuildError, GasEstimateMode, MixedPrivateActionRequest, MixedPrivateOutputRole,
-    MixedPrivateSend, MixedPrivateSendRole, RailgunGasModel,
+    BuildError, CompositeAdapter, GasEstimateMode, MixedPrivateActionRequest,
+    MixedPrivateOutputRole, MixedPrivateSend, MixedPrivateSendRole, RailgunGasModel,
 };
 use railgun_wallet::{ProverService, TransactionBuilder, Utxo};
 use tracing::Instrument as _;
@@ -288,13 +288,12 @@ impl ExecutorOwner {
             chain_type: 0,
             chain_id: self.chain.chain_id,
             railgun_contract: chain.railgun_contract,
-            relay_adapt_contract: chain.relay_adapt_contract,
         };
         let budget_gas = budget_gas(chain.gas.gas_limit_buffer);
         // Only the private fee affects note selection. The calls' gas is accounted
         // for above; their signed calldata is created after authorization.
         let request = MixedPrivateActionRequest {
-            executor: None,
+            adapter: None,
             executor_calls: Vec::new(),
             private_sends: vec![MixedPrivateSend {
                 token_address: candidate.token,
@@ -466,7 +465,6 @@ impl ExecutorOwner {
             chain_type: 0,
             chain_id: self.chain.chain_id,
             railgun_contract: chain.railgun_contract,
-            relay_adapt_contract: chain.relay_adapt_contract,
         };
         update_transaction_generation_stage(
             progress_tx,
@@ -692,7 +690,7 @@ fn paid_execution_request(
     verify_proof: bool,
 ) -> MixedPrivateActionRequest {
     MixedPrivateActionRequest {
-        executor: Some(preparation.context()),
+        adapter: Some(CompositeAdapter::Executor(preparation.context())),
         executor_calls: calls.to_vec(),
         private_sends: vec![MixedPrivateSend {
             token_address: candidate.token,
@@ -852,15 +850,14 @@ mod tests {
             chain_type: 0,
             chain_id: 1,
             railgun_contract: Address::repeat_byte(4),
-            relay_adapt_contract: Address::repeat_byte(5),
         };
         let request = MixedPrivateActionRequest {
-            executor: Some(ExecutorContext {
+            adapter: Some(CompositeAdapter::Executor(ExecutorContext {
                 chain_id: 1,
                 executor,
                 delegate: alloy::primitives::address!("05ae73c5925d843864ae6f261f3175de2ebcd963"),
                 execution_nonce: U256::ZERO,
-            }),
+            })),
             // Fee selection previews the same native-wrap action regardless of its value.
             executor_calls: vec![Call {
                 to: wrapped_native,
@@ -921,7 +918,7 @@ mod tests {
         // The read-only preview must price the same private notes before account
         // keys and the shield calls have been prepared with spend authorization.
         let mut preview = request.clone();
-        preview.executor = None;
+        preview.adapter = None;
         preview.executor_calls.clear();
         let (gas, preview_fee) = estimate_private_fee(
             &builder,

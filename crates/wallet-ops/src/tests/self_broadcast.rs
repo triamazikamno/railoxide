@@ -219,7 +219,7 @@ fn executor_unshield_estimate_includes_delegation_and_chain_buffer_before_alloca
     let utxos = vec![utxo(token, 10_000, 0, 0).utxo];
     let quote = SelfBroadcastGasFeeQuote::from_rpc_gas_price(100);
     let gas_limit_buffer = 30_000;
-    let estimate_on = |chain_id, executor, gas_limit_buffer| {
+    let try_estimate = |chain_id, executor, unwrap, gas_limit_buffer| {
         crate::estimate_desktop_unshield_self_broadcast_cost(
             chain_id,
             gas_limit_buffer,
@@ -228,24 +228,28 @@ fn executor_unshield_estimate_includes_delegation_and_chain_buffer_before_alloca
             token,
             U256::from(1_000),
             FeeHandlingMode::DeductFromAmount,
-            true,
+            unwrap,
             None,
             quote,
             120,
             2,
         )
-        .unwrap()
+    };
+    // Unwrap has no direct route, so the direct quote is for a plain Unshield.
+    assert!(try_estimate(1, false, true, gas_limit_buffer).is_err());
+    let estimate_on = |chain_id, executor, gas_limit_buffer| {
+        try_estimate(chain_id, executor, executor, gas_limit_buffer).unwrap()
     };
     let estimate = |executor, gas_limit_buffer| estimate_on(1, executor, gas_limit_buffer);
     let selection =
         railgun_wallet::tx::unshield_selection_info(&utxos, token, U256::from(1_000), false)
             .unwrap();
-    let shape = unshield_approximate_shape(&selection, selection.max_spendable, true);
     let gas = |chain_id, mode, executor| {
         approximate_public_broadcaster_gas(
             railgun_wallet::tx::RailgunGasModel::for_chain(chain_id),
             mode,
-            shape.with_executor(executor),
+            unshield_approximate_shape(&selection, selection.max_spendable, executor)
+                .with_executor(executor),
         )
     };
     let legacy = estimate(false, gas_limit_buffer);
@@ -348,7 +352,7 @@ fn direct_self_broadcast_estimates_private_send_and_unshield_costs() {
 }
 
 #[test]
-fn direct_self_broadcast_estimate_includes_each_native_top_up_protocol_fee() {
+fn self_broadcast_estimate_includes_each_native_top_up_protocol_fee() {
     let token = address(0x42);
     let wrapped_native = address(0x43);
     let native_amount = U256::from(100_u64);
@@ -367,7 +371,7 @@ fn direct_self_broadcast_estimate_includes_each_native_top_up_protocol_fee() {
     let separate_tokens = crate::estimate_desktop_unshield_self_broadcast_cost(
         1,
         crate::GAS_LIMIT_BUFFER,
-        false,
+        true,
         &utxos,
         token,
         U256::from(1_000_u64),
@@ -406,7 +410,7 @@ fn direct_self_broadcast_estimate_includes_each_native_top_up_protocol_fee() {
     let combined = crate::estimate_desktop_unshield_self_broadcast_cost(
         1,
         crate::GAS_LIMIT_BUFFER,
-        false,
+        true,
         &wrapped_utxos,
         wrapped_native,
         entered_amount,

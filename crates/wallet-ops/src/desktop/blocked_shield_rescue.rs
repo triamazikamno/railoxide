@@ -95,13 +95,10 @@ pub async fn resolve_source_tx_origin(
 ) -> Result<Address> {
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     // The delegate RelayAdapt7702 never holds tokens, so it is not a shared RelayAdapt here.
-    let mut relay_adapts = vec![chain.relay_adapt_contract];
-    relay_adapts.extend_from_slice(
-        effective_chain
-            .require_railgun()?
-            .deployment
-            .relay_adapt_history,
-    );
+    let relay_adapt_history = effective_chain
+        .require_railgun()?
+        .deployment
+        .relay_adapt_history;
     let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
     let source =
         resolve_source_transaction_by_block(&query_rpc_pool, source_block_number, source_tx_hash)
@@ -111,22 +108,24 @@ pub async fn resolve_source_tx_origin(
         token,
         value,
         chain.railgun_contract,
-        &relay_adapts,
+        chain.relay_adapt_contract,
+        relay_adapt_history,
         source.from,
     )
     .ok_or_else(|| eyre!("source transaction has ambiguous Shield funding accounts"))
 }
 
 /// The account the Railgun contract pulled a Shield's tokens from, read from the Shield
-/// transaction's receipt logs. A shared `RelayAdapt` funder, or a receipt without a matching
-/// Transfer, resolves to `from`. `None` means several accounts funded Shields of `token`
-/// that `value` cannot tell apart.
+/// transaction's receipt logs. A shared `RelayAdapt` funder, current or historical, or a
+/// receipt without a matching Transfer, resolves to `from`. `None` means several accounts
+/// funded Shields of `token` that `value` cannot tell apart.
 pub(crate) fn shield_funding_account(
     logs: &[Log],
     token: Address,
     value: U256,
     railgun: Address,
-    relay_adapts: &[Address],
+    relay_adapt: Option<Address>,
+    relay_adapt_history: &[Address],
     from: Address,
 ) -> Option<Address> {
     let transfers = logs
@@ -152,11 +151,13 @@ pub(crate) fn shield_funding_account(
         }
         funder
     };
-    Some(if relay_adapts.contains(&funder) {
-        from
-    } else {
-        funder
-    })
+    Some(
+        if relay_adapt == Some(funder) || relay_adapt_history.contains(&funder) {
+            from
+        } else {
+            funder
+        },
+    )
 }
 
 pub(crate) fn blocked_shield_rescue_candidate_from_records(

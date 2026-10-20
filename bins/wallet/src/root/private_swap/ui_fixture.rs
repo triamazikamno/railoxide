@@ -232,6 +232,10 @@
 //!   in `reused`, and that #12 isn't used for another swap. On the later swap's detail,
 //!   Cancel preparation… ends in an error, as the wallet's store holds no such swap, and the
 //!   other actions do nothing.
+//! - `unshield` lets the Private tab's Unshield open a stand-in 1.0 of the network's wrapped
+//!   native token when the wallet holds nothing it can unshield, so the form's Output toggle
+//!   and gas top-up can be looked at. The network's private session must be started. Nothing
+//!   about the asset is real, so its estimates and Unshield fail.
 //!
 //! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
@@ -308,6 +312,7 @@ enum Mode {
     Accounts,
     Refund(Refund),
     Utxos,
+    Unshield,
     RetryReview,
     QuoteError,
     Split(Split),
@@ -479,6 +484,9 @@ fn parse(value: &str) -> Option<Mode> {
     }
     if value == "utxos" {
         return Some(Mode::Utxos);
+    }
+    if value == "unshield" {
+        return Some(Mode::Unshield);
     }
     if value == "retry-review" {
         return Some(Mode::RetryReview);
@@ -2537,6 +2545,28 @@ impl WalletRoot {
         Self::open_blocked_shield_refund_dialog(REFUND_UTXO, window, cx);
         true
     }
+}
+
+/// The stand-in asset of the `unshield` mode: 1.0 of `chain_id`'s wrapped native token
+/// `wrapped_native`. `None` in every other mode.
+pub(in crate::root) fn unshield_asset(
+    chain_id: u64,
+    wrapped_native: Address,
+) -> Option<crate::root::UnshieldAsset> {
+    let amount = U256::from(10).pow(U256::from(18));
+    matches!(mode(), Some(Mode::Unshield)).then(|| crate::root::UnshieldAsset {
+        chain_id,
+        token: wrapped_native,
+        label: known_tokens_for_chain(chain_id)
+            .find(|token| token.token == wrapped_native)
+            .map_or("WETH", |token| token.symbol)
+            .to_owned(),
+        decimals: Some(18),
+        total: amount,
+        poi_verified_total: amount,
+        max_batched: amount,
+        icon_path: None,
+    })
 }
 
 /// Whether the UTXO table shows the rows of the `utxos` mode in place of the wallet's own,

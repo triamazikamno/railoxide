@@ -72,6 +72,7 @@ pub struct SponsoredAdmission {
     pub has_relays: bool,
     pub wrapped_native_token: Option<Address>,
     pub coinbase_payer: Option<Address>,
+    pub relay_adapt_contract: Option<Address>,
     pub payer_verified: bool,
     pub signer_eligible: bool,
     pub poi_spendable_wrapped_native: U256,
@@ -174,6 +175,8 @@ pub enum SponsorshipError {
     MissingWrappedNativeToken,
     #[error("the selected chain has no coinbase payer")]
     MissingCoinbasePayer,
+    #[error("the selected chain has no legacy RelayAdapt contract")]
+    MissingRelayAdapt,
     #[error("coinbase payer verification has not succeeded")]
     PayerNotVerified,
     #[error("the selected signer is not eligible for sponsored funding")]
@@ -516,6 +519,9 @@ pub fn validate_sponsored_admission(admission: SponsoredAdmission) -> Result<(),
     }
     if admission.coinbase_payer.is_none() {
         return Err(SponsorshipError::MissingCoinbasePayer);
+    }
+    if admission.relay_adapt_contract.is_none() {
+        return Err(SponsorshipError::MissingRelayAdapt);
     }
     if !admission.payer_verified {
         return Err(SponsorshipError::PayerNotVerified);
@@ -928,6 +934,7 @@ mod tests {
             has_relays: true,
             wrapped_native_token: Some(Address::from([1; 20])),
             coinbase_payer: Some(Address::from([2; 20])),
+            relay_adapt_contract: Some(Address::from([3; 20])),
             payer_verified: true,
             signer_eligible: true,
             poi_spendable_wrapped_native: U256::from(10_u8),
@@ -986,6 +993,13 @@ mod tests {
                     ..valid
                 },
                 SponsorshipError::MissingCoinbasePayer,
+            ),
+            (
+                SponsoredAdmission {
+                    relay_adapt_contract: None,
+                    ..valid
+                },
+                SponsorshipError::MissingRelayAdapt,
             ),
             (
                 SponsoredAdmission {

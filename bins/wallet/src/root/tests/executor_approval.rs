@@ -11,7 +11,6 @@ fn executor_broadcaster_approval_only_continues_within_the_displayed_terms() {
         &[fee_row(1, token, "quote")],
         1,
         token,
-        None,
         SystemTime::now(),
         wallet_ops::BroadcasterFeePolicy::default(),
         None,

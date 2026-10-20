@@ -435,7 +435,9 @@ impl EffectiveChainConfig {
         self.enabled
             && self.wrapped_native_token.is_some()
             && self.railgun.as_ref().is_some_and(|railgun| {
-                !railgun.sponsored_bundle_relays.is_empty() && railgun.coinbase_payer.is_some()
+                !railgun.sponsored_bundle_relays.is_empty()
+                    && railgun.coinbase_payer.is_some()
+                    && railgun.deployment.relay_adapt_contract.is_some()
             })
     }
 }

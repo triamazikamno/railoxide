@@ -18,6 +18,11 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
             request.chain_id
         ));
     }
+    require_unshield_executor(
+        request.unwrap,
+        request.native_top_up.is_some(),
+        request.executor.is_some(),
+    )?;
     let chain = effective_desktop_chain_config(request.chain_id, &request.effective_chain)?;
     let executor =
         validate_desktop_executor_preparation(&request.session, request.executor.as_deref())?;
@@ -46,7 +51,6 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         request.fee_token,
         &request.fee_rows,
         &request.selection,
-        request.executor.is_none() && (request.unwrap || request.native_top_up.is_some()),
         request
             .executor
             .as_ref()
@@ -216,16 +220,10 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         "public broadcaster unshield",
     )?;
 
-    let mode = if request.unwrap {
-        UnshieldMode::UnwrapBase
-    } else {
-        UnshieldMode::Token
-    };
     let tx_builder = TransactionBuilder {
         chain_type: 0,
         chain_id: request.chain_id,
         railgun_contract: chain.railgun_contract,
-        relay_adapt_contract: chain.relay_adapt_contract,
     };
 
     let maximum_fee = executor.and(request.executor_maximum_private_fee);
@@ -309,7 +307,6 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                 token_address: request.token,
                 amount: split.receiver_amount,
                 recipient: request.recipient,
-                mode,
                 verify_proof: request.verify_proof,
                 spend_up_to: false,
                 broadcaster_fee: Some(BroadcasterFeeOutput {
@@ -563,7 +560,6 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         request.fee_token,
         &request.fee_rows,
         &request.selection,
-        false,
         None,
         request.fee_policy,
         &request.trust_filter,
@@ -678,7 +674,6 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         chain_type: 0,
         chain_id: request.chain_id,
         railgun_contract: chain.railgun_contract,
-        relay_adapt_contract: chain.relay_adapt_contract,
     };
 
     let mut fee_amount = request

@@ -454,6 +454,12 @@ impl WalletRoot {
             asset.chain_id,
             asset.token,
         );
+        // Without an executor route, unwrap and top-up can't be turned on. One already on stays
+        // switchable off.
+        let executor_unavailable = self.unshield_form_executor_unavailable(form);
+        let executor_reason = executor_unavailable
+            .filter(|_| unwrap_supported || form.native_top_up.is_some())
+            .map(|reason| app_muted_text(reason.to_string()).whitespace_normal());
         let unit_hint = if asset.decimals.is_some() {
             format!("{} amount", asset.label)
         } else {
@@ -703,7 +709,7 @@ impl WalletRoot {
                             key,
                             asset.chain_id,
                             form.unwrap,
-                            form.generating,
+                            form.generating || (executor_unavailable.is_some() && !form.unwrap),
                         )
                     }))
                     .child(
@@ -728,9 +734,10 @@ impl WalletRoot {
                 key,
                 form.native_top_up.as_ref(),
                 form.native_top_up_enabled,
-                form.generating,
+                form.generating || (executor_unavailable.is_some() && !form.native_top_up_enabled),
                 Some(&self.effective_token_registry),
-            ));
+            ))
+            .children(executor_reason);
         if let Some(estimate_state) = sponsored_funding_estimate {
             card = card.child(render_sponsored_funding_estimate(
                 estimate_root.clone(),
