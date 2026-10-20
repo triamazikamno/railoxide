@@ -54,38 +54,3 @@ impl EffectiveChainConfig {
         )
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::settings::{WalletSettings, build_effective_chain_configs};
-
-    #[test]
-    fn effective_overrides_cannot_admit_an_unknown_executor_profile() {
-        let mut chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
-        for chain_id in [1, 56, 137, 42161] {
-            let chain = chains.get_mut(chain_id).unwrap();
-            let accepted = chain.accepted_executor_profile().unwrap();
-            assert_eq!(accepted.chain_id(), chain_id);
-            chain
-                .railgun
-                .as_mut()
-                .unwrap()
-                .deployment
-                .relay_adapt_7702_contract = Address::repeat_byte(7);
-            assert!(chain.accepted_executor_profile().is_none());
-            chain
-                .railgun
-                .as_mut()
-                .unwrap()
-                .deployment
-                .relay_adapt_7702_contract = accepted.delegate();
-            chain.enabled = false;
-            assert!(chain.accepted_executor_profile().is_none());
-        }
-        assert!(
-            ExecutorProfile::accepted(10, address!("48cf4b897f64d81212c1423d78a05e828d0ce19d"))
-                .is_none()
-        );
-    }
-}

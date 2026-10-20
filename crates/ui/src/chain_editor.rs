@@ -58,7 +58,6 @@ pub struct ChainEditor {
     stale: bool,
     advanced_open: bool,
     railgun_open: bool,
-    edit_deployment: bool,
     error: Option<String>,
     focus: FocusHandle,
 }
@@ -120,7 +119,6 @@ impl ChainEditor {
             stale: false,
             advanced_open: false,
             railgun_open: false,
-            edit_deployment: false,
             error: None,
             focus: cx.focus_handle(),
         }
@@ -293,15 +291,8 @@ impl ChainEditor {
         self.error = None;
         let advanced_open = self.override_count(ChainField::is_advanced_evm, cx) > 0;
         let railgun_open = has_railgun && self.railgun_override_count(cx) > 0;
-        // Existing deployment overrides stay editable; untouched presets start locked.
-        let edit_deployment = ChainField::ALL
-            .iter()
-            .copied()
-            .filter(|field| field.is_deployment())
-            .any(|field| self.changed_default(field, cx).is_some());
         self.advanced_open = advanced_open;
         self.railgun_open = railgun_open;
-        self.edit_deployment = edit_deployment;
         cx.notify();
     }
 
@@ -992,45 +983,13 @@ impl ChainEditor {
                 None,
                 cx,
             ))
-            .child(self.render_deployment_block(cx));
+            .child(self.render_field(ChainField::ArchiveUntilBlock, false, None, cx))
+            .child(self.render_field(ChainField::ArchiveRpcUrl, false, None, cx));
         Collapsible::new()
             .w_full()
             .open(self.railgun_open)
             .child(self.section_header(Disclosure::Railgun, "Railgun", trailing, cx))
             .content(content)
-    }
-
-    fn render_deployment_block(&self, cx: &Context<'_, Self>) -> gpui::Div {
-        ChainField::ALL
-            .iter()
-            .copied()
-            .filter(|field| field.is_deployment())
-            .fold(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .min_w_0()
-                    .child(
-                        Alert::warning(
-                            "chain-deployment-warning",
-                            "Contract addresses and deployment blocks can make funds unreachable \
-                             if changed.",
-                        )
-                        .small(),
-                    )
-                    .child(
-                        Checkbox::new("chain-edit-deployment")
-                            .label("Edit deployment values")
-                            .checked(self.edit_deployment)
-                            .disabled(self.pending)
-                            .on_click(cx.listener(|this, checked, _, cx| {
-                                this.edit_deployment = *checked;
-                                cx.notify();
-                            })),
-                    ),
-                |body, field| body.child(self.render_field(field, !self.edit_deployment, None, cx)),
-            )
     }
 
     const fn disclosure_open(&self, section: Disclosure) -> bool {

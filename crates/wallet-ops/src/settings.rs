@@ -38,8 +38,8 @@ mod walletconnect;
 
 use validation::{
     parse_fixed_hex_32, validate_address, validate_enr_tree, validate_optional_address,
-    validate_optional_non_empty, validate_optional_range, validate_range, validate_required_u64,
-    validate_url_scheme, validate_waku_direct_peer,
+    validate_optional_non_empty, validate_optional_range, validate_range, validate_url_scheme,
+    validate_waku_direct_peer,
 };
 
 pub use chain_editor::*;

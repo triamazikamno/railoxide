@@ -101,10 +101,6 @@ pub enum NativeShieldUnavailable {
     #[error("the stealth-account native shield isn't available on this network")]
     UnsupportedChain,
     #[error(
-        "this network's configured RelayAdapt7702 contract differs from the pinned deployment that the stealth-account native shield delegates to"
-    )]
-    IncompatibleContracts,
-    #[error(
         "hardware-wallet Public accounts can't sign the EIP-7702 (type-4) transaction of the stealth-account native shield"
     )]
     HardwarePayer,
@@ -135,10 +131,6 @@ pub fn stealth_native_shield_contracts(
     ) else {
         return Err(NativeShieldUnavailable::UnsupportedChain);
     };
-    // The stealth account delegates only to the pinned RelayAdapt7702, never an override.
-    if private.deployment.relay_adapt_7702_contract != pinned.relay_adapt_7702_contract {
-        return Err(NativeShieldUnavailable::IncompatibleContracts);
-    }
     let contracts = NativeShieldContracts {
         chain_id,
         railgun: private.deployment.contract,

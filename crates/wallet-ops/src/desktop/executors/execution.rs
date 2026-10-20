@@ -93,9 +93,7 @@ pub enum ExecutorRouteUnavailable {
         "Unwrap and gas top-up need this wallet's stealth account, which this session doesn't have."
     )]
     NoExecutorOwner,
-    #[error(
-        "Unwrap and gas top-up need the accepted RelayAdapt7702 contract on this network. Check the network's Relay adapter 7702 setting."
-    )]
+    #[error("Unwrap and gas top-up need the accepted RelayAdapt7702 contract on this network.")]
     NoAcceptedProfile,
 }
 
@@ -978,6 +976,8 @@ mod tests {
             .unwrap()
             .deployment
             .relay_adapt_7702_contract = Address::repeat_byte(7);
+        let mut disabled = accepted.clone();
+        disabled.enabled = false;
         // (unwrap, top-up, sponsored, executor owner, chain, route when required)
         let cases = [
             (true, false, false, true, &accepted, Some(Ok(profile))),
@@ -996,6 +996,14 @@ mod tests {
                 false,
                 true,
                 &unaccepted,
+                Some(Err(ExecutorRouteUnavailable::NoAcceptedProfile)),
+            ),
+            (
+                true,
+                false,
+                false,
+                true,
+                &disabled,
                 Some(Err(ExecutorRouteUnavailable::NoAcceptedProfile)),
             ),
             (true, true, true, false, &unaccepted, None),

@@ -2,8 +2,8 @@
 use super::{
     ChainContractSettings, ChainDeploymentSettings, ChainGasSettings, ChainMutation,
     ChainSettingsOverride, CustomChainSettings, MAX_CHAIN_MUTATION_BYTES, NativeCurrency,
-    NativeUsdPricing, QuickSyncSettings, RailgunContractSettings, RailgunSettingsOverride,
-    WalletSettings, presets, settings_revision,
+    NativeUsdPricing, QuickSyncSettings, RailgunSettingsOverride, WalletSettings, presets,
+    settings_revision,
 };
 use railgun_ui::chain_editor::{
     ChainDraft, ChainEditorCommand, ChainEditorSnapshot, ChainField, ChainSummary, NativeUsdChoice,
@@ -140,19 +140,6 @@ fn built_in_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, Stri
     draft.use_default_relays = private.sponsored_bundle_relays.is_none();
     for (field, value) in [
         (
-            ChainField::RailgunContract,
-            &private.contracts.railgun_contract,
-        ),
-        (
-            ChainField::RelayAdaptContract,
-            &private.contracts.relay_adapt_contract,
-        ),
-        (
-            ChainField::RelayAdapt7702Contract,
-            &private.contracts.relay_adapt_7702_contract,
-        ),
-        (ChainField::CoinbasePayer, &private.contracts.coinbase_payer),
-        (
             ChainField::ArchiveRpcUrl,
             &private.deployment.archive_rpc_url,
         ),
@@ -163,15 +150,6 @@ fn built_in_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, Stri
             .insert(field, value.clone().unwrap_or_default());
     }
     for (field, value) in [
-        (
-            ChainField::DeploymentBlock,
-            private.deployment.deployment_block,
-        ),
-        (ChainField::V2StartBlock, private.deployment.v2_start_block),
-        (
-            ChainField::LegacyShieldBlock,
-            private.deployment.legacy_shield_block,
-        ),
         (
             ChainField::ArchiveUntilBlock,
             private.deployment.archive_until_block,
@@ -277,35 +255,6 @@ fn inherited_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, Str
     };
     for (field, value) in [
         (
-            ChainField::RailgunContract,
-            Some(private.deployment.contract),
-        ),
-        (
-            ChainField::RelayAdaptContract,
-            private.deployment.relay_adapt_contract,
-        ),
-        (
-            ChainField::RelayAdapt7702Contract,
-            Some(private.deployment.relay_adapt_7702_contract),
-        ),
-        (ChainField::CoinbasePayer, private.coinbase_payer),
-    ] {
-        draft.fields.insert(
-            field,
-            value.map(|value| value.to_string()).unwrap_or_default(),
-        );
-    }
-    for (field, value) in [
-        (
-            ChainField::DeploymentBlock,
-            private.deployment.deployment_block,
-        ),
-        (ChainField::V2StartBlock, private.deployment.v2_start_block),
-        (
-            ChainField::LegacyShieldBlock,
-            private.deployment.legacy_shield_block,
-        ),
-        (
             ChainField::ArchiveUntilBlock,
             private.sync.archive_until_block,
         ),
@@ -389,12 +338,7 @@ fn same_field_value(field: ChainField, left: &str, right: &str) -> bool {
         return true;
     }
     match field {
-        ChainField::WrappedNativeToken
-        | ChainField::MulticallContract
-        | ChainField::RailgunContract
-        | ChainField::RelayAdaptContract
-        | ChainField::RelayAdapt7702Contract
-        | ChainField::CoinbasePayer => {
+        ChainField::WrappedNativeToken | ChainField::MulticallContract => {
             matches!((left.parse::<alloy::primitives::Address>(), right.parse::<alloy::primitives::Address>()), (Ok(left), Ok(right)) if left == right)
         }
         ChainField::RpcEndpoints | ChainField::SponsoredBundleRelays => {
@@ -612,19 +556,7 @@ fn draft_mutation(
                         ChainField::QuickSyncIndexedWalletBlockRange,
                     )?,
                 },
-                contracts: RailgunContractSettings {
-                    railgun_contract: optional_text(draft, ChainField::RailgunContract),
-                    relay_adapt_contract: optional_text(draft, ChainField::RelayAdaptContract),
-                    relay_adapt_7702_contract: optional_text(
-                        draft,
-                        ChainField::RelayAdapt7702Contract,
-                    ),
-                    coinbase_payer: optional_text(draft, ChainField::CoinbasePayer),
-                },
                 deployment: ChainDeploymentSettings {
-                    deployment_block: optional_number(draft, ChainField::DeploymentBlock)?,
-                    v2_start_block: optional_number(draft, ChainField::V2StartBlock)?,
-                    legacy_shield_block: optional_number(draft, ChainField::LegacyShieldBlock)?,
                     archive_until_block: optional_number(draft, ChainField::ArchiveUntilBlock)?,
                     archive_rpc_url: optional_text(draft, ChainField::ArchiveRpcUrl),
                 },
@@ -809,8 +741,8 @@ mod tests {
             );
             let private = config.railgun.as_ref().unwrap();
             assert_eq!(
-                optional_number(&draft, ChainField::DeploymentBlock).unwrap(),
-                Some(private.deployment.deployment_block)
+                optional_number(&draft, ChainField::ArchiveUntilBlock).unwrap(),
+                Some(private.sync.archive_until_block)
             );
             assert_eq!(
                 optional_number(&draft, ChainField::BlockRange).unwrap(),
@@ -902,10 +834,9 @@ mod tests {
         );
 
         let mut private = draft;
-        private.fields.insert(
-            ChainField::RailgunContract,
-            "0x0000000000000000000000000000000000000001".into(),
-        );
+        private
+            .fields
+            .insert(ChainField::ArchiveRpcUrl, "https://archive.example".into());
         assert!(
             draft_mutation(&settings, &private, true)
                 .err()
@@ -988,8 +919,6 @@ mod tests {
         chain.railgun.sponsored_bundle_relays = Some(vec![]);
         chain.railgun.quick_sync.enabled = false;
         chain.railgun.quick_sync.endpoint = Some("https://quick.example".into());
-        chain.railgun.contracts.relay_adapt_7702_contract =
-            Some("0x1111111111111111111111111111111111111111".into());
         chain.railgun.deployment.archive_until_block = Some(0);
         chain.railgun.deployment.archive_rpc_url = Some("https://archive.example".into());
         chain.gas.gas_price_buffer_numerator = Some(12);

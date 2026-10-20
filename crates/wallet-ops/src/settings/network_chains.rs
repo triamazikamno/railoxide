@@ -1,8 +1,7 @@
 use super::{
-    Address, BTreeMap, ChainGasSettings, Deserialize, FromStr, MAX_BLOCK_RANGE, MAX_FINALITY_DEPTH,
-    MAX_INTERVAL_SECS, RailgunDeployment, SUPPORTED_PROXY_SCHEMES, Serialize, WalletNetworkMode,
-    supported_chain_id, validate_optional_address, validate_optional_range, validate_required_u64,
-    validate_url_scheme,
+    BTreeMap, ChainGasSettings, Deserialize, MAX_BLOCK_RANGE, MAX_FINALITY_DEPTH,
+    MAX_INTERVAL_SECS, SUPPORTED_PROXY_SCHEMES, Serialize, WalletNetworkMode, supported_chain_id,
+    validate_optional_address, validate_optional_range, validate_url_scheme,
 };
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -143,7 +142,7 @@ pub enum NativeUsdPricing {
 }
 
 impl NativeUsdPricing {
-    const fn is_default(&self) -> bool {
+    pub(super) const fn is_default(&self) -> bool {
         matches!(self, Self::Default)
     }
 
@@ -188,7 +187,6 @@ impl Default for ChainSettingsOverride {
 pub struct RailgunSettingsOverride {
     pub sponsored_bundle_relays: Option<Vec<String>>,
     pub quick_sync: QuickSyncSettings,
-    pub contracts: RailgunContractSettings,
     pub deployment: ChainDeploymentSettings,
     pub block_range: Option<u64>,
     pub poll_interval_secs: Option<u64>,
@@ -240,13 +238,7 @@ impl RailgunSettingsOverride {
             }
         }
         self.quick_sync.validate(chain_id, errors);
-        self.contracts.validate(chain_id, errors);
-        self.deployment.validate(
-            chain_id,
-            self.contracts
-                .railgun_contract_differs_from_default(chain_id),
-            errors,
-        );
+        self.deployment.validate(chain_id, errors);
         validate_optional_range(
             &format!("{field}.block_range"),
             self.block_range,
@@ -333,101 +325,13 @@ impl ChainContractSettings {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
-pub struct RailgunContractSettings {
-    pub railgun_contract: Option<String>,
-    pub relay_adapt_contract: Option<String>,
-    pub relay_adapt_7702_contract: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub coinbase_payer: Option<String>,
-}
-
-impl RailgunContractSettings {
-    #[must_use]
-    pub fn railgun_contract_differs_from_default(&self, chain_id: u64) -> bool {
-        let Some(contract) = self
-            .railgun_contract
-            .as_deref()
-            .map(str::trim)
-            .filter(|contract| !contract.is_empty())
-        else {
-            return false;
-        };
-        let Ok(contract) = Address::from_str(contract) else {
-            return false;
-        };
-        let Some(defaults) = RailgunDeployment::for_chain(chain_id) else {
-            return false;
-        };
-        contract != defaults.contract
-    }
-
-    pub(super) fn validate(&self, chain_id: u64, errors: &mut Vec<String>) {
-        validate_optional_address(
-            &format!("chains.per_chain.{chain_id}.contracts.railgun_contract"),
-            self.railgun_contract.as_deref(),
-            errors,
-        );
-        validate_optional_address(
-            &format!("chains.per_chain.{chain_id}.contracts.relay_adapt_contract"),
-            self.relay_adapt_contract.as_deref(),
-            errors,
-        );
-        validate_optional_address(
-            &format!("chains.per_chain.{chain_id}.contracts.relay_adapt_7702_contract"),
-            self.relay_adapt_7702_contract.as_deref(),
-            errors,
-        );
-        validate_optional_address(
-            &format!("chains.per_chain.{chain_id}.contracts.coinbase_payer"),
-            self.coinbase_payer.as_deref(),
-            errors,
-        );
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
 pub struct ChainDeploymentSettings {
-    pub deployment_block: Option<u64>,
-    pub v2_start_block: Option<u64>,
-    pub legacy_shield_block: Option<u64>,
     pub archive_until_block: Option<u64>,
     pub archive_rpc_url: Option<String>,
 }
 
 impl ChainDeploymentSettings {
-    #[must_use]
-    pub const fn has_any_override(&self) -> bool {
-        self.deployment_block.is_some()
-            || self.v2_start_block.is_some()
-            || self.legacy_shield_block.is_some()
-            || self.archive_until_block.is_some()
-            || self.archive_rpc_url.is_some()
-    }
-
-    pub(super) fn validate(&self, chain_id: u64, required: bool, errors: &mut Vec<String>) {
-        if required {
-            validate_required_u64(
-                &format!("chains.per_chain.{chain_id}.deployment.deployment_block"),
-                self.deployment_block,
-                errors,
-            );
-            validate_required_u64(
-                &format!("chains.per_chain.{chain_id}.deployment.v2_start_block"),
-                self.v2_start_block,
-                errors,
-            );
-            validate_required_u64(
-                &format!("chains.per_chain.{chain_id}.deployment.legacy_shield_block"),
-                self.legacy_shield_block,
-                errors,
-            );
-            validate_required_u64(
-                &format!("chains.per_chain.{chain_id}.deployment.archive_until_block"),
-                self.archive_until_block,
-                errors,
-            );
-        }
+    pub(super) fn validate(&self, chain_id: u64, errors: &mut Vec<String>) {
         if let Some(archive_rpc_url) = self.archive_rpc_url.as_deref() {
             validate_url_scheme(
                 &format!("chains.per_chain.{chain_id}.deployment.archive_rpc_url"),
@@ -436,20 +340,6 @@ impl ChainDeploymentSettings {
                 errors,
             );
         }
-    }
-}
-
-#[must_use]
-pub fn should_show_chain_deployment_metadata_settings(
-    chain_id: u64,
-    settings: &ChainSettingsOverride,
-) -> bool {
-    {
-        let railgun = &settings.railgun;
-        railgun
-            .contracts
-            .railgun_contract_differs_from_default(chain_id)
-            || railgun.deployment.has_any_override()
     }
 }
 

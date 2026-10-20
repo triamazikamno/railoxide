@@ -112,28 +112,8 @@ pub fn build_effective_chain_configs(
             .unwrap_or(&defaults);
         let mut config = built_in_chain_config(chain_id, preset, saved, settings);
         let private = &saved.railgun;
-        let mut deployment =
+        let deployment =
             super::RailgunDeployment::for_chain(chain_id).expect("built-in Railgun deployment");
-        deployment.contract = parse_address(private.contracts.railgun_contract.as_deref())
-            .unwrap_or(deployment.contract);
-        deployment.relay_adapt_contract =
-            parse_address(private.contracts.relay_adapt_contract.as_deref())
-                .or(deployment.relay_adapt_contract);
-        deployment.relay_adapt_7702_contract =
-            parse_address(private.contracts.relay_adapt_7702_contract.as_deref())
-                .unwrap_or(deployment.relay_adapt_7702_contract);
-        deployment.deployment_block = private
-            .deployment
-            .deployment_block
-            .unwrap_or(deployment.deployment_block);
-        deployment.v2_start_block = private
-            .deployment
-            .v2_start_block
-            .unwrap_or(deployment.v2_start_block);
-        deployment.legacy_shield_block = private
-            .deployment
-            .legacy_shield_block
-            .unwrap_or(deployment.legacy_shield_block);
         let mut sync = super::RailgunSyncOptions::for_chain(
             chain_id,
             private
@@ -207,8 +187,7 @@ pub fn build_effective_chain_configs(
                         .collect()
                 },
             ),
-            coinbase_payer: parse_address(private.contracts.coinbase_payer.as_deref())
-                .or_else(|| default_coinbase_payer(chain_id)),
+            coinbase_payer: default_coinbase_payer(chain_id),
         });
         configs.insert(chain_id, config);
     }

@@ -4751,32 +4751,10 @@ fn native_shield_eligibility_explains_unavailable_routes() {
         );
         assert_eq!(Some(contracts.wrapped_native), chain.wrapped_native_token);
     }
-    let mut other_delegate = default_effective_chain(1);
-    other_delegate
-        .railgun
-        .as_mut()
-        .unwrap()
-        .deployment
-        .relay_adapt_7702_contract = Address::repeat_byte(1);
-    for (chain_id, chain, payer, unavailable) in [
-        (
-            10,
-            default_effective_chain(1),
-            Software,
-            NativeShieldUnavailable::UnsupportedChain,
-        ),
-        (
-            1,
-            other_delegate,
-            Software,
-            NativeShieldUnavailable::IncompatibleContracts,
-        ),
-    ] {
-        assert_eq!(
-            stealth_native_shield_contracts(chain_id, &chain, payer),
-            Err(unavailable)
-        );
-    }
+    assert_eq!(
+        stealth_native_shield_contracts(10, &default_effective_chain(1), Software),
+        Err(NativeShieldUnavailable::UnsupportedChain)
+    );
 
     // The route follows the payer, never the profile; only Railoxide has a fallback.
     let chain = default_effective_chain(1);

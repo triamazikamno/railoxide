@@ -88,14 +88,6 @@ pub(super) fn validate_optional_range(
     }
 }
 
-pub(super) fn validate_required_u64(field: &str, value: Option<u64>, errors: &mut Vec<String>) {
-    if value.is_none() {
-        errors.push(format!(
-            "{field} is required when railgun_contract is custom"
-        ));
-    }
-}
-
 pub(super) fn validate_range(
     field: &str,
     value: u64,

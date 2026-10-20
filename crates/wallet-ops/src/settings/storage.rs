@@ -250,12 +250,12 @@ fn decode_wallet_settings_with_migration(
         6
     }
     let version: Version = rmp_serde::from_slice(data)?;
-    let (mut settings, migrated) = match version.version {
+    let (mut settings, migrated): (WalletSettings, _) = match version.version {
         WALLET_SETTINGS_VERSION => Ok((rmp_serde::from_slice(data)?, None)),
-        7..=9 => {
-            let mut settings: WalletSettings = rmp_serde::from_slice(data)?;
-            settings.version = WALLET_SETTINGS_VERSION;
-            Ok((settings, Some(version.version)))
+        7..=10 => {
+            let released: super::legacy::ReleasedWalletSettings = rmp_serde::from_slice(data)?;
+            warn_discarded_protocol_overrides(released.has_protocol_overrides());
+            Ok((released.into(), Some(version.version)))
         }
         1..=6 => {
             let mut legacy: super::legacy::LegacyWalletSettings = rmp_serde::from_slice(data)?;
@@ -265,6 +265,7 @@ fn decode_wallet_settings_with_migration(
             if version.version == 3 {
                 legacy.privacy.mimic_railway_shields_by_default = false;
             }
+            warn_discarded_protocol_overrides(legacy.has_protocol_overrides());
             Ok((legacy.into(), Some(version.version)))
         }
         version => Err(WalletSettingsError::UnsupportedVersion { version }),
@@ -281,6 +282,12 @@ fn decode_wallet_settings_with_migration(
         }
     }
     Ok((settings, migrated))
+}
+
+fn warn_discarded_protocol_overrides(discarded: bool) {
+    if discarded {
+        tracing::warn!("discarded saved Railgun protocol overrides; built-in values apply");
+    }
 }
 
 pub fn encode_wallet_ui_state(state: &WalletUiState) -> Result<Vec<u8>, WalletUiStateError> {

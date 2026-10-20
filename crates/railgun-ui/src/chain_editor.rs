@@ -21,13 +21,6 @@ pub enum ChainField {
     GasLimitBuffer,
     GasPriceBufferNumerator,
     GasPriceBufferDenominator,
-    RailgunContract,
-    RelayAdaptContract,
-    RelayAdapt7702Contract,
-    CoinbasePayer,
-    DeploymentBlock,
-    V2StartBlock,
-    LegacyShieldBlock,
     ArchiveUntilBlock,
     ArchiveRpcUrl,
     QuickSyncEndpoint,
@@ -53,13 +46,6 @@ impl ChainField {
         Self::GasLimitBuffer,
         Self::GasPriceBufferNumerator,
         Self::GasPriceBufferDenominator,
-        Self::RailgunContract,
-        Self::RelayAdaptContract,
-        Self::RelayAdapt7702Contract,
-        Self::CoinbasePayer,
-        Self::DeploymentBlock,
-        Self::V2StartBlock,
-        Self::LegacyShieldBlock,
         Self::ArchiveUntilBlock,
         Self::ArchiveRpcUrl,
         Self::QuickSyncEndpoint,
@@ -86,13 +72,6 @@ impl ChainField {
             Self::GasLimitBuffer => "Gas limit buffer",
             Self::GasPriceBufferNumerator => "Gas price buffer numerator",
             Self::GasPriceBufferDenominator => "Gas price buffer denominator",
-            Self::RailgunContract => "Railgun contract",
-            Self::RelayAdaptContract => "Relay adapter",
-            Self::RelayAdapt7702Contract => "Relay adapter 7702",
-            Self::CoinbasePayer => "Coinbase payer",
-            Self::DeploymentBlock => "Deployment block",
-            Self::V2StartBlock => "V2 start block",
-            Self::LegacyShieldBlock => "Legacy Shield block",
             Self::ArchiveUntilBlock => "Archive boundary block",
             Self::ArchiveRpcUrl => "Archive RPC endpoint",
             Self::QuickSyncEndpoint => "Quick-sync endpoint",
@@ -108,14 +87,7 @@ impl ChainField {
     pub const fn is_railgun(self) -> bool {
         matches!(
             self,
-            Self::RailgunContract
-                | Self::RelayAdaptContract
-                | Self::RelayAdapt7702Contract
-                | Self::CoinbasePayer
-                | Self::DeploymentBlock
-                | Self::V2StartBlock
-                | Self::LegacyShieldBlock
-                | Self::ArchiveUntilBlock
+            Self::ArchiveUntilBlock
                 | Self::ArchiveRpcUrl
                 | Self::QuickSyncEndpoint
                 | Self::QuickSyncIndexedWalletBlockRange
@@ -151,23 +123,6 @@ impl ChainField {
                 | Self::GasLimitBuffer
                 | Self::GasPriceBufferNumerator
                 | Self::GasPriceBufferDenominator
-        )
-    }
-
-    /// Contract addresses and deployment blocks that can make funds unreachable when changed.
-    #[must_use]
-    pub const fn is_deployment(self) -> bool {
-        matches!(
-            self,
-            Self::RailgunContract
-                | Self::RelayAdaptContract
-                | Self::RelayAdapt7702Contract
-                | Self::CoinbasePayer
-                | Self::DeploymentBlock
-                | Self::V2StartBlock
-                | Self::LegacyShieldBlock
-                | Self::ArchiveUntilBlock
-                | Self::ArchiveRpcUrl
         )
     }
 
