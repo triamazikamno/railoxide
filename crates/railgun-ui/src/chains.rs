@@ -4,12 +4,12 @@ use std::sync::LazyLock;
 static CHAIN_ICON_DIR: LazyLock<PathBuf> =
     LazyLock::new(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/chains"));
 
-pub const DEFAULT_CHAINS: &[u64] = &[1, 56, 137, 42161];
+pub const DEFAULT_CHAINS: &[u64] = &[1, 56, 137, 42161, 8453];
 
 /// Built-in presets without a Railgun deployment. Public EVM operations only.
 pub const PUBLIC_CHAINS: &[u64] = &[
-    5042, 9745, 5000, 42793, 988, 143, 4663, 146, 130, 57073, 8453, 252, 10, 43114, 100, 81457,
-    59144, 747_474, 30, 25, 4326, 80094, 4217, 480, 1672, 999,
+    5042, 9745, 5000, 42793, 988, 143, 4663, 146, 130, 57073, 252, 10, 43114, 100, 81457, 59144,
+    747_474, 30, 25, 4326, 80094, 4217, 480, 1672, 999,
 ];
 
 /// True for any chain the app ships a preset for, with or without Railgun.

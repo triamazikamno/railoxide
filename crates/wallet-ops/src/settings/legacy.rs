@@ -16,9 +16,8 @@ pub(super) struct ChainSettings {
 
 impl Default for ChainSettings {
     fn default() -> Self {
-        let per_chain = railgun_ui::DEFAULT_CHAINS
-            .iter()
-            .copied()
+        let per_chain = [1, 56, 137, 42161]
+            .into_iter()
             .map(|chain_id| (chain_id, ChainSettingsOverride::default()))
             .collect();
         Self { per_chain }

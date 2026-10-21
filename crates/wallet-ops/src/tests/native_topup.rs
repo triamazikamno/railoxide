@@ -10,6 +10,8 @@ fn native_top_up_policy_constants_are_fixed() {
     assert_eq!(polygon.top_up_amount, uint!(1_000_000_000_000_000_000_U256));
     let bsc = native_top_up_policy_for_chain(56).expect("bsc policy");
     assert_eq!(bsc.top_up_amount, uint!(5_000_000_000_000_000_U256));
+    let base = native_top_up_policy_for_chain(8453).expect("base policy");
+    assert_eq!(base.top_up_amount, uint!(500_000_000_000_000_U256));
     assert_eq!(native_top_up_policy_for_chain(10), None);
 }
 

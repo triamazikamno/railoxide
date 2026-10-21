@@ -31,7 +31,6 @@ impl EvmPreset {
                     "https://public-eth.nownodes.io",
                     "https://eth.api.pocket.network",
                     "https://mainnet.rpc.sentio.xyz",
-                    "https://eth.drpc.org",
                 ]
                 .into_iter()
                 .map(str::to_owned)
@@ -55,7 +54,6 @@ impl EvmPreset {
                     "https://binance-smart-chain-public.nodies.app",
                     "https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3",
                     "https://bsc.rpc.blxrbdn.com",
-                    "https://bsc.drpc.org",
                 ]
                 .into_iter()
                 .map(str::to_owned)
@@ -79,7 +77,6 @@ impl EvmPreset {
                     "https://polygon-public.nodies.app",
                     "https://polygon-bor-rpc.publicnode.com",
                     "https://poly.api.pocket.network",
-                    "https://polygon.drpc.org",
                 ]
                 .into_iter()
                 .map(str::to_owned)
@@ -129,7 +126,6 @@ impl EvmPreset {
                 rpc_endpoints: [
                     "https://rpc.beamrpc.com",
                     "https://rpc.blockdaemon.mainnet.arc.io",
-                    "https://rpc.drpc.mainnet.arc.io",
                     "https://rpc.mainnet.arc.io",
                     "https://rpc.quicknode.mainnet.arc.io",
                 ]
@@ -174,7 +170,6 @@ impl EvmPreset {
                 },
                 rpc_endpoints: [
                     "https://rpc-mantle.blockmachine.io",
-                    "https://mantle.drpc.org",
                     "https://mantle.api.pocket.network",
                     "https://mantle-rpc.publicnode.com",
                     "https://rpc.mantle.xyz",
@@ -221,7 +216,6 @@ impl EvmPreset {
                 },
                 rpc_endpoints: [
                     "https://stable-mainnet.rpc.sentio.xyz",
-                    "https://stable.drpc.org",
                     "https://rpc.stable.xyz",
                     "https://988.rpc.thirdweb.com",
                 ]
@@ -300,7 +294,6 @@ impl EvmPreset {
                     decimals: 18,
                 },
                 rpc_endpoints: [
-                    "https://sonic.drpc.org",
                     "https://sonic.api.pocket.network",
                     "https://sonic-json-rpc.stakely.io",
                     "https://sonic-mainnet.rpc.sentio.xyz",
@@ -325,7 +318,6 @@ impl EvmPreset {
                     decimals: 18,
                 },
                 rpc_endpoints: [
-                    "https://unichain.drpc.org",
                     "https://unichain-rpc.publicnode.com",
                     "https://rpc.swiftnodes.io/rpc/unichain",
                     "https://unichain-mainnet.rpc.sentio.xyz",
@@ -350,7 +342,6 @@ impl EvmPreset {
                     decimals: 18,
                 },
                 rpc_endpoints: [
-                    "https://ink.drpc.org",
                     "https://ink.api.pocket.network",
                     "https://rpc-qnd.inkonchain.com",
                     "https://rpc-gel.inkonchain.com",
@@ -374,14 +365,12 @@ impl EvmPreset {
                     decimals: 18,
                 },
                 rpc_endpoints: [
-                    "https://base.drpc.org",
                     "https://base-rpc.publicnode.com",
                     "https://base.api.pocket.network",
                     "https://base.rpc.sentio.xyz",
                     "https://base.public.blockpi.network/v1/rpc/public",
                     "https://base-public.nodies.app",
                     "https://base-mainnet.public.blastapi.io",
-                    "https://developer-access-mainnet.base.org",
                     "https://rpc.baseazul.dev",
                     "https://mainnet.base.org",
                     "https://xrpc.cl/base",
@@ -398,7 +387,9 @@ impl EvmPreset {
                 native_usd_oracle: Some(address!("0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70")),
                 wrapped_native: crate::amounts::wrapped_native_token_for_chain(chain_id),
                 block_time: Duration::from_secs(2),
-                finality_depth: 64,
+                // A single sequencer leaves only rare L1-origin and sequencer-fault reorgs;
+                // 20 seconds, near Arbitrum's 64 blocks at 250 ms.
+                finality_depth: 10,
             }),
             252 => Some(Self {
                 name: "Fraxtal",
@@ -408,7 +399,6 @@ impl EvmPreset {
                     decimals: 18,
                 },
                 rpc_endpoints: [
-                    "https://fraxtal.drpc.org",
                     "https://fraxtal.api.pocket.network",
                     "https://frax-mainnet.rpc.sentio.xyz",
                     "https://fraxtal-rpc.publicnode.com",
@@ -435,7 +425,6 @@ impl EvmPreset {
                 },
                 rpc_endpoints: [
                     "https://rpc-optimism.blockmachine.io",
-                    "https://optimism.drpc.org",
                     "https://optimism-rpc.publicnode.com",
                     "https://public-op-mainnet.fastnode.io",
                     "https://op.api.pocket.network",
@@ -472,7 +461,6 @@ impl EvmPreset {
                 },
                 rpc_endpoints: [
                     "https://avalanche-c-chain-rpc.publicnode.com",
-                    "https://avalanche.drpc.org",
                     "https://avax.api.pocket.network",
                     "https://rpc-avalanche.blockmachine.io",
                     "https://public.1rpc.io/avax/c",
@@ -504,7 +492,6 @@ impl EvmPreset {
                 },
                 rpc_endpoints: [
                     "https://gnosis-rpc.publicnode.com",
-                    "https://gnosis.drpc.org",
                     "https://gnosis.api.pocket.network",
                     "https://rpc.gnosischain.com",
                     "https://gnosis.oat.farm",
@@ -531,7 +518,6 @@ impl EvmPreset {
                 },
                 rpc_endpoints: [
                     "https://blast-rpc.publicnode.com",
-                    "https://blast.drpc.org",
                     "https://blast.api.pocket.network",
                     "https://blast-mainnet.rpc.sentio.xyz",
                     "https://rpc.blast.io",
@@ -557,7 +543,6 @@ impl EvmPreset {
                 },
                 rpc_endpoints: [
                     "https://linea-rpc.publicnode.com",
-                    "https://linea.drpc.org",
                     "https://linea.api.pocket.network",
                     "https://public.1rpc.io/linea",
                     "https://linea.rpc.sentio.xyz",
@@ -582,7 +567,6 @@ impl EvmPreset {
                     decimals: 18,
                 },
                 rpc_endpoints: [
-                    "https://katana.drpc.org",
                     "https://katana.rpc.sentio.xyz",
                     "https://katana.gateway.tenderly.co",
                     "https://rpc.katana.network",
@@ -607,7 +591,6 @@ impl EvmPreset {
                     decimals: 18,
                 },
                 rpc_endpoints: [
-                    "https://rootstock.drpc.org",
                     "https://public-node.rsk.co",
                     "https://mycrypto.rsk.co",
                     "https://30.rpc.thirdweb.com",
@@ -634,7 +617,6 @@ impl EvmPreset {
                 },
                 rpc_endpoints: [
                     "https://cronos-evm-rpc.publicnode.com",
-                    "https://cronos.drpc.org",
                     "https://public.1rpc.io/cro",
                     "https://cronos.rpc.sentio.xyz",
                     "https://evm.cronos.org",
@@ -659,7 +641,6 @@ impl EvmPreset {
                     decimals: 18,
                 },
                 rpc_endpoints: [
-                    "https://megaeth.drpc.org",
                     "https://megaeth.rpc.sentio.xyz",
                     "https://rpc-megaeth-mainnet.globalstake.io",
                     "https://mainnet.megaeth.com/rpc",
@@ -686,7 +667,6 @@ impl EvmPreset {
                 },
                 rpc_endpoints: [
                     "https://berachain-rpc.publicnode.com",
-                    "https://berachain.drpc.org",
                     "https://rpc.berachain-apis.com",
                     "https://bera.api.pocket.network",
                     "https://berachain.rpc.sentio.xyz",
@@ -710,13 +690,7 @@ impl EvmPreset {
                     symbol: "USD".into(),
                     decimals: 18,
                 },
-                rpc_endpoints: [
-                    "https://rpc.mainnet.tempo.xyz",
-                    "https://tempo-mainnet.drpc.org",
-                ]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
+                rpc_endpoints: vec!["https://rpc.mainnet.tempo.xyz".to_owned()],
                 explorer_urls: &["https://explore.tempo.xyz"],
                 multicall: Some(address!("0xcA11bde05977b3631167028862bE2a173976CA11")),
                 native_usd_oracle: None,
@@ -732,7 +706,6 @@ impl EvmPreset {
                     decimals: 18,
                 },
                 rpc_endpoints: [
-                    "https://worldchain.drpc.org",
                     "https://worldchain-mainnet.g.alchemy.com/public",
                     "https://worldchain-mainnet.gateway.tenderly.co",
                     "https://sparkling-autumn-dinghy.worldchain-mainnet.quiknode.pro",
@@ -781,7 +754,6 @@ impl EvmPreset {
                 },
                 rpc_endpoints: [
                     "https://hyperevm.rpc.sentio.xyz",
-                    "https://hyperliquid.drpc.org",
                     "https://hyperliquid-json-rpc.stakely.io",
                     "https://rpc.hyperliquid.xyz/evm",
                     "https://hyperliquid.rpc.blxrbdn.com",

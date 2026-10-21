@@ -407,8 +407,9 @@ pub(super) async fn setup_synced_view_wallet_with_store(
         chain_id,
         contract: private.deployment.contract,
     };
-    let effective_use_indexed_wallet_catch_up =
-        use_indexed_wallet_catch_up && private.sync.quick_sync_endpoint.is_some();
+    let effective_use_indexed_wallet_catch_up = use_indexed_wallet_catch_up
+        && (private.sync.quick_sync_endpoint.is_some()
+            || private.sync.indexed_artifact_source.is_some());
     let chain_cfg = verified_chain_config(&effective_chain, http, progress_tx.clone()).await?;
     let wallet_quick_sync_endpoint = chain_cfg.sync.quick_sync_endpoint.clone();
     let chain_service = sync_manager

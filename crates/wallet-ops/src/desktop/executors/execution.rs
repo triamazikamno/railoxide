@@ -3,13 +3,15 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use alloy::eips::eip7702::Authorization;
+use alloy::network::TransactionBuilder;
 use alloy::primitives::{Address, B256, Signature, U256};
+use alloy::providers::Provider;
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolCall;
 use broadcaster_core::contracts::railgun::RelayAdapt7702;
-use eyre::{Result, eyre};
+use eyre::{Result, WrapErr, eyre};
 use railgun_wallet::tx::ExecutorContext;
 use railgun_wallet::{TransactionCall, Utxo};
 
@@ -959,6 +961,45 @@ pub(super) fn authorize_delegation(
     Ok(())
 }
 
+/// `request`'s gas estimate. A type-4 request is checked against RPCs that silently ignore
+/// authorizations and simulate an empty account, which estimates only intrinsic and calldata
+/// gas and leaves the executor's execution out of the limit.
+pub(crate) async fn estimate_delegated_gas(
+    provider: &impl Provider,
+    request: &TransactionRequest,
+) -> Result<u64> {
+    let delegated = request.transaction_type == Some(4);
+    if delegated {
+        // Require the executor's getter to return ABI data through this delegation. The
+        // getter takes no value.
+        let nonce_request = request
+            .clone()
+            .with_value(U256::ZERO)
+            .with_input(RelayAdapt7702::nonceCall {}.abi_encode());
+        let nonce_result = provider
+            .call(nonce_request)
+            .pending()
+            .await
+            .wrap_err("simulate executor delegation")?;
+        RelayAdapt7702::nonceCall::abi_decode_returns(&nonce_result)
+            .wrap_err("RPC did not simulate executor delegation")?;
+    }
+    let estimated_gas = provider
+        .estimate_gas(request.clone())
+        .await
+        .wrap_err("estimate gas")?;
+    if delegated {
+        // eth_call and eth_estimateGas can have different authorization support.
+        // Check the estimate before a buffer can conceal an execution shortfall.
+        provider
+            .call(request.clone().with_gas_limit(estimated_gas))
+            .pending()
+            .await
+            .wrap_err("simulate transaction at estimated gas")?;
+    }
+    Ok(estimated_gas)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,6 +1057,53 @@ mod tests {
                 assert_eq!(unshield_executor_route(owner, chain), route);
             }
         }
+    }
+
+    /// RPCs that ignore authorizations simulate an empty account: `eth_call` returns no data
+    /// and `eth_estimateGas` leaves out the executor's execution. Neither estimate is used.
+    #[tokio::test]
+    async fn delegated_gas_rejects_rpcs_that_ignore_authorizations() {
+        use alloy::primitives::Bytes;
+        use alloy::providers::{Provider, ProviderBuilder};
+        use alloy::transports::mock::Asserter;
+
+        let responses = Asserter::new();
+        let provider = ProviderBuilder::new()
+            .connect_mocked_client(responses.clone())
+            .erased();
+        let delegated = TransactionRequest {
+            transaction_type: Some(4),
+            ..Default::default()
+        };
+        let nonce = Bytes::from(RelayAdapt7702::nonceCall::abi_encode_returns(&U256::ZERO));
+
+        // eth_call ignores the authorization.
+        responses.push_success(&Bytes::new());
+        assert!(estimate_delegated_gas(&provider, &delegated).await.is_err());
+
+        // eth_estimateGas ignores it, so the request fails at the estimate.
+        responses.push_success(&nonce);
+        responses.push_success(&"0x5352");
+        responses.push_failure_msg("out of gas");
+        assert!(estimate_delegated_gas(&provider, &delegated).await.is_err());
+
+        responses.push_success(&nonce);
+        responses.push_success(&"0xbea0");
+        responses.push_success(&Bytes::new());
+        assert_eq!(
+            estimate_delegated_gas(&provider, &delegated).await.unwrap(),
+            48_800
+        );
+
+        // Other requests are estimated as they are.
+        responses.push_success(&"0x5208");
+        assert_eq!(
+            estimate_delegated_gas(&provider, &TransactionRequest::default())
+                .await
+                .unwrap(),
+            21_000
+        );
+        assert!(responses.read_q().is_empty());
     }
 
     #[tokio::test]

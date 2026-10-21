@@ -1612,6 +1612,15 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
             super::default_coinbase_payer(chain_id)
         );
     }
+    // Base syncs from indexed artifacts and RPC, without a legacy RelayAdapt or Squid.
+    let base = configs.get(8453).expect("base config");
+    assert!(base.enabled);
+    assert_eq!(base.block_time, Some(std::time::Duration::from_secs(2)));
+    assert_eq!(base.finality_depth, 10);
+    let base_private = base.require_railgun().expect("base railgun");
+    assert_eq!(base_private.deployment.relay_adapt_contract, None);
+    assert_eq!(base_private.sync.quick_sync_endpoint, None);
+    assert!(base_private.sync.indexed_artifact_source.is_some());
     assert_eq!(
         ethereum.require_railgun().unwrap().sync.archive_until_block,
         sync.archive_until_block
@@ -1719,22 +1728,22 @@ fn executor_profiles_accept_every_listed_delegate_with_the_newest_as_primary() {
 fn public_presets_resolve_without_railgun_and_reject_railgun_overrides() {
     let mut settings = WalletSettings::default();
     let configs = build_effective_chain_configs(&settings).expect("build effective configs");
-    let base = configs.get(8453).expect("base config");
-    assert!(base.built_in);
-    assert!(base.railgun.is_none());
-    assert!(base.enabled, "built-in presets ship enabled");
-    assert!(base.rpc_route.multicall().is_some());
+    let optimism = configs.get(10).expect("optimism config");
+    assert!(optimism.built_in);
+    assert!(optimism.railgun.is_none());
+    assert!(optimism.enabled, "built-in presets ship enabled");
+    assert!(optimism.rpc_route.multicall().is_some());
     assert_eq!(
-        base.native_usd_oracle,
-        super::presets::EvmPreset::for_chain(8453)
-            .expect("base preset")
+        optimism.native_usd_oracle,
+        super::presets::EvmPreset::for_chain(10)
+            .expect("optimism preset")
             .native_usd_oracle,
         "default pricing resolves to the preset oracle"
     );
-    assert!(settings.chains.enabled_chain_ids().contains(&8453));
+    assert!(settings.chains.enabled_chain_ids().contains(&10));
 
     settings.chains.per_chain.insert(
-        8453,
+        10,
         super::ChainSettingsOverride {
             enabled: false,
             ..super::ChainSettingsOverride::default()
@@ -1743,13 +1752,13 @@ fn public_presets_resolve_without_railgun_and_reject_railgun_overrides() {
     settings
         .validate()
         .expect("a disabled public preset is a valid override");
-    assert!(!settings.chains.enabled_chain_ids().contains(&8453));
+    assert!(!settings.chains.enabled_chain_ids().contains(&10));
 
     settings
         .chains
         .per_chain
-        .get_mut(&8453)
-        .expect("base override")
+        .get_mut(&10)
+        .expect("optimism override")
         .railgun
         .block_range = Some(1_000);
     let error = settings
@@ -1759,7 +1768,7 @@ fn public_presets_resolve_without_railgun_and_reject_railgun_overrides() {
         error
             .messages
             .iter()
-            .any(|message| message.contains("chains.per_chain.8453.railgun")
+            .any(|message| message.contains("chains.per_chain.10.railgun")
                 && message.contains("no Railgun deployment"))
     );
 }
@@ -2950,7 +2959,7 @@ fn custom_chains_fold_into_built_in_presets_on_load() {
     let mut saved = WalletSettings::default();
     let mut adopted = custom_evm_chain();
     adopted.rpc_endpoints = vec!["https://base.example".into()];
-    adopted.enabled = true;
+    adopted.enabled = false;
     adopted.finality_depth = Some(32);
     saved.chains.custom.insert(8453, adopted);
     let payload = encode_wallet_settings(&saved).unwrap();
@@ -2978,11 +2987,21 @@ fn custom_chains_fold_into_built_in_presets_on_load() {
         adopted.rpc_endpoints,
         vec!["https://base.example".to_owned()]
     );
-    assert!(adopted.enabled);
+    assert!(!adopted.enabled);
     assert_eq!(adopted.finality_depth, Some(32));
     assert_eq!(
         decode_wallet_settings(&written.expect("the fold is written back")).unwrap(),
         migrated
+    );
+    // Base's saved public fields apply on top of its default Railgun settings, and it stays off.
+    let configs = build_effective_chain_configs(&migrated).expect("build effective configs");
+    let base = configs.get(8453).expect("base config");
+    assert!(!base.enabled);
+    assert!(!migrated.chains.enabled_chain_ids().contains(&8453));
+    assert_eq!(base.finality_depth, 32);
+    assert_eq!(
+        base.railgun.as_ref().expect("base railgun").deployment,
+        broadcaster_core::deployment::RailgunDeployment::for_chain(8453).unwrap()
     );
 
     drop(store);

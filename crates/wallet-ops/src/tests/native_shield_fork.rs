@@ -3,8 +3,9 @@
 //! left holding the value of one that skipped its delegation, the Mimic ERC-20 reference path
 //! and the Railoxide wrap fallback in both approval modes. Each test forks its chain with
 //! [`ForkChain`] from the RPC its env var names (`ETH_FORK_RPC_URL`, `BNB_FORK_RPC_URL`,
-//! `POLYGON_FORK_RPC_URL`, `ARBITRUM_FORK_RPC_URL`), funds a synthetic Public account only on
-//! that fork, and drives the wallet's own preparation and submission against it.
+//! `POLYGON_FORK_RPC_URL`, `ARBITRUM_FORK_RPC_URL`, `BASE_FORK_RPC_URL`), funds a synthetic
+//! Public account only on that fork, and drives the wallet's own preparation and submission
+//! against it.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,7 +21,8 @@ use local_db::{DbConfig, DbStore};
 use zeroize::Zeroizing;
 
 use super::cow_fork::{
-    ARBITRUM_FORK_RPC_URL_ENV, BNB_FORK_RPC_URL_ENV, FORK_RPC_URL_ENV, ForkChain, MULTICALL3,
+    ARBITRUM_FORK_RPC_URL_ENV, BASE_FORK_RPC_URL_ENV, BNB_FORK_RPC_URL_ENV, FORK_RPC_URL_ENV,
+    ForkChain, MULTICALL3,
 };
 use super::helpers::{TEST_MNEMONIC, TEST_PASSWORD, temp_db_root};
 use crate::public_wallet::{
@@ -479,6 +481,28 @@ async fn native_shield_fork_completes_on_arbitrum_with_mimic_railway() {
     native_shield_completes(
         ARBITRUM_FORK_RPC_URL_ENV,
         42161,
+        PublicShieldTransactionProfile::Railway,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs BASE_FORK_RPC_URL and anvil"]
+async fn native_shield_fork_completes_on_base_in_railoxide() {
+    native_shield_completes(
+        BASE_FORK_RPC_URL_ENV,
+        8453,
+        PublicShieldTransactionProfile::Railoxide,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs BASE_FORK_RPC_URL and anvil"]
+async fn native_shield_fork_completes_on_base_with_mimic_railway() {
+    native_shield_completes(
+        BASE_FORK_RPC_URL_ENV,
+        8453,
         PublicShieldTransactionProfile::Railway,
     )
     .await;

@@ -24,7 +24,6 @@ use alloy::network::TransactionBuilder as _;
 use alloy::primitives::aliases::U120;
 use alloy::primitives::ruint::UintTryFrom as _;
 use alloy::primitives::{Address, Bytes, U256};
-use alloy::providers::Provider;
 use alloy::rpc::types::{Log, TransactionRequest};
 use alloy::signers::SignerSync;
 use alloy::signers::local::PrivateKeySigner;
@@ -41,7 +40,7 @@ use super::gas::{native_shield_gas_limit, public_fee_candidates};
 use super::runtime::public_chain_runtime_config;
 use super::signer::VaultedPublicSigner;
 use super::types::{EvmFeeModel, PublicShieldTransactionProfile};
-use crate::desktop::executors::native_shield_execute_calldata;
+use crate::desktop::executors::{estimate_delegated_gas, native_shield_execute_calldata};
 use crate::rpc_broker::RpcCandidates;
 use crate::settings::EffectiveChainConfig;
 use crate::{DesktopPrivateSpendAuthorization, HttpContext};
@@ -514,13 +513,13 @@ async fn estimate_native_shield_gas(
     let mut tried = HashSet::new();
     let mut last_error = None;
     while let Some(provider) = candidates.next_untried(&mut tried).await {
-        match provider.provider.estimate_gas(request.clone()).await {
+        match estimate_delegated_gas(&provider.provider, request).await {
             Ok(estimate) => return Ok(estimate),
             Err(error) => last_error = Some(error),
         }
     }
     Err(last_error.map_or_else(
         || eyre!("no healthy query RPC available"),
-        |error| eyre::Report::new(error).wrap_err("estimate the native shield gas"),
+        |error| error.wrap_err("estimate the native shield gas"),
     ))
 }

@@ -4,6 +4,7 @@ pub const NATIVE_TOP_UP_ETHEREUM_AMOUNT: U256 = uint!(3_000_000_000_000_000_U256
 pub const NATIVE_TOP_UP_ARBITRUM_AMOUNT: U256 = uint!(500_000_000_000_000_U256);
 pub const NATIVE_TOP_UP_POLYGON_AMOUNT: U256 = uint!(1_000_000_000_000_000_000_U256);
 pub const NATIVE_TOP_UP_BSC_AMOUNT: U256 = uint!(5_000_000_000_000_000_U256);
+pub const NATIVE_TOP_UP_BASE_AMOUNT: U256 = uint!(500_000_000_000_000_U256);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeTopUpPolicy {
@@ -35,6 +36,9 @@ pub const fn native_top_up_policy_for_chain(chain_id: u64) -> Option<NativeTopUp
         }),
         56 => Some(NativeTopUpPolicy {
             top_up_amount: NATIVE_TOP_UP_BSC_AMOUNT,
+        }),
+        8453 => Some(NativeTopUpPolicy {
+            top_up_amount: NATIVE_TOP_UP_BASE_AMOUNT,
         }),
         _ => None,
     }

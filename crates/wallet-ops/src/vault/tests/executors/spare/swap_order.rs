@@ -29,10 +29,23 @@ pub(super) async fn spawn_orderbook(
     operation: ExecutorOperationId,
     settlement: Address,
 ) -> (url::Url, Submissions, tokio::task::JoinHandle<()>) {
-    spawn_orderbook_with_lost_response(db, view, operation, settlement, false).await
+    spawn_orderbook_on(1, db, view, operation, settlement, false).await
 }
 
 async fn spawn_orderbook_with_lost_response(
+    db: Arc<local_db::DbStore>,
+    view: Arc<DesktopViewSession>,
+    operation: ExecutorOperationId,
+    settlement: Address,
+    lose_first_response: bool,
+) -> (url::Url, Submissions, tokio::task::JoinHandle<()>) {
+    spawn_orderbook_on(1, db, view, operation, settlement, lose_first_response).await
+}
+
+/// [`spawn_orderbook`] for orders on the chain `chain_id`, which loses its response to the
+/// first order with `lose_first_response`.
+pub(super) async fn spawn_orderbook_on(
+    chain_id: u64,
     db: Arc<local_db::DbStore>,
     view: Arc<DesktopViewSession>,
     operation: ExecutorOperationId,
@@ -52,8 +65,8 @@ async fn spawn_orderbook_with_lost_response(
                 continue;
             };
             let owner = body["from"].as_str().unwrap().parse().unwrap();
-            let uid = order_uid(&submitted_order(&body), 1, settlement, owner);
-            let persisted = ExecutorStore::new(db.clone(), view.clone(), 1)
+            let uid = order_uid(&submitted_order(&body), chain_id, settlement, owner);
+            let persisted = ExecutorStore::new(db.clone(), view.clone(), chain_id)
                 .unwrap()
                 .records()
                 .unwrap()

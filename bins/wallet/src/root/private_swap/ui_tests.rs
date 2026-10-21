@@ -6515,12 +6515,12 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
         };
         cx.update(|window, cx| {
             root.update(cx, |root, _| {
-                enable_stub_chain(root, &stubs, 8453);
-                // A Railgun chain with a higher id than Base, which the selector lists first.
+                enable_stub_chain(root, &stubs, 100);
+                // A Railgun chain with a higher id than Gnosis, which the selector lists first.
                 enable_stub_chain(root, &stubs, 42161);
                 // A chain the user added has no Railgun deployment and no 1Click name, and the
                 // stub Across has no route to it.
-                let mut added = root.effective_chain_configs.get(8453).unwrap().clone();
+                let mut added = root.effective_chain_configs.get(100).unwrap().clone();
                 added.chain_id = ADDED;
                 added.built_in = false;
                 added.rpc_route = wallet_ops::RpcChainRoute::new(ADDED, vec![stubs.rpc()]);
@@ -6562,7 +6562,7 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
                 );
                 assert_eq!(
                     chains(swaps, ReceiveTo::PublicAddress, cx),
-                    [1, 42161, 8453, ADDED],
+                    [1, 42161, 100, ADDED],
                     "the same order, with the Public-address-only chains after"
                 );
                 let content = swaps.buy_picker_content(swaps.form.as_ref().unwrap(), cx);
@@ -6570,12 +6570,12 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
                 assert_eq!(
                     content.network_counts,
                     (2, 4),
-                    "Base and the added chain take a Public address only"
+                    "Gnosis and the added chain take a Public address only"
                 );
             });
             let states = &root.read(cx).chain_states;
             assert!(
-                !states.contains_key(&8453) && !states.contains_key(&ADDED),
+                !states.contains_key(&100) && !states.contains_key(&ADDED),
                 "no session starts on a chain without Railgun"
             );
             swaps.update(cx, |swaps, cx| {
@@ -6585,7 +6585,7 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
                     listed(swaps, ReceiveTo::PublicAddress, cx),
                     [
                         (42161, NetworkAvailability::Available),
-                        (8453, NetworkAvailability::Available),
+                        (100, NetworkAvailability::Available),
                         (ADDED, NetworkAvailability::Available),
                     ],
                     "a chain can be picked before its routes are fetched"
@@ -6609,7 +6609,7 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
                 assert_eq!(matches(" ARBITRUM ", cx), [42161]);
                 assert_eq!(matches("7777", cx), [ADDED]);
                 assert_eq!(listed(swaps, ReceiveTo::PublicAddress, cx).len(), 3);
-                assert_eq!(matches("", cx), [1, 42161, 8453, ADDED]);
+                assert_eq!(matches("", cx), [1, 42161, 100, ADDED]);
             });
         });
 
@@ -6648,7 +6648,7 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
                 listed(swaps, ReceiveTo::PublicAddress, cx),
                 [
                     (42161, NetworkAvailability::Available),
-                    (8453, NetworkAvailability::Available),
+                    (100, NetworkAvailability::Available),
                     (ADDED, unavailable(NetworkUnavailable::NoBridge)),
                 ]
             );

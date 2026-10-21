@@ -14,7 +14,9 @@ use alloy::sol_types::SolCall;
 use broadcaster_core::contracts::executor::{EXECUTION_NONCE_STORAGE_SLOT, execute_signing_hash};
 use broadcaster_core::contracts::railgun::{RelayAdapt7702, RelayAdapt7702ActionData};
 
-use super::cow_fork::{BNB_FORK_RPC_URL_ENV, FORK_RPC_URL_ENV, ForkChain, VERIFICATION_BYPASS};
+use super::cow_fork::{
+    BASE_FORK_RPC_URL_ENV, BNB_FORK_RPC_URL_ENV, FORK_RPC_URL_ENV, ForkChain, VERIFICATION_BYPASS,
+};
 
 const GAS_LIMIT: u64 = 500_000;
 
@@ -156,6 +158,26 @@ async fn ethereum_delegates_are_interchangeable() {
         address!("1F74b4339990Db761bC0168F20D294A3a141497e"),
     )
     .await;
+}
+
+/// Base lists a single delegate, so there is nothing to interchange: a fresh account delegated
+/// to it executes one signed action and its execution nonce advances.
+#[tokio::test]
+#[ignore = "requires BASE_FORK_RPC_URL and anvil"]
+async fn base_delegate_executes_a_nonce_bearing_action() {
+    let delegate = address!("AcBC3De27E7d9750a7F26b2eCCE9c89C24Cc8691");
+    let fork = ForkChain::start_destination_from(BASE_FORK_RPC_URL_ENV, 8453).await;
+    assert!(
+        !fork.code(delegate).await.is_empty(),
+        "{delegate} is deployed"
+    );
+    let executor = Executor {
+        fork: &fork,
+        key: PrivateKeySigner::from_bytes(&keccak256(b"railoxide executor delegate fork")).unwrap(),
+        chain_id: 8453,
+    };
+    executor.send(executor.execute(0), Some(delegate)).await;
+    executor.assert_state(delegate, 1).await;
 }
 
 #[tokio::test]

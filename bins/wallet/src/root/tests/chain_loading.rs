@@ -1745,6 +1745,7 @@ fn balance_sync_presence_degrades_for_stalled_or_lagging_heads() {
         balance_lag_threshold_blocks(Duration::from_millis(250)),
         180
     );
+    assert_eq!(balance_lag_threshold_blocks(Duration::from_secs(2)), 22);
     assert_eq!(
         balance_sync_issue(Some(fresh), ethereum_block_time, now),
         None

@@ -494,6 +494,8 @@ const TOKENS: &[TokenRow] = &[
     // Base (8453)
     (8453, address!("0x4200000000000000000000000000000000000006"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("1-0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.png")),
     (8453, address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"), "USDC", 6, &[feed(BASE_ETH_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.png")),
+    (8453, address!("0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"), "USDT", 6, &[feed(BASE_ETH_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0xdac17f958d2ee523a2206206994597c13d831ec7.png")),
+    (8453, address!("0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"), "DAI", 18, &[feed(BASE_ETH_USD_FEED, 8, 18, false)], TokenIcon::Shared("1-0x6b175474e89094c44da98b954eedeac495271d0f.png")),
     (8453, address!("0x820C137fa70C8691f0e44Dc420a5e53c168921Dc"), "USDS", 18, &[feed(BASE_ETH_USD_FEED, 8, 18, false)], TokenIcon::Shared("1-0xdc035d45d973e3ec169d2276ddab16f1e407384f.png")),
     (8453, address!("0x5d3a1Ff2b6BAb83b63cd9AD0787074081a52ef34"), "USDe", 18, &[feed(BASE_ETH_USD_FEED, 8, 18, false)], TokenIcon::Shared("1-0x4c9edd5852cd905f086c759e8383e09bff1e68b3.png")),
     (8453, address!("0x0555E30da8f98308EdB960aa94C0Db47230d2B9c"), "WBTC", 8, &[TokenAnchorSource::Product { sources: &[feed(BASE_ETH_USD_FEED, 8, 8, false), feed(BASE_WBTC_USD_FEED, 8, 8, true)], scale_decimals: 8 }], TokenIcon::Shared("1-0x2260fac5e5542a773aa44fbcfedf7c193bc2c599.png")),

@@ -5,9 +5,13 @@
 //!
 //! Set `ANVIL_BIN` when `anvil` is not on `PATH`.
 //!
+//! `swap_fork_settlement_on_base_with_both_hooks_completes_at_finality` settles its order on a
+//! Base fork instead, from `BASE_FORK_RPC_URL`.
+//!
 //! The `swap_fork_private_across` scenarios also fork Polygon, the destination chain of their
 //! private Bridge delivery, and replay the Across fill there. They read its RPC from
-//! `DESTINATION_FORK_RPC_URL`.
+//! `DESTINATION_FORK_RPC_URL`. `swap_fork_private_across_fill_shields_to_the_wallet_on_base`
+//! delivers to Base instead, forked from `BASE_FORK_RPC_URL`.
 //!
 //! The `swap_fork_public` scenarios pay from a Public account on Ethereum. Those that deliver
 //! to Polygon fork it from `DESTINATION_FORK_RPC_URL` too, and the one that delivers to BNB
@@ -29,7 +33,7 @@
 //! `VERIFICATION_BYPASS` address, and a settlement can run the swap's pre-hook.
 
 use super::swap_order::{
-    OutputPois, read_json_body, spawn_bridge_stub, spawn_orderbook, submitted_order,
+    OutputPois, read_json_body, spawn_bridge_stub, spawn_orderbook_on, submitted_order,
 };
 use super::swap_setup::{
     DESTINATION_CHAIN, DESTINATION_TOKEN, USDC, WETH, broadcaster, password, setup_approval,
@@ -152,11 +156,12 @@ const fn across_delivery(surplus: BridgeSurplus) -> SwapDelivery {
     })
 }
 
-/// The transaction builder the wallet plans swaps with. Planning never reads its contracts.
-const fn builder() -> railgun_wallet::TransactionBuilder {
+/// The transaction builder the wallet plans swaps on the chain `chain_id` with, which the
+/// pre-hook's signature binds. Planning never reads its contracts.
+const fn builder(chain_id: u64) -> railgun_wallet::TransactionBuilder {
     railgun_wallet::TransactionBuilder {
         chain_type: 0,
-        chain_id: 1,
+        chain_id,
         railgun_contract: Address::repeat_byte(4),
     }
 }
@@ -196,7 +201,7 @@ struct Wallet {
     chain: crate::settings::EffectiveChainConfig,
     owner: ExecutorOwner,
     positions: AtomicU64,
-    /// The buy token and delivery of new swaps. The sell token is WETH.
+    /// The buy token and delivery of new swaps. The sell token is the chain's WETH.
     pair: (Address, SwapDelivery),
     /// The wallet on the destination chain of private Across orders.
     destination: Option<Destination>,
@@ -243,6 +248,8 @@ impl Signing {
 struct Destination {
     chain: crate::settings::EffectiveChainConfig,
     owner: ExecutorOwner,
+    /// The token private Across orders deliver there.
+    token: Address,
 }
 
 /// The wallet's local notes on the destination chain, as a test states them. The fork wallet
@@ -305,11 +312,12 @@ impl Wallet {
 
     /// Also open the wallet's owner on the destination chain, over `fork`.
     fn with_destination(self, fork: &ForkChain) -> Self {
-        self.with_destination_on(fork, DESTINATION_CHAIN)
+        self.with_destination_on(fork, DESTINATION_CHAIN, DESTINATION_TOKEN)
     }
 
-    /// Also open the wallet's owner on the destination chain `chain_id`, over `fork`.
-    fn with_destination_on(mut self, fork: &ForkChain, chain_id: u64) -> Self {
+    /// Also open the wallet's owner on the destination chain `chain_id`, over `fork`, where
+    /// private Across orders deliver `token`.
+    fn with_destination_on(mut self, fork: &ForkChain, chain_id: u64, token: Address) -> Self {
         let mut chain = crate::settings::build_effective_chain_configs(
             &crate::settings::WalletSettings::default(),
         )
@@ -327,15 +335,24 @@ impl Wallet {
             HttpContext::direct_for_tests(),
         )
         .unwrap();
-        self.destination = Some(Destination { chain, owner });
+        self.destination = Some(Destination {
+            chain,
+            owner,
+            token,
+        });
         self
+    }
+
+    /// The chain's WETH, which every swap here sells.
+    fn weth(&self) -> Address {
+        crate::amounts::wrapped_native_token_for_chain(self.chain.chain_id).unwrap()
     }
 
     fn note(&self, tree: RailgunTree, value: U256) -> Utxo {
         Utxo::new(
             broadcaster_core::notes::Note::new_change(
                 self.view.scan_keys().master_public_key,
-                WETH,
+                self.weth(),
                 value,
                 [7; 16],
             ),
@@ -363,7 +380,9 @@ impl Wallet {
 
     /// Sign, persist, and submit `delegated`'s order to a local orderbook stub.
     async fn swap_from(&self, fork: &ForkChain, delegated: DelegatedSwapExecutor) -> Swap {
-        let tree = fork.railgun_tree().await;
+        let tree = fork
+            .railgun_tree_of(self.chain.require_railgun().unwrap().deployment.contract)
+            .await;
         self.swap_at_root(fork, delegated, tree).await
     }
 
@@ -375,17 +394,19 @@ impl Wallet {
         tree: RailgunTree,
     ) -> Swap {
         let note = self.note(tree, U256::from(SELL_AMOUNT) * U256::from(2));
-        let transactions = vec![synthetic_transaction(
+        let mut transaction = synthetic_transaction(
             tree,
             self.nullifier(&note),
             delegated.executor(),
             Some(unshield_to(
                 delegated.executor(),
-                WETH,
+                self.weth(),
                 U256::from(SELL_AMOUNT),
             )),
-        )];
-        self.submit(fork, delegated, note, Some(transactions), None)
+        );
+        // Railgun rejects bound parameters of another chain.
+        transaction.boundParams.chainID = self.chain.chain_id;
+        self.submit(fork, delegated, note, Some(vec![transaction]), None)
             .await
     }
 
@@ -393,13 +414,15 @@ impl Wallet {
     async fn delegate(&self, fork: &ForkChain) -> DelegatedSwapExecutor {
         let authorization = password();
         let delegate = self.chain.accepted_executor_profile().unwrap().delegate();
+        let mut candidate = broadcaster(delegate);
+        candidate.chain_id = self.chain.chain_id;
         let operation = ExecutorOperationId::random().unwrap();
         let prepared = self
             .owner
             .prepare_swap_setup(
                 operation,
-                broadcaster(delegate),
-                setup_approval(WETH, self.pair.0, self.pair.1),
+                candidate,
+                setup_approval(self.weth(), self.pair.0, self.pair.1),
                 None,
                 &authorization,
             )
@@ -430,15 +453,15 @@ impl Wallet {
             .unwrap()
             .delegate();
         let mut destination_candidate = broadcaster(destination_delegate);
-        destination_candidate.chain_id = DESTINATION_CHAIN;
+        destination_candidate.chain_id = destination.chain.chain_id;
         let mut approval = setup_approval(
-            WETH,
+            self.weth(),
             USDC,
             SwapDelivery::Bridge(BridgeDelivery {
                 provider: BridgeProvider::Across,
-                destination_chain: DESTINATION_CHAIN,
+                destination_chain: destination.chain.chain_id,
                 receiver: Address::ZERO,
-                destination_token: DESTINATION_TOKEN,
+                destination_token: destination.token,
                 surplus,
                 private: Some(BridgePrivateDelivery { on_shield_failure }),
             }),
@@ -529,7 +552,7 @@ impl Wallet {
         // Only a side that needs setup has a setup fee limit, and neither does. The receiver
         // is a placeholder until the preparation binds the destination account.
         let mut approval = setup_approval(
-            WETH,
+            self.weth(),
             USDC,
             SwapDelivery::Bridge(BridgeDelivery {
                 receiver: Address::ZERO,
@@ -724,7 +747,7 @@ impl Wallet {
             .prepare_swap_setup(
                 operation,
                 broadcaster(delegate),
-                setup_approval(WETH, self.pair.0, self.pair.1),
+                setup_approval(self.weth(), self.pair.0, self.pair.1),
                 None,
                 &authorization,
             )
@@ -863,12 +886,12 @@ impl Wallet {
     ) -> eyre::Result<SwapAmountPlan> {
         let swap_profile = self.chain.swap_profile().unwrap();
         crate::plan_swap_inputs(
-            &builder(),
+            &builder(self.chain.chain_id),
             &swap_profile,
             delegated,
             notes,
             &SwapAmountRequest {
-                sell_token: WETH,
+                sell_token: self.weth(),
                 buy_token: self.pair.0,
                 amount,
                 delivery: self.pair.1,
@@ -937,7 +960,7 @@ impl Wallet {
         };
         let quote: CowQuote = serde_json::from_value(json!({
             "quote": {
-                "sellToken": WETH, "buyToken": buy_token,
+                "sellToken": self.weth(), "buyToken": buy_token,
                 "sellAmount": (SELL_AMOUNT - quote_fee).to_string(), "buyAmount": "20000000",
                 "validTo": 1, "feeAmount": quote_fee.to_string(), "gasAmount": "0",
                 "gasPrice": "0", "sellTokenPrice": "1000000000000", "kind": "sell",
@@ -982,17 +1005,19 @@ impl Wallet {
                 }),
             });
         }
-        let (orderbook_url, submissions, orderbook_task) = spawn_orderbook(
+        let (orderbook_url, submissions, orderbook_task) = spawn_orderbook_on(
+            self.chain.chain_id,
             self.db.clone(),
             self.view.clone(),
             operation,
             swap_profile.settlement(),
+            false,
         )
         .await;
         let orderbook = CowOrderbookClient::new(
             OperationHttpClient::for_tests(reqwest::Client::new(), isolation),
             orderbook_url,
-            1,
+            self.chain.chain_id,
         )
         .unwrap();
         let across = match bridge {
@@ -1155,7 +1180,7 @@ impl Wallet {
         notes: &[Utxo],
     ) -> (Vec<Utxo>, Vec<Transaction>) {
         let profile = self.chain.swap_profile().unwrap();
-        let preview = builder()
+        let preview = builder(self.chain.chain_id)
             .preview_mixed_private_action_plan(notes, &plan.proof_request(&profile).unwrap())
             .unwrap();
         let selected = notes
@@ -1182,7 +1207,7 @@ impl Wallet {
                     tree,
                     self.nullifier(note),
                     plan.executor(),
-                    Some(unshield_to(plan.executor(), WETH, note.note.value)),
+                    Some(unshield_to(plan.executor(), self.weth(), note.note.value)),
                 );
                 if shape.output_count == 1 {
                     transaction.commitments.remove(0);
@@ -1367,7 +1392,7 @@ impl Wallet {
         let delegated = self.redelegate(open.operation).await;
         let notes = std::slice::from_ref(&open.note);
         let SwapAmountPlan::Fits(plan) = crate::plan_swap_speed_up_inputs(
-            &builder(),
+            &builder(self.chain.chain_id),
             &self.chain.swap_profile().unwrap(),
             &self.record(open.operation),
             delegated,
@@ -1550,8 +1575,39 @@ fn shields(call: &Call, executor: Address) -> bool {
 #[tokio::test]
 #[ignore = "needs ETH_FORK_RPC_URL and anvil"]
 async fn swap_fork_settlement_with_both_hooks_completes_at_finality() {
-    let fork = ForkChain::start().await;
-    let wallet = Wallet::open(&fork);
+    Box::pin(settlement_with_both_hooks_scenario(
+        1,
+        FORK_RPC_URL_ENV,
+        USDC,
+    ))
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs BASE_FORK_RPC_URL and anvil"]
+async fn swap_fork_settlement_on_base_with_both_hooks_completes_at_finality() {
+    Box::pin(settlement_with_both_hooks_scenario(
+        BASE,
+        BASE_FORK_RPC_URL_ENV,
+        BASE_USDC,
+    ))
+    .await;
+}
+
+/// A Reshield order selling the chain `chain_id`'s WETH for its `usdc`, on a fork from the RPC
+/// that `rpc_env` names, settles with both hooks: the pre-hook runs the deadline guard, the
+/// trade completes and the post-hook shields the bought USDC to the chain's Railgun, which the
+/// wallet observes as Done at finality.
+async fn settlement_with_both_hooks_scenario(chain_id: u64, rpc_env: &str, usdc: Address) {
+    let fork = ForkChain::start_origin(rpc_env, chain_id).await;
+    let mut wallet = Wallet::open_on(&fork, chain_id);
+    wallet.pair.0 = usdc;
+    let railgun = wallet.chain.require_railgun().unwrap().deployment.contract;
+    // The pre-hook unshields from Railgun's own balance, which a newer deployment may lack.
+    let (weth, sold) = (wallet.weth(), U256::from(SELL_AMOUNT));
+    if fork.erc20_balance(weth, railgun).await < sold {
+        fork.add_erc20(weth, railgun, sold).await;
+    }
     let swap = wallet.swap(&fork).await;
     // Balanced share of the stub quote: the best case is 20,000,000 plus the 20,020 network
     // fee, less 0.5% tolerance (19,919,919), less 25% of a one-unit gas estimate at 1 wei.
@@ -1567,7 +1623,7 @@ async fn swap_fork_settlement_with_both_hooks_completes_at_finality() {
         )
         .await;
     assert!(receipt.status(), "the solver settles with both hooks");
-    assert_eq!(fork.erc20_balance(USDC, swap.executor).await, U256::ZERO);
+    assert_eq!(fork.erc20_balance(usdc, swap.executor).await, U256::ZERO);
     let settled = receipt.block_number.unwrap();
     fork.mine(wallet.chain.finality_depth).await;
 
@@ -1603,18 +1659,18 @@ async fn swap_fork_settlement_with_both_hooks_completes_at_finality() {
         .inner
         .logs()
         .iter()
-        .filter(|log| log.address() == RAILGUN)
+        .filter(|log| log.address() == railgun)
         .filter_map(|log| log.log_decode::<Shield>().ok())
         .flat_map(|log| log.inner.data.commitments)
-        .find(|preimage| preimage.token.tokenAddress == USDC)
+        .find(|preimage| preimage.token.tokenAddress == usdc)
         .map(|preimage| U256::from(preimage.value))
         .expect("the post-hook shields the bought USDC");
     let origin = crate::resolve_source_tx_origin(
-        1,
+        chain_id,
         &wallet.chain,
         settled,
         receipt.transaction_hash,
-        USDC,
+        usdc,
         shielded,
         &HttpContext::direct_for_tests(),
     )
@@ -4048,7 +4104,7 @@ fn placed_private_deposit(
     };
     let message = private_delivery_message(
         handler,
-        DESTINATION_TOKEN,
+        destination.token,
         account.executor(),
         shield.clone(),
         fallback,
@@ -4074,9 +4130,9 @@ fn placed_private_deposit(
             deposit.destinationChainId
         ),
         (
-            address_to_bytes32(DESTINATION_TOKEN),
+            address_to_bytes32(destination.token),
             U256::from(DESTINATION_MINIMUM),
-            U256::from(DESTINATION_CHAIN)
+            U256::from(destination.chain.chain_id)
         )
     );
     assert_eq!(
@@ -4230,7 +4286,7 @@ async fn verify_fill(
         "fillTx": filled.transaction_hash,
         "outputAmount": DESTINATION_MINIMUM.to_string(),
         "recipient": placed.terms.recipient.unwrap(),
-        "destinationChainId": DESTINATION_CHAIN.to_string()
+        "destinationChainId": destination.chain.chain_id.to_string()
     }})
     .to_string();
     let (url, _, stub) = spawn_bridge_stub(move |_| located.clone()).await;
@@ -4301,7 +4357,7 @@ fn accepted_shield_note(
     let mut utxo = Utxo::new(
         broadcaster_core::notes::Note::new_change(
             wallet.view.scan_keys().master_public_key,
-            DESTINATION_TOKEN,
+            wallet.destination.as_ref().unwrap().token,
             value,
             [9; 16],
         ),
@@ -4341,9 +4397,31 @@ fn issued_nonces(record: &ExecutorRecord) -> Vec<(ExecutorPayloadPurpose, U256)>
 #[tokio::test]
 #[ignore = "needs ETH_FORK_RPC_URL, DESTINATION_FORK_RPC_URL and anvil"]
 async fn swap_fork_private_across_fill_shields_to_the_wallet_on_the_destination_chain() {
+    Box::pin(private_across_fill_scenario(
+        DESTINATION_CHAIN,
+        DESTINATION_FORK_RPC_URL_ENV,
+        DESTINATION_TOKEN,
+    ))
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs ETH_FORK_RPC_URL, BASE_FORK_RPC_URL and anvil"]
+async fn swap_fork_private_across_fill_shields_to_the_wallet_on_base() {
+    Box::pin(private_across_fill_scenario(
+        BASE,
+        BASE_FORK_RPC_URL_ENV,
+        BASE_USDC,
+    ))
+    .await;
+}
+
+/// The fill and second use described above, with the private Across orders delivering `token`
+/// to the chain `chain_id`, forked from the RPC that `rpc_env` names.
+async fn private_across_fill_scenario(chain_id: u64, rpc_env: &str, token: Address) {
     let fork = ForkChain::start().await;
-    let destination_fork = ForkChain::start_destination(DESTINATION_CHAIN).await;
-    let mut wallet = Wallet::open(&fork).with_destination(&destination_fork);
+    let destination_fork = ForkChain::start_destination_from(rpc_env, chain_id).await;
+    let mut wallet = Wallet::open(&fork).with_destination_on(&destination_fork, chain_id, token);
     let placed = private_deposit(
         &mut wallet,
         &fork,
@@ -4363,14 +4441,20 @@ async fn swap_fork_private_across_fill_shields_to_the_wallet_on_the_destination_
         .contract;
     let account = placed.account.executor();
     let output = U256::from(DESTINATION_MINIMUM);
-    let balance = |holder| destination_fork.erc20_balance(DESTINATION_TOKEN, holder);
+    let balance = |holder| destination_fork.erc20_balance(token, holder);
     let nonce = execution_nonce(&destination_fork, account).await;
     assert_eq!(nonce, placed.account.observed().nonce());
     assert!(
         destination_fork.timestamp().await < u64::from(placed.terms.fill_deadline),
         "the destination fork's clock is before the fill deadline"
     );
-    fund_relayer(&destination_fork, spoke_pool).await;
+    fund_relayer_with(
+        &destination_fork,
+        spoke_pool,
+        token,
+        U256::from(10 * DESTINATION_MINIMUM),
+    )
+    .await;
     let funded = balance(RELAYER).await;
     let held_by_handler = balance(handler).await;
 
@@ -4393,7 +4477,13 @@ async fn swap_fork_private_across_fill_shields_to_the_wallet_on_the_destination_
     destination_fork
         .set_storage(account, EXECUTION_NONCE_STORAGE_SLOT, nonce + U256::ONE)
         .await;
-    let (failed, reverts) = fill(&destination_fork, spoke_pool, relay_of(&placed.deposit)).await;
+    let (failed, reverts) = fill_on(
+        &destination_fork,
+        spoke_pool,
+        relay_of(&placed.deposit),
+        chain_id,
+    )
+    .await;
     assert!(
         !failed.status() && reverts.is_some(),
         "a failed shield reverts a fill without a fallback recipient"
@@ -4411,12 +4501,18 @@ async fn swap_fork_private_across_fill_shields_to_the_wallet_on_the_destination_
         message: Bytes::new(),
         ..relay_of(&placed.deposit)
     };
-    let (plain_fill, reverts) = fill(&destination_fork, spoke_pool, plain).await;
+    let (plain_fill, reverts) = fill_on(&destination_fork, spoke_pool, plain, chain_id).await;
     assert!(plain_fill.status(), "the plain fill pays: {reverts:?}");
     destination_fork.revert(snapshot).await;
 
     let shielded_before = balance(railgun).await;
-    let (filled, reverts) = fill(&destination_fork, spoke_pool, relay_of(&placed.deposit)).await;
+    let (filled, reverts) = fill_on(
+        &destination_fork,
+        spoke_pool,
+        relay_of(&placed.deposit),
+        chain_id,
+    )
+    .await;
     assert!(
         filled.status(),
         "the fill runs the handler's instructions and the shield: {reverts:?}"
@@ -4447,7 +4543,7 @@ async fn swap_fork_private_across_fill_shields_to_the_wallet_on_the_destination_
     );
     // The output moves from the relayer through the handler and the account into Railgun,
     // less the shield fee, which goes to Railgun's treasury.
-    let shields = shields_of(&filled, railgun, DESTINATION_TOKEN);
+    let shields = shields_of(&filled, railgun, token);
     let [(credited, fee)] = shields.as_slice() else {
         panic!("the fill shields once");
     };
@@ -4576,12 +4672,18 @@ async fn swap_fork_private_across_fill_shields_to_the_wallet_on_the_destination_
         "the destination fork's clock is before the second fill deadline"
     );
     let (relayer_before, shielded_before) = (balance(RELAYER).await, balance(railgun).await);
-    let (refilled, reverts) = fill(&destination_fork, spoke_pool, relay_of(&again.deposit)).await;
+    let (refilled, reverts) = fill_on(
+        &destination_fork,
+        spoke_pool,
+        relay_of(&again.deposit),
+        chain_id,
+    )
+    .await;
     assert!(
         refilled.status(),
         "the second fill runs the reused account's shield: {reverts:?}"
     );
-    let reshields = shields_of(&refilled, railgun, DESTINATION_TOKEN);
+    let reshields = shields_of(&refilled, railgun, token);
     let [(recredited, refee)] = reshields.as_slice() else {
         panic!("the second fill shields once");
     };
@@ -4663,9 +4765,7 @@ async fn swap_fork_private_across_fill_shields_to_the_wallet_on_the_destination_
     );
     // Its shield, replayed on the destination chain while the account holds enough to pass
     // the guard, reverts on its nonce alone and leaves the tokens in the account.
-    destination_fork
-        .add_erc20(DESTINATION_TOKEN, account, output)
-        .await;
+    destination_fork.add_erc20(token, account, output).await;
     let shielded = balance(railgun).await;
     let replayed = destination_fork
         .send_as_bypass(account, placed.shield.clone(), FILL_GAS)
@@ -6207,7 +6307,8 @@ async fn held_public_order(
 async fn public_order_scenario(route: OrderDestination) {
     let fork = ForkChain::start().await;
     let destination_fork = ForkChain::start_destination_from(route.rpc_env, route.chain_id).await;
-    let wallet = Wallet::open(&fork).with_destination_on(&destination_fork, route.chain_id);
+    let wallet =
+        Wallet::open(&fork).with_destination_on(&destination_fork, route.chain_id, route.token);
     let origin = &wallet.chain;
     let destination = wallet.destination.as_ref().unwrap();
     let owner = &destination.owner;

@@ -89,7 +89,8 @@ const MAINNET_SWAP_PROFILE: SwapProfile = SwapProfile {
 };
 
 // CoW's core and HooksTrampoline deployments use the same addresses on these chains.
-// SwapRouter02 supplies the deadline guard; BNB has a different deployment.
+// SwapRouter02 supplies the deadline guard; BNB and Base have different deployments. Base's
+// was checked on 2026-10-21 to accept `multicall(deadline, [])` only before the deadline.
 const BNB_SWAP_PROFILE: SwapProfile = SwapProfile {
     chain_id: 56,
     deadline_guard: address!("B971eF87ede563556b2ED4b1C0b0019111Dd85d2"),
@@ -104,6 +105,12 @@ const POLYGON_SWAP_PROFILE: SwapProfile = SwapProfile {
 const ARBITRUM_SWAP_PROFILE: SwapProfile = SwapProfile {
     chain_id: 42161,
     orderbook_api_base: "https://api.cow.fi/arbitrum_one",
+    ..MAINNET_SWAP_PROFILE
+};
+const BASE_SWAP_PROFILE: SwapProfile = SwapProfile {
+    chain_id: 8453,
+    deadline_guard: address!("2626664c2603336E57B271c5C0b26F421741e481"),
+    orderbook_api_base: "https://api.cow.fi/base",
     ..MAINNET_SWAP_PROFILE
 };
 
@@ -152,9 +159,11 @@ const fn pinned_spoke_pool(chain_id: u64) -> Option<Address> {
 
 /// The pinned `SpokePool` a Bridge delivery's destination role names: the swap chains' only.
 /// The pools pinned for other chains were checked as deposit origins, not as fill destinations.
+/// Base's was added on 2026-10-21, after a private Across fill on a Base fork shielded to the
+/// wallet.
 const fn destination_spoke_pool(chain_id: u64) -> Option<Address> {
     match chain_id {
-        1 | 56 | 137 | 42161 => pinned_spoke_pool(chain_id),
+        1 | 56 | 137 | 42161 | 8453 => pinned_spoke_pool(chain_id),
         _ => None,
     }
 }
@@ -162,10 +171,10 @@ const fn destination_spoke_pool(chain_id: u64) -> Option<Address> {
 /// The bridge profile of a swap chain, with its `SpokePool` from [`pinned_spoke_pool`] and its
 /// 1Click name from [`destination_one_click_blockchain`].
 const fn built_in_bridge_profile(chain_id: u64) -> Option<BridgeProfile> {
-    // Across's `MulticallHandler` deployments, checked on-chain on 2026-10-02; BNB Smart
-    // Chain's is at its own address.
+    // Across's `MulticallHandler` deployments, checked on-chain on 2026-10-02, and Base's on
+    // 2026-10-21 (same code hash as Arbitrum's); BNB Smart Chain's is at its own address.
     let multicall_handler = match chain_id {
-        1 | 137 | 42161 => address!("924a9f036260DdD5808007E1AA95f08eD08aA569"),
+        1 | 137 | 42161 | 8453 => address!("924a9f036260DdD5808007E1AA95f08eD08aA569"),
         56 => address!("AC537C12fE8f544D712d71ED4376a502EEa944d7"),
         _ => return None,
     };
@@ -377,19 +386,18 @@ const fn public_profile_of(cow: &SwapProfile) -> PublicSwapProfile {
     }
 }
 
-/// The Public swap profile of a chain: the four swap chains', from their [`SwapProfile`], and
-/// those of Base, Avalanche, Linea and Ink, which have no stealth swap profile.
+/// The Public swap profile of a chain: the swap chains', from their [`SwapProfile`], and
+/// those of Avalanche, Linea and Ink, which have no stealth swap profile.
 const fn built_in_public_swap_profile(chain_id: u64) -> Option<PublicSwapProfile> {
     if let Some(cow) = built_in_swap_profile(chain_id) {
         return Some(public_profile_of(&cow));
     }
-    // Checked on-chain on 2026-10-06: each of these four has `GPv2Settlement` with this
+    // Checked on-chain on 2026-10-06: each of these three has `GPv2Settlement` with this
     // chain's EIP-712 domain separator, its vault relayer, the hooks trampoline, the cow-shed
     // factory and implementation and the weiroll executor, all at the swap chains' addresses
     // and with their code hashes, and a `CoW` orderbook at the root named here. None of them
     // has a stealth swap profile.
     let orderbook_api_base = match chain_id {
-        8453 => "https://api.cow.fi/base",
         43114 => "https://api.cow.fi/avalanche",
         57073 => "https://api.cow.fi/ink",
         59144 => "https://api.cow.fi/linea",
@@ -590,6 +598,7 @@ const fn built_in_swap_profile(chain_id: u64) -> Option<SwapProfile> {
         56 => Some(BNB_SWAP_PROFILE),
         137 => Some(POLYGON_SWAP_PROFILE),
         42161 => Some(ARBITRUM_SWAP_PROFILE),
+        8453 => Some(BASE_SWAP_PROFILE),
         _ => None,
     }
 }
@@ -711,6 +720,11 @@ mod tests {
                 "arbitrum_one",
                 address!("68b3465833fb72A70ecDF485E0e4C7bD8665Fc45"),
             ),
+            (
+                8453,
+                "base",
+                address!("2626664c2603336E57B271c5C0b26F421741e481"),
+            ),
         ] {
             let chain = chains.get_mut(chain_id).unwrap();
             let profile = chain.swap_profile().expect("supported chain");
@@ -781,7 +795,7 @@ mod tests {
                 assert_eq!(origin.chain_id(), chain.chain_id);
                 assert_eq!(origin.spoke_pool(), bridge.spoke_pool());
                 assert_eq!(origin.across_api_base(), bridge.across_api_base());
-            } else if chain.built_in && ![1, 56, 137, 42161].contains(&chain.chain_id) {
+            } else if chain.built_in && ![1, 56, 137, 42161, 8453].contains(&chain.chain_id) {
                 assert!(bridge.is_none(), "chain {}", chain.chain_id);
                 // A chain with a pinned pool and no Public swap profile is a deposit origin
                 // only.
@@ -801,6 +815,16 @@ mod tests {
             }
         }
         assert!(unsupported_built_in > 0);
+        let base = chains
+            .get(8453)
+            .unwrap()
+            .bridge_profile()
+            .expect("base bridge");
+        assert_eq!(
+            base.spoke_pool(),
+            address!("09aea4b2242abC8bb4BB78D537A67a245A7bEC64")
+        );
+        assert_eq!(base.one_click_blockchain(), "base");
         origin_only.sort_unstable();
         assert_eq!(origin_only, [10, 130, 143, 480, 999, 4326, 4663, 9745]);
         // Across serves Arc and Tempo, which did not pass the fork check.
@@ -829,7 +853,7 @@ mod tests {
     #[test]
     fn public_swap_profiles_need_no_accepted_executor() {
         let mut chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
-        for chain_id in [1, 56, 137, 42161] {
+        for chain_id in [1, 56, 137, 42161, 8453] {
             let chain = chains.get_mut(chain_id).unwrap();
             let profile = chain.public_swap_profile().expect("supported chain");
             assert_eq!(profile.chain_id(), chain_id);
@@ -871,18 +895,13 @@ mod tests {
         }
     }
 
-    /// Base, Avalanche, Linea and Ink take orders from a Public account without being swap or
-    /// bridge chains of the stealth flow.
+    /// Avalanche, Linea and Ink take orders from a Public account without being swap or bridge
+    /// chains of the stealth flow.
     #[test]
     fn public_swap_profiles_cover_chains_without_a_swap_profile() {
         let mut chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
         let mainnet = chains.get(1).unwrap().public_swap_profile().unwrap();
-        for (chain_id, api) in [
-            (8453, "base"),
-            (43114, "avalanche"),
-            (57073, "ink"),
-            (59144, "linea"),
-        ] {
+        for (chain_id, api) in [(43114, "avalanche"), (57073, "ink"), (59144, "linea")] {
             let chain = chains.get_mut(chain_id).unwrap();
             assert!(chain.swap_profile().is_none(), "chain {chain_id}");
             assert!(chain.bridge_profile().is_none(), "chain {chain_id}");
@@ -927,9 +946,9 @@ mod tests {
             .custom
             .insert(CUSTOM, crate::settings::tests::custom_evm_chain());
         let mut chains = build_effective_chain_configs(&settings).unwrap();
-        // Built-in chains without Railgun, and a chain the user added: Base has a 1Click name,
-        // and none of them a pinned pool.
-        for (chain_id, one_click) in [(8453, Some("base")), (59144, None), (CUSTOM, None)] {
+        // Built-in chains without Railgun, and a chain the user added: Avalanche has a 1Click
+        // name, and none of them a destination pool.
+        for (chain_id, one_click) in [(43114, Some("avax")), (59144, None), (CUSTOM, None)] {
             let chain = chains.get(chain_id).unwrap();
             assert!(chain.railgun.is_none(), "chain {chain_id}");
             assert!(chain.bridge_profile().is_none(), "chain {chain_id}");
@@ -939,7 +958,7 @@ mod tests {
             assert_eq!(destination.spoke_pool(), None);
         }
 
-        let chain = chains.get_mut(8453).unwrap();
+        let chain = chains.get_mut(43114).unwrap();
         chain.enabled = false;
         assert!(chain.bridge_destination().is_none());
     }

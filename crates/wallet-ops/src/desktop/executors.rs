@@ -42,6 +42,7 @@ mod spare;
 mod status;
 mod swap;
 pub use discovery::ExecutorDiscoveryReport;
+pub(crate) use execution::estimate_delegated_gas;
 pub use execution::*;
 pub use locks::{
     ExecutorInputLock, ExecutorInputLockKind, ExecutorInputLockReason, LockedNotes, WalletNoteLocks,

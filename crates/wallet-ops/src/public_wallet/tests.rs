@@ -4960,6 +4960,8 @@ async fn native_preparation_estimates_the_full_request() {
         logged.lock().unwrap().push(request.clone());
         let result = match request["method"].as_str().unwrap_or_default() {
             "eth_estimateGas" => json!("0x186a0"),
+            // The executor's `nonce()` through the delegation, and the request at its estimate.
+            "eth_call" => json!(B256::ZERO),
             // eth_chainId and anything else.
             _ => json!("0x1"),
         };

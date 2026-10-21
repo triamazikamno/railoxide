@@ -904,34 +904,9 @@ pub(super) async fn estimate_public_broadcaster_fee(
             .with_chain_id(chain_id)
             .with_gas_price(min_gas_price)
     };
-    let delegated = tx_req.transaction_type == Some(4);
-    if delegated {
-        // Some RPCs silently ignore authorizations and simulate an empty account.
-        // Require the executor's getter to return ABI data through this delegation.
-        let nonce_request = tx_req
-            .clone()
-            .input(RelayAdapt7702::nonceCall {}.abi_encode().into());
-        let nonce_result = provider
-            .call(nonce_request)
-            .pending()
-            .await
-            .wrap_err("simulate public broadcaster executor delegation")?;
-        RelayAdapt7702::nonceCall::abi_decode_returns(&nonce_result)
-            .wrap_err("RPC did not simulate public broadcaster executor delegation")?;
-    }
-    let estimated_gas = provider
-        .estimate_gas(tx_req.clone())
+    let estimated_gas = super::executors::estimate_delegated_gas(provider, &tx_req)
         .await
         .wrap_err("estimate public broadcaster gas")?;
-    if delegated {
-        // eth_call and eth_estimateGas can have different authorization support.
-        // Check the estimate before the buffer can conceal an execution shortfall.
-        provider
-            .call(tx_req.with_gas_limit(estimated_gas))
-            .pending()
-            .await
-            .wrap_err("simulate public broadcaster transaction at estimated gas")?;
-    }
     let gas_limit = public_broadcaster_gas_limit_with_buffer(estimated_gas, gas_limit_buffer);
     let service_gas_price = public_broadcaster_service_gas_price(min_gas_price);
     Ok((

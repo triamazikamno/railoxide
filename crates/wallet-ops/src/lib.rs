@@ -198,8 +198,8 @@ pub use http::{
 };
 pub use native_topup::{
     DesktopNativeTopUpPlan, DesktopNativeTopUpRequest, NATIVE_TOP_UP_ARBITRUM_AMOUNT,
-    NATIVE_TOP_UP_BSC_AMOUNT, NATIVE_TOP_UP_ETHEREUM_AMOUNT, NATIVE_TOP_UP_POLYGON_AMOUNT,
-    NativeTopUpPolicy, native_top_up_policy_for_chain,
+    NATIVE_TOP_UP_BASE_AMOUNT, NATIVE_TOP_UP_BSC_AMOUNT, NATIVE_TOP_UP_ETHEREUM_AMOUNT,
+    NATIVE_TOP_UP_POLYGON_AMOUNT, NativeTopUpPolicy, native_top_up_policy_for_chain,
     native_top_up_primary_recipient_amount_for_fee_mode,
     native_top_up_required_wrapped_native_amount,
     native_top_up_required_wrapped_native_amount_for_fee_mode, native_top_up_wrapped_native_amount,

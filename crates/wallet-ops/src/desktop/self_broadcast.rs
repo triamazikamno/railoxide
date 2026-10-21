@@ -1345,8 +1345,7 @@ pub(super) async fn self_broadcast_preflight(
         max_priority_fee_per_gas,
         nonce,
     )?;
-    let estimated_gas = provider
-        .estimate_gas(tx_req.clone())
+    let estimated_gas = super::executors::estimate_delegated_gas(provider, &tx_req)
         .await
         .wrap_err("estimate self-broadcast gas")?;
     let gas_limit =

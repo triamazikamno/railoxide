@@ -750,7 +750,11 @@ mod tests {
             );
             assert_eq!(
                 draft.value(ChainField::QuickSyncEndpoint),
-                private.sync.quick_sync_endpoint.as_ref().unwrap().as_str()
+                private
+                    .sync
+                    .quick_sync_endpoint
+                    .as_ref()
+                    .map_or("", url::Url::as_str)
             );
             assert_eq!(
                 lines(&draft, ChainField::SponsoredBundleRelays).len(),
@@ -820,12 +824,12 @@ mod tests {
     #[test]
     fn public_preset_drafts_carry_no_railgun_settings() {
         let settings = WalletSettings::default();
-        let draft = chain_editor_draft(&settings, 8453).unwrap();
+        let draft = chain_editor_draft(&settings, 10).unwrap();
         assert!(draft.built_in && !draft.railgun);
         assert!(draft.enabled, "built-in presets ship enabled");
         assert_eq!(
             lines(&draft, ChainField::RpcEndpoints),
-            presets::EvmPreset::for_chain(8453)
+            presets::EvmPreset::for_chain(10)
                 .unwrap()
                 .rpc_endpoints
                 .iter()
