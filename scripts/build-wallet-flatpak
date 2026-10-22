@@ -206,13 +206,17 @@ fi
 [[ -z "$generator_metadata_path" ]] || die "--generator-metadata requires --generate-sources"
 rust_toolchain_source="$packaging_dir/rust-toolchain.yml"
 wasm_bindgen_source="$packaging_dir/wasm-bindgen.yml"
+sccache_source="$packaging_dir/sccache.yml"
 if [[ -n "$cargo_sources" ]]; then
   rust_toolchain_source="$(dirname -- "$cargo_sources")/rust-toolchain.yml"
   wasm_bindgen_source="$(dirname -- "$cargo_sources")/wasm-bindgen.yml"
+  sccache_source="$(dirname -- "$cargo_sources")/sccache.yml"
   [[ -f "$rust_toolchain_source" && -r "$rust_toolchain_source" ]] \
     || die "Cargo source sibling rust-toolchain.yml must be a readable regular file: $rust_toolchain_source"
   [[ -f "$wasm_bindgen_source" && -r "$wasm_bindgen_source" ]] \
     || die "Cargo source sibling wasm-bindgen.yml must be a readable regular file: $wasm_bindgen_source"
+  [[ -f "$sccache_source" && -r "$sccache_source" ]] \
+    || die "Cargo source sibling sccache.yml must be a readable regular file: $sccache_source"
 fi
 
 require_command flatpak
@@ -267,6 +271,8 @@ repo_dir="${repo_dir:-$output_root/repo}"
 build_dir="${build_dir:-$output_root/build}"
 state_dir="${state_dir:-$repo_root/.flatpak-builder/$arch}"
 mkdir -p -- "$repo_dir" "$build_dir" "$state_dir"
+# Flatpak mounts this directory at /run/ccache even with --sandbox enabled.
+mkdir -p -- "$state_dir/ccache/sccache"
 
 temporary_dir="$(mktemp -d "$repo_root/.railoxide-flatpak-build.XXXXXXXX")"
 generated_cargo_sources="$temporary_dir/cargo-sources.json"
@@ -314,6 +320,7 @@ PY
 
 cp -- "$rust_toolchain_source" "$rust_toolchain_manifest"
 cp -- "$wasm_bindgen_source" "$temporary_dir/wasm-bindgen.yml"
+cp -- "$sccache_source" "$temporary_dir/sccache.yml"
 
 builder_args=(
   --arch="$arch"
@@ -333,7 +340,7 @@ if [[ "$install_deps" -eq 1 ]]; then
   builder_args+=(--install-deps-from=flathub --user)
 fi
 
-flatpak-builder "${builder_args[@]}" "$build_dir" "$generated_manifest"
+CCACHE_DIR="$state_dir/ccache" flatpak-builder "${builder_args[@]}" "$build_dir" "$generated_manifest"
 
 if [[ -n "$bundle_path" ]]; then
   mkdir -p -- "$(dirname -- "$bundle_path")"

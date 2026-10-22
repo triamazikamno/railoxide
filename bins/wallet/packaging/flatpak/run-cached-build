@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Each flatpak-builder command gets its own sandbox. Report and stop the
+# server here, while it is still reachable, before the sandbox exits.
+finish() {
+  local status=$?
+  trap - EXIT
+  printf 'Build command completed in %s seconds (exit %s)\n' "$SECONDS" "$status"
+  sccache --show-stats || true
+  sccache --stop-server >/dev/null || true
+  exit "$status"
+}
+
+sccache --start-server
+trap finish EXIT
+"$@"

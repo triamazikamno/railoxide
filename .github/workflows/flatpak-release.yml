@@ -66,6 +66,9 @@ jobs:
           git merge-base --is-ancestor "$release_sha" origin/main
           printf 'release_sha=%s\n' "$release_sha" >>"$GITHUB_OUTPUT"
 
+      - name: Test compiler cache helpers
+        run: python3 -m unittest discover -s scripts/tests -p test_flatpak_cache.py -v
+
       - name: Generate Cargo sources
         shell: bash
         run: |
@@ -77,6 +80,8 @@ jobs:
             out/flatpak/generated/rust-toolchain.yml
           cp -- bins/wallet/packaging/flatpak/wasm-bindgen.yml \
             out/flatpak/generated/wasm-bindgen.yml
+          cp -- bins/wallet/packaging/flatpak/sccache.yml \
+            out/flatpak/generated/sccache.yml
 
       - name: Upload Cargo sources
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -117,6 +122,25 @@ jobs:
           name: flatpak-cargo-sources
           path: out/flatpak/generated
 
+      - name: Resolve sccache environment
+        id: sccache
+        shell: bash
+        env:
+          BUILD_INPUTS_HASH: ${{ hashFiles('Cargo.lock', 'Cargo.toml', 'bins/wallet/packaging/flatpak/**', 'scripts/build-wallet-flatpak', '.github/workflows/flatpak-ci.yml', '.github/workflows/flatpak-release.yml') }}
+        run: |
+          set -euo pipefail
+          sdk_commit="$(flatpak info --arch=${{ matrix.arch }} --show-commit org.freedesktop.Sdk//25.08)"
+          [[ "$sdk_commit" =~ ^[0-9a-f]{64}$ ]]
+          printf 'prefix=flatpak-sccache-%s-%s-%s-\n' '${{ matrix.arch }}' "$sdk_commit" "$BUILD_INPUTS_HASH" >>"$GITHUB_OUTPUT"
+
+      - name: Restore sccache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        continue-on-error: true
+        with:
+          path: .flatpak-builder/${{ matrix.arch }}/ccache/sccache
+          key: ${{ steps.sccache.outputs.prefix }}${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ steps.sccache.outputs.prefix }}
+
       - name: Build hardware variant
         run: >-
           scripts/build-wallet-flatpak
@@ -132,6 +156,13 @@ jobs:
           --arch ${{ matrix.arch }}
           --cargo-sources out/flatpak/generated/cargo-sources.json
           --no-install-deps
+
+      - name: Save sccache
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        continue-on-error: true
+        with:
+          path: .flatpak-builder/${{ matrix.arch }}/ccache/sccache
+          key: ${{ steps.sccache.outputs.prefix }}${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload repositories
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Only locked, vendored dependencies may use the compiler cache. Workspace
+# crates can embed changing assets that procedural macros do not track.
+if [[ -n "${CARGO_HOME:-}" && "${CARGO_MANIFEST_DIR:-}" == "$CARGO_HOME"/vendor/* ]]; then
+  exec sccache "$@"
+fi
+exec "$@"

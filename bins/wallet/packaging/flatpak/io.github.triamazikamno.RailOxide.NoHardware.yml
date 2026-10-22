@@ -15,22 +15,28 @@ finish-args:
 modules:
   - rust-toolchain.yml
   - wasm-bindgen.yml
+  - sccache.yml
   - name: railoxide
     buildsystem: simple
     build-options:
-      prepend-path: /app/lib/railoxide-rust/bin:/app/lib/railoxide-wasm-bindgen/bin
+      prepend-path: /app/lib/railoxide-rust/bin:/app/lib/railoxide-wasm-bindgen/bin:/app/lib/railoxide-sccache/bin
       env:
         CARGO_HOME: /run/build/railoxide/cargo
         CARGO_NET_OFFLINE: "true"
         CARGO_TOOLCHAIN: ""
+        CARGO_INCREMENTAL: "0"
+        RUSTC_WRAPPER: /run/build/railoxide/bins/wallet/packaging/flatpak/rustc-cache
+        SCCACHE_DIR: /run/ccache/sccache
+        SCCACHE_CACHE_SIZE: 2G
+        SCCACHE_SERVER_UDS: /tmp/railoxide-sccache.sock
         RAILOXIDE_EXTENSION_BUNDLE: /run/build/railoxide/target/browser-extension.zip
         RAILOXIDE_BUILD_GIT_SHORT_HASH: "@GIT_SHORT_HASH@"
         RAILOXIDE_RELEASE_DATE: "@RELEASE_DATE@"
         RAILOXIDE_RELEASE_TYPE: "@RELEASE_TYPE@"
         RAILOXIDE_RELEASE_VERSION: "@RELEASE_VERSION@"
     build-commands:
-      - scripts/build-browser-extension
-      - cargo build --frozen --release -p wallet
+      - bins/wallet/packaging/flatpak/run-cached-build scripts/build-browser-extension
+      - bins/wallet/packaging/flatpak/run-cached-build cargo build --frozen --release -p wallet
       - python3 scripts/verify-browser-extension.py target/release/wallet target/browser-extension.zip
       - install -Dm0755 target/release/wallet ${FLATPAK_DEST}/bin/io.github.triamazikamno.RailOxide
       - install -Dm0644 LICENSE ${FLATPAK_DEST}/share/licenses/io.github.triamazikamno.RailOxide/LICENSE
