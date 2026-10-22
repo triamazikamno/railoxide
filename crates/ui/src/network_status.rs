@@ -532,6 +532,16 @@ pub fn network_status_popover_content(
                     .text_color(rgb(theme::TEXT_MUTED))
                     .child(health.detail.clone()),
             )
+            .child(
+                div()
+                    .text_size(gpui::rems(12.0 / 16.0))
+                    .line_height(gpui::relative(APP_TEXT_LINE_HEIGHT))
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(format!(
+                        "PPOI submissions are not isolated in {}.",
+                        health.kind.label().to_lowercase()
+                    )),
+            )
         })
         .when_some(error, |this, error| {
             this.child(Alert::error("wallet-network-status-error", error.to_string()).small())

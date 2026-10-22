@@ -628,7 +628,41 @@ pub(crate) fn chain_config(
         finality_depth: effective_chain.finality_depth,
         http_client: http.client.clone(),
         progress_tx,
+        // A network mode change restarts sync, so the choice holds for this config's life.
+        poi_submission_routes: (http.network_mode() == WalletNetworkMode::Tor).then(|| {
+            Arc::new(OperationPoiSubmissionRoutes { http: http.clone() })
+                as Arc<dyn sync_service::PoiSubmissionRouteProvider>
+        }),
     })
+}
+
+/// Opens one built-in Tor route per Railgun transaction's PPOI submissions.
+struct OperationPoiSubmissionRoutes {
+    http: HttpContext,
+}
+
+#[async_trait::async_trait]
+impl sync_service::PoiSubmissionRouteProvider for OperationPoiSubmissionRoutes {
+    async fn isolated_route(
+        &self,
+    ) -> std::result::Result<sync_service::PoiSubmissionRoute, sync_service::PoiSubmissionRouteError>
+    {
+        let operation = self.http.operation_http_client().await.map_err(|error| {
+            sync_service::PoiSubmissionRouteError::new(format!(
+                "open PPOI submission route: {error}"
+            ))
+        })?;
+        if operation.isolation() != OperationNetworkIsolation::Dedicated {
+            return Err(sync_service::PoiSubmissionRouteError::new(
+                "PPOI submission route is not isolated",
+            ));
+        }
+        // The route keeps `operation`, and with it the loopback bridge, alive.
+        Ok(sync_service::PoiSubmissionRoute::new(
+            operation.client().clone(),
+            operation,
+        ))
+    }
 }
 
 pub(super) const fn poi_read_source_label(poi_read_source: &PoiReadSource) -> &'static str {
@@ -1157,6 +1191,7 @@ mod tests {
                         finality_depth: 0,
                         http_client: reqwest::Client::new(),
                         progress_tx: None,
+                        poi_submission_routes: None,
                     })
                     .await
                     .expect("add test chain");
@@ -1225,5 +1260,24 @@ mod tests {
                 drop(db);
                 fs::remove_dir_all(root_dir).expect("remove temp db dir");
             });
+    }
+
+    #[tokio::test]
+    async fn chain_config_isolates_ppoi_submissions_only_in_built_in_tor_mode() {
+        let effective_chain =
+            settings::build_effective_chain_configs(&settings::WalletSettings::default())
+                .expect("default chain configs")
+                .get(1)
+                .cloned()
+                .expect("Ethereum chain config");
+        for (mode, isolated) in [
+            (WalletNetworkMode::Tor, true),
+            (WalletNetworkMode::Proxy, false),
+            (WalletNetworkMode::Direct, false),
+        ] {
+            let http = HttpContext::with_rpc_client_for_tests(reqwest::Client::new(), mode);
+            let config = chain_config(&effective_chain, &http, None).expect("chain config");
+            assert_eq!(config.poi_submission_routes.is_some(), isolated, "{mode:?}");
+        }
     }
 }
