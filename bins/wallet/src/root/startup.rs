@@ -974,6 +974,14 @@ impl WalletStartupRoot {
             });
         }
     }
+
+    pub(super) fn toggle_network_status_from_shortcut(&self, cx: &mut Context<'_, Self>) {
+        if let Some(root) = self.wallet_root.clone() {
+            root.update(cx, |root, cx| {
+                root.toggle_network_status_from_shortcut(cx);
+            });
+        }
+    }
 }
 
 impl Render for WalletStartupRoot {

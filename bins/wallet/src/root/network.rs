@@ -17,7 +17,7 @@ use wallet_ops::{
 
 use super::{
     NETWORK_HEALTH_REFRESH_INTERVAL, TOR_EXIT_IP_QUERY_TIMEOUT, TOR_EXIT_IP_QUERY_URL,
-    TOR_HEALTH_RETRY_TIMEOUT, WalletRoot,
+    TOR_HEALTH_RETRY_TIMEOUT, VaultState, WalletRoot,
 };
 
 const TOR_ACTIVITY_RATE_WINDOW: Duration = Duration::from_secs(5);
@@ -363,6 +363,15 @@ impl WalletRoot {
         } else if !open {
             cx.notify();
         }
+    }
+
+    pub(super) fn toggle_network_status_from_shortcut(&mut self, cx: &mut Context<'_, Self>) {
+        if !matches!(self.vault_state, VaultState::ViewUnlocked) {
+            return;
+        }
+        // The next render opens the popover, which remembers the focused field, or closes it and
+        // returns focus there.
+        self.set_network_status_popover_open(!self.network_status_popover_open, cx);
     }
 
     pub(super) fn rotate_tor_session(&mut self, cx: &mut Context<'_, Self>) -> eyre::Result<u64> {

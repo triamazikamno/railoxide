@@ -755,3 +755,167 @@ fn native_shield_route_follows_the_payer_and_keeps_the_mimic_preference(cx: &mut
     cx.run_until_parked();
     std::fs::remove_dir_all(path).unwrap();
 }
+
+#[gpui::test]
+fn network_status_stays_reachable_above_dialogs(cx: &mut TestAppContext) {
+    use gpui::InteractiveElement as _;
+    use gpui_component::input::{Input, InputState};
+
+    let path = temp_wallet_db_root("network-status-dialogs");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        ui::theme::apply_zenburn_component_theme(cx);
+        install_wallet_action_bindings(cx);
+    });
+    let mut root = None;
+    let (host, cx) = cx.add_window_view(|window, cx| {
+        let wallet = fixture_root(&path, &runtime, window, cx);
+        root = Some(wallet.clone());
+        Root::new(wallet, window, cx)
+    });
+    let root = root.unwrap();
+    cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(1000.)));
+    // Two stacked dialogs with entered text; the second input has focus.
+    let inputs = cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.network_health.mode = wallet_ops::WalletNetworkMode::Tor;
+            root.network_health.state = wallet_ops::WalletNetworkHealthState::Ready;
+            cx.notify();
+        });
+        let inputs = ["first draft", "second draft"]
+            .map(|value| cx.new(|cx| InputState::new(window, cx).default_value(value)));
+        for (ix, input) in inputs.iter().enumerate() {
+            let input = input.clone();
+            gpui_component::WindowExt::open_dialog(window, cx, move |dialog, _, _| {
+                dialog.child(Input::new(&input)).child(
+                    div()
+                        .debug_selector(move || format!("test-dialog-{ix}"))
+                        .child("Dialog"),
+                )
+            });
+        }
+        inputs[1].update(cx, |input, cx| input.focus(window, cx));
+        window.draw(cx).clear(cx);
+        inputs
+    });
+    let draw = |cx: &mut gpui::VisualTestContext| cx.update(|window, cx| window.draw(cx).clear(cx));
+    let click = |cx: &mut gpui::VisualTestContext, position: gpui::Point<gpui::Pixels>| {
+        cx.simulate_click(position, gpui::Modifiers::default());
+        draw(cx);
+    };
+    let pill = cx
+        .debug_bounds("wallet-network-status-pill")
+        .expect("network pill is rendered");
+    // (popover open, focus inside popover, dialogs shown, second input focused)
+    let state = |cx: &mut gpui::VisualTestContext| {
+        let dialogs = ["test-dialog-0", "test-dialog-1"]
+            .into_iter()
+            .filter(|id| cx.debug_bounds(id).is_some())
+            .count();
+        cx.update(|window, cx| {
+            let root = root.read(cx);
+            (
+                root.network_status_popover_open,
+                root.network_status_popover_focus
+                    .contains_focused(window, cx),
+                dialogs,
+                inputs[1].read(cx).focus_handle(cx).is_focused(window),
+            )
+        })
+    };
+    let toggle_from_shortcut = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_, cx| {
+            root.update(cx, WalletRoot::toggle_network_status_from_shortcut);
+        });
+        draw(cx);
+    };
+
+    click(cx, pill.center());
+    assert_eq!(
+        state(cx),
+        (true, true, 2, false),
+        "pill opens above dialogs"
+    );
+    for keys in ["tab", "shift-tab"] {
+        cx.simulate_keystrokes(keys);
+        draw(cx);
+        assert_eq!(state(cx), (true, true, 2, false), "{keys} stays in popover");
+    }
+    let new_session = cx
+        .debug_bounds("wallet-network-new-tor-session")
+        .expect("Tor session action is rendered");
+    click(cx, new_session.center());
+    assert_eq!(
+        state(cx),
+        (true, true, 2, false),
+        "recovery keeps everything open"
+    );
+    cx.update(|_, cx| {
+        assert!(root.read(cx).network_status_error.is_some(), "recovery ran");
+        assert_eq!(
+            inputs
+                .each_ref()
+                .map(|input| input.read(cx).value().to_string()),
+            ["first draft", "second draft"]
+        );
+    });
+
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    assert_eq!(
+        state(cx),
+        (false, false, 2, true),
+        "Escape closes only popover"
+    );
+    click(cx, pill.center());
+    click(cx, gpui::point(gpui::px(1380.), gpui::px(20.)));
+    assert_eq!(
+        state(cx),
+        (false, false, 2, true),
+        "backdrop press closes only popover"
+    );
+
+    toggle_from_shortcut(cx);
+    assert_eq!(
+        state(cx),
+        (true, true, 2, false),
+        "shortcut opens and focuses"
+    );
+    toggle_from_shortcut(cx);
+    assert_eq!(
+        state(cx),
+        (false, false, 2, true),
+        "shortcut closes only popover"
+    );
+
+    // The lifted pill must not expose the sidebar controls beneath the dialog.
+    click(
+        cx,
+        pill.bottom_center() + gpui::point(gpui::px(0.), gpui::px(20.)),
+    );
+    assert!(cx.update(|_, cx| !root.read(cx).logs_open));
+
+    toggle_from_shortcut(cx);
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.lock_vault(window, cx);
+            assert!(!root.network_status_popover_open, "lock closes popover");
+            root.toggle_network_status_from_shortcut(cx);
+            assert!(
+                !root.network_status_popover_open,
+                "shortcut ignored while locked"
+            );
+        });
+    });
+
+    cx.update(|window, _| window.remove_window());
+    drop(host);
+    drop(root);
+    cx.run_until_parked();
+    std::fs::remove_dir_all(path).unwrap();
+}

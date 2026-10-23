@@ -97,6 +97,10 @@ pub(crate) struct OpenSettings;
 #[action(no_json)]
 pub(crate) struct LockVault;
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, gpui::Action)]
+#[action(no_json)]
+pub(crate) struct ToggleNetworkStatus;
+
 #[derive(Default)]
 struct WalletShortcutRegistry {
     roots_by_window: HashMap<WindowId, WeakEntity<WalletStartupRoot>>,
@@ -108,6 +112,7 @@ impl Global for WalletShortcutRegistry {}
 enum WalletShortcutAction {
     OpenSettings,
     LockVault,
+    ToggleNetworkStatus,
 }
 
 pub(super) const PUBLIC_ACCOUNT_SECTION_KEY_CONTEXT: &str = "PublicAccountSection";
@@ -187,6 +192,7 @@ pub(crate) fn install_wallet_action_bindings(app: &mut App) {
         ),
         KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("secondary-l", LockVault, None),
+        KeyBinding::new("secondary-shift-t", ToggleNetworkStatus, None),
         KeyBinding::new(
             "ctrl-r",
             RefreshBroadcasterEstimate,
@@ -220,6 +226,9 @@ pub(crate) fn install_wallet_action_bindings(app: &mut App) {
     });
     app.on_action(|_: &LockVault, cx| {
         dispatch_wallet_shortcut(WalletShortcutAction::LockVault, cx);
+    });
+    app.on_action(|_: &ToggleNetworkStatus, cx| {
+        dispatch_wallet_shortcut(WalletShortcutAction::ToggleNetworkStatus, cx);
     });
     #[cfg(feature = "hardware")]
     app.bind_keys([KeyBinding::new(
@@ -258,6 +267,9 @@ fn dispatch_wallet_shortcut(action: WalletShortcutAction, cx: &mut App) {
             root.update(cx, |root, cx| match action {
                 WalletShortcutAction::OpenSettings => root.open_settings_from_shortcut(window, cx),
                 WalletShortcutAction::LockVault => root.lock_vault_from_shortcut(window, cx),
+                WalletShortcutAction::ToggleNetworkStatus => {
+                    root.toggle_network_status_from_shortcut(cx);
+                }
             });
         });
     });

@@ -1,10 +1,10 @@
 use gpui::{
     Anchor, App, Entity, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, img,
+    SharedString, StatefulInteractiveElement, Styled, Window, deferred, div, img,
     prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
-    Collapsible, Icon, IconName, Sizable,
+    Collapsible, FocusTrapElement as _, Icon, IconName, Sizable, WindowExt as _,
     button::{Button, ButtonVariants},
     popover::Popover,
     progress::Progress as UiProgress,
@@ -198,7 +198,11 @@ impl WalletRoot {
                         },
                     )
                     .child(self.render_gateway_status_pill(&gateway_root, collapsed))
-                    .child(self.render_network_status_pill(&network_root, collapsed))
+                    .child(self.render_network_status_pill(
+                        &network_root,
+                        collapsed,
+                        window.has_active_dialog(cx),
+                    ))
                     .child(
                         SidebarMenu::new()
                             .w_full()
@@ -242,13 +246,19 @@ impl WalletRoot {
         )
     }
 
-    fn render_network_status_pill(&self, root: &Entity<Self>, collapsed: bool) -> impl IntoElement {
+    fn render_network_status_pill(
+        &self,
+        root: &Entity<Self>,
+        collapsed: bool,
+        above_dialogs: bool,
+    ) -> impl IntoElement {
         let status = self.network_status_presentation();
         let expanded_tor = !collapsed && status.kind().is_tor();
         let activity = self.network_activity_presentation();
         let download_rate = self.tor_download_rate;
         let popover_root = root.clone();
         let content_root = root.clone();
+        let popover_focus = self.network_status_popover_focus.clone();
         let network_status_error = self.network_status_error.clone();
         let tor_exit_ip_query = self.tor_exit_ip_query.clone();
         let tor_state_reset_confirming = self.tor_state_reset_confirming;
@@ -260,7 +270,10 @@ impl WalletRoot {
             activity.as_ref(),
             download_rate,
             SIDEBAR_WIDTH - SIDEBAR_FOOTER_HORIZONTAL_INSET - SIDEBAR_FOOTER_HORIZONTAL_INSET,
-        );
+        )
+        .debug_selector(|| "wallet-network-status-pill".into())
+        // A pointer press must not focus the pill, so closing restores focus to the prior field.
+        .capture_any_mouse_down(|_, window, _| window.prevent_default());
 
         let trigger = if expanded_tor {
             trigger
@@ -277,12 +290,11 @@ impl WalletRoot {
             .p_0()
             .anchor(Anchor::BottomLeft)
             .open(self.network_status_popover_open)
-            .on_open_change(move |open, window, cx| {
+            .overlay_closable(false)
+            .track_focus(&popover_focus)
+            .on_open_change(move |open, _window, cx| {
                 popover_root.update(cx, |root, cx| {
                     root.set_network_status_popover_open(*open, cx);
-                    if !open {
-                        root.network_status_focus.focus(window, cx);
-                    }
                 });
             })
             .trigger(NetworkStatusTrigger::new(
@@ -292,6 +304,7 @@ impl WalletRoot {
             ))
             .content(move |_state, window, _cx| {
                 let root = content_root.clone();
+                let dismiss_root = content_root.clone();
                 let copy = match tor_exit_ip_query {
                     TorExitIpQueryState::Success(ip) => Some(
                         clipboard_with_toast("wallet-network-exit-ip-copy", ip.to_string())
@@ -314,9 +327,17 @@ impl WalletRoot {
                     ),
                     window,
                 )
+                // Consume the outside press so it cannot also dismiss a dialog underneath.
+                .on_mouse_down_out(move |_, _window, cx| {
+                    cx.stop_propagation();
+                    dismiss_root.update(cx, |root, cx| {
+                        root.set_network_status_popover_open(false, cx);
+                    });
+                })
+                .focus_trap("wallet-network-status-popover-trap", &popover_focus)
             });
 
-        if expanded_tor {
+        let pill = if expanded_tor {
             div()
                 .w(SIDEBAR_WIDTH
                     - SIDEBAR_FOOTER_HORIZONTAL_INSET
@@ -326,6 +347,14 @@ impl WalletRoot {
                 .into_any_element()
         } else {
             popover.into_any_element()
+        };
+
+        if above_dialogs {
+            deferred(div().occlude().child(pill))
+                .with_priority(gpui_kit::base::POPUP_PRIORITY)
+                .into_any_element()
+        } else {
+            pill
         }
     }
 

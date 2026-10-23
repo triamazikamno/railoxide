@@ -1242,6 +1242,7 @@ impl WalletRoot {
         self.clear_private_broadcaster_progress_state();
         self.stop_waku();
         window.close_all_dialogs(cx);
+        self.set_network_status_popover_open(false, cx);
         self.clear_protected_software_seed_session(cx);
         self.view_session = None;
         self.pending_software_profile_open = None;
