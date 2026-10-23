@@ -1273,6 +1273,7 @@ impl WalletRoot {
             &accounts,
             chain_id,
             self.public_balance_snapshot.as_deref(),
+            &cx.weak_entity(),
         );
         let selected_index = self_broadcast_gas_payer_select_index(&items, selected_uuid);
         cx.new(|cx| {
@@ -1650,10 +1651,25 @@ pub(in crate::root) fn self_broadcast_native_balance_label(
     chain_id: u64,
     public_account_uuid: &str,
 ) -> String {
-    self_broadcast_native_balance_entry(snapshot, chain_id, public_account_uuid).map_or_else(
-        || "unavailable".to_string(),
-        |entry| public_balance_amount_label(&entry.amount, entry.asset.decimals),
+    if public_account_balances_for_chain(
+        snapshot,
+        chain_id,
+        public_account_uuid,
+        PublicAccountStatus::Active,
     )
+    .is_none()
+    {
+        return "Not fetched".to_owned();
+    }
+    match self_broadcast_native_balance_entry(snapshot, chain_id, public_account_uuid) {
+        Some(entry) if matches!(entry.amount, PublicBalanceAmount::Available(_)) => format!(
+            "{} {}",
+            public_balance_amount_label(&entry.amount, entry.asset.decimals),
+            native_token_display_label(chain_id)
+        ),
+        // The native read failed.
+        _ => "unavailable".to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -1743,19 +1759,26 @@ pub(in crate::root) fn self_broadcast_gas_payer_select_items(
     accounts: &[PublicAccountMetadata],
     chain_id: u64,
     snapshot: Option<&PublicBalanceSnapshot>,
+    root: &gpui::WeakEntity<WalletRoot>,
 ) -> Vec<SelfBroadcastGasPayerSelectItem> {
     accounts
         .iter()
-        .map(|account| SelfBroadcastGasPayerSelectItem {
-            public_account_uuid: Arc::from(account.public_account_uuid.as_str()),
-            label: Arc::from(self_broadcast_gas_payer_label(account)),
-            address: account.address,
-            chain_id,
-            balance_label: Arc::from(self_broadcast_native_balance_label(
-                snapshot,
+        .map(|account| {
+            let uuid = account.public_account_uuid.as_str();
+            let status = PublicAccountStatus::Active;
+            SelfBroadcastGasPayerSelectItem {
+                public_account_uuid: Arc::from(uuid),
+                label: Arc::from(self_broadcast_gas_payer_label(account)),
+                address: account.address,
                 chain_id,
-                &account.public_account_uuid,
-            )),
+                balance_label: Arc::from(self_broadcast_native_balance_label(
+                    snapshot, chain_id, uuid,
+                )),
+                fetchable: public_account_balances_for_chain(snapshot, chain_id, uuid, status)
+                    .is_none()
+                    || public_account_stale_for_chain(snapshot, chain_id, uuid, status),
+                root: root.clone(),
+            }
         })
         .collect()
 }
@@ -1780,7 +1803,8 @@ pub(in crate::root) fn sync_self_broadcast_gas_payer_select_entity(
     window: &mut Window,
     cx: &mut Context<'_, WalletRoot>,
 ) {
-    let items = self_broadcast_gas_payer_select_items(accounts, chain_id, snapshot);
+    let items =
+        self_broadcast_gas_payer_select_items(accounts, chain_id, snapshot, &cx.weak_entity());
     select.update(cx, |select, cx| {
         select.set_items(FullWidthSelectItems::new(items), window, cx);
         if let Some(uuid) = selected_uuid {

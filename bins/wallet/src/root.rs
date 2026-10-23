@@ -505,9 +505,7 @@ pub(crate) struct WalletRoot {
     public_transaction_cleanup: Option<public_transactions::PublicTransactionCleanup>,
     public_balance_snapshot: Option<Arc<PublicBalanceSnapshot>>,
     public_balance_error: Option<Arc<str>>,
-    public_balance_refreshing: bool,
     public_inactive_balance_error: Option<Arc<str>>,
-    public_inactive_balance_refreshing: bool,
     send_forms: BTreeMap<UnshieldAssetKey, SendFormState>,
     private_action_form: Option<PrivateActionFormState>,
     send_generation_seq: u64,
@@ -1576,9 +1574,7 @@ impl WalletRoot {
             public_transaction_cleanup: None,
             public_balance_snapshot: None,
             public_balance_error: None,
-            public_balance_refreshing: false,
             public_inactive_balance_error: None,
-            public_inactive_balance_refreshing: false,
             send_forms: BTreeMap::new(),
             private_action_form: None,
             send_generation_seq: 0,
@@ -2197,7 +2193,7 @@ impl WalletRoot {
                 if this
                     .update(cx, |root, cx| {
                         if root.active_wallet_tab == WalletTab::Public {
-                            root.schedule_public_balance_refresh(cx);
+                            root.schedule_automatic_public_balance_refresh(cx);
                         }
                     })
                     .is_err()

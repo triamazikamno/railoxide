@@ -2238,7 +2238,7 @@ impl PrivateSwapsView {
                     Ok(Ok(PublicExecutionResult::Finished(identity))) => {
                         view.public_execution = None;
                         view.refresh_public_swap_records(cx);
-                        view.refresh_public_source_balances(cx);
+                        view.refresh_public_source_balance(identity, cx);
                         view.navigate(SwapDialogView::PublicDetail(identity), window, cx);
                     }
                     Ok(Err(error)) => {
@@ -2797,25 +2797,38 @@ impl PrivateSwapsView {
         self.refresh_public_conflict(cx);
     }
 
-    fn refresh_public_source_balances(&self, cx: &mut Context<'_, Self>) {
-        let chains = self
+    /// Refreshes only the Public account that paid for this swap, on its origin chain.
+    fn refresh_public_source_balance(
+        &self,
+        identity: super::super::model::SwapIdentity,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((origin_chain, source)) = self
             .public_records
             .iter()
-            .flat_map(|(_, record)| record.swap_uses().iter())
-            .filter_map(|swap_use| match swap_use.role() {
-                SwapUseRole::PublicSourceDestination { origin_chain, .. } => Some(*origin_chain),
-                _ => None,
-            })
-            .collect::<std::collections::BTreeSet<_>>();
+            .filter(|(_, record)| record.operation() == identity.operation)
+            .find_map(
+                |(_, record)| match record.swap_use(identity.swap_use)?.role() {
+                    SwapUseRole::PublicSourceDestination {
+                        origin_chain,
+                        source,
+                        ..
+                    } => Some((*origin_chain, *source)),
+                    _ => None,
+                },
+            )
+        else {
+            return;
+        };
         let _ = self.root.update(cx, |root, cx| {
-            for chain in chains {
-                root.schedule_public_balance_refresh_for_chain(
-                    chain,
-                    PublicAccountStatus::Active,
-                    None,
-                    cx,
-                );
-            }
+            // The record names its payer by address.
+            let accounts = root
+                .public_accounts
+                .iter()
+                .filter(|account| account.address == source)
+                .map(|account| account.public_account_uuid.clone())
+                .collect::<Vec<_>>();
+            root.schedule_account_public_balance_refresh(origin_chain, accounts, None, cx);
         });
     }
 
@@ -2944,7 +2957,13 @@ impl PrivateSwapsView {
                 }
                 match result {
                     Ok(Ok(progress)) if progress.refresh_public_balances => {
-                        view.refresh_public_source_balances(cx);
+                        view.refresh_public_source_balance(
+                            super::super::model::SwapIdentity {
+                                operation,
+                                swap_use: id,
+                            },
+                            cx,
+                        );
                     }
                     // A background pass is read again on the next one, so only a check the
                     // user asked for reports its failure.

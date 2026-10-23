@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use super::{
     ConfirmedHardwarePublicAccount, DesktopVaultStore, DesktopViewSession, EncryptedRecord,
     KEY_LEN, PUBLIC_ACCOUNT_METADATA_PREFIX, ProtectedSoftwareSeedSession, PublicAccountMetadata,
@@ -433,6 +435,18 @@ impl DesktopVaultStore {
                 Err(VaultError::InvalidPublicAccountOperation)
             }
         }
+    }
+
+    /// Ids of every stored public account, across wallets and statuses.
+    pub fn list_public_account_ids_with_view_unlock(
+        &self,
+        view: &ViewUnlock,
+    ) -> Result<BTreeSet<String>, VaultError> {
+        Ok(self
+            .list_public_account_metadata_with_view(view)?
+            .into_iter()
+            .map(|account| account.public_account_uuid)
+            .collect())
     }
 
     pub(in crate::vault) fn list_public_account_metadata_with_view(

@@ -282,14 +282,62 @@ pub(in crate::root) fn self_broadcast_gas_payer_select_trigger_row(
 pub(in crate::root) fn self_broadcast_gas_payer_select_menu_row(
     label: &str,
     address: &Address,
-    chain_id: u64,
     balance: &str,
+    action: Option<gpui::AnyElement>,
 ) -> gpui::Div {
-    ui::private_action::self_broadcast::signer_menu_row(
+    ui::private_action::self_broadcast::signer_menu_row_with_action(
         label.to_owned(),
         short_address(address),
-        format!("{balance} {}", native_token_display_label(chain_id)),
+        balance.to_owned(),
+        action,
     )
+}
+
+/// Fetches one picker candidate's balances without selecting it or closing the picker.
+pub(in crate::root) fn self_broadcast_gas_payer_fetch_button(
+    root: gpui::WeakEntity<WalletRoot>,
+    chain_id: u64,
+    public_account_uuid: Arc<str>,
+    cx: &App,
+) -> gpui::AnyElement {
+    // Read at render so the open menu shows the fetch start and end without replacing its
+    // items, which would drop the search query.
+    let fetching = root.upgrade().is_some_and(|root| {
+        let root = root.read(cx);
+        root.current_public_balance_scope(chain_id)
+            .is_some_and(|scope| {
+                root.public_balance_cache
+                    .refreshing_accounts(&scope)
+                    .contains(public_account_uuid.as_ref())
+            })
+    });
+    let id = format!("gas-payer-fetch-{public_account_uuid}");
+    // Not disabled while fetching: a disabled button takes focus on mouse down, which closes
+    // the menu. A loading button already ignores clicks.
+    app_button_base(SharedString::from(id.clone()))
+        .ghost()
+        .xsmall()
+        .compact()
+        .icon(Icon::empty().path(ui::icons::refresh_ccw_icon_path()))
+        .accessibility_label("Fetch balance")
+        .tooltip("Fetch balance")
+        .tab_stop(false)
+        .loading(fetching)
+        .debug_selector(move || id)
+        .on_click(move |_, window, cx| {
+            // The list row confirms on click.
+            cx.stop_propagation();
+            let window = window.window_handle();
+            let _ = root.update(cx, |root, cx| {
+                root.schedule_account_public_balance_refresh(
+                    chain_id,
+                    [public_account_uuid.as_ref()],
+                    Some(window),
+                    cx,
+                );
+            });
+        })
+        .into_any_element()
 }
 
 pub(in crate::root) fn render_unshield_output_toggle(
@@ -322,16 +370,24 @@ mod gas_payer_layout_tests {
     fn gas_payer_balances_align_at_menu_edge_and_rows_remain_selectable(
         cx: &mut gpui::TestAppContext,
     ) {
-        let items = [("A", "1"), ("Longer account", "123.456")]
-            .into_iter()
-            .map(|(label, balance)| SelfBroadcastGasPayerSelectItem {
+        let items = [
+            ("A", "1 ETH", false),
+            ("Longer account", "123.456 ETH", false),
+            ("Unread", "Not fetched", true),
+        ]
+        .into_iter()
+        .map(
+            |(label, balance, fetchable)| SelfBroadcastGasPayerSelectItem {
                 public_account_uuid: Arc::from(label),
                 label: Arc::from(label),
                 address: Address::ZERO,
                 chain_id: 1,
                 balance_label: Arc::from(balance),
-            })
-            .collect();
+                fetchable,
+                root: gpui::WeakEntity::new_invalid(),
+            },
+        )
+        .collect();
         crate::root::ui_helpers::select_layout_test::assert_balances_align_and_rows_select(
             cx,
             items,
@@ -339,6 +395,7 @@ mod gas_payer_layout_tests {
             false,
             ["gas-payer-balance-A", "gas-payer-balance-Longer account"],
             "Longer account",
+            Some("gas-payer-fetch-Unread"),
         );
     }
 }

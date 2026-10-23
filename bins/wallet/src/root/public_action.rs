@@ -41,7 +41,7 @@ use wallet_ops::{
     quote_public_action_gas_fee_bundle_with_profile, resolve_public_action_gas_fee,
     select_native_shield_route, submit_public_send_with_progress,
     submit_public_shield_with_progress,
-    vault::{DesktopVaultStore, DesktopViewSession, PublicAccountSource, PublicAccountStatus},
+    vault::{DesktopVaultStore, DesktopViewSession, PublicAccountSource},
 };
 
 use super::gas_fee::{

@@ -38,8 +38,9 @@ use wallet_ops::{
 
 use super::public_account_display_label;
 use crate::root::public_balances::{
+    public_account_balances_for_chain, public_account_stale_for_chain,
     public_account_visible_balances_for_chain, public_balance_compact_usd,
-    public_balances_usd_total,
+    public_balances_usd_total, public_section_freshness,
 };
 
 // Design dimensions in units at the default 16px rem. Rendering and fit arithmetic
@@ -104,8 +105,17 @@ pub(in crate::root) fn sort_public_accounts(
                 account.status,
             );
             let total = public_balances_usd_total(&balances, chain_id, cache);
+            // Accounts with a balance, then read but empty, then not yet read.
+            let unread = public_account_balances_for_chain(
+                snapshot,
+                chain_id,
+                &account.public_account_uuid,
+                account.status,
+            )
+            .is_none();
             (
                 balances.is_empty(),
+                unread,
                 Reverse(total.value.unwrap_or_default()),
                 account_name_key(account),
             )
@@ -154,8 +164,16 @@ impl WalletRoot {
                 public_account_matches_search(account, &self.public_form.search_query)
             })
             .filter(|account| {
+                // Hide empty hides accounts read as empty; unread ones stay listed.
                 account.status != PublicAccountStatus::Active
                     || !self.ui_state.public_hide_empty_accounts
+                    || public_account_balances_for_chain(
+                        self.public_balance_snapshot.as_deref(),
+                        self.selected_chain,
+                        &account.public_account_uuid,
+                        account.status,
+                    )
+                    .is_none()
                     || !self
                         .public_account_visible_balances(
                             &account.public_account_uuid,
@@ -339,11 +357,18 @@ impl WalletRoot {
                 .text_color(subtle)
                 .child(text)
         };
+        let freshness = public_section_freshness(
+            self.public_balance_snapshot.as_deref(),
+            &self.public_accounts,
+            self.selected_chain,
+            PublicAccountStatus::Active,
+            &self.public_failed_accounts(),
+        );
         let mut value = div().flex().items_baseline().gap_2().min_w_0();
         if self.public_chain_has_pricing() {
             let label = total.value.map_or_else(
                 || {
-                    if self.public_balance_snapshot.is_some() && !total.partial {
+                    if freshness.counted > 0 && !total.partial {
                         "$0.00".into()
                     } else {
                         "Unavailable".into()
@@ -380,21 +405,70 @@ impl WalletRoot {
                         }),
                 );
         }
-        let refreshed = self
-            .public_balance_snapshot
-            .as_ref()
-            .filter(|snapshot| snapshot.chain_id == self.selected_chain)
-            .map_or_else(
-                || "Not refreshed".to_owned(),
-                |snapshot| relative_time_label(snapshot.refreshed_at),
-            );
-        let status = if self.public_balance_refreshing {
-            app_muted_text("Refreshing…")
-        } else if let Some(error) = &self.public_balance_error {
-            app_muted_text(format!("Stale · {error}")).text_color(cx.theme().warning)
-        } else {
-            app_muted_text(refreshed)
+        let omission = (self.public_chain_has_pricing()
+            && freshness.counted > 0
+            && freshness.not_refreshed > 0)
+            .then(|| {
+                app_muted_text(format!("Excludes {} not fetched", freshness.not_refreshed))
+                    .text_xs()
+                    .truncate()
+            });
+        let (status, stale) = self.public_summary_status();
+        let status = app_muted_text(status).when(stale, |text| text.text_color(cx.theme().warning));
+        let refreshing = self.public_section_refreshing(PublicAccountStatus::Active);
+        let none_included = self
+            .public_global_refresh_ids(PublicAccountStatus::Active)
+            .is_empty();
+        let refresh_root = root.clone();
+        let auto_root = root.clone();
+        let interval = self.public_balance_refresh_interval.as_secs();
+        let every = match interval {
+            60 => "every minute".to_owned(),
+            secs if secs % 60 == 0 => format!("every {} minutes", secs / 60),
+            secs => format!("every {secs} seconds"),
         };
+        let refresh_controls = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .mt_1()
+            .child(
+                // The status line above already reads "Refreshing…".
+                app_button("wallet-public-refresh", "Refresh")
+                    .outline()
+                    .xsmall()
+                    .icon(gpui_component::Icon::empty().path(ui::icons::refresh_ccw_icon_path()))
+                    .loading(refreshing)
+                    .disabled(refreshing || none_included)
+                    .when(
+                        none_included && self.has_active_public_accounts(),
+                        |button| button.tooltip("No active accounts are included in Refresh"),
+                    )
+                    .on_click(move |_, _, cx| {
+                        refresh_root.update(cx, |root, cx| {
+                            root.schedule_global_public_balance_refresh(
+                                PublicAccountStatus::Active,
+                                cx,
+                            );
+                        });
+                    }),
+            )
+            .child(
+                Checkbox::new("public-auto-refresh")
+                    .debug_selector(|| "public-auto-refresh".into())
+                    .small()
+                    .label("Auto")
+                    .accessibility_label("Auto-refresh")
+                    .tooltip(format!("Refresh included accounts {every}"))
+                    .checked(self.ui_state.public_auto_refresh)
+                    .on_click(move |checked, _, cx| {
+                        auto_root.update(cx, |root, cx| {
+                            root.ui_state.public_auto_refresh = *checked;
+                            root.save_ui_state();
+                            cx.notify();
+                        });
+                    }),
+            );
         div()
             .flex()
             .items_center()
@@ -412,7 +486,8 @@ impl WalletRoot {
                     .flex_col()
                     .min_w_0()
                     .child(caption("Total balance".into()))
-                    .child(value),
+                    .child(value)
+                    .children(omission),
             )
             .child(
                 div()
@@ -420,10 +495,41 @@ impl WalletRoot {
                     .flex()
                     .flex_col()
                     .child(caption("Last refreshed".into()))
-                    .child(status.text_sm().truncate()),
+                    .child(status.text_sm().truncate())
+                    .child(refresh_controls),
             )
             .child(div().flex_1())
             .child(self.render_stealth_accounts_button(root, cx))
+    }
+
+    /// The summary strip's "Last refreshed" line, and whether it marks the total stale.
+    pub(in crate::root) fn public_summary_status(&self) -> (String, bool) {
+        if self.public_section_refreshing(PublicAccountStatus::Active) {
+            return ("Refreshing…".to_owned(), false);
+        }
+        let snapshot = self.public_balance_snapshot.as_deref();
+        let freshness = public_section_freshness(
+            snapshot,
+            &self.public_accounts,
+            self.selected_chain,
+            PublicAccountStatus::Active,
+            &self.public_failed_accounts(),
+        );
+        if freshness.stale || freshness.failed {
+            let reason = self
+                .public_balance_error
+                .as_deref()
+                .unwrap_or("some balances could not be read");
+            return (format!("Stale · {reason}"), true);
+        }
+        let refreshed = snapshot
+            // Counted rows exist only in a snapshot of the selected chain.
+            .filter(|_| freshness.counted > 0)
+            .map_or_else(
+                || "Not fetched".to_owned(),
+                |snapshot| relative_time_label(snapshot.refreshed_at),
+            );
+        (refreshed, false)
     }
 
     pub(super) fn public_selected_chain_name(&self) -> String {
@@ -787,16 +893,26 @@ impl WalletRoot {
             });
         if inactive && open && !disabled {
             let fetch_root = root.clone();
+            let refreshing = self.public_section_refreshing(PublicAccountStatus::Inactive);
+            let none_included = self
+                .public_global_refresh_ids(PublicAccountStatus::Inactive)
+                .is_empty();
             trigger = trigger.child(
                 app_button("public-fetch-inactive", "Fetch balances")
                     .outline()
                     .xsmall()
-                    .loading(self.public_inactive_balance_refreshing)
-                    .disabled(self.public_inactive_balance_refreshing)
+                    .loading(refreshing)
+                    .disabled(refreshing || none_included)
+                    .when(none_included, |button| {
+                        button.tooltip("No inactive accounts are included in Refresh")
+                    })
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
                         fetch_root.update(cx, |root, cx| {
-                            root.schedule_inactive_public_balance_refresh(cx);
+                            root.schedule_global_public_balance_refresh(
+                                PublicAccountStatus::Inactive,
+                                cx,
+                            );
                         });
                     }),
             );
@@ -822,12 +938,26 @@ impl WalletRoot {
                 header.border_t_1().border_color(cx.theme().border)
             });
         let mut rows = div().w_full().flex().flex_col();
-        if inactive {
-            rows = rows.children(self.public_inactive_balance_error.as_ref().map(|error| {
-                app_muted_text(error.to_string())
-                    .text_color(cx.theme().warning)
-                    .whitespace_normal()
-            }));
+        let inactive_freshness = inactive.then(|| {
+            public_section_freshness(
+                self.public_balance_snapshot.as_deref(),
+                &self.public_accounts,
+                self.selected_chain,
+                PublicAccountStatus::Inactive,
+                &self.public_failed_accounts(),
+            )
+        });
+        if inactive_freshness.is_some_and(|freshness| freshness.stale || freshness.failed) {
+            rows = rows.child(
+                app_muted_text(
+                    self.public_inactive_balance_error
+                        .as_deref()
+                        .unwrap_or("Some inactive balances could not be read")
+                        .to_owned(),
+                )
+                .text_color(cx.theme().warning)
+                .whitespace_normal(),
+            );
         }
         if accounts.is_empty() {
             rows = rows.child(
@@ -933,6 +1063,13 @@ impl WalletRoot {
             .gap(dimension(6.0))
             .min_w_0()
             .child(name.truncate().when(dim, |text| text.text_color(subtle)));
+        let excluded = self
+            .ui_state
+            .public_refresh_excluded
+            .contains(&account.public_account_uuid);
+        let refreshing = self
+            .public_refreshing_accounts()
+            .contains(&account.public_account_uuid);
         let shortcuts = |root: &Entity<Self>| {
             let mut shortcuts = div()
                 .flex()
@@ -968,7 +1105,43 @@ impl WalletRoot {
                     }),
                 );
             }
-            shortcuts
+            // Its own opacity keeps the spinner visible while the shortcuts are hidden.
+            let refresh_root = root.clone();
+            let refresh_uuid = uuid.clone();
+            let refresh = div()
+                .flex_none()
+                .opacity(if selected || refreshing { 1.0 } else { 0.0 })
+                .group_hover(group.clone(), |style| style.opacity(1.0))
+                .child(
+                    super::components::public_account_icon_button(
+                        SharedString::from(format!(
+                            "public-shortcut-{}-{}",
+                            AccountCommand::Refresh.label(),
+                            uuid
+                        )),
+                        gpui_component::Icon::empty().path(ui::icons::refresh_ccw_icon_path()),
+                        AccountCommand::Refresh.label(),
+                    )
+                    .tab_stop(false)
+                    .loading(refreshing)
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        refresh_root.update(cx, |root, cx| {
+                            root.run_public_account_command(
+                                &refresh_uuid,
+                                AccountCommand::Refresh,
+                                window,
+                                cx,
+                            );
+                        });
+                    }),
+                );
+            div()
+                .flex()
+                .items_center()
+                .flex_none()
+                .child(shortcuts)
+                .child(refresh)
         };
         let tag = |text: &'static str, color: gpui::Hsla| {
             div()
@@ -993,6 +1166,34 @@ impl WalletRoot {
         }
         if account.is_global() {
             tags = tags.child(tag("Global", cx.theme().info));
+        }
+        if excluded {
+            tags = tags.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "public-refresh-excluded-{uuid}"
+                    )))
+                    .flex_none()
+                    .tooltip(|window, cx| {
+                        gpui_component::tooltip::Tooltip::new(
+                            "Not in Refresh. Refresh and Auto skip this account.",
+                        )
+                        .build(window, cx)
+                    })
+                    .child(
+                        gpui_component::Icon::new(crate::assets::RailgunActionIcon::RefreshCwOff)
+                            .small()
+                            .text_color(subtle),
+                    ),
+            );
+        }
+        if public_account_stale_for_chain(
+            self.public_balance_snapshot.as_deref(),
+            self.selected_chain,
+            &account.public_account_uuid,
+            account.status,
+        ) {
+            tags = tags.child(tag("Stale", cx.theme().warning));
         }
         let sessions = self.walletconnect_account_session_count(&uuid);
         if sessions > 0 {
@@ -1072,7 +1273,7 @@ impl WalletRoot {
                 app_muted_text(if fetched {
                     format!("No balances on {chain_name}")
                 } else {
-                    "Balances not fetched".into()
+                    "Not fetched".into()
                 })
                 .text_xs()
                 .text_color(subtle)

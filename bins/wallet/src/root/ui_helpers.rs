@@ -527,6 +527,7 @@ pub(super) mod select_layout_test {
         small: bool,
         balance_selectors: [&'static str; 2],
         expected_value: &str,
+        row_action: Option<&'static str>,
     ) where
         T: SelectItem<Value = Arc<str>> + 'static,
     {
@@ -569,6 +570,21 @@ pub(super) mod select_layout_test {
                 "balance must reach the menu's trailing content edge"
             );
             assert!(second.right() < trigger.right());
+            if let Some(action) = row_action {
+                let selected = |cx: &mut gpui::VisualTestContext| {
+                    cx.update(|_, cx| probe.read(cx).select.read(cx).selected_value().cloned())
+                };
+                let before = selected(cx);
+                let action = cx.debug_bounds(action).expect("row action");
+                cx.simulate_click(action.center(), gpui::Modifiers::none());
+                cx.run_until_parked();
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+                assert!(
+                    cx.debug_bounds(balance_selectors[1]).is_some(),
+                    "a row action must keep the menu open"
+                );
+                assert_eq!(selected(cx), before, "a row action must not select its row");
+            }
             cx.simulate_click(second.center(), gpui::Modifiers::none());
             cx.run_until_parked();
             cx.update(|_, cx| {

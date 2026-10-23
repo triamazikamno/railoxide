@@ -314,8 +314,6 @@ impl WalletRoot {
         if let Some(view) = self.stealth_accounts_body() {
             return view.into_any_element();
         }
-        let refresh_root = root.clone();
-
         div()
             .size_full()
             .min_w(px(0.0))
@@ -341,34 +339,6 @@ impl WalletRoot {
                             .child(self.render_public_list_controls(root))
                             .child(div().flex_1().min_w(px(0.0)))
                             .child(self.render_walletconnect_toolbar_button(root))
-                            .child(
-                                app_button(
-                                    "wallet-public-refresh",
-                                    if self.public_balance_refreshing {
-                                        "Refreshing…"
-                                    } else {
-                                        "Refresh"
-                                    },
-                                )
-                                .outline()
-                                .small()
-                                .icon(
-                                    gpui_component::Icon::empty()
-                                        .path(ui::icons::refresh_ccw_icon_path()),
-                                )
-                                .loading(self.public_balance_refreshing)
-                                .disabled(
-                                    self.public_balance_refreshing
-                                        || !self.has_active_public_accounts(),
-                                )
-                                .on_click(
-                                    move |_event, _window, cx| {
-                                        refresh_root.update(cx, |root, cx| {
-                                            root.schedule_public_balance_refresh(cx);
-                                        });
-                                    },
-                                ),
-                            )
                             .child(self.render_public_add_account_dropdown(root)),
                     )
                     .child(self.render_public_accounts_summary(root, cx))
@@ -389,9 +359,7 @@ impl WalletRoot {
         self.public_accounts.clear();
         self.public_balance_snapshot = None;
         self.public_balance_error = None;
-        self.public_balance_refreshing = false;
         self.public_inactive_balance_error = None;
-        self.public_inactive_balance_refreshing = false;
         self.public_form.selected_account_uuid = None;
         self.public_form.editing_account_uuid = None;
         self.public_form.selected_asset = None;
@@ -515,6 +483,9 @@ impl WalletRoot {
             self.invalidate_blocked_shield_rescue_rows(cx);
             return;
         };
+        let next_derived_index = store
+            .next_derived_public_account_index_for_session(view_session.as_ref())
+            .ok();
         match store.list_public_accounts_for_session(view_session.as_ref(), true) {
             Ok(accounts) => {
                 self.public_form.next_account_label_number =
@@ -526,19 +497,15 @@ impl WalletRoot {
                     view_session.wallet_id(),
                 );
                 if self.public_accounts != accounts {
-                    self.public_balance_cache.clear();
-                    self.public_balance_snapshot = None;
-                    self.public_balance_refreshing = false;
-                    self.public_inactive_balance_refreshing = false;
+                    self.public_balance_cache.retain_accounts(&accounts);
+                    self.restore_public_balance_snapshot();
                 }
                 self.public_accounts = accounts;
                 self.public_form.selected_account_uuid = selected;
                 if let Some(account) = self.selected_public_account() {
                     self.public_form.open_section = account.status;
                 }
-                self.public_form.next_derived_index = store
-                    .next_derived_public_account_index_for_session(view_session.as_ref())
-                    .ok();
+                self.public_form.next_derived_index = next_derived_index;
                 self.reconcile_public_account_selection();
                 self.remember_public_account_selection();
                 self.publish_gateway_desktop_state();
@@ -756,7 +723,12 @@ impl WalletRoot {
                     .add_label_input
                     .update(cx, |input, cx| input.set_value("", window, cx));
                 self.reload_public_accounts(window, cx);
-                self.schedule_public_balance_refresh(cx);
+                self.schedule_account_public_balance_refresh(
+                    self.selected_chain,
+                    [account.public_account_uuid],
+                    None,
+                    cx,
+                );
                 window.close_all_dialogs(cx);
             }
             Err(error) => {
@@ -868,7 +840,12 @@ impl WalletRoot {
                             .add_label_input
                             .update(cx, |input, cx| input.set_value("", window, cx));
                         root.reload_public_accounts(window, cx);
-                        root.schedule_public_balance_refresh(cx);
+                        root.schedule_account_public_balance_refresh(
+                            root.selected_chain,
+                            [account.public_account_uuid],
+                            None,
+                            cx,
+                        );
                         root.clear_trezor_pin_matrix_prompt(cx);
                         window.close_all_dialogs(cx);
                     }
@@ -880,7 +857,12 @@ impl WalletRoot {
                             .add_label_input
                             .update(cx, |input, cx| input.set_value("", window, cx));
                         root.reload_public_accounts(window, cx);
-                        root.schedule_public_balance_refresh(cx);
+                        root.schedule_account_public_balance_refresh(
+                            root.selected_chain,
+                            [account.public_account_uuid],
+                            None,
+                            cx,
+                        );
                         window.close_all_dialogs(cx);
                     }
                     Ok(Err(error)) => {
@@ -981,7 +963,12 @@ impl WalletRoot {
                     .update(cx, |input, cx| input.set_value("", window, cx));
                 self.public_form.import_global = false;
                 self.reload_public_accounts(window, cx);
-                self.schedule_public_balance_refresh(cx);
+                self.schedule_account_public_balance_refresh(
+                    self.selected_chain,
+                    [account.public_account_uuid],
+                    None,
+                    cx,
+                );
                 window.close_all_dialogs(cx);
             }
             Err(error) => {
@@ -1062,7 +1049,6 @@ impl WalletRoot {
                 self.reload_public_accounts(window, cx);
                 self.reset_public_asset_focus();
                 self.scroll_selected_public_row_into_view(window);
-                self.schedule_public_balance_refresh(cx);
             }
             Err(error) => self.public_form.error = Some(Arc::from(error.to_string())),
         }
@@ -1088,7 +1074,12 @@ impl WalletRoot {
                 self.public_form.selected_account_uuid =
                     Some(Arc::from(account.public_account_uuid.as_str()));
                 self.reload_public_accounts(window, cx);
-                self.schedule_public_balance_refresh(cx);
+                self.schedule_account_public_balance_refresh(
+                    self.selected_chain,
+                    [account.public_account_uuid],
+                    None,
+                    cx,
+                );
             }
             Err(error) => self.public_form.error = Some(Arc::from(error.to_string())),
         }
@@ -1178,8 +1169,14 @@ impl WalletRoot {
                         &account.public_account_uuid,
                     )
                 };
-                if participation_changed {
+                let exclusion_changed = self
+                    .ui_state
+                    .public_refresh_excluded
+                    .remove(&account.public_account_uuid);
+                if participation_changed || exclusion_changed {
                     self.save_ui_state();
+                }
+                if participation_changed {
                     self.invalidate_governance_context();
                 }
                 if self.public_form.selected_account_uuid.as_deref() == Some(public_account_uuid) {
@@ -1188,7 +1185,6 @@ impl WalletRoot {
                 self.reload_public_accounts(window, cx);
                 self.reset_public_asset_focus();
                 self.scroll_selected_public_row_into_view(window);
-                self.schedule_public_balance_refresh(cx);
             }
             Err(error) => self.public_form.error = Some(Arc::from(error.to_string())),
         }

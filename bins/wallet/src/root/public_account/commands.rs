@@ -18,6 +18,9 @@ pub(super) enum AccountCommand {
     Qr,
     Connect,
     Sessions(usize),
+    Refresh,
+    ExcludeFromRefresh,
+    IncludeInRefresh,
     Stealth,
     Rename,
     Activate,
@@ -32,6 +35,9 @@ impl AccountCommand {
             Self::Qr => "Show QR code".into(),
             Self::Connect => "Connect dapp".into(),
             Self::Sessions(count) => format!("WalletConnect sessions · {count}"),
+            Self::Refresh => "Refresh balances".into(),
+            Self::ExcludeFromRefresh => "Exclude from Refresh".into(),
+            Self::IncludeInRefresh => "Include in Refresh".into(),
             Self::Stealth => "View stealth account".into(),
             Self::Rename => "Rename".into(),
             Self::Activate => "Activate".into(),
@@ -45,6 +51,9 @@ impl AccountCommand {
             Self::Copy => "copy",
             Self::Qr => "qr",
             Self::Connect | Self::Sessions(_) => "walletconnect",
+            Self::Refresh => "refresh",
+            Self::ExcludeFromRefresh => "exclude-refresh",
+            Self::IncludeInRefresh => "include-refresh",
             Self::Stealth => "stealth",
             Self::Rename => "rename",
             Self::Activate => "activate",
@@ -71,6 +80,16 @@ impl WalletRoot {
                 AccountCommand::Connect
             } else {
                 AccountCommand::Sessions(sessions)
+            },
+            AccountCommand::Refresh,
+            if self
+                .ui_state
+                .public_refresh_excluded
+                .contains(&account.public_account_uuid)
+            {
+                AccountCommand::IncludeInRefresh
+            } else {
+                AccountCommand::ExcludeFromRefresh
             },
         ];
         if matches!(account.source, PublicAccountSource::ExecutorDerived(_)) {
@@ -123,6 +142,11 @@ impl WalletRoot {
             AccountCommand::Sessions(_) => {
                 self.open_walletconnect_account_sessions_dialog(Arc::from(uuid), window, cx);
             }
+            AccountCommand::Refresh => {
+                self.schedule_account_public_balance_refresh(self.selected_chain, [uuid], None, cx);
+            }
+            AccountCommand::ExcludeFromRefresh => self.set_public_refresh_excluded(uuid, true, cx),
+            AccountCommand::IncludeInRefresh => self.set_public_refresh_excluded(uuid, false, cx),
             AccountCommand::Rename => {
                 self.open_public_account_edit_dialog(Arc::from(uuid), window, cx);
             }
@@ -180,12 +204,15 @@ impl WalletRoot {
         menu
     }
 
-    /// Account-level commands for the selected row's action bar. Copy, QR and
-    /// stealth navigation stay in the address line and the row menu.
+    /// Account-level commands for the selected row's action bar. Copy, QR,
+    /// refresh and stealth navigation stay in the address line and the row menu.
     const fn action_bar_command(command: AccountCommand) -> bool {
         !matches!(
             command,
-            AccountCommand::Copy | AccountCommand::Qr | AccountCommand::Stealth
+            AccountCommand::Copy
+                | AccountCommand::Qr
+                | AccountCommand::Refresh
+                | AccountCommand::Stealth
         )
     }
 
@@ -219,6 +246,17 @@ impl WalletRoot {
                         matches!(command, AccountCommand::Sessions(_)),
                     )
                 }
+                AccountCommand::IncludeInRefresh => Icon::empty()
+                    .path(ui::icons::refresh_ccw_icon_path())
+                    .small()
+                    .text_color(icon_color)
+                    .into_any_element(),
+                AccountCommand::ExcludeFromRefresh => {
+                    Icon::new(crate::assets::RailgunActionIcon::RefreshCwOff)
+                        .small()
+                        .text_color(icon_color)
+                        .into_any_element()
+                }
                 AccountCommand::Rename => Icon::new(crate::assets::RailgunActionIcon::Pencil)
                     .small()
                     .text_color(icon_color)
@@ -237,9 +275,10 @@ impl WalletRoot {
                     .small()
                     .text_color(icon_color)
                     .into_any_element(),
-                AccountCommand::Copy | AccountCommand::Qr | AccountCommand::Stealth => {
-                    gpui::Empty.into_any_element()
-                }
+                AccountCommand::Copy
+                | AccountCommand::Qr
+                | AccountCommand::Refresh
+                | AccountCommand::Stealth => gpui::Empty.into_any_element(),
             };
             let mut button = app_button_base(id)
                 .accessibility_label(label.clone())

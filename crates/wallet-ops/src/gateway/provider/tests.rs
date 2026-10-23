@@ -1741,7 +1741,9 @@ fn seed_balance(
     );
     let cache = &provider.wallet.public_balance_cache;
     cache.set_scope(scope.clone());
-    let ticket = cache.begin_refresh(&scope, account.status).unwrap();
+    let ticket = cache
+        .begin_refresh(&scope, [account.public_account_uuid.as_str()])
+        .unwrap();
     assert!(
         cache
             .finish_refresh(

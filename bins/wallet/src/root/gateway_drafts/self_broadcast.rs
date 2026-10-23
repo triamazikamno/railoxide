@@ -811,14 +811,10 @@ impl WalletRoot {
                 choice.id.clone_from(&account.public_account_uuid);
                 choice.label = self_broadcast_gas_payer_label(account);
                 choice.address_label = railgun_ui::short_address(&account.address);
-                choice.balance_label = format!(
-                    "{} {}",
-                    self_broadcast_native_balance_label(
-                        self.public_balance_snapshot.as_deref(),
-                        input.chain_id,
-                        &account.public_account_uuid,
-                    ),
-                    crate::root::native_token_display_label(input.chain_id)
+                choice.balance_label = self_broadcast_native_balance_label(
+                    self.public_balance_snapshot.as_deref(),
+                    input.chain_id,
+                    &account.public_account_uuid,
                 );
                 choice.unavailable = signer_unavailable_reason(account).map(str::to_owned);
                 choice.random_candidate = choice.unavailable.is_none()

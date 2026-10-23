@@ -820,7 +820,8 @@ impl WalletRoot {
         form.delivery_mode = mode;
         form.custom_fee_amount = None;
         if mode == DeliveryMode::SelfBroadcast {
-            form.self_broadcast_gas_payer_uuid = self_broadcast_gas_payer_uuid;
+            form.self_broadcast_gas_payer_uuid
+                .clone_from(&self_broadcast_gas_payer_uuid);
         }
         form.self_broadcast_estimated_native_gas_cost = None;
         form.error = None;
@@ -839,7 +840,12 @@ impl WalletRoot {
         if mode == DeliveryMode::PublicBroadcaster {
             self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
         } else if mode == DeliveryMode::SelfBroadcast {
-            self.schedule_self_broadcast_public_balance_refresh(window, cx);
+            self.schedule_account_public_balance_refresh(
+                key.chain_id,
+                self_broadcast_gas_payer_uuid.as_deref(),
+                Some(window.window_handle()),
+                cx,
+            );
             self.refresh_self_broadcast_gas_fee_quote(DeliveryFormKind::Send, key, cx);
         }
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
@@ -1217,6 +1223,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let payer = public_account_uuid.clone();
         let changed = match kind {
             DeliveryFormKind::Send => self.send_forms.get_mut(&key).is_some_and(|form| {
                 if form.generating || form.self_broadcast_gas_payer_uuid == public_account_uuid {
@@ -1242,6 +1249,12 @@ impl WalletRoot {
         if changed {
             self.sync_self_broadcast_gas_payer_select(kind, key, window, cx);
             self.debounce_sponsored_funding_estimate(kind, key, cx);
+            self.schedule_account_public_balance_refresh(
+                key.chain_id,
+                payer.as_deref(),
+                Some(window.window_handle()),
+                cx,
+            );
         }
     }
 
@@ -1949,7 +1962,8 @@ impl WalletRoot {
         form.delivery_mode = mode;
         form.custom_fee_amount = None;
         if mode == DeliveryMode::SelfBroadcast {
-            form.self_broadcast_gas_payer_uuid = self_broadcast_gas_payer_uuid;
+            form.self_broadcast_gas_payer_uuid
+                .clone_from(&self_broadcast_gas_payer_uuid);
         }
         form.self_broadcast_estimated_native_gas_cost = None;
         form.error = None;
@@ -1972,7 +1986,12 @@ impl WalletRoot {
         if mode == DeliveryMode::PublicBroadcaster {
             self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
         } else if mode == DeliveryMode::SelfBroadcast {
-            self.schedule_self_broadcast_public_balance_refresh(window, cx);
+            self.schedule_account_public_balance_refresh(
+                key.chain_id,
+                self_broadcast_gas_payer_uuid.as_deref(),
+                Some(window.window_handle()),
+                cx,
+            );
             self.refresh_self_broadcast_gas_fee_quote(DeliveryFormKind::Unshield, key, cx);
         }
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);

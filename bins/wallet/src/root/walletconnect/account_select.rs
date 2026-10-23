@@ -229,6 +229,7 @@ mod layout_tests {
                 "walletconnect-balance-Longer account",
             ],
             "Longer account",
+            None,
         );
     }
 }

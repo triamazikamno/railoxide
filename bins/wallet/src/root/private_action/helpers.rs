@@ -607,15 +607,21 @@ impl WalletRoot {
         self.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
     }
 
-    pub(in crate::root) fn unshield_delivery_affects_visible_public_account(
+    /// The visible Public account an unshield to `recipient` pays out to, if any.
+    pub(in crate::root) fn unshield_delivery_visible_public_account(
         &self,
         chain_id: u64,
         recipient: Address,
-    ) -> bool {
-        self.selected_chain == chain_id
-            && self.public_accounts.iter().any(|account| {
+    ) -> Option<String> {
+        if self.selected_chain != chain_id {
+            return None;
+        }
+        self.public_accounts
+            .iter()
+            .find(|account| {
                 account.status == PublicAccountStatus::Active && account.address == recipient
             })
+            .map(|account| account.public_account_uuid.clone())
     }
 
     pub(in crate::root) fn private_action_asset_options(

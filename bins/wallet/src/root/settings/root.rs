@@ -308,10 +308,11 @@ impl WalletRoot {
             });
             if changed.contains(&previous_selection) || previous_selection != self.selected_chain {
                 self.clear_public_chain_balance_state();
+                self.restore_public_balance_snapshot();
                 self.invalidate_advanced_public_send_estimate();
                 self.invalidate_public_action_gas_fee_quote(PublicActionMode::Send);
                 self.invalidate_public_action_gas_fee_quote(PublicActionMode::Shield);
-                self.schedule_public_balance_refresh(cx);
+                self.schedule_automatic_public_balance_refresh(cx);
             }
             if !self.selected_chain_has_railgun() {
                 self.active_wallet_tab = crate::root::shell::WalletTab::Public;

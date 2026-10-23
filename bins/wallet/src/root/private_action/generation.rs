@@ -1927,9 +1927,9 @@ impl WalletRoot {
                 let mut sponsored_progress_outcome = None;
                 let mut progress_error = None;
                 let mut clear_spend_authorization = false;
-                let mut refresh_public_balances = false;
-                let affects_visible_public_account =
-                    root.unshield_delivery_affects_visible_public_account(chain_id, recipient);
+                let mut refresh_public_account = None;
+                let visible_public_account =
+                    root.unshield_delivery_visible_public_account(chain_id, recipient);
                 {
                     let Some(form) = root.unshield_forms.get_mut(&key) else {
                         return;
@@ -1943,14 +1943,14 @@ impl WalletRoot {
                     form.generating = false;
                     match result {
                         Ok(result) => {
-                            refresh_public_balances = match &result {
+                            refresh_public_account = match &result {
                                 UnshieldResult::PublicBroadcaster(result)
                                     if matches!(
                                         result.result,
                                         PublicBroadcasterResultKind::Submitted { .. }
                                     ) =>
                                 {
-                                    affects_visible_public_account
+                                    visible_public_account
                                 }
                                 UnshieldResult::SelfBroadcast(result)
                                     if result
@@ -1958,7 +1958,7 @@ impl WalletRoot {
                                         .receipt()
                                         .is_some_and(|receipt| receipt.status) =>
                                 {
-                                    affects_visible_public_account
+                                    visible_public_account
                                 }
                                 UnshieldResult::Sponsored(result)
                                     if matches!(
@@ -1968,9 +1968,9 @@ impl WalletRoot {
                                         ) if receipt.status
                                     ) =>
                                 {
-                                    affects_visible_public_account
+                                    visible_public_account
                                 }
-                                _ => false,
+                                _ => None,
                             };
                             if let UnshieldResult::PublicBroadcaster(result) = &result {
                                 progress_result = Some((**result).clone());
@@ -2014,9 +2014,9 @@ impl WalletRoot {
                 {
                     root.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
                 }
-                if refresh_public_balances {
+                if let Some(account) = refresh_public_account {
                     root.http.rpc_broker().invalidate_block(chain_id);
-                    root.schedule_public_balance_refresh(cx);
+                    root.schedule_account_public_balance_refresh(chain_id, [account], None, cx);
                 }
                 if let Some(result) = progress_result {
                     root.finish_private_broadcaster_progress(

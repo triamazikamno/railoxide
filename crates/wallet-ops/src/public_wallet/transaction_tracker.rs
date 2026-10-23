@@ -208,6 +208,9 @@ impl PublicTransactionTracker {
 
     /// Reapply outstanding work after scope changes, before refresh or local reuse.
     /// Only the current wallet owner may supply scopes here. No notification is emitted.
+    /// A changed cache namespace gets its pending state, inclusion minimum and observation
+    /// fence restored without queuing a refresh. Account metadata changes alone, such as a
+    /// label or status, only update the family; `retain_accounts` fences those.
     ///
     /// # Panics
     /// Panics if a registry or balance-cache mutex is poisoned.
@@ -230,32 +233,33 @@ impl PublicTransactionTracker {
                 if !family.matches_account(scope, account) {
                     continue;
                 }
+                family.account = account.clone();
                 if family
                     .cache_scope_identity
                     .as_ref()
                     .is_none_or(|previous| !Arc::ptr_eq(previous, &identity))
-                    || family.account != *account
                 {
                     family.scope = scope.clone();
-                    family.account = account.clone();
                     family.cache = cache.clone();
                     family.cache_scope_identity = Some(identity.clone());
                     changed = true;
                 }
             }
             if changed {
-                registry.invalidate(scope, account, cache);
+                registry.invalidate(scope, account, cache, false);
             }
         }
     }
 }
 
 impl Registry {
+    /// Transaction events `queue` the account's refresh; scope reconciliation only fences.
     fn invalidate(
         &self,
         scope: &PublicBalanceScope,
         account: &PublicAccountMetadata,
         cache: &PublicBalanceCache,
+        queue: bool,
     ) {
         let mut found = false;
         let mut pending = false;
@@ -272,8 +276,10 @@ impl Registry {
                 minimum = Some(block);
             }
         }
-        if found {
+        if found && queue {
             cache.invalidate_account(scope, account, pending, minimum);
+        } else if found {
+            cache.fence_account(scope, account, pending, minimum);
         }
     }
 }
@@ -526,7 +532,7 @@ impl PublicTransactionFamily {
 
     fn notify(&self, registry: &Registry) {
         let family = &registry.families[self.id];
-        registry.invalidate(&family.scope, &family.account, &family.cache);
+        registry.invalidate(&family.scope, &family.account, &family.cache, true);
         self.tracker.changes.send_replace(());
     }
 }
@@ -633,10 +639,16 @@ mod tests {
             std::slice::from_ref(&context.account),
             &context.cache,
         );
-        let mut queued = context.cache.take_queued_refreshes();
-        assert_eq!(queued.len(), 1);
-        let old = queued.pop().unwrap();
+        // Reconciliation fences without queuing work, so the refresh starts explicitly.
         assert!(context.cache.take_queued_refreshes().is_empty());
+        assert!(context.cache.refreshing_accounts(&context.scope).is_empty());
+        let old = context
+            .cache
+            .begin_refresh(
+                &context.scope,
+                [context.account.public_account_uuid.as_str()],
+            )
+            .unwrap();
         first.included(first_hash, block, 0);
         assert!(context.cache.take_queued_refreshes().is_empty());
         let completion = context
@@ -676,9 +688,33 @@ mod tests {
             std::slice::from_ref(&context.account),
             &context.cache,
         );
+        // The new namespace regains the inclusion minimum and pending restriction unqueued.
+        assert!(context.cache.take_queued_refreshes().is_empty());
+        let probe = context
+            .cache
+            .begin_refresh(&new_scope, [context.account.public_account_uuid.as_str()])
+            .unwrap();
+        assert_eq!(probe.minimum_block(), Some(block));
+        assert!(
+            context
+                .cache
+                .finish_refresh(probe, Some(observation(&context, block)))
+                .accepted
+        );
+        assert!(
+            context
+                .cache
+                .eligible_balance(
+                    &new_scope,
+                    &context.account,
+                    PublicAssetId::Native,
+                    Instant::now()
+                )
+                .is_none()
+        );
         let old = context
             .cache
-            .begin_refresh(&new_scope, context.account.status)
+            .begin_refresh(&new_scope, [context.account.public_account_uuid.as_str()])
             .unwrap();
         second.included(second_hash, block, 1);
         let completion = context
@@ -698,6 +734,22 @@ mod tests {
                 .finish_refresh(current, Some(observation(&context, block)))
                 .accepted
         );
+        assert_eq!(
+            context.cache.eligible_balance(
+                &new_scope,
+                &context.account,
+                PublicAssetId::Native,
+                Instant::now()
+            ),
+            Some(U256::from(5))
+        );
+        // An idle relabel or deactivation keeps the row's observation and queues nothing.
+        let mut relabeled = context.account.clone();
+        relabeled.label = Some("renamed".into());
+        relabeled.status = crate::vault::PublicAccountStatus::Inactive;
+        tracker.reconcile_scope(&new_scope, std::slice::from_ref(&relabeled), &context.cache);
+        assert!(context.cache.take_queued_refreshes().is_empty());
+        assert!(context.cache.refreshing_accounts(&new_scope).is_empty());
         assert_eq!(
             context.cache.eligible_balance(
                 &new_scope,
@@ -737,7 +789,7 @@ mod tests {
         assert!(other.cache.take_queued_refreshes().is_empty());
         let current = other
             .cache
-            .begin_refresh(&other.scope, other.account.status)
+            .begin_refresh(&other.scope, [other.account.public_account_uuid.as_str()])
             .unwrap();
         assert!(
             other
@@ -767,7 +819,11 @@ mod tests {
             std::slice::from_ref(&global.account),
             &global.cache,
         );
-        let current = global.cache.take_queued_refreshes().pop().unwrap();
+        assert!(global.cache.take_queued_refreshes().is_empty());
+        let current = global
+            .cache
+            .begin_refresh(&global.scope, [global.account.public_account_uuid.as_str()])
+            .unwrap();
         assert!(
             global
                 .cache
@@ -787,7 +843,7 @@ mod tests {
         );
         let old = global
             .cache
-            .begin_refresh(&global.scope, global.account.status)
+            .begin_refresh(&global.scope, [global.account.public_account_uuid.as_str()])
             .unwrap();
         global_pending.included(global_hash, block, 2);
         let done = global

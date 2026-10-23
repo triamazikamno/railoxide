@@ -598,7 +598,7 @@ impl WalletRoot {
                 .await
                 .map_err(WalletDeletionTaskError::SyncShutdown)?;
             tokio::task::spawn_blocking(move || {
-                if whole_profile {
+                let deleted = if whole_profile {
                     store
                         .delete_software_profile_with_view_unlock(view.as_ref(), &wallet_id_string)
                         .map(|wallets| {
@@ -617,7 +617,15 @@ impl WalletRoot {
                         }
                     }
                     .map(|wallet| vec![wallet.wallet_uuid])
-                }
+                };
+                // The remaining accounts bound the refresh exclusions; a listing failure
+                // only skips pruning them.
+                deleted.map(|deleted| {
+                    let remaining = store
+                        .list_public_account_ids_with_view_unlock(view.as_ref())
+                        .ok();
+                    (deleted, remaining)
+                })
             })
             .await
             .map_err(|error| WalletDeletionTaskError::Join(error.to_string()))?
@@ -629,7 +637,7 @@ impl WalletRoot {
                 root.manage_wallets.deleting_wallet_id = None;
                 root.resume_public_transactions();
                 let deletion_succeeded =
-                    matches!(&result, Ok(Ok(wallet_ids)) if !wallet_ids.is_empty());
+                    matches!(&result, Ok(Ok((wallet_ids, _))) if !wallet_ids.is_empty());
                 if restart_selected_wallet_sync_after_deletion(
                     deleting_selected_wallet,
                     deletion_succeeded,
@@ -637,9 +645,15 @@ impl WalletRoot {
                     root.restart_selected_wallet_sync_after_failed_deletion(window, cx);
                 }
                 match result {
-                    Ok(Ok(deleted_wallet_ids)) => {
+                    Ok(Ok((deleted_wallet_ids, remaining_public_accounts))) => {
                         let mut participation_changed = false;
                         let mut selection_changed = false;
+                        let exclusions = &mut root.ui_state.public_refresh_excluded;
+                        let excluded = exclusions.len();
+                        if let Some(remaining) = remaining_public_accounts {
+                            exclusions.retain(|id| remaining.contains(id));
+                        }
+                        let exclusions_changed = exclusions.len() != excluded;
                         for wallet_id in &deleted_wallet_ids {
                             selection_changed |= root
                                 .ui_state
@@ -651,7 +665,7 @@ impl WalletRoot {
                                 wallet_id,
                             );
                         }
-                        if participation_changed || selection_changed {
+                        if participation_changed || selection_changed || exclusions_changed {
                             root.save_ui_state();
                         }
                         if participation_changed {
@@ -797,8 +811,7 @@ impl WalletRoot {
         self.sync_wallet_select(window, cx);
         self.reload_broadcaster_preferences(cx);
         self.reload_public_accounts(window, cx);
-        self.schedule_public_balance_refresh(cx);
-        self.schedule_inactive_public_balance_refresh(cx);
+        self.schedule_automatic_public_balance_refresh(cx);
         self.ensure_chain_load(self.selected_chain, cx);
     }
 

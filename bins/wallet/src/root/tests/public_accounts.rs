@@ -540,11 +540,17 @@ fn public_account_removal_selects_next_then_previous_visible_neighbour(cx: &mut 
         );
         root.public_form.selected_account_uuid =
             Some(Arc::from(middle.public_account_uuid.as_str()));
+        root.set_public_refresh_excluded(&middle.public_account_uuid, true, cx);
         root.delete_public_account(&middle.public_account_uuid, window, cx);
         assert_eq!(
             root.public_form.selected_account_uuid.as_deref(),
             Some(last.public_account_uuid.as_str())
         );
+        let saved = wallet_ops::settings::load_wallet_ui_state(
+            root.vault_store.as_ref().unwrap().db().as_ref(),
+        )
+        .unwrap();
+        assert!(saved.public_refresh_excluded.is_empty());
         root.deactivate_public_account(&last.public_account_uuid, window, cx);
         assert_eq!(
             root.public_form.selected_account_uuid.as_deref(),
@@ -558,6 +564,267 @@ fn public_account_removal_selects_next_then_previous_visible_neighbour(cx: &mut 
                 .status,
             PublicAccountStatus::Inactive
         );
+    });
+    cx.update(|window, _| window.remove_window());
+    drop(host);
+    drop(root);
+    cx.run_until_parked();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+/// Chains 10 and 20 without Railgun, each with an unreachable RPC so a balance scope exists.
+/// Started reads never complete: the fixture's runtime is not driven.
+fn use_public_only_test_chains(root: &mut WalletRoot) {
+    let template = root.effective_chain_configs.get(1).unwrap().clone();
+    root.effective_chain_configs = [10, 20]
+        .into_iter()
+        .map(|chain_id| {
+            let mut chain = template.clone();
+            chain.chain_id = chain_id;
+            chain.railgun = None;
+            chain.rpc_route = wallet_ops::RpcChainRoute::new(
+                chain_id,
+                vec![reqwest::Url::parse("http://127.0.0.1:1").unwrap()],
+            );
+            chain
+        })
+        .collect();
+    root.selected_chain = 10;
+    root.public_balance_snapshot = None;
+    root.publish_gateway_desktop_state();
+}
+
+fn observed_native_balance(account: &PublicAccountMetadata) -> PublicAccountBalance {
+    PublicAccountBalance {
+        account: account.clone(),
+        observed_at: Some(std::time::Instant::now()),
+        observed_block: Some(alloy::eips::BlockNumHash::new(
+            10,
+            alloy::primitives::B256::ZERO,
+        )),
+        balances: vec![PublicBalanceEntry {
+            asset: PublicBalanceAsset {
+                id: PublicAssetId::Native,
+                symbol: "ETH".into(),
+                decimals: 18,
+            },
+            amount: PublicBalanceAmount::Available(uint!(1_000_000_000_000_000_000_U256)),
+        }],
+    }
+}
+
+#[gpui::test]
+fn public_balance_triggers_follow_autorefresh_and_read_only_their_accounts(
+    cx: &mut TestAppContext,
+) {
+    let path = temp_wallet_db_root("public-refresh-triggers");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    cx.update(gpui_component::init);
+    let mut root = None;
+    let (host, cx) = cx.add_window_view(|window, cx| {
+        let wallet = fixture_root(&path, &runtime, window, cx);
+        root = Some(wallet.clone());
+        Root::new(wallet, window, cx)
+    });
+    let root = root.unwrap();
+    let ids = |ids: &[u8]| {
+        ids.iter()
+            .map(|index| format!("account-{index}"))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    root.update_in(cx, |root, window, cx| {
+        use_public_only_test_chains(root);
+        root.ui_state
+            .public_refresh_excluded
+            .insert("account-2".into());
+        // Chain 10 holds a balance read earlier in the session.
+        let scope = root.current_public_balance_scope(10).unwrap();
+        let ticket = root
+            .public_balance_cache
+            .begin_refresh(&scope, ["account-0"])
+            .unwrap();
+        let read = PublicBalanceSnapshot {
+            chain_id: 10,
+            refreshed_at: SystemTime::now(),
+            accounts: vec![observed_native_balance(&root.public_accounts[0])],
+        };
+        assert!(
+            root.public_balance_cache
+                .finish_refresh(ticket, Some(read))
+                .accepted
+        );
+
+        // Automatic refresh off: showing the tab and a chain round trip read nothing,
+        // and returning shows the earlier read.
+        root.active_wallet_tab = WalletTab::Private;
+        root.select_wallet_tab(WalletTab::Public, cx);
+        assert!(root.public_refreshing_accounts().is_empty());
+        root.select_chain(20, window, cx);
+        assert!(root.public_refreshing_accounts().is_empty());
+        assert!(root.public_balance_snapshot.is_none());
+        root.select_chain(10, window, cx);
+        assert!(root.public_refreshing_accounts().is_empty());
+        assert!(
+            crate::root::public_balances::public_account_balances_for_chain(
+                root.public_balance_snapshot.as_deref(),
+                10,
+                "account-0",
+                PublicAccountStatus::Active,
+            )
+            .is_some()
+        );
+        // Hide empty keeps the accounts not yet read on this chain.
+        root.ui_state.public_hide_empty_accounts = true;
+        assert_eq!(root.public_list_accounts().0.len(), 14);
+        root.ui_state.public_hide_empty_accounts = false;
+
+        // Automatic refresh on: the same trigger reads only included active accounts.
+        root.ui_state.public_auto_refresh = true;
+        root.select_chain(20, window, cx);
+        assert_eq!(
+            root.public_refreshing_accounts(),
+            ids(&[0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+        );
+
+        // Account events read only their account, whatever the toggle says.
+        root.ui_state.public_auto_refresh = false;
+        root.select_chain(10, window, cx);
+        assert!(root.public_refreshing_accounts().is_empty());
+        root.refresh_public_action_submitter(10, "account-1", cx);
+        assert_eq!(root.public_refreshing_accounts(), ids(&[1]));
+        root.public_form.selected_account_uuid = Some(Arc::from("account-3"));
+        // The extension shows only its selected account as refreshing.
+        let gateway = root.gateway_public_view();
+        assert_eq!(gateway.selected_account.as_deref(), Some("account-3"));
+        assert!(!gateway.refreshing);
+        root.apply_gateway_public_command(
+            "peer",
+            wallet_ops::gateway::GatewayPublicCommand::RefreshBalances,
+            window,
+            cx,
+        );
+        assert_eq!(root.public_refreshing_accounts(), ids(&[1, 3]));
+        assert!(root.gateway_public_view().refreshing);
+    });
+    cx.update(|window, _| window.remove_window());
+    drop(host);
+    drop(root);
+    cx.run_until_parked();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[gpui::test]
+fn failed_account_refresh_stays_stale_after_another_account_succeeds(cx: &mut TestAppContext) {
+    use crate::root::public_balances::{public_account_stale_for_chain, public_section_freshness};
+    let path = temp_wallet_db_root("public-refresh-stale");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    cx.update(gpui_component::init);
+    let mut root = None;
+    let (host, cx) = cx.add_window_view(|window, cx| {
+        let wallet = fixture_root(&path, &runtime, window, cx);
+        root = Some(wallet.clone());
+        Root::new(wallet, window, cx)
+    });
+    let root = root.unwrap();
+    root.update(cx, |root, cx| {
+        use_public_only_test_chains(root);
+        let scope = root.current_public_balance_scope(10).unwrap();
+        let read = |root: &WalletRoot, indices: &[usize]| PublicBalanceSnapshot {
+            chain_id: 10,
+            refreshed_at: SystemTime::now(),
+            accounts: indices
+                .iter()
+                .map(|&index| observed_native_balance(&root.public_accounts[index]))
+                .collect(),
+        };
+        let mut refresh =
+            |root: &mut WalletRoot,
+             id: &str,
+             result: Result<PublicBalanceSnapshot, eyre::Report>| {
+                let ticket = root
+                    .public_balance_cache
+                    .begin_refresh(&scope, [id])
+                    .unwrap();
+                root.apply_public_balance_refresh_result(ticket, Ok(result), None, cx);
+            };
+        // An Inactive-only read leaves every Active account unread.
+        let inactive = read(root, &[14]);
+        refresh(root, "account-14", Ok(inactive));
+        assert_eq!(
+            root.public_summary_status(),
+            ("Not fetched".to_owned(), false)
+        );
+        // A never-read account's failed first refresh is the only warning, and it holds
+        // until that account itself is read.
+        refresh(root, "account-0", Err(eyre::eyre!("rpc down")));
+        let (status, marked) = root.public_summary_status();
+        assert!(marked && status.contains("rpc down"), "{status}");
+        let first = read(root, &[1]);
+        refresh(root, "account-1", Ok(first));
+        assert!(root.public_summary_status().1);
+        let recovered = read(root, &[0]);
+        refresh(root, "account-0", Ok(recovered));
+        assert!(!root.public_summary_status().1);
+
+        let both = read(root, &[0, 1]);
+        let ticket = root
+            .public_balance_cache
+            .begin_refresh(&scope, ["account-0", "account-1"])
+            .unwrap();
+        root.apply_public_balance_refresh_result(ticket, Ok(Ok(both)), None, cx);
+        let ticket = root
+            .public_balance_cache
+            .begin_refresh(&scope, ["account-0"])
+            .unwrap();
+        root.apply_public_balance_refresh_result(
+            ticket,
+            Ok(Err(eyre::eyre!("rpc down"))),
+            None,
+            cx,
+        );
+        let second = read(root, &[1]);
+        let ticket = root
+            .public_balance_cache
+            .begin_refresh(&scope, ["account-1"])
+            .unwrap();
+        root.apply_public_balance_refresh_result(ticket, Ok(Ok(second)), None, cx);
+
+        let snapshot = root.public_balance_snapshot.as_deref();
+        let stale =
+            |id| public_account_stale_for_chain(snapshot, 10, id, PublicAccountStatus::Active);
+        assert!(stale("account-0"));
+        assert!(!stale("account-1"));
+        let (status, marked) = root.public_summary_status();
+        assert!(marked);
+        assert!(status.contains("rpc down"), "{status}");
+        // The total counts both read accounts and says it leaves out the other twelve.
+        let freshness = public_section_freshness(
+            snapshot,
+            &root.public_accounts,
+            10,
+            PublicAccountStatus::Active,
+            &root.public_failed_accounts(),
+        );
+        assert_eq!((freshness.counted, freshness.not_refreshed), (2, 12));
+        // The extension reports only its selected account's failure, while the desktop
+        // strip keeps the aggregate warning.
+        root.public_form.selected_account_uuid = Some(Arc::from("account-1"));
+        let gateway = root.gateway_public_view();
+        assert_eq!(gateway.selected_account.as_deref(), Some("account-1"));
+        assert!(!gateway.balance_error);
+        assert!(root.public_summary_status().1);
+        root.public_form.selected_account_uuid = Some(Arc::from("account-0"));
+        let gateway = root.gateway_public_view();
+        assert_eq!(gateway.selected_account.as_deref(), Some("account-0"));
+        assert!(gateway.balance_error);
     });
     cx.update(|window, _| window.remove_window());
     drop(host);

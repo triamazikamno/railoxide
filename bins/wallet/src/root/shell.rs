@@ -279,7 +279,7 @@ impl WalletRoot {
         );
         if tab == WalletTab::Public {
             self.focus_public_account_search_on_render = true;
-            self.schedule_public_balance_refresh(cx);
+            self.schedule_automatic_public_balance_refresh(cx);
         }
         cx.notify();
     }

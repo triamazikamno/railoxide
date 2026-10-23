@@ -60,6 +60,7 @@ const WRENCH_ICON_PATH: &str = "railgun/icons/wrench.svg";
 const FILE_PEN_LINE_ICON_PATH: &str = "railgun/icons/file-pen-line.svg";
 const FOLDER_COG_ICON_PATH: &str = "railgun/icons/folder-cog.svg";
 const SPARKLES_ICON_PATH: &str = "railgun/icons/sparkles.svg";
+const REFRESH_CW_OFF_ICON_PATH: &str = "railgun/icons/refresh-cw-off.svg";
 const NETWORK_ICON_PATH: &str = "railgun/icons/network.svg";
 const PIN_ICON_PATH: &str = "railgun/icons/pin.svg";
 const UI_ASSET_PREFIX: &str = "ui/";
@@ -111,6 +112,7 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     FILE_PEN_LINE_ICON_PATH,
     FOLDER_COG_ICON_PATH,
     SPARKLES_ICON_PATH,
+    REFRESH_CW_OFF_ICON_PATH,
     NETWORK_ICON_PATH,
     PIN_ICON_PATH,
 ];
@@ -168,6 +170,7 @@ const WRENCH_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/wrench.svg");
 const FILE_PEN_LINE_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/file-pen-line.svg");
 const FOLDER_COG_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/folder-cog.svg");
 const SPARKLES_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/sparkles.svg");
+const REFRESH_CW_OFF_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/refresh-cw-off.svg");
 const NETWORK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/network.svg");
 const PIN_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/pin.svg");
 
@@ -356,6 +359,7 @@ pub(crate) enum RailgunActionIcon {
     FilePenLine,
     FolderCog,
     Sparkles,
+    RefreshCwOff,
 }
 
 impl IconNamed for RailgunActionIcon {
@@ -380,6 +384,7 @@ impl IconNamed for RailgunActionIcon {
             Self::FilePenLine => FILE_PEN_LINE_ICON_PATH,
             Self::FolderCog => FOLDER_COG_ICON_PATH,
             Self::Sparkles => SPARKLES_ICON_PATH,
+            Self::RefreshCwOff => REFRESH_CW_OFF_ICON_PATH,
         }
         .into()
     }
@@ -470,6 +475,7 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         FILE_PEN_LINE_ICON_PATH => Some(FILE_PEN_LINE_ICON_BYTES),
         FOLDER_COG_ICON_PATH => Some(FOLDER_COG_ICON_BYTES),
         SPARKLES_ICON_PATH => Some(SPARKLES_ICON_BYTES),
+        REFRESH_CW_OFF_ICON_PATH => Some(REFRESH_CW_OFF_ICON_BYTES),
         NETWORK_ICON_PATH => Some(NETWORK_ICON_BYTES),
         PIN_ICON_PATH => Some(PIN_ICON_BYTES),
         _ => None,

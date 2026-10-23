@@ -484,6 +484,17 @@ pub fn signer_trigger_row(label: String, address_label: String) -> Div {
 
 #[must_use]
 pub fn signer_menu_row(label: String, address_label: String, balance_label: String) -> Div {
+    signer_menu_row_with_action(label, address_label, balance_label, None)
+}
+
+/// A signer row whose `action` follows its balance at the trailing edge.
+#[must_use]
+pub fn signer_menu_row_with_action(
+    label: String,
+    address_label: String,
+    balance_label: String,
+    action: Option<gpui::AnyElement>,
+) -> Div {
     div()
         .w_full()
         .py_1()
@@ -503,9 +514,17 @@ pub fn signer_menu_row(label: String, address_label: String, balance_label: Stri
                 .child(app_muted_text(address_label)),
         )
         .child(
-            app_muted_text(balance_label)
-                .debug_selector(move || format!("gas-payer-balance-{label}"))
+            div()
                 .flex_none()
-                .text_right(),
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    app_muted_text(balance_label)
+                        .debug_selector(move || format!("gas-payer-balance-{label}"))
+                        .flex_none()
+                        .text_right(),
+                )
+                .children(action),
         )
 }

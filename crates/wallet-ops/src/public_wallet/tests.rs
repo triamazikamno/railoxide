@@ -466,13 +466,36 @@ fn balance_plan_batches_native_and_known_tokens_per_account() {
         status: PublicAccountStatus::Active,
         display_order: 0,
     };
+    let accounts = [
+        account.clone(),
+        PublicAccountMetadata {
+            public_account_uuid: "public-2".to_string(),
+            address: address!("0x2222222222222222222222222222222222222222"),
+            ..account.clone()
+        },
+        PublicAccountMetadata {
+            public_account_uuid: "public-3".to_string(),
+            address: address!("0x3333333333333333333333333333333333333333"),
+            ..account.clone()
+        },
+    ];
+    let requested = [accounts[0].clone(), accounts[2].clone()];
     let calls = plan_public_balance_calls(
         &effective_chain_for_rpc("http://127.0.0.1:1", 0),
-        std::slice::from_ref(&account),
+        &requested,
         None,
         BlockId::latest(),
     )
     .unwrap();
+    // Only the two requested accounts of the three are read.
+    let read_accounts: std::collections::BTreeSet<_> = calls
+        .iter()
+        .map(|call| call.public_account_uuid.as_str())
+        .collect();
+    assert_eq!(
+        read_accounts,
+        std::collections::BTreeSet::from(["public-1", "public-3"])
+    );
 
     let native = calls.first().expect("native call");
     assert_eq!(native.asset.id, PublicAssetId::Native);

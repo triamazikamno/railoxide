@@ -2970,9 +2970,10 @@ impl WalletRoot {
         self.broadcaster_picker = None;
         self.local_pending_spent_clear_confirming = false;
         self.clear_public_chain_balance_state();
+        self.restore_public_balance_snapshot();
         self.sync_utxo_table(cx);
         if self.active_wallet_tab == WalletTab::Public || self.gateway_has_connected_browser() {
-            self.schedule_public_balance_refresh(cx);
+            self.schedule_automatic_public_balance_refresh(cx);
         }
         self.publish_gateway_desktop_state();
         if should_focus_utxo_table(

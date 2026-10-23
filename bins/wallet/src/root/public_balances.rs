@@ -1,15 +1,16 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use alloy::primitives::U256;
-use gpui::{Context, Window};
+use gpui::Context;
 use railgun_ui::{
     format_scaled_amount, format_token_amount, format_usd_micro_value,
     native_currency_icon_asset_path, short_address,
 };
 use wallet_ops::{
-    PublicAssetId, PublicBalanceAmount, PublicBalanceEntry, PublicBalanceRefreshTicket,
-    PublicBalanceSnapshot, TokenAnchorRateCache, refresh_public_balances_at_least,
-    settings::EffectiveTokenRegistry, vault::PublicAccountStatus,
+    PublicAccountBalance, PublicAssetId, PublicBalanceAmount, PublicBalanceEntry,
+    PublicBalanceRefreshTicket, PublicBalanceSnapshot, TokenAnchorRateCache,
+    refresh_public_balances_at_least, settings::EffectiveTokenRegistry, vault::PublicAccountStatus,
 };
 
 use super::{WalletRoot, format_report_chain, token_display_metadata};
@@ -250,6 +251,16 @@ pub(super) fn public_account_balances_for_chain<'a>(
     public_account_uuid: &str,
     status: PublicAccountStatus,
 ) -> Option<&'a [PublicBalanceEntry]> {
+    public_account_row_for_chain(snapshot, chain_id, public_account_uuid, status)
+        .map(|account| account.balances.as_slice())
+}
+
+fn public_account_row_for_chain<'a>(
+    snapshot: Option<&'a PublicBalanceSnapshot>,
+    chain_id: u64,
+    public_account_uuid: &str,
+    status: PublicAccountStatus,
+) -> Option<&'a PublicAccountBalance> {
     snapshot
         .filter(|snapshot| snapshot.chain_id == chain_id)?
         .accounts
@@ -258,7 +269,59 @@ pub(super) fn public_account_balances_for_chain<'a>(
             account.account.public_account_uuid.as_str() == public_account_uuid
                 && account.account.status == status
         })
-        .map(|account| account.balances.as_slice())
+}
+
+/// The account's row keeps balances from an earlier read, but its latest refresh failed or
+/// was partial, which clears the observation.
+pub(super) fn public_account_stale_for_chain(
+    snapshot: Option<&PublicBalanceSnapshot>,
+    chain_id: u64,
+    public_account_uuid: &str,
+    status: PublicAccountStatus,
+) -> bool {
+    public_account_row_for_chain(snapshot, chain_id, public_account_uuid, status)
+        .is_some_and(public_row_stale)
+}
+
+const fn public_row_stale(row: &PublicAccountBalance) -> bool {
+    !row.balances.is_empty() && row.observed_at.is_none()
+}
+
+#[derive(Default)]
+pub(super) struct PublicSectionFreshness {
+    /// Accounts with a selected-chain row, so counted in the section's total.
+    pub(super) counted: usize,
+    /// Accounts with no selected-chain row.
+    pub(super) not_refreshed: usize,
+    /// Some counted row is stale.
+    pub(super) stale: bool,
+    /// Some account with no selected-chain row failed its latest refresh.
+    pub(super) failed: bool,
+}
+
+pub(super) fn public_section_freshness(
+    snapshot: Option<&PublicBalanceSnapshot>,
+    accounts: &[wallet_ops::vault::PublicAccountMetadata],
+    chain_id: u64,
+    status: PublicAccountStatus,
+    failed: &BTreeSet<String>,
+) -> PublicSectionFreshness {
+    let mut freshness = PublicSectionFreshness::default();
+    for account in accounts
+        .iter()
+        .filter(|account| account.status == status && account.is_available_on_chain(chain_id))
+    {
+        if let Some(row) =
+            public_account_row_for_chain(snapshot, chain_id, &account.public_account_uuid, status)
+        {
+            freshness.counted += 1;
+            freshness.stale |= public_row_stale(row);
+        } else {
+            freshness.not_refreshed += 1;
+            freshness.failed |= failed.contains(&account.public_account_uuid);
+        }
+    }
+    freshness
 }
 
 pub(super) fn public_account_visible_balances_for_chain(
@@ -320,9 +383,7 @@ impl WalletRoot {
     pub(super) fn clear_public_chain_balance_state(&mut self) {
         self.public_balance_snapshot = None;
         self.public_balance_error = None;
-        self.public_balance_refreshing = false;
         self.public_inactive_balance_error = None;
-        self.public_inactive_balance_refreshing = false;
         self.public_form.selected_asset = None;
         self.reset_public_asset_focus();
         self.clear_public_action_progress_state();
@@ -330,69 +391,109 @@ impl WalletRoot {
         self.public_form.shield_error = None;
     }
 
-    pub(super) fn schedule_public_balance_refresh(&mut self, cx: &mut Context<'_, Self>) {
-        self.schedule_public_balance_refresh_for_chain(
-            self.selected_chain,
-            PublicAccountStatus::Active,
-            None,
-            cx,
-        );
+    /// Shows the balances already read this session for the selected chain, without RPC.
+    pub(super) fn restore_public_balance_snapshot(&mut self) {
+        self.public_balance_snapshot = self
+            .current_public_balance_scope(self.selected_chain)
+            .and_then(|scope| self.public_balance_cache.snapshot(&scope))
+            .map(Arc::new);
     }
 
-    pub(super) fn schedule_self_broadcast_public_balance_refresh(
+    /// Selected-chain accounts of `status` that a global refresh reads.
+    pub(super) fn public_global_refresh_ids(&self, status: PublicAccountStatus) -> Vec<String> {
+        self.public_accounts
+            .iter()
+            .filter(|account| {
+                account.status == status
+                    && account.is_available_on_chain(self.selected_chain)
+                    && !self
+                        .ui_state
+                        .public_refresh_excluded
+                        .contains(&account.public_account_uuid)
+            })
+            .map(|account| account.public_account_uuid.clone())
+            .collect()
+    }
+
+    /// Selected-chain account ids in the in-flight refresh or queued behind it.
+    pub(super) fn public_refreshing_accounts(&self) -> BTreeSet<String> {
+        self.current_public_balance_scope(self.selected_chain)
+            .map(|scope| self.public_balance_cache.refreshing_accounts(&scope))
+            .unwrap_or_default()
+    }
+
+    /// Selected-chain account ids whose latest refresh failed without returning their row.
+    pub(super) fn public_failed_accounts(&self) -> BTreeSet<String> {
+        self.current_public_balance_scope(self.selected_chain)
+            .map(|scope| self.public_balance_cache.failed_accounts(&scope))
+            .unwrap_or_default()
+    }
+
+    pub(super) fn public_section_refreshing(&self, status: PublicAccountStatus) -> bool {
+        let pending = self.public_refreshing_accounts();
+        self.public_accounts.iter().any(|account| {
+            account.status == status && pending.contains(&account.public_account_uuid)
+        })
+    }
+
+    pub(super) fn set_public_refresh_excluded(
         &mut self,
-        window: &Window,
+        public_account_uuid: &str,
+        excluded: bool,
         cx: &mut Context<'_, Self>,
     ) {
-        self.schedule_public_balance_refresh_for_chain(
-            self.selected_chain,
-            PublicAccountStatus::Active,
-            Some(window.window_handle()),
-            cx,
-        );
+        let exclusions = &mut self.ui_state.public_refresh_excluded;
+        let changed = if excluded {
+            exclusions.insert(public_account_uuid.to_owned())
+        } else {
+            exclusions.remove(public_account_uuid)
+        };
+        if changed {
+            self.save_ui_state();
+            cx.notify();
+        }
     }
 
-    pub(super) fn schedule_inactive_public_balance_refresh(&mut self, cx: &mut Context<'_, Self>) {
-        self.schedule_public_balance_refresh_for_chain(
-            self.selected_chain,
-            PublicAccountStatus::Inactive,
-            None,
-            cx,
-        );
+    /// Timer, view, chain, settings and reload triggers: only with automatic refresh on.
+    pub(super) fn schedule_automatic_public_balance_refresh(&mut self, cx: &mut Context<'_, Self>) {
+        if self.ui_state.public_auto_refresh {
+            self.schedule_global_public_balance_refresh(PublicAccountStatus::Active, cx);
+        }
     }
 
-    pub(super) fn schedule_public_balance_refresh_for_chain(
+    /// The section's included accounts on the selected chain, whatever the toggle says.
+    pub(super) fn schedule_global_public_balance_refresh(
+        &mut self,
+        status: PublicAccountStatus,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let accounts = self.public_global_refresh_ids(status);
+        self.schedule_account_public_balance_refresh(self.selected_chain, accounts, None, cx);
+    }
+
+    /// Exactly the named accounts, ignoring the toggle and exclusions.
+    pub(super) fn schedule_account_public_balance_refresh<I, S>(
         &mut self,
         chain_id: u64,
-        status: PublicAccountStatus,
+        accounts: I,
         window: Option<gpui::AnyWindowHandle>,
         cx: &mut Context<'_, Self>,
-    ) {
+    ) where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let accounts = accounts
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<String>>();
+        if accounts.is_empty() {
+            return;
+        }
         self.publish_gateway_desktop_state();
         let Some(scope) = self.current_public_balance_scope(chain_id) else {
             return;
         };
-        if !self
-            .public_accounts
-            .iter()
-            .any(|account| account.status == status)
-        {
-            return;
-        }
-        if chain_id == self.selected_chain {
-            self.public_balance_snapshot = self.public_balance_cache.snapshot(&scope).map(Arc::new);
-            match status {
-                PublicAccountStatus::Active => {
-                    self.public_balance_refreshing = true;
-                    self.public_balance_error = None;
-                }
-                PublicAccountStatus::Inactive => {
-                    self.public_inactive_balance_refreshing = true;
-                    self.public_inactive_balance_error = None;
-                }
-            }
-        }
-        if let Some(ticket) = self.public_balance_cache.begin_refresh(&scope, status) {
+        if let Some(ticket) = self.public_balance_cache.begin_refresh(&scope, accounts) {
             self.run_public_balance_refresh(ticket, window, cx);
         }
         self.publish_gateway_desktop_state();
@@ -416,26 +517,25 @@ impl WalletRoot {
             .public_accounts
             .iter()
             .filter(|account| {
-                ticket.includes_status(account.status) && account.is_available_on_chain(chain_id)
+                ticket.includes_account(&account.public_account_uuid)
+                    && account.is_available_on_chain(chain_id)
             })
             .cloned()
             .collect::<Vec<_>>();
         let http = self.http.clone();
         let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            // Finish the ticket so its ids stop showing as pending.
+            if let Some(follow_up) = self
+                .public_balance_cache
+                .finish_refresh(ticket, None)
+                .follow_up
+            {
+                self.run_public_balance_refresh(follow_up, window, cx);
+            }
             return;
         };
         let effective_token_registry = self.effective_token_registry.clone();
         let minimum = ticket.minimum_block();
-        if chain_id == self.selected_chain {
-            if ticket.includes_status(PublicAccountStatus::Active) {
-                self.public_balance_refreshing = true;
-                self.public_balance_error = None;
-            }
-            if ticket.includes_status(PublicAccountStatus::Inactive) {
-                self.public_inactive_balance_refreshing = true;
-                self.public_inactive_balance_error = None;
-            }
-        }
         let join = self.runtime.spawn(async move {
             refresh_public_balances_at_least(
                 chain_id,
@@ -486,7 +586,7 @@ impl WalletRoot {
         .detach();
     }
 
-    fn apply_public_balance_refresh_result(
+    pub(super) fn apply_public_balance_refresh_result(
         &mut self,
         ticket: PublicBalanceRefreshTicket,
         result: Result<Result<PublicBalanceSnapshot, eyre::Report>, tokio::task::JoinError>,
@@ -494,8 +594,13 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) -> (bool, bool) {
         let scope = ticket.scope().clone();
-        let active = ticket.includes_status(PublicAccountStatus::Active);
-        let inactive = ticket.includes_status(PublicAccountStatus::Inactive);
+        let covers = |status| {
+            self.public_accounts.iter().any(|account| {
+                account.status == status && ticket.includes_account(&account.public_account_uuid)
+            })
+        };
+        let active = covers(PublicAccountStatus::Active);
+        let inactive = covers(PublicAccountStatus::Inactive);
         let (snapshot, error, join_failed) = match result {
             Ok(Ok(snapshot)) => (Some(snapshot), None, false),
             Ok(Err(error)) => (None, Some(format_report_chain(&error)), false),
@@ -512,32 +617,33 @@ impl WalletRoot {
             let previous = self.public_balance_snapshot.clone();
             self.public_balance_snapshot = self.public_balance_cache.snapshot(&scope).map(Arc::new);
             restore_focus = self.revalidate_public_asset_focus(focused_asset);
-            if active {
-                self.public_balance_refreshing = false;
-                self.public_balance_error = error.as_ref().map(|error| {
-                    Arc::from(if join_failed {
+            // Keep the latest failure; rows decide whether it still applies, so another
+            // account's success doesn't clear it.
+            if let Some(error) = &error {
+                if active {
+                    self.public_balance_error = Some(Arc::from(if join_failed {
                         format!("Public balance refresh failed: {error}")
                     } else {
                         error.clone()
-                    })
-                });
-                if succeeded && let Some(snapshot) = self.public_balance_snapshot.clone() {
-                    self.revalidate_sponsored_estimates_for_public_balance_change(
-                        previous.as_deref(),
-                        &snapshot,
-                        cx,
-                    );
+                    }));
                 }
-            }
-            if inactive {
-                self.public_inactive_balance_refreshing = false;
-                self.public_inactive_balance_error = error.as_ref().map(|error| {
-                    Arc::from(if join_failed {
+                if inactive {
+                    self.public_inactive_balance_error = Some(Arc::from(if join_failed {
                         format!("Inactive public balance refresh failed: {error}")
                     } else {
                         error.clone()
-                    })
-                });
+                    }));
+                }
+            }
+            if active
+                && succeeded
+                && let Some(snapshot) = self.public_balance_snapshot.clone()
+            {
+                self.revalidate_sponsored_estimates_for_public_balance_change(
+                    previous.as_deref(),
+                    &snapshot,
+                    cx,
+                );
             }
         }
         if let Some(follow_up) = completion.follow_up {

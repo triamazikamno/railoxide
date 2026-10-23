@@ -1121,22 +1121,36 @@ fn random_self_broadcast_gas_payer_skips_known_zero_native_balance() {
 }
 
 #[test]
-fn self_broadcast_native_balance_label_uses_snapshot_or_unavailable() {
-    let snapshot = public_balance_snapshot_for_test(1);
-    let expected =
+fn self_broadcast_native_balance_label_separates_not_fetched_failed_and_amount() {
+    let funded =
+        public_account_for_search_with_uuid("public-1", Some("Funded"), Address::from([0x11; 20]));
+    let failed =
+        public_account_for_search_with_uuid("public-2", Some("Failed"), Address::from([0x22; 20]));
+    let snapshot = public_native_balance_snapshot_for_test(
+        1,
+        vec![
+            (funded, PublicBalanceAmount::Available(U256::from(5_u64))),
+            (failed, PublicBalanceAmount::Unavailable),
+        ],
+    );
+    let amount =
         public_balance_amount_label(&PublicBalanceAmount::Available(U256::from(5_u64)), 18);
 
     assert_eq!(
-        self_broadcast_native_balance_label(Some(&snapshot), 1, "public-account"),
-        expected
+        self_broadcast_native_balance_label(Some(&snapshot), 1, "public-1"),
+        format!("{amount} ETH")
     );
     assert_eq!(
-        self_broadcast_native_balance_label(Some(&snapshot), 56, "public-account"),
+        self_broadcast_native_balance_label(Some(&snapshot), 1, "public-2"),
         "unavailable"
+    );
+    assert_eq!(
+        self_broadcast_native_balance_label(Some(&snapshot), 56, "public-1"),
+        "Not fetched"
     );
     assert_eq!(
         self_broadcast_native_balance_label(Some(&snapshot), 1, "missing"),
-        "unavailable"
+        "Not fetched"
     );
 }
 
@@ -1894,6 +1908,8 @@ fn public_account_sort_orders_value_name_and_added_with_unpriced_fallback() {
         public_account_for_search_with_uuid("small", Some("beta"), Address::ZERO),
         public_account_for_search_with_uuid("large", Some("Beta"), Address::ZERO),
         public_account_for_search_with_uuid("unnamed", None, Address::ZERO),
+        // Not read on the chain: the snapshot below has no row for it.
+        public_account_for_search_with_uuid("unread", Some("Gamma"), Address::ZERO),
     ];
     for (order, account) in accounts.iter_mut().enumerate() {
         account.display_order = u32::try_from(order).unwrap();
@@ -1920,22 +1936,22 @@ fn public_account_sort_orders_value_name_and_added_with_unpriced_fallback() {
         (
             PublicAccountSort::Value,
             true,
-            ["large", "small", "unnamed", "empty"],
+            ["large", "small", "unnamed", "empty", "unread"],
         ),
         (
             PublicAccountSort::Name,
             true,
-            ["empty", "small", "large", "unnamed"],
+            ["empty", "small", "large", "unread", "unnamed"],
         ),
         (
             PublicAccountSort::Value,
             false,
-            ["empty", "small", "large", "unnamed"],
+            ["empty", "small", "large", "unread", "unnamed"],
         ),
         (
             PublicAccountSort::Added,
             true,
-            ["empty", "small", "large", "unnamed"],
+            ["empty", "small", "large", "unnamed", "unread"],
         ),
     ] {
         sort_public_accounts(

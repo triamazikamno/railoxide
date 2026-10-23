@@ -8,6 +8,7 @@
 - `hat-glasses.svg`: Lucide `hat-glasses`, ISC License, https://lucide.dev/icons/hat-glasses
 - `list-sort-descending.svg`: Lucide `list-sort-descending`, ISC License, https://lucide.dev/icons/list-sort-descending
 - `wrench.svg`: Lucide `wrench`, ISC License, https://lucide.dev/icons/wrench
+- `refresh-cw-off.svg`: Lucide `refresh-cw-off`, unchanged from Lucide 1.43.0 as vendored by `gpui-kit-assets` 0.7.3, ISC License, https://lucide.dev/icons/refresh-cw-off
 - `file-pen-line.svg`: Lucide `file-pen-line`, ISC License, https://lucide.dev/icons/file-pen-line
 - `folder-cog.svg`: Lucide `folder-cog`, ISC License, https://lucide.dev/icons/folder-cog
 - `sparkles.svg`: Lucide `sparkles`, ISC License, https://lucide.dev/icons/sparkles

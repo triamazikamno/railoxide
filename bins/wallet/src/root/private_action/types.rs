@@ -8,11 +8,11 @@ use super::{
     SelfBroadcastGasFeeSelection, SharedString, SpendAuthorizationSummary,
     SpendAuthorizationSummaryRow, SponsoredAuthorizationLimit, SponsoredFundingEstimateState,
     SponsoredIncentive, SponsoredSelfBroadcastSessionOutcome, TransactionGenerationStage, U256,
-    WalletIconSource, WalletSession, Window, format_send_amount_input,
+    WalletIconSource, WalletRoot, WalletSession, Window, format_send_amount_input,
     format_unshield_amount_input, native_top_up_primary_recipient_amount_for_fee_mode,
-    private_action_asset_select_row, self_broadcast_gas_payer_fields_match,
-    self_broadcast_gas_payer_select_menu_row, self_broadcast_gas_payer_select_trigger_row,
-    short_address,
+    private_action_asset_select_row, self_broadcast_gas_payer_fetch_button,
+    self_broadcast_gas_payer_fields_match, self_broadcast_gas_payer_select_menu_row,
+    self_broadcast_gas_payer_select_trigger_row, short_address,
 };
 
 #[cfg(test)]
@@ -67,6 +67,9 @@ pub(in crate::root) struct SelfBroadcastGasPayerSelectItem {
     pub(in crate::root) address: Address,
     pub(in crate::root) chain_id: u64,
     pub(in crate::root) balance_label: Arc<str>,
+    /// No selected-chain row, or a stale one: the row offers a fetch button.
+    pub(in crate::root) fetchable: bool,
+    pub(in crate::root) root: gpui::WeakEntity<WalletRoot>,
 }
 
 impl SelectItem for SelfBroadcastGasPayerSelectItem {
@@ -83,12 +86,20 @@ impl SelectItem for SelfBroadcastGasPayerSelectItem {
         )
     }
 
-    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let fetch = self.fetchable.then(|| {
+            self_broadcast_gas_payer_fetch_button(
+                self.root.clone(),
+                self.chain_id,
+                self.public_account_uuid.clone(),
+                cx,
+            )
+        });
         self_broadcast_gas_payer_select_menu_row(
             &self.label,
             &self.address,
-            self.chain_id,
             &self.balance_label,
+            fetch,
         )
     }
 

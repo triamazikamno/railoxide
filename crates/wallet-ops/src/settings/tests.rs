@@ -1167,11 +1167,14 @@ fn ui_state_roundtrip_through_local_db() {
         ("wallet-123".to_owned(), "account-2".to_owned()),
         ("hardware-123".to_owned(), "hardware-account".to_owned()),
     ]);
+    let excluded = std::collections::BTreeSet::from(["account-excluded".to_owned()]);
     let state = WalletUiState {
         version: 0,
         public_account_sort: super::PublicAccountSort::Added,
         public_hide_empty_accounts: true,
         swap_disclaimer_acknowledged: true,
+        public_auto_refresh: true,
+        public_refresh_excluded: excluded.clone(),
         last_wallet_id: Some("wallet-123".to_owned()),
         last_chain_id: Some(137),
         last_wallet_kind: RememberedWalletKind::SoftwareProfile,
@@ -1183,6 +1186,20 @@ fn ui_state_roundtrip_through_local_db() {
     };
 
     save_wallet_ui_state(&store, &state).expect("save UI state");
+    // Exclusions are keyed by account id only; no account address reaches plaintext UI state.
+    let excluded_address = Address::repeat_byte(0xa5);
+    let stored = store
+        .get_app_settings_record(WALLET_UI_STATE_KEY)
+        .expect("read stored UI state")
+        .expect("stored UI state");
+    assert!(stored.windows(16).any(|w| w == b"account-excluded"));
+    assert!(!stored.windows(20).any(|w| w == excluded_address.as_slice()));
+    let address_hex = alloy::hex::encode(excluded_address);
+    assert!(
+        !stored
+            .windows(address_hex.len())
+            .any(|w| w == address_hex.as_bytes())
+    );
     drop(store);
     let store = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -1197,6 +1214,8 @@ fn ui_state_roundtrip_through_local_db() {
             public_account_sort: super::PublicAccountSort::Added,
             public_hide_empty_accounts: true,
             swap_disclaimer_acknowledged: true,
+            public_auto_refresh: true,
+            public_refresh_excluded: excluded,
             last_wallet_id: Some("wallet-123".to_owned()),
             last_chain_id: Some(137),
             last_wallet_kind: RememberedWalletKind::SoftwareProfile,
@@ -3465,6 +3484,8 @@ fn released_v4_ui_state_preserves_account_memory_and_defaults_public_preferences
     assert_eq!(state.version, WALLET_UI_STATE_VERSION);
     assert_eq!(state.public_account_sort, super::PublicAccountSort::Value);
     assert!(!state.public_hide_empty_accounts);
+    assert!(!state.public_auto_refresh);
+    assert!(state.public_refresh_excluded.is_empty());
     assert_eq!(state.last_public_accounts["wallet-123"], "account-1");
     assert_eq!(state.governance_participants["wallet-123"], ["account-1"]);
 }

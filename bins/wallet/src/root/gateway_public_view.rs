@@ -23,16 +23,14 @@ impl WalletRoot {
         let mut presentation = GatewayPublicView::default();
         presentation.mimic_railway_shields_by_default = self.mimic_railway_shields_by_default;
         presentation.drafts = self.gateway.drafts.borrow().views(self);
-        presentation.selected_account = self
-            .selected_public_account()
-            .filter(|account| {
-                account.is_active_for_wallet(view.wallet_id())
-                    && account.is_available_on_chain(self.selected_chain)
-            })
-            .map(|account| account.public_account_uuid.clone());
+        presentation.selected_account = self.gateway_selected_public_account();
         presentation.selected_chain = Some(self.selected_chain);
-        presentation.refreshing = self.public_balance_refreshing;
-        presentation.balance_error = self.public_balance_error.is_some();
+        // The extension shows and refreshes only the selected account, so other accounts'
+        // refreshes and failures stay out of its status.
+        if let Some(selected) = presentation.selected_account.as_ref() {
+            presentation.refreshing = self.public_refreshing_accounts().contains(selected);
+            presentation.balance_error = self.public_failed_accounts().contains(selected);
+        }
         let snapshot = self
             .public_balance_snapshot
             .as_deref()
@@ -104,6 +102,17 @@ impl WalletRoot {
         presentation
     }
 
+    /// The extension's active account: the selected Public account when it is active here.
+    fn gateway_selected_public_account(&self) -> Option<String> {
+        let view = self.view_session.as_ref()?;
+        self.selected_public_account()
+            .filter(|account| {
+                account.is_active_for_wallet(view.wallet_id())
+                    && account.is_available_on_chain(self.selected_chain)
+            })
+            .map(|account| account.public_account_uuid.clone())
+    }
+
     pub(super) fn apply_gateway_public_command(
         &mut self,
         peer_id: &str,
@@ -141,10 +150,14 @@ impl WalletRoot {
                 }
             }
             GatewayPublicCommand::RefreshBalances => {
-                // Coalesce explicit refreshes in the existing desktop balance owner.
-                if !self.public_balance_refreshing {
-                    self.schedule_public_balance_refresh(cx);
-                }
+                // A request during a refresh queues a follow-up read of the account.
+                let account = self.gateway_selected_public_account();
+                self.schedule_account_public_balance_refresh(
+                    self.selected_chain,
+                    account,
+                    None,
+                    cx,
+                );
             }
             _ => return,
         }

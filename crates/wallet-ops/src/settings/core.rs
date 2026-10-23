@@ -4,7 +4,7 @@ use super::{
     RuntimeSettings, SensitiveUrl, Serialize, TokenSettings, Url, WakuSettings,
     WalletConnectSettings, WalletNetworkMode, fmt,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub use trustless_artifacts::DEFAULT_GATEWAYS as OFFICIAL_POI_ARTIFACT_GATEWAYS;
 
@@ -131,6 +131,11 @@ pub struct WalletUiState {
     /// "I understand" was pressed in the swap disclaimer, so it no longer opens by itself.
     #[serde(default)]
     pub swap_disclaimer_acknowledged: bool,
+    #[serde(default)]
+    pub public_auto_refresh: bool,
+    /// `public_account_uuid`s left out of global Public balance refreshes.
+    #[serde(default)]
+    pub public_refresh_excluded: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -153,6 +158,8 @@ impl Default for WalletUiState {
             public_account_sort: PublicAccountSort::default(),
             public_hide_empty_accounts: false,
             swap_disclaimer_acknowledged: false,
+            public_auto_refresh: false,
+            public_refresh_excluded: BTreeSet::new(),
         }
     }
 }

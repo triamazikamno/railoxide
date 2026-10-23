@@ -1,6 +1,16 @@
 use super::*;
 
 impl WalletRoot {
+    /// After a Public action succeeds, only the account that submitted it changed.
+    pub(in crate::root) fn refresh_public_action_submitter(
+        &mut self,
+        chain_id: u64,
+        public_account_uuid: &str,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.schedule_account_public_balance_refresh(chain_id, [public_account_uuid], None, cx);
+    }
+
     pub(in crate::root) fn open_public_action_dialog(
         &mut self,
         public_account_uuid: Arc<str>,
@@ -2551,15 +2561,11 @@ impl WalletRoot {
                         root.public_form.action_action_error = None;
                         root.public_form.action_contract_address =
                             result.tx.contract_address.as_deref().map(Arc::from);
-                        match root
-                            .public_account_for_uuid(Some(submitted_public_account_uuid.as_ref()))
-                            .map(|account| account.status)
-                        {
-                            Some(PublicAccountStatus::Inactive) => {
-                                root.schedule_inactive_public_balance_refresh(cx);
-                            }
-                            _ => root.schedule_public_balance_refresh(cx),
-                        }
+                        root.refresh_public_action_submitter(
+                            chain_id,
+                            &submitted_public_account_uuid,
+                            cx,
+                        );
                     }
                     Ok(Err(error)) => {
                         let message = format_report_chain(&error);
@@ -2996,15 +3002,11 @@ impl WalletRoot {
                         root.public_form.action_action_error = None;
                         root.public_form.mimic_railway_shield =
                             root.mimic_railway_shields_by_default;
-                        match root
-                            .public_account_for_uuid(Some(submitted_public_account_uuid.as_ref()))
-                            .map(|account| account.status)
-                        {
-                            Some(PublicAccountStatus::Inactive) => {
-                                root.schedule_inactive_public_balance_refresh(cx);
-                            }
-                            _ => root.schedule_public_balance_refresh(cx),
-                        }
+                        root.refresh_public_action_submitter(
+                            chain_id,
+                            &submitted_public_account_uuid,
+                            cx,
+                        );
                     }
                     Ok(Err(error)) => {
                         // A retired stealth account, or one that may hold an undelivered
