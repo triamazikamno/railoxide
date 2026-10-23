@@ -1,4 +1,5 @@
 use super::operation::{self, ReceiptBlock, RpcOperation};
+use crate::http::OperationHttpClient;
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy::rlp::Encodable;
@@ -13,6 +14,7 @@ use serde_json::{Number, Value};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use url::Url;
@@ -782,7 +784,7 @@ impl RpcOrigin {
 /// A clone-shared snapshot of chain endpoints and Multicall3 configuration.
 ///
 /// Equality and hashing compare contents, so independently built equivalent snapshots share
-/// deduplication keys.
+/// deduplication keys. An isolated route equals only itself and its clones.
 #[derive(Debug, Clone)]
 pub struct RpcChainRoute {
     chain_id: u64,
@@ -790,6 +792,16 @@ pub struct RpcChainRoute {
     multicall: Option<Address>,
     verify_identity: bool,
     pub(super) verified_identities: Arc<VerifiedIdentities>,
+    isolation: Option<Arc<RouteIsolation>>,
+}
+
+static NEXT_ROUTE_ISOLATION: AtomicU64 = AtomicU64::new(1);
+
+/// The caller's HTTP client bound to an isolated route, with a process-unique id.
+#[derive(Debug)]
+pub(super) struct RouteIsolation {
+    id: u64,
+    client: OperationHttpClient,
 }
 
 /// Successful identity checks shared by a route and its clones.
@@ -806,6 +818,7 @@ impl PartialEq for RpcChainRoute {
             && self.endpoints == other.endpoints
             && self.multicall == other.multicall
             && self.verify_identity == other.verify_identity
+            && self.isolation_id() == other.isolation_id()
     }
 }
 
@@ -816,6 +829,7 @@ impl Hash for RpcChainRoute {
         self.chain_id.hash(state);
         self.multicall.hash(state);
         self.verify_identity.hash(state);
+        self.isolation_id().hash(state);
         for endpoint in self.endpoints.iter() {
             endpoint.expose_url().hash(state);
         }
@@ -844,7 +858,36 @@ impl RpcChainRoute {
             multicall: None,
             verify_identity: false,
             verified_identities,
+            isolation: None,
         }
+    }
+    /// Returns a clone whose reads go over `client` and are kept apart from every other route,
+    /// including the result cache. Endpoint verification stays shared with this route.
+    #[must_use]
+    pub fn isolated(&self, client: OperationHttpClient) -> Self {
+        let mut route = self.clone();
+        route.isolation = Some(Arc::new(RouteIsolation {
+            id: NEXT_ROUTE_ISOLATION.fetch_add(1, Ordering::Relaxed),
+            client,
+        }));
+        route
+    }
+    pub(super) const fn is_isolated(&self) -> bool {
+        self.isolation.is_some()
+    }
+    /// The client for this route's reads when it is isolated. Identity checks always use the
+    /// broker's shared client.
+    pub(super) fn isolated_client(&self) -> Option<&reqwest::Client> {
+        self.isolation
+            .as_ref()
+            .map(|isolation| isolation.client.client())
+    }
+    fn isolation_id(&self) -> Option<u64> {
+        self.isolation.as_ref().map(|isolation| isolation.id)
+    }
+    #[cfg(test)]
+    pub(super) fn isolation_probe(&self) -> Option<std::sync::Weak<RouteIsolation>> {
+        self.isolation.as_ref().map(Arc::downgrade)
     }
     #[must_use]
     pub const fn with_identity_verification(mut self) -> Self {

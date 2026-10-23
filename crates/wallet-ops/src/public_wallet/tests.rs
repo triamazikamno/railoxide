@@ -5,9 +5,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Instant, SystemTime};
 
-use alloy::eips::{BlockId, BlockNumHash};
+use alloy::eips::BlockId;
 use alloy::network::TransactionBuilder as _;
 use alloy::primitives::{Address, B256, Bytes, TxKind, U256, address};
+use alloy::providers::bindings::IMulticall3;
 use alloy::rpc::types::{TransactionRequest, transaction::AccessList};
 use alloy::sol_types::{Revert, SolCall, SolError};
 use eyre::eyre;
@@ -565,16 +566,27 @@ async fn balance_refresh_submits_more_wallet_reads_than_the_dapp_cap() {
     assert!(results.iter().all(std::result::Result::is_ok));
 }
 
-fn public_balance_block_for_test(identity: BlockNumHash) -> Value {
-    let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
-    block.header.inner.number = identity.number;
-    block.header.hash = identity.hash;
-    serde_json::to_value(block).unwrap()
+fn balance_word_for_test(value: u64) -> Bytes {
+    Bytes::from(U256::from(value).to_be_bytes::<32>().to_vec())
+}
+
+fn aggregated_calls_for_test(request: &Value) -> Vec<IMulticall3::Call> {
+    let input = alloy::hex::decode(request["params"][0]["input"].as_str().unwrap()).unwrap();
+    IMulticall3::tryAggregateCall::abi_decode(&input)
+        .expect("one aggregate per account")
+        .calls
 }
 
 #[tokio::test]
-async fn balance_refresh_pins_canonical_hash_and_rejects_unsatisfied_minimum() {
-    let head = BlockNumHash::new(10, B256::repeat_byte(10));
+async fn balance_refresh_pins_one_account_to_its_route_block_number() {
+    const BLOCK: u64 = 10;
+    enum Case {
+        Accepted,
+        BelowMinimum,
+        FailedToken,
+        // The first two-member aggregate answers -32000, so the broker splits it.
+        Reduced,
+    }
     let account = PublicAccountMetadata {
         public_account_uuid: "public-1".to_string(),
         address: Address::repeat_byte(1),
@@ -604,66 +616,141 @@ async fn balance_refresh_pins_canonical_hash_and_rejects_unsatisfied_minimum() {
         )]
         .into(),
     };
-    for minimum in [
-        head,
-        BlockNumHash::new(11, head.hash),
-        BlockNumHash::new(10, B256::repeat_byte(11)),
+    for case in [
+        Case::Accepted,
+        Case::BelowMinimum,
+        Case::FailedToken,
+        Case::Reduced,
     ] {
+        let minimum = match case {
+            Case::Accepted => Some(BLOCK),
+            Case::BelowMinimum => Some(BLOCK + 1),
+            Case::FailedToken | Case::Reduced => None,
+        };
+        let fail_token = matches!(case, Case::FailedToken);
+        let reduce = Arc::new(AtomicBool::new(matches!(case, Case::Reduced)));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let recorded = calls.clone();
         let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
             Arc::new(move |request| {
                 recorded.lock().unwrap().push(request.clone());
-                let result = match request["method"].as_str().unwrap() {
-                    "eth_getBlockByNumber" => public_balance_block_for_test(head),
-                    "eth_getBalance" => json!("0x7"),
-                    "eth_call" => json!(Bytes::from(U256::from(9).to_be_bytes::<32>().to_vec())),
-                    _ => panic!("unexpected balance refresh RPC"),
-                };
+                if request["method"] == "eth_blockNumber" {
+                    return json!({"jsonrpc": "2.0", "id": request["id"], "result": "0xa"});
+                }
+                let members = aggregated_calls_for_test(&request);
+                if members.len() > 1 && reduce.swap(false, Ordering::SeqCst) {
+                    return json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32000, "message": "too large"}});
+                }
+                let returns = members
+                    .into_iter()
+                    .map(|call| {
+                        let (success, data) = if call
+                            .callData
+                            .starts_with(&IMulticall3::getEthBalanceCall::SELECTOR)
+                        {
+                            (true, balance_word_for_test(7))
+                        } else if fail_token {
+                            (false, Bytes::new())
+                        } else {
+                            (true, balance_word_for_test(9))
+                        };
+                        IMulticall3::Result {
+                            success,
+                            returnData: data,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let result =
+                    Bytes::from(IMulticall3::tryAggregateCall::abi_encode_returns(&returns));
                 json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
             }),
             Arc::default(),
             Arc::default(),
         )
         .await;
-        let mut chain = effective_chain_for_rpc(endpoint.as_str(), 0);
-        chain.rpc_route = RpcChainRoute::new(1, vec![endpoint]);
+        let chain = effective_chain_for_rpc(endpoint.as_str(), 0);
         let http = HttpContext::direct_for_tests();
         let started = Instant::now();
-        let result = refresh_public_balances_at_least(
-            1,
-            std::slice::from_ref(&account),
-            &chain,
-            Some(&registry),
-            &http,
-            Some(minimum),
-        )
-        .await;
+        let result =
+            refresh_public_balances_at_least(1, &account, &chain, Some(&registry), &http, minimum)
+                .await;
         let calls = calls.lock().unwrap();
-        assert_eq!(calls[0]["method"], "eth_getBlockByNumber");
-        assert_eq!(calls[0]["params"], json!(["latest", false]));
-        if minimum == head {
-            let snapshot = result.unwrap();
-            assert_eq!(snapshot.accounts[0].observed_block, Some(head));
-            assert!(snapshot.accounts[0].observed_at.unwrap() >= started);
-            assert_eq!(calls.len(), 3);
-            for method in ["eth_getBalance", "eth_call"] {
-                let call = calls.iter().find(|call| call["method"] == method).unwrap();
-                assert_eq!(
-                    call["params"][1],
-                    json!({"blockHash": head.hash, "requireCanonical": true})
-                );
+        // The route's block number comes first, then the balances pinned to it.
+        assert_eq!(calls[0]["method"], "eth_blockNumber");
+        let balance_calls = &calls[1..];
+        for call in balance_calls {
+            assert_eq!(call["method"], "eth_call");
+            assert_eq!(call["params"][1], json!("0xa"), "pinned to block {BLOCK}");
+            assert!(aggregated_calls_for_test(call).iter().all(|member| {
+                !member
+                    .callData
+                    .starts_with(&IMulticall3::getBlockNumberCall::SELECTOR)
+            }));
+        }
+        match case {
+            Case::BelowMinimum => {
+                assert!(result.is_err(), "a number below the minimum is not current");
+                assert!(balance_calls.is_empty(), "no balance read is sent");
             }
-        } else {
-            assert!(result.is_err());
-            assert_eq!(
-                calls.len(),
-                1,
-                "an unsatisfied minimum must not submit balance reads"
-            );
+            Case::Accepted | Case::Reduced => {
+                if matches!(case, Case::Reduced) {
+                    assert!(balance_calls.len() > 1, "the aggregate was split");
+                } else {
+                    assert_eq!(balance_calls.len(), 1);
+                    assert_eq!(aggregated_calls_for_test(&balance_calls[0]).len(), 2);
+                }
+                let snapshot = result.unwrap();
+                let row = &snapshot.accounts[0];
+                assert_eq!(row.balances.len(), 2);
+                assert!(
+                    row.balances
+                        .iter()
+                        .all(|balance| balance.amount.amount().is_some())
+                );
+                assert_eq!(row.observed_block, Some(BLOCK));
+                assert!(row.observed_at.unwrap() >= started);
+            }
+            Case::FailedToken => {
+                // A failed balance member keeps the balances without an observation.
+                assert_eq!(balance_calls.len(), 1);
+                let snapshot = result.unwrap();
+                let row = &snapshot.accounts[0];
+                assert_eq!(row.balances.len(), 2);
+                assert_eq!(
+                    row.balances
+                        .iter()
+                        .filter(|balance| balance.amount.amount().is_some())
+                        .count(),
+                    1
+                );
+                assert_eq!(row.observed_block, None);
+                assert_eq!(row.observed_at, None);
+            }
         }
         server.abort();
     }
+
+    // Without an isolated route the account fails and nothing goes over the shared one.
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorded = calls.clone();
+    let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
+        Arc::new(move |request| {
+            recorded.lock().unwrap().push(request.clone());
+            json!({"jsonrpc": "2.0", "id": request["id"], "result": "0x"})
+        }),
+        Arc::default(),
+        Arc::default(),
+    )
+    .await;
+    let chain = effective_chain_for_rpc(endpoint.as_str(), 0);
+    let http = http_context_for_route(WalletNetworkMode::Tor, "tor");
+    assert!(
+        refresh_public_balances_at_least(1, &account, &chain, Some(&registry), &http, None)
+            .await
+            .is_err()
+    );
+    assert!(calls.lock().unwrap().is_empty());
+    server.abort();
 }
 
 #[tokio::test]
@@ -711,8 +798,11 @@ async fn custom_balance_refresh_preserves_partial_results_without_multicall() {
         Arc::new(move |request| {
             let result = if request["method"] == "eth_chainId" {
                 json!(alloy::primitives::U64::from(CHAIN))
-            } else if request["method"] == "eth_getBlockByNumber" {
-                public_balance_block_for_test(BlockNumHash::new(10, B256::repeat_byte(10)))
+            } else if request["method"] == "eth_blockNumber" {
+                json!("0xa")
+            } else if request["params"][1] != json!("0xa") {
+                // Each individual read must be pinned to the route's block number.
+                return json!({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32602, "message": "unpinned"}});
             } else if request["method"] == "eth_getBalance" {
                 json!("0x7")
             } else {
@@ -754,8 +844,8 @@ async fn custom_balance_refresh_preserves_partial_results_without_multicall() {
         .unwrap();
     assert!(chain.railgun.is_none());
     assert!(chain.rpc_route.multicall().is_none());
-    let http = http_context_for_route(WalletNetworkMode::Tor, "tor");
-    let snapshot = refresh_public_balances(CHAIN, &[account], &chain, Some(&registry), &http)
+    let http = HttpContext::direct_for_tests();
+    let snapshot = refresh_public_balances(CHAIN, &account, &chain, Some(&registry), &http)
         .await
         .unwrap();
     let balances = &snapshot.accounts[0].balances;
@@ -1306,7 +1396,7 @@ fn balance_snapshot_preserves_partial_success() {
     successful_call.public_account_uuid = successful_account.public_account_uuid.clone();
     planned.push(successful_call);
     let observed_at = Instant::now();
-    let observed_block = BlockNumHash::new(10, B256::repeat_byte(10));
+    let observed_block = Some(10);
     let snapshot = public_balance_snapshot_from_results(
         1,
         &[account, successful_account],
@@ -1319,7 +1409,7 @@ fn balance_snapshot_preserves_partial_success() {
     assert_eq!(snapshot.accounts[0].observed_at, None);
     assert_eq!(snapshot.accounts[0].observed_block, None);
     assert_eq!(snapshot.accounts[1].observed_at, Some(observed_at));
-    assert_eq!(snapshot.accounts[1].observed_block, Some(observed_block));
+    assert_eq!(snapshot.accounts[1].observed_block, observed_block);
     let balances = &snapshot.accounts[0].balances;
     assert_eq!(balances[0].amount.amount(), Some(U256::from(7_u64)));
     assert!(matches!(

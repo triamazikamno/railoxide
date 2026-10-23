@@ -3,7 +3,7 @@ use super::*;
 impl WalletRoot {
     /// After a Public action succeeds, only the account that submitted it changed.
     pub(in crate::root) fn refresh_public_action_submitter(
-        &mut self,
+        &self,
         chain_id: u64,
         public_account_uuid: &str,
         cx: &mut Context<'_, Self>,

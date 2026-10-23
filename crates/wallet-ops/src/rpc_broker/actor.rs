@@ -389,7 +389,8 @@ impl Actor {
     pub(super) fn any_threshold_reached(&self) -> bool {
         #[expect(
             clippy::mutable_key_type,
-            reason = "route equality and hashing exclude the endpoint verification cache"
+            reason = "route equality and hashing exclude the endpoint verification cache and the \
+                      isolation client"
         )]
         let mut loads = HashMap::<&RpcRoute, RouteLoad>::new();
         for pending in &self.pending {
@@ -449,7 +450,9 @@ impl Actor {
             Some(BlockId::Hash(hash)) if hash.require_canonical != Some(true) => Some(0),
             _ => None,
         };
+        // Isolated reads neither use nor fill the cache, which is shared by every route.
         if read.is_cacheable()
+            && !key.route.is_isolated()
             && expected_epoch.is_some()
             && let Some(cached) = self.cache.lookup(&key.identity, expected_epoch)
         {
@@ -555,6 +558,10 @@ impl Actor {
     /// waiting jobs and queued work that cannot read yet.
     pub(super) fn pump_ready(&mut self) {
         self.expire_ready();
+        // A job that stopped waiting, e.g. because another owner verified its endpoint, must not
+        // keep its route's client alive or hold a runner turn while every runner is busy.
+        self.runner_waiters
+            .retain(|request| !request.grant.is_closed());
         while self.ledger.held(SlotKind::Read) < self.max_in_flight {
             match self.scheduler.next(job_read_ready) {
                 Some(Claim::Queued(job)) => self.start_job(job, StartMode::Read),
@@ -790,7 +797,7 @@ impl Actor {
             }
             if let Some(active) = self.active.remove(&key) {
                 let read = active.read;
-                if read.is_cacheable() && result.is_ok() {
+                if read.is_cacheable() && result.is_ok() && !key.route.is_isolated() {
                     let chain_id = key.identity.chain_id();
                     let observed = match read.reuse_block_id() {
                         Some(BlockId::Number(BlockNumberOrTag::Latest)) => self

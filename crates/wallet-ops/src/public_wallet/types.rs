@@ -246,8 +246,8 @@ pub struct PublicAccountBalance {
     pub balances: Vec<PublicBalanceEntry>,
     /// Monotonic start of a complete account observation; never persisted.
     pub observed_at: Option<Instant>,
-    /// Canonical block shared by every successful balance in this observation.
-    pub observed_block: Option<alloy::eips::BlockNumHash>,
+    /// Block number the account's read reported it was answered at.
+    pub observed_block: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

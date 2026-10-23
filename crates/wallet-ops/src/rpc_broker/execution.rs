@@ -118,6 +118,7 @@ pub(super) fn run_job(
                 let mut failover = SingleFailover::new(
                     &item.read,
                     item.waiters.clone(),
+                    route.chain_route().isolated_client(),
                     route.chain_id(),
                     route.attempt_timeout,
                 );
@@ -194,6 +195,7 @@ trait Failover {
 struct SingleFailover<'a> {
     read: &'a RpcRead,
     waiters: Arc<WaiterState>,
+    isolated_client: Option<&'a reqwest::Client>,
     fallback_attempt_timeout: Duration,
     result: AttemptOutcome<RpcResult>,
     attempted: Vec<(Url, EndpointHealthOutcome)>,
@@ -203,12 +205,14 @@ impl<'a> SingleFailover<'a> {
     const fn new(
         read: &'a RpcRead,
         waiters: Arc<WaiterState>,
+        isolated_client: Option<&'a reqwest::Client>,
         chain_id: u64,
         fallback_attempt_timeout: Duration,
     ) -> Self {
         Self {
             read,
             waiters,
+            isolated_client,
             fallback_attempt_timeout,
             result: AttemptOutcome::CallerError(RpcBrokerError::NoEndpoint { chain_id }),
             attempted: Vec::new(),
@@ -246,7 +250,7 @@ impl Failover for SingleFailover<'_> {
         endpoint: &'b Url,
     ) -> BoxFuture<'b, Self::Outcome> {
         Box::pin(execute_single_shared_waiter_attempt(
-            &resources.client,
+            self.isolated_client.unwrap_or(&resources.client),
             &resources.http,
             self.read,
             endpoint,
@@ -365,7 +369,12 @@ impl Failover for AggregateFailover {
         endpoint: &'b Url,
     ) -> BoxFuture<'b, Self::Outcome> {
         let context = Arc::new(ReductionContext {
-            client: resources.client.clone(),
+            client: self
+                .route
+                .chain_route()
+                .isolated_client()
+                .unwrap_or(&resources.client)
+                .clone(),
             semaphore: resources.http.clone(),
             route: self.route.clone(),
             endpoint: endpoint.clone(),
@@ -1221,7 +1230,7 @@ async fn execute_single_with_shared_waiters_attempt(
         http: Arc::clone(semaphore),
         ..JobResources::new(client.clone(), 1)
     };
-    let mut failover = SingleFailover::new(read, waiters, chain_id, fallback_attempt_timeout);
+    let mut failover = SingleFailover::new(read, waiters, None, chain_id, fallback_attempt_timeout);
     for endpoint in endpoints.iter().map(SensitiveUrl::expose_url) {
         let outcome = failover.attempt(&resources, endpoint).await;
         if !failover.apply(endpoint, outcome) {

@@ -19,6 +19,7 @@ use gpui_component::{
     checkbox::Checkbox,
     kbd::Kbd,
     menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
+    popover::Popover,
     scroll::ScrollableElement,
 };
 use gpui_kit::base::{Accordion, AccordionHeader, AccordionItem, AccordionPanel, AccordionTrigger};
@@ -30,6 +31,7 @@ use ui::controls::{
 use wallet_ops::vault::{PublicAccountSource, PublicAccountStatus};
 
 use std::cmp::Reverse;
+use ui::hint::hint_card;
 
 use wallet_ops::{
     PublicBalanceSnapshot, TokenAnchorRateCache, settings::PublicAccountSort,
@@ -42,6 +44,43 @@ use crate::root::public_balances::{
     public_account_visible_balances_for_chain, public_balance_compact_usd,
     public_balances_usd_total, public_section_freshness,
 };
+
+const PUBLIC_READ_HELP_TITLE: &str = "How balances are read";
+
+/// The "How balances are read" card. `unisolated_mode` names the network mode when balance
+/// reads aren't isolated, and is `None` in built-in Tor.
+fn public_read_help_card(unisolated_mode: Option<&'static str>, window: &Window) -> gpui::Div {
+    let paragraph = |text: SharedString| div().whitespace_normal().child(text);
+    let route = unisolated_mode.map_or_else(
+        || {
+            SharedString::from(
+                "Each account is read over its own Tor circuit, opened for that \
+                 read and closed after it. No other account and no other wallet \
+                 traffic uses that circuit.",
+            )
+        },
+        |mode| {
+            SharedString::from(format!(
+                "In {mode} mode, balance reads aren't isolated: they share the \
+                 wallet's connection with other wallet traffic. Each account still \
+                 gets its own requests."
+            ))
+        },
+    );
+    hint_card(PUBLIC_READ_HELP_TITLE, ui::theme::INFO, window)
+        .child(paragraph(route))
+        .child(paragraph(
+            "Several accounts are read one at a time, in random order, with a short \
+             random pause between them, so the RPC provider can't link them by \
+             timing."
+                .into(),
+        ))
+        .child(paragraph(
+            "Refresh and Auto skip accounts that aren't in Refresh. Their own \
+             refresh button still reads them."
+                .into(),
+        ))
+}
 
 // Design dimensions in units at the default 16px rem. Rendering and fit arithmetic
 // use the same scale; shell insets remain the existing physical window geometry.
@@ -427,6 +466,46 @@ impl WalletRoot {
             secs if secs % 60 == 0 => format!("every {} minutes", secs / 60),
             secs => format!("every {secs} seconds"),
         };
+        let unisolated_mode = match self.http.network_mode() {
+            wallet_ops::WalletNetworkMode::Tor => None,
+            wallet_ops::WalletNetworkMode::Proxy => Some("proxy"),
+            wallet_ops::WalletNetworkMode::Direct => Some("direct"),
+        };
+        let help_open = self.public_form.refresh_help_open;
+        let help_root = root.clone();
+        let read_help = div()
+            .id("public-refresh-help")
+            .flex_none()
+            .when(!help_open, |this| {
+                this.tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::element(move |window, _| {
+                        public_read_help_card(unisolated_mode, window)
+                    })
+                    .build(window, cx)
+                })
+            })
+            .child(
+                Popover::new("public-refresh-help-popover")
+                    .open(help_open)
+                    .on_open_change(move |open, _, cx| {
+                        help_root.update(cx, |root, cx| {
+                            root.public_form.refresh_help_open = *open;
+                            cx.notify();
+                        });
+                    })
+                    .trigger(
+                        app_button_base("public-refresh-help-trigger")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Info)
+                            .accessibility_label(PUBLIC_READ_HELP_TITLE)
+                            .debug_selector(|| "public-refresh-help-trigger".into()),
+                    )
+                    .content(move |_, window, _| {
+                        public_read_help_card(unisolated_mode, window)
+                            .debug_selector(|| "public-refresh-help-content".into())
+                    }),
+            );
         let refresh_controls = div()
             .flex()
             .items_center()
@@ -453,6 +532,7 @@ impl WalletRoot {
                         });
                     }),
             )
+            .child(read_help)
             .child(
                 Checkbox::new("public-auto-refresh")
                     .debug_selector(|| "public-auto-refresh".into())

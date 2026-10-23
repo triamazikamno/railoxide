@@ -263,17 +263,15 @@ impl Registry {
     ) {
         let mut found = false;
         let mut pending = false;
-        let mut minimum: Option<BlockNumHash> = None;
+        let mut minimum: Option<u64> = None;
         for family in &self.families {
             if !family.matches_account(scope, account) || family.hashes.is_empty() {
                 continue;
             }
             found = true;
             pending |= family.inclusion.is_none();
-            if let Some(block) = family.inclusion
-                && minimum.is_none_or(|previous| block.number >= previous.number)
-            {
-                minimum = Some(block);
+            if let Some(block) = family.inclusion {
+                minimum = minimum.max(Some(block.number));
             }
         }
         if found && queue {
@@ -616,7 +614,7 @@ mod tests {
                     amount: PublicBalanceAmount::Available(U256::from(5)),
                 }],
                 observed_at: Some(Instant::now()),
-                observed_block: Some(block),
+                observed_block: Some(block.number),
             }],
         }
     }
@@ -656,7 +654,7 @@ mod tests {
             .finish_refresh(old, Some(observation(&context, block)));
         assert!(!completion.accepted);
         let current = completion.follow_up.unwrap();
-        assert_eq!(current.minimum_block(), Some(block));
+        assert_eq!(current.minimum_block(), Some(block.number));
         assert!(
             context
                 .cache
@@ -694,7 +692,7 @@ mod tests {
             .cache
             .begin_refresh(&new_scope, [context.account.public_account_uuid.as_str()])
             .unwrap();
-        assert_eq!(probe.minimum_block(), Some(block));
+        assert_eq!(probe.minimum_block(), Some(block.number));
         assert!(
             context
                 .cache

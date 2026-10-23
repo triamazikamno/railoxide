@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use alloy::eips::BlockNumHash;
 use alloy::primitives::U256;
+use rand::RngExt as _;
+use rand::rngs::StdRng;
 
 use super::{PublicAssetId, PublicBalanceAsset, PublicBalanceSnapshot};
 use crate::vault::PublicAccountMetadata;
@@ -56,8 +57,9 @@ pub struct PublicBalanceRefreshTicket {
     scope: PublicBalanceScope,
     generation: u64,
     identity: Arc<()>,
+    /// Exactly one account id.
     accounts: BTreeSet<String>,
-    minimum: Option<BlockNumHash>,
+    minimum: Option<u64>,
 }
 
 impl PublicBalanceRefreshTicket {
@@ -72,7 +74,7 @@ impl PublicBalanceRefreshTicket {
     }
 
     #[must_use]
-    pub const fn minimum_block(&self) -> Option<BlockNumHash> {
+    pub const fn minimum_block(&self) -> Option<u64> {
         self.minimum
     }
 }
@@ -90,21 +92,24 @@ struct Namespace {
     generation: u64,
     snapshot: Option<PublicBalanceSnapshot>,
     pending_accounts: BTreeSet<String>,
-    /// The in-flight ticket's identity and account ids.
+    /// The in-flight ticket's identity and account id.
     active: Option<(Arc<()>, BTreeSet<String>)>,
     queued: BTreeSet<String>,
-    minimum: Option<BlockNumHash>,
+    minimum: Option<u64>,
     /// Ids whose latest accepted refresh failed and has not since returned their row.
     failed: BTreeSet<String>,
 }
 
 impl Namespace {
-    fn start_queued(&mut self) -> PublicBalanceRefreshTicket {
-        let accounts = std::mem::take(&mut self.queued);
-        self.start(accounts)
+    /// Serve one queued id, chosen uniformly at random.
+    fn start_queued(&mut self, rng: &mut StdRng) -> PublicBalanceRefreshTicket {
+        let id = pick(&self.queued, rng);
+        self.queued.remove(&id);
+        self.start(id)
     }
 
-    fn start(&mut self, accounts: BTreeSet<String>) -> PublicBalanceRefreshTicket {
+    fn start(&mut self, id: String) -> PublicBalanceRefreshTicket {
+        let accounts = BTreeSet::from([id]);
         let identity = Arc::new(());
         self.active = Some((identity.clone(), accounts.clone()));
         PublicBalanceRefreshTicket {
@@ -117,13 +122,40 @@ impl Namespace {
     }
 }
 
+/// Requires a non-empty `ids`.
+fn pick(ids: &BTreeSet<String>, rng: &mut StdRng) -> String {
+    let index = rng.random_range(0..ids.len());
+    ids.iter().nth(index).cloned().expect("index within ids")
+}
+
 /// Shared by desktop refreshes and gateway lookups, independently of UI selection.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PublicBalanceCache {
     namespaces: Arc<Mutex<BTreeMap<u64, Namespace>>>,
+    /// Picks each ticket's account. Locked only while `namespaces` is held.
+    rng: Arc<Mutex<StdRng>>,
+}
+
+impl Default for PublicBalanceCache {
+    fn default() -> Self {
+        Self::with_rng(rand::make_rng())
+    }
 }
 
 impl PublicBalanceCache {
+    /// `rng` picks the order in which queued accounts are read; tests pass a seeded one.
+    #[must_use]
+    pub fn with_rng(rng: StdRng) -> Self {
+        Self {
+            namespaces: Arc::default(),
+            rng: Arc::new(Mutex::new(rng)),
+        }
+    }
+
+    fn rng(&self) -> MutexGuard<'_, StdRng> {
+        self.rng.lock().expect("public balance cache rng poisoned")
+    }
+
     /// Activate only from the current wallet owner, never from a captured request.
     ///
     /// # Panics
@@ -300,9 +332,9 @@ impl PublicBalanceCache {
         ))
     }
 
-    /// Start a ticket for exactly `accounts` when none is in flight, leaving other queued
-    /// ids queued for its follow-up. Otherwise queue `accounts` behind the in-flight ticket.
-    /// An empty request starts nothing.
+    /// When none is in flight, start a ticket for one of `accounts`, chosen at random, and
+    /// queue the rest for its follow-ups. Otherwise queue `accounts` behind the in-flight
+    /// ticket. An empty request starts nothing.
     ///
     /// # Panics
     /// Panics if the cache mutex is poisoned.
@@ -333,8 +365,10 @@ impl PublicBalanceCache {
         if accounts.is_empty() {
             return None;
         }
-        entry.queued.retain(|id| !accounts.contains(id));
-        Some(entry.start(accounts))
+        let id = pick(&accounts, &mut self.rng());
+        entry.queued.extend(accounts);
+        entry.queued.remove(&id);
+        Some(entry.start(id))
     }
 
     /// Account ids in the in-flight ticket or queued behind it. Ids queued while no ticket
@@ -409,7 +443,7 @@ impl PublicBalanceCache {
         }
     }
 
-    /// Admit queued refreshes for idle namespaces after reconciling current scopes.
+    /// Admit one queued account's refresh per idle namespace after reconciling current scopes.
     /// Active refreshes retain their queued account ids for `finish_refresh`.
     ///
     /// # Panics
@@ -426,7 +460,7 @@ impl PublicBalanceCache {
                 if entry.active.is_some() || entry.queued.is_empty() {
                     return None;
                 }
-                Some(entry.start_queued())
+                Some(entry.start_queued(&mut self.rng()))
             })
             .collect()
     }
@@ -442,7 +476,7 @@ impl PublicBalanceCache {
         scope: &PublicBalanceScope,
         account: &PublicAccountMetadata,
         pending: bool,
-        inclusion: Option<BlockNumHash>,
+        inclusion: Option<u64>,
     ) {
         self.fence(scope, account, pending, inclusion, true);
     }
@@ -458,7 +492,7 @@ impl PublicBalanceCache {
         scope: &PublicBalanceScope,
         account: &PublicAccountMetadata,
         pending: bool,
-        inclusion: Option<BlockNumHash>,
+        inclusion: Option<u64>,
     ) {
         self.fence(scope, account, pending, inclusion, false);
     }
@@ -468,7 +502,7 @@ impl PublicBalanceCache {
         scope: &PublicBalanceScope,
         account: &PublicAccountMetadata,
         pending: bool,
-        inclusion: Option<BlockNumHash>,
+        inclusion: Option<u64>,
         queue: bool,
     ) {
         let mut namespaces = self
@@ -500,13 +534,7 @@ impl PublicBalanceCache {
                 }
             }
         }
-        if let Some(inclusion) = inclusion
-            && entry
-                .minimum
-                .is_none_or(|minimum| inclusion.number >= minimum.number)
-        {
-            entry.minimum = Some(inclusion);
-        }
+        entry.minimum = entry.minimum.max(inclusion);
         if queue {
             entry.queued.insert(account.public_account_uuid.clone());
         }
@@ -562,11 +590,9 @@ impl PublicBalanceCache {
                             .balances
                             .iter()
                             .all(|balance| balance.amount.amount().is_some())
-                        && account.observed_block.is_some_and(|block| {
-                            minimum.is_none_or(|minimum| {
-                                block.number > minimum.number || block == minimum
-                            })
-                        });
+                        && account
+                            .observed_block
+                            .is_some_and(|block| minimum.is_none_or(|minimum| block >= minimum));
                     if !complete {
                         account.observed_at = None;
                         account.observed_block = None;
@@ -602,10 +628,9 @@ impl PublicBalanceCache {
                 }
             }
         } else {
-            // The namespace fence also obsoletes unaffected accounts in this batch.
             entry.queued.extend(accounts);
         }
-        let follow_up = (!entry.queued.is_empty()).then(|| entry.start_queued());
+        let follow_up = (!entry.queued.is_empty()).then(|| entry.start_queued(&mut self.rng()));
         PublicBalanceRefreshCompletion {
             accepted,
             follow_up,
@@ -617,7 +642,8 @@ impl PublicBalanceCache {
 mod tests {
     use std::time::SystemTime;
 
-    use alloy::primitives::{Address, B256};
+    use alloy::primitives::Address;
+    use rand::SeedableRng as _;
 
     use super::*;
     use crate::HttpContext;
@@ -646,7 +672,7 @@ mod tests {
         chain_id: u64,
         account: &PublicAccountMetadata,
         time: Instant,
-        block: BlockNumHash,
+        block: u64,
     ) -> PublicBalanceSnapshot {
         PublicBalanceSnapshot {
             chain_id,
@@ -685,8 +711,8 @@ mod tests {
         cache.set_scope(second.clone());
         let active = account("active", PublicAccountStatus::Active);
         let now = Instant::now();
-        let before = BlockNumHash::new(10, B256::ZERO);
-        let inclusion = BlockNumHash::new(11, B256::repeat_byte(1));
+        let before = 10;
+        let inclusion = 11;
         let old = cache.begin_refresh(&first, ["active"]).unwrap();
         let other = cache.begin_refresh(&second, ["active"]).unwrap();
         assert!(cache.begin_refresh(&first, ["inactive"]).is_none());
@@ -703,25 +729,38 @@ mod tests {
         let done = cache.finish_refresh(old, Some(observation(1, &active, now, before)));
         assert!(!done.accepted);
         assert!(cache.snapshot(&first).is_none());
-        let follow_up = done.follow_up.unwrap();
-        assert!(follow_up.includes_account("active"));
-        assert!(follow_up.includes_account("inactive"));
-        assert_eq!(follow_up.minimum_block(), Some(inclusion));
-        let done = cache.finish_refresh(follow_up, Some(observation(1, &active, now, inclusion)));
-        assert!(done.accepted);
-        assert!(done.follow_up.is_none());
+        // The rejected account and the queued one are read next, one per ticket.
+        let mut follow_up = done.follow_up;
+        let mut served = BTreeSet::new();
+        while let Some(ticket) = follow_up {
+            assert_eq!(ticket.minimum_block(), Some(inclusion));
+            let id = if ticket.includes_account("active") {
+                "active"
+            } else {
+                "inactive"
+            };
+            assert!(served.insert(id.to_owned()));
+            let done = cache.finish_refresh(ticket, Some(observation(1, &active, now, inclusion)));
+            assert!(done.accepted);
+            follow_up = done.follow_up;
+        }
+        assert_eq!(served, ids(&["active", "inactive"]));
         assert!(
             cache
                 .eligible_balance(&first, &active, PublicAssetId::Native, now)
                 .is_none()
         );
         cache.invalidate_account(&first, &active, false, Some(inclusion));
-        let refresh = cache.begin_refresh(&first, ["active"]).unwrap();
-        let _ = cache.finish_refresh(refresh, Some(observation(1, &active, now, inclusion)));
-        assert_eq!(
-            cache.eligible_balance(&first, &active, PublicAssetId::Native, now),
-            Some(U256::from(5))
-        );
+        // A result below the inclusion block is kept without an observation; one at it is current.
+        for (block, eligible) in [(before, None), (inclusion, Some(U256::from(5)))] {
+            let refresh = cache.begin_refresh(&first, ["active"]).unwrap();
+            let done = cache.finish_refresh(refresh, Some(observation(1, &active, now, block)));
+            assert!(done.accepted);
+            assert_eq!(
+                cache.eligible_balance(&first, &active, PublicAssetId::Native, now),
+                eligible
+            );
+        }
 
         let obsolete = cache.begin_refresh(&first, ["active"]).unwrap();
         let changed =
@@ -750,9 +789,9 @@ mod tests {
         let active = account("active", PublicAccountStatus::Active);
         let inactive = account("inactive", PublicAccountStatus::Inactive);
         let observed = Instant::now();
-        let block = BlockNumHash::new(10, B256::ZERO);
+        let block = 10;
         let inactive_observed = observed + Duration::from_secs(31);
-        let inactive_block = BlockNumHash::new(11, B256::repeat_byte(1));
+        let inactive_block = 11;
         let active_snapshot = observation(1, &active, observed, block);
         let inactive_snapshot = observation(1, &inactive, inactive_observed, inactive_block);
         let active_balances = active_snapshot.accounts[0].balances.clone();
@@ -837,29 +876,31 @@ mod tests {
             .find(|row| row.account.public_account_uuid == id)
     }
 
-    /// Refreshes `accounts` through one accepted ticket.
+    /// Refreshes `accounts` through accepted tickets, one per account.
     fn refresh_all(
         cache: &PublicBalanceCache,
         scope: &PublicBalanceScope,
         accounts: &[&PublicAccountMetadata],
         time: Instant,
-        block: BlockNumHash,
+        block: u64,
     ) {
-        let ticket = cache
-            .begin_refresh(
-                scope,
-                accounts
-                    .iter()
-                    .map(|account| account.public_account_uuid.clone()),
-            )
-            .unwrap();
+        let mut ticket = cache.begin_refresh(
+            scope,
+            accounts
+                .iter()
+                .map(|account| account.public_account_uuid.clone()),
+        );
         let mut result = observation(scope.chain_id(), accounts[0], time, block);
         for account in &accounts[1..] {
             result
                 .accounts
                 .extend(observation(scope.chain_id(), account, time, block).accounts);
         }
-        assert!(cache.finish_refresh(ticket, Some(result)).accepted);
+        while let Some(current) = ticket {
+            let done = cache.finish_refresh(current, Some(result.clone()));
+            assert!(done.accepted);
+            ticket = done.follow_up;
+        }
     }
 
     fn ids(ids: &[&str]) -> BTreeSet<String> {
@@ -880,7 +921,7 @@ mod tests {
         let a = account("a", PublicAccountStatus::Active);
         let b = account("b", PublicAccountStatus::Active);
         let seeded = Instant::now();
-        let seeded_block = BlockNumHash::new(10, B256::ZERO);
+        let seeded_block = 10;
         refresh_all(&cache, &scope, &[&a, &b], seeded, seeded_block);
 
         let only_a = cache.begin_refresh(&scope, ["a"]).unwrap();
@@ -889,7 +930,7 @@ mod tests {
         assert!(cache.begin_refresh(&scope, ["c"]).is_none());
         assert_eq!(cache.refreshing_accounts(&scope), ids(&["a", "c"]));
         let later = seeded + Duration::from_secs(5);
-        let later_block = BlockNumHash::new(11, B256::repeat_byte(1));
+        let later_block = 11;
         // Rows outside the ticket are ignored even if the read returned them.
         let mut result = observation(1, &a, later, later_block);
         result
@@ -898,22 +939,25 @@ mod tests {
         let done = cache.finish_refresh(only_a, Some(result));
         assert!(done.accepted);
         let follow_up = done.follow_up.unwrap();
-        assert!(follow_up.includes_account("a") && follow_up.includes_account("c"));
+        assert_ne!(
+            follow_up.includes_account("a"),
+            follow_up.includes_account("c")
+        );
         assert!(!follow_up.includes_account("b"));
         assert_eq!(row(&cache, &scope, "a").unwrap().observed_at, Some(later));
         let untouched = row(&cache, &scope, "b").unwrap();
         assert_eq!(untouched.observed_at, Some(seeded));
         assert_eq!(untouched.observed_block, Some(seeded_block));
 
-        // Inclusion queues only its account, and the fenced batch re-queues exactly its ids.
+        // Inclusion queues only its account, and the fenced ticket re-queues its id.
         // A rejected failure records nothing as failed.
         cache.invalidate_account(&scope, &b, false, None);
         let done = cache.finish_refresh(follow_up, None);
         assert!(!done.accepted);
         assert!(cache.failed_accounts(&scope).is_empty());
-        let retry = done.follow_up.unwrap();
+        let mut retry = done.follow_up;
         assert_eq!(cache.refreshing_accounts(&scope), ids(&["a", "b", "c"]));
-        // An accepted failure clears its accounts' observations and records them as failed,
+        // An accepted failure clears its account's observation and records it as failed,
         // in this chain's namespace only.
         let other = PublicBalanceScope::new(
             "wallet".into(),
@@ -922,13 +966,17 @@ mod tests {
             RpcChainRoute::new(137, Vec::<url::Url>::new()),
         );
         cache.set_scope(other.clone());
-        assert!(cache.finish_refresh(retry, None).accepted);
+        while let Some(ticket) = retry {
+            let done = cache.finish_refresh(ticket, None);
+            assert!(done.accepted);
+            retry = done.follow_up;
+        }
         assert_eq!(row(&cache, &scope, "a").unwrap().observed_at, None);
         assert!(cache.refreshing_accounts(&scope).is_empty());
         assert_eq!(cache.failed_accounts(&scope), ids(&["a", "b", "c"]));
         assert!(cache.failed_accounts(&other).is_empty());
         // A success clears only the ids whose rows it returned.
-        let ticket = cache.begin_refresh(&scope, ["a", "c"]).unwrap();
+        let ticket = cache.begin_refresh(&scope, ["a"]).unwrap();
         let done = cache.finish_refresh(ticket, Some(observation(1, &a, later, later_block)));
         assert!(done.accepted);
         assert_eq!(cache.failed_accounts(&scope), ids(&["b", "c"]));
@@ -948,6 +996,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tickets_serve_one_random_account_and_a_fence_requeues_only_its_account() {
+        let http = HttpContext::direct_for_tests();
+        let scope = PublicBalanceScope::new(
+            "wallet".into(),
+            1,
+            http.rpc_broker(),
+            RpcChainRoute::new(1, Vec::<url::Url>::new()),
+        );
+        let requested = ["a", "b", "c"];
+        let mut orders = Vec::new();
+        for seed in 0..8 {
+            let cache = PublicBalanceCache::with_rng(StdRng::seed_from_u64(seed));
+            cache.set_scope(scope.clone());
+            let mut ticket = cache.begin_refresh(&scope, requested);
+            let mut order = Vec::new();
+            while let Some(current) = ticket {
+                let unserved = requested
+                    .into_iter()
+                    .filter(|id| !order.contains(id))
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>();
+                assert_eq!(cache.refreshing_accounts(&scope), unserved);
+                let served = requested
+                    .into_iter()
+                    .filter(|id| current.includes_account(id))
+                    .collect::<Vec<_>>();
+                assert_eq!(served.len(), 1, "each ticket reads one account");
+                order.extend(served);
+                ticket = cache.finish_refresh(current, None).follow_up;
+            }
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, requested, "every account is read once");
+            orders.push(order);
+        }
+        assert!(
+            orders.iter().any(|order| order != &requested),
+            "the read order does not follow id order"
+        );
+
+        // A fence while the second account is read rejects only that account's work.
+        let cache = PublicBalanceCache::default();
+        cache.set_scope(scope.clone());
+        let accounts = requested.map(|id| account(id, PublicAccountStatus::Active));
+        let served = |ticket: &PublicBalanceRefreshTicket| {
+            accounts
+                .iter()
+                .find(|account| ticket.includes_account(&account.public_account_uuid))
+                .unwrap()
+        };
+        let now = Instant::now();
+        let first = cache.begin_refresh(&scope, requested).unwrap();
+        let first_account = served(&first);
+        let done = cache.finish_refresh(first, Some(observation(1, first_account, now, 10)));
+        assert!(done.accepted);
+        let second = done.follow_up.unwrap();
+        let second_account = served(&second);
+        cache.fence_account(
+            &scope,
+            &account("d", PublicAccountStatus::Active),
+            false,
+            None,
+        );
+        let done = cache.finish_refresh(second, Some(observation(1, second_account, now, 10)));
+        assert!(!done.accepted);
+        let first_id = &first_account.public_account_uuid;
+        assert_eq!(
+            row(&cache, &scope, first_id).unwrap().observed_at,
+            Some(now)
+        );
+        let mut unread = ids(&requested);
+        unread.remove(first_id);
+        assert_eq!(cache.refreshing_accounts(&scope), unread);
+    }
+
+    #[tokio::test]
     async fn retained_accounts_keep_rows_and_reject_refreshes_of_changed_accounts() {
         let http = HttpContext::direct_for_tests();
         let scope = PublicBalanceScope::new(
@@ -962,7 +1086,7 @@ mod tests {
         let b = account("b", PublicAccountStatus::Active);
         let c = account("c", PublicAccountStatus::Active);
         let observed = Instant::now();
-        let block = BlockNumHash::new(10, B256::ZERO);
+        let block = 10;
         refresh_all(&cache, &scope, &[&a, &b], observed, block);
         let before = cache.snapshot(&scope).unwrap().accounts;
 

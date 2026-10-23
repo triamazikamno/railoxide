@@ -1760,10 +1760,7 @@ fn seed_balance(
                             ),
                         }],
                         observed_at: Some(observed_at.into_std()),
-                        observed_block: Some(alloy::eips::BlockNumHash::new(
-                            10,
-                            alloy::primitives::B256::repeat_byte(10)
-                        )),
+                        observed_block: Some(10),
                     }],
                 })
             )

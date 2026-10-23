@@ -5,6 +5,7 @@
 use super::candidates::ready;
 use super::*;
 use crate::HttpContext;
+use crate::http::{OperationHttpClient, OperationNetworkIsolation};
 use crate::rpc_broker::RpcCandidates;
 use crate::rpc_broker::capacity::DEFAULT_MAX_IDENTITY_PROBES;
 
@@ -682,6 +683,63 @@ async fn parked_jobs_wake_when_a_route_clone_verifies_an_endpoint() {
     drop(broker);
     failing.server.abort();
     stalled_endpoint.server.abort();
+    healthy.server.abort();
+}
+
+#[tokio::test]
+async fn an_abandoned_runner_request_releases_its_isolated_route_while_runners_are_held() {
+    let traffic = Traffic::default();
+    let broker = test_broker(Duration::from_millis(1), DEFAULT_MAX_IN_FLIGHT);
+    let stall = Latch::new();
+    // Unrelated jobs hold every probe runner until the end of the test.
+    let mut stalled = Vec::new();
+    for _ in 0..PROBE_BUDGET {
+        stalled.push(stalled_verification_job(&broker, &traffic, &stall).await);
+    }
+    wait_until(
+        "the probe budget is occupied by stalled identity checks",
+        || traffic.identity_in_flight() >= PROBE_BUDGET,
+    )
+    .await;
+    let failing = spawn_endpoint(failing_read_responder(), None, &traffic).await;
+    let healthy = spawn_endpoint(healthy_responder(), None, &traffic).await;
+    let shared = Shape::Individual.route(vec![failing.url.clone(), healthy.url.clone()]);
+    warm_identity(&shared, &failing.url).await;
+    let isolated = long_lived(RpcRoute::from(shared.chain_route().isolated(
+        OperationHttpClient::for_tests(
+            reqwest::Client::new(),
+            OperationNetworkIsolation::Dedicated,
+        ),
+    )));
+    let probe = isolated
+        .chain_route()
+        .isolation_probe()
+        .expect("isolated route");
+
+    // Starts on the verified endpoint without a runner and, after that read fails, waits for one.
+    let runnerless = spawn_submit(&broker, isolated, Shape::Individual.reads(0));
+    wait_until("the isolated read fails", || failing.reads().len() == 1).await;
+    time::sleep(SETTLE).await;
+    assert!(!runnerless.is_finished());
+
+    // Another owner verifies the fallback, so the job proceeds and abandons its runner request.
+    warm_identity(&shared, &healthy.url).await;
+    let results = time::timeout(BOUND, runnerless)
+        .await
+        .expect("parked job resumes on the newly verified endpoint")
+        .expect("submission task")
+        .expect("broker admits the submission");
+    assert_eq!(results, Shape::Individual.expected());
+    // No runner frees up before the stalled jobs are released, so only dropping the abandoned
+    // request lets the route's isolation go.
+    wait_until("the broker holds no clone of the isolated route", || {
+        probe.upgrade().is_none()
+    })
+    .await;
+    assert!(!stall.is_open());
+    release_stalled_jobs(&stall, stalled).await;
+    drop(broker);
+    failing.server.abort();
     healthy.server.abort();
 }
 

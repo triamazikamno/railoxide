@@ -89,7 +89,7 @@ async fn executor_public_registration_is_atomic_idempotent_and_preserves_custody
         crate::RpcChainRoute::new(137, vec!["http://127.0.0.1:9".parse::<url::Url>().unwrap()]);
     let snapshot = crate::refresh_public_balances(
         137,
-        std::slice::from_ref(&first),
+        &first,
         &other_chain,
         None,
         &HttpContext::direct_for_tests(),

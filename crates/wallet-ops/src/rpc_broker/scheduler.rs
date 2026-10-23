@@ -462,7 +462,8 @@ impl ReadyScheduler {
         let mut groups: Vec<Vec<WorkItem>> = Vec::new();
         #[expect(
             clippy::mutable_key_type,
-            reason = "route equality and hashing exclude the endpoint verification cache"
+            reason = "route equality and hashing exclude the endpoint verification cache and the \
+                      isolation client"
         )]
         let mut group_indices: HashMap<(RpcChainRoute, Option<BlockKey>), usize> = HashMap::new();
         for item in work {

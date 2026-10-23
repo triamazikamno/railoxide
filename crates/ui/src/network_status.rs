@@ -542,6 +542,17 @@ pub fn network_status_popover_content(
                         health.kind.label().to_lowercase()
                     )),
             )
+            .child(
+                div()
+                    .debug_selector(|| "wallet-network-public-balance-disclosure".into())
+                    .text_size(gpui::rems(12.0 / 16.0))
+                    .line_height(gpui::relative(APP_TEXT_LINE_HEIGHT))
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child(format!(
+                        "Public balance reads are not isolated in {}.",
+                        health.kind.label().to_lowercase()
+                    )),
+            )
         })
         .when_some(error, |this, error| {
             this.child(Alert::error("wallet-network-status-error", error.to_string()).small())
@@ -889,6 +900,10 @@ mod tests {
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.read(|cx| first.read(cx).open));
         assert!(cx.read(|cx| first.read(cx).intents.is_empty()));
+        assert!(
+            cx.debug_bounds("wallet-network-public-balance-disclosure")
+                .is_none()
+        );
         click(cx, "wallet-network-new-tor-session");
         first.update(cx, |probe, _| {
             assert!(probe.open, "session recovery keeps the popover open");
@@ -934,6 +949,10 @@ mod tests {
             cx.update(|window, cx| window.draw(cx).clear(cx));
             assert!(cx.debug_bounds("wallet-network-new-tor-session").is_none());
             assert!(cx.debug_bounds("wallet-network-query-exit-ip").is_none());
+            assert!(
+                cx.debug_bounds("wallet-network-public-balance-disclosure")
+                    .is_some()
+            );
             assert!(
                 cx.debug_bounds("wallet-network-confirm-tor-reset")
                     .is_none()

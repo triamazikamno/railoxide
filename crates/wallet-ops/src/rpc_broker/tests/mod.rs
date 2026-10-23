@@ -215,6 +215,35 @@ pub(crate) async fn spawn_rpc_mock_with_gate(
     maximum: Arc<AtomicUsize>,
     gate: Option<RpcMockGate>,
 ) -> (Url, tokio::task::JoinHandle<()>) {
+    serve_rpc_mock(responder, active, maximum, gate, None).await
+}
+
+/// Each request's `x-route` header, naming the client that sent it, and JSON body.
+pub(super) type RecordedRequests = Arc<Mutex<Vec<(Option<String>, Value)>>>;
+
+/// Like [`spawn_rpc_mock`], also recording every request in arrival order.
+pub(super) async fn spawn_recording_rpc_mock(
+    responder: RpcResponder,
+) -> (Url, RecordedRequests, tokio::task::JoinHandle<()>) {
+    let recorded = RecordedRequests::default();
+    let (url, task) = serve_rpc_mock(
+        responder,
+        Arc::default(),
+        Arc::default(),
+        None,
+        Some(recorded.clone()),
+    )
+    .await;
+    (url, recorded, task)
+}
+
+async fn serve_rpc_mock(
+    responder: RpcResponder,
+    active: Arc<AtomicUsize>,
+    maximum: Arc<AtomicUsize>,
+    gate: Option<RpcMockGate>,
+    recorded: Option<RecordedRequests>,
+) -> (Url, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind RPC mock");
@@ -225,7 +254,10 @@ pub(crate) async fn spawn_rpc_mock_with_gate(
             let active = active.clone();
             let maximum = maximum.clone();
             let gate = gate.clone();
-            tokio::spawn(handle_rpc_mock(stream, responder, active, maximum, gate));
+            let recorded = recorded.clone();
+            tokio::spawn(handle_rpc_mock(
+                stream, responder, active, maximum, gate, recorded,
+            ));
         }
     });
     (
@@ -275,10 +307,11 @@ async fn handle_rpc_mock(
     active: Arc<AtomicUsize>,
     maximum: Arc<AtomicUsize>,
     gate: Option<RpcMockGate>,
+    recorded: Option<RecordedRequests>,
 ) -> std::io::Result<()> {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 4096];
-    let (body_start, content_length) = loop {
+    let (body_start, content_length, route_tag) = loop {
         let read = stream.read(&mut buffer).await?;
         if read == 0 {
             return Ok(());
@@ -299,7 +332,12 @@ async fn handle_rpc_mock(
                     .and_then(|(_, value)| value.trim().parse::<usize>().ok())
             })
             .unwrap_or(0);
-        break (body_start, content_length);
+        let route_tag = headers.lines().find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("x-route:")
+                .map(|tag| tag.trim().to_owned())
+        });
+        break (body_start, content_length, route_tag);
     };
     while request.len() < body_start + content_length {
         let read = stream.read(&mut buffer).await?;
@@ -310,6 +348,9 @@ async fn handle_rpc_mock(
     }
     let body: Value = serde_json::from_slice(&request[body_start..body_start + content_length])
         .expect("RPC mock JSON request");
+    if let Some(recorded) = recorded {
+        recorded.lock().unwrap().push((route_tag, body.clone()));
+    }
     let current = active.fetch_add(1, Ordering::SeqCst) + 1;
     maximum.fetch_max(current, Ordering::SeqCst);
     if let Some(gate) = gate {
@@ -330,6 +371,7 @@ async fn handle_rpc_mock(
 
 mod actor;
 mod candidates;
+mod isolation;
 mod methods;
 mod model;
 mod profile;

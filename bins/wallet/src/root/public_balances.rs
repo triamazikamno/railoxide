@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy::primitives::U256;
 use gpui::Context;
@@ -7,6 +8,7 @@ use railgun_ui::{
     format_scaled_amount, format_token_amount, format_usd_micro_value,
     native_currency_icon_asset_path, short_address,
 };
+use rand::RngExt as _;
 use wallet_ops::{
     PublicAccountBalance, PublicAssetId, PublicBalanceAmount, PublicBalanceEntry,
     PublicBalanceRefreshTicket, PublicBalanceSnapshot, TokenAnchorRateCache,
@@ -455,7 +457,7 @@ impl WalletRoot {
     }
 
     /// Timer, view, chain, settings and reload triggers: only with automatic refresh on.
-    pub(super) fn schedule_automatic_public_balance_refresh(&mut self, cx: &mut Context<'_, Self>) {
+    pub(super) fn schedule_automatic_public_balance_refresh(&self, cx: &mut Context<'_, Self>) {
         if self.ui_state.public_auto_refresh {
             self.schedule_global_public_balance_refresh(PublicAccountStatus::Active, cx);
         }
@@ -463,7 +465,7 @@ impl WalletRoot {
 
     /// The section's included accounts on the selected chain, whatever the toggle says.
     pub(super) fn schedule_global_public_balance_refresh(
-        &mut self,
+        &self,
         status: PublicAccountStatus,
         cx: &mut Context<'_, Self>,
     ) {
@@ -473,7 +475,7 @@ impl WalletRoot {
 
     /// Exactly the named accounts, ignoring the toggle and exclusions.
     pub(super) fn schedule_account_public_balance_refresh<I, S>(
-        &mut self,
+        &self,
         chain_id: u64,
         accounts: I,
         window: Option<gpui::AnyWindowHandle>,
@@ -501,7 +503,7 @@ impl WalletRoot {
     }
 
     pub(super) fn run_public_balance_refresh(
-        &mut self,
+        &self,
         ticket: PublicBalanceRefreshTicket,
         window: Option<gpui::AnyWindowHandle>,
         cx: &Context<'_, Self>,
@@ -513,24 +515,24 @@ impl WalletRoot {
             return;
         }
         let chain_id = ticket.scope().chain_id();
-        let accounts = self
+        // The read skips an account that is unavailable on this chain.
+        let account = self
             .public_accounts
             .iter()
-            .filter(|account| {
-                ticket.includes_account(&account.public_account_uuid)
-                    && account.is_available_on_chain(chain_id)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+            .find(|account| ticket.includes_account(&account.public_account_uuid))
+            .cloned();
         let http = self.http.clone();
-        let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
-            // Finish the ticket so its ids stop showing as pending.
+        let (Some(account), Ok(effective_chain)) = (
+            account,
+            self.effective_chain_configs.enabled(chain_id).cloned(),
+        ) else {
+            // Finish the ticket so its id stops showing as pending.
             if let Some(follow_up) = self
                 .public_balance_cache
                 .finish_refresh(ticket, None)
                 .follow_up
             {
-                self.run_public_balance_refresh(follow_up, window, cx);
+                self.run_public_balance_follow_up(follow_up, window, cx);
             }
             return;
         };
@@ -539,7 +541,7 @@ impl WalletRoot {
         let join = self.runtime.spawn(async move {
             refresh_public_balances_at_least(
                 chain_id,
-                &accounts,
+                &account,
                 &effective_chain,
                 Some(&effective_token_registry),
                 &http,
@@ -581,6 +583,32 @@ impl WalletRoot {
                         root.sync_self_broadcast_gas_payer_selects(window, cx);
                     });
                 });
+            }
+        })
+        .detach();
+    }
+
+    /// Runs a follow-up after a random 0.5-3 s, so successive accounts' reads aren't
+    /// timed together. A scope change meanwhile finishes it without reads.
+    fn run_public_balance_follow_up(
+        &self,
+        ticket: PublicBalanceRefreshTicket,
+        window: Option<gpui::AnyWindowHandle>,
+        cx: &Context<'_, Self>,
+    ) {
+        let delay = Duration::from_millis(rand::rng().random_range(500..=3_000));
+        let cache = self.public_balance_cache.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let mut ticket = Some(ticket);
+            let _ = this.update(cx, |root, cx| {
+                let ticket = ticket.take().expect("follow-up ticket available");
+                root.run_public_balance_refresh(ticket, window, cx);
+            });
+            if let Some(ticket) = ticket {
+                let _ = cache.finish_refresh(ticket, None);
+                // The owner has gone away; discard any admitted follow-up as well.
+                cache.clear();
             }
         })
         .detach();
@@ -647,7 +675,7 @@ impl WalletRoot {
             }
         }
         if let Some(follow_up) = completion.follow_up {
-            self.run_public_balance_refresh(follow_up, window, cx);
+            self.run_public_balance_follow_up(follow_up, window, cx);
         }
         self.publish_gateway_desktop_state();
         cx.notify();

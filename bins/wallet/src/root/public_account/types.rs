@@ -103,4 +103,6 @@ pub(in crate::root) struct PublicAccountFormState {
         Option<(PublicAssetId, Entity<gpui_component::menu::PopupMenu>)>,
     pub(in crate::root) asset_menu_subscription: Option<gpui::Subscription>,
     pub(in crate::root) open_section: wallet_ops::vault::PublicAccountStatus,
+    /// Whether the "How balances are read" popover is open, which drops its hover tooltip.
+    pub(in crate::root) refresh_help_open: bool,
 }

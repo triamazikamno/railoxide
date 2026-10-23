@@ -2,14 +2,14 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::{Instant, SystemTime};
 
-use alloy::eips::{BlockId, BlockNumHash, BlockNumberOrTag};
-use alloy::network::{AnyRpcBlock, primitives::HeaderResponse};
-use alloy::primitives::{Address, Bytes, U256};
+use alloy::eips::BlockId;
+use alloy::primitives::{Address, Bytes, U64, U256};
 use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use alloy::serde::WithOtherFields;
 use alloy::sol_types::SolCall;
-use eyre::{Result, eyre};
+use eyre::{Result, WrapErr, eyre};
 use railgun_ui::known_tokens_for_chain;
+use serde_json::Value;
 
 use super::contracts::PublicErc20;
 use super::runtime::public_chain_runtime_config;
@@ -20,7 +20,9 @@ use super::types::{
 use crate::rpc_broker::total_failure;
 use crate::settings::{EffectiveChainConfig, EffectiveTokenRegistry};
 use crate::vault::PublicAccountMetadata;
-use crate::{HttpContext, RpcRead, RpcResult, RpcRoute, RpcSubmission, WalletRpcOrigin};
+use crate::{
+    HttpContext, RpcBrokerError, RpcRead, RpcResult, RpcRoute, RpcSubmission, WalletRpcOrigin,
+};
 
 const PUBLIC_BALANCE_REFRESH_INTERVAL_SECS: u64 = 60;
 
@@ -110,14 +112,14 @@ pub(super) fn plan_public_balance_calls(
 
 pub async fn refresh_public_balances(
     chain_id: u64,
-    accounts: &[PublicAccountMetadata],
+    account: &PublicAccountMetadata,
     effective_chain: &EffectiveChainConfig,
     token_registry: Option<&EffectiveTokenRegistry>,
     http: &HttpContext,
 ) -> Result<PublicBalanceSnapshot> {
     refresh_public_balances_at_least(
         chain_id,
-        accounts,
+        account,
         effective_chain,
         token_registry,
         http,
@@ -126,69 +128,57 @@ pub async fn refresh_public_balances(
     .await
 }
 
+/// Reads one account over its own isolated route, pinned to the block number read first on
+/// that route. A number below `minimum` is an error before any balance read is sent.
 pub async fn refresh_public_balances_at_least(
     chain_id: u64,
-    accounts: &[PublicAccountMetadata],
+    account: &PublicAccountMetadata,
     effective_chain: &EffectiveChainConfig,
     token_registry: Option<&EffectiveTokenRegistry>,
     http: &HttpContext,
-    minimum: Option<BlockNumHash>,
+    minimum: Option<u64>,
 ) -> Result<PublicBalanceSnapshot> {
-    let accounts = accounts
-        .iter()
-        .filter(|account| account.is_available_on_chain(chain_id))
-        .cloned()
-        .collect::<Vec<_>>();
-    let accounts = accounts.as_slice();
+    let accounts = if account.is_available_on_chain(chain_id) {
+        std::slice::from_ref(account)
+    } else {
+        &[]
+    };
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
     if accounts.is_empty()
         || public_balance_assets_for_chain_with_registry(effective_chain, token_registry).is_empty()
     {
         return Ok(empty_public_balance_snapshot(chain_id, accounts));
     }
-    let route = RpcRoute::from(chain.rpc_route);
-    let head_read = RpcRead::get_block_by_number(BlockNumberOrTag::Latest, false);
-    let head_results = http
-        .rpc_broker()
-        .submit(RpcSubmission::new(
-            route.clone(),
-            vec![head_read],
-            WalletRpcOrigin::PublicWallet.into(),
-        ))
+    // Never fall back to the shared route: that would mix this account with other traffic.
+    let client = http
+        .operation_http_client()
         .await
-        .map_err(|_| eyre!("public balance canonical head unavailable"))?;
-    let head: AnyRpcBlock = head_results
-        .first()
-        .and_then(|result| result.as_ref().ok())
-        .and_then(|result| serde_json::from_value(result.expose_value().clone()).ok())
-        .ok_or_else(|| eyre!("public balance canonical head unavailable"))?;
-    let observed_block = head.header.num_hash();
-    if minimum.is_some_and(|minimum| {
-        observed_block.number < minimum.number
-            || (observed_block.number == minimum.number && observed_block.hash != minimum.hash)
-    }) {
+        .wrap_err("public balance isolated route unavailable")?;
+    let route = RpcRoute::from(chain.rpc_route.isolated(client));
+    let head = RpcRead::from_method_params("eth_blockNumber", Value::Array(Vec::new()), chain_id)?;
+    let observed_block = submit_public_balance_reads(http, route.clone(), vec![head])
+        .await?
+        .pop()
+        .and_then(std::result::Result::ok)
+        .and_then(|result| serde_json::from_value::<U64>(result.into_value()).ok())
+        .map(|number| number.to::<u64>())
+        .ok_or_else(|| eyre!("public balance block number read failed"))?;
+    if minimum.is_some_and(|minimum| observed_block < minimum) {
         return Err(eyre!(
-            "public balance canonical head does not satisfy minimum block"
+            "public balance observed block does not satisfy minimum block"
         ));
     }
+    // Pinning every read to the route's number keeps it valid for each request the broker
+    // splits, chunks or fails over the aggregate into.
     let planned_calls = plan_public_balance_calls(
         effective_chain,
         accounts,
         token_registry,
-        BlockId::hash_canonical(observed_block.hash),
+        BlockId::number(observed_block),
     )?;
-    let reads = planned_calls.iter().map(|call| call.read.clone()).collect();
-    // This shared submission starts the observation for every account in the batch.
+    let reads: Vec<RpcRead> = planned_calls.iter().map(|call| call.read.clone()).collect();
     let observed_at = Instant::now();
-    let results = http
-        .rpc_broker()
-        .submit(RpcSubmission::new(
-            route,
-            reads,
-            WalletRpcOrigin::PublicWallet.into(),
-        ))
-        .await
-        .map_err(|error| eyre!("RPC broker balance submission failed: {error}"))?;
+    let results = submit_public_balance_reads(http, route, reads).await?;
     if let Some(error) = total_failure(&results) {
         tracing::warn!(
             chain_id,
@@ -222,8 +212,23 @@ pub async fn refresh_public_balances_at_least(
             })
             .collect(),
         observed_at,
-        observed_block,
+        Some(observed_block),
     ))
+}
+
+async fn submit_public_balance_reads(
+    http: &HttpContext,
+    route: RpcRoute,
+    reads: Vec<RpcRead>,
+) -> Result<Vec<Result<RpcResult, RpcBrokerError>>> {
+    http.rpc_broker()
+        .submit(RpcSubmission::new(
+            route,
+            reads,
+            WalletRpcOrigin::PublicWallet.into(),
+        ))
+        .await
+        .map_err(|error| eyre!("RPC broker balance submission failed: {error}"))
 }
 
 fn decode_public_balance(asset: &PublicAssetId, result: &RpcResult) -> Option<U256> {
@@ -242,7 +247,7 @@ pub(super) fn public_balance_snapshot_from_results(
     planned_calls: &[PlannedPublicBalanceCall],
     results: Vec<Option<U256>>,
     observed_at: Instant,
-    observed_block: BlockNumHash,
+    observed_block: Option<u64>,
 ) -> PublicBalanceSnapshot {
     let expected_counts =
         planned_calls
@@ -275,7 +280,8 @@ pub(super) fn public_balance_snapshot_from_results(
                 let balances = by_account
                     .remove(&account.public_account_uuid)
                     .unwrap_or_default();
-                let complete = !balances.is_empty()
+                let complete = observed_block.is_some()
+                    && !balances.is_empty()
                     && expected_counts.get(account.public_account_uuid.as_str())
                         == Some(&balances.len())
                     && balances
@@ -285,7 +291,7 @@ pub(super) fn public_balance_snapshot_from_results(
                     balances,
                     account,
                     observed_at: complete.then_some(observed_at),
-                    observed_block: complete.then_some(observed_block),
+                    observed_block: observed_block.filter(|_| complete),
                 }
             })
             .collect(),

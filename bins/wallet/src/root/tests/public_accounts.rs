@@ -598,10 +598,7 @@ fn observed_native_balance(account: &PublicAccountMetadata) -> PublicAccountBala
     PublicAccountBalance {
         account: account.clone(),
         observed_at: Some(std::time::Instant::now()),
-        observed_block: Some(alloy::eips::BlockNumHash::new(
-            10,
-            alloy::primitives::B256::ZERO,
-        )),
+        observed_block: Some(10),
         balances: vec![PublicBalanceEntry {
             asset: PublicBalanceAsset {
                 id: PublicAssetId::Native,
@@ -710,6 +707,80 @@ fn public_balance_triggers_follow_autorefresh_and_read_only_their_accounts(
         assert_eq!(root.public_refreshing_accounts(), ids(&[1, 3]));
         assert!(root.gateway_public_view().refreshing);
     });
+
+    // A refresh reads one account per ticket and applies each read as it completes. Each
+    // read after the first waits a random 0.5-3 s.
+    let reads = || runtime.metrics().num_alive_tasks();
+    let started = root.update(cx, |root, cx| {
+        // A new wallet generation leaves the reads started above behind.
+        root.active_wallet_generation += 1;
+        root.publish_gateway_desktop_state();
+        let scope = root.current_public_balance_scope(10).unwrap();
+        let ticket = root
+            .public_balance_cache
+            .begin_refresh(&scope, ["account-4", "account-5", "account-6"])
+            .unwrap();
+        let served = [4, 5, 6]
+            .into_iter()
+            .filter(|index| ticket.includes_account(&format!("account-{index}")))
+            .collect::<Vec<u8>>();
+        assert_eq!(served.len(), 1);
+        // The read returned every requested row; only its own account's is applied.
+        let read = PublicBalanceSnapshot {
+            chain_id: 10,
+            refreshed_at: SystemTime::now(),
+            accounts: [4, 5, 6]
+                .map(|index| observed_native_balance(&root.public_accounts[index]))
+                .into(),
+        };
+        root.apply_public_balance_refresh_result(ticket, Ok(Ok(read)), None, cx);
+        for index in [4, 5, 6] {
+            let applied = crate::root::public_balances::public_account_balances_for_chain(
+                root.public_balance_snapshot.as_deref(),
+                10,
+                &format!("account-{index}"),
+                PublicAccountStatus::Active,
+            )
+            .is_some();
+            assert_eq!(applied, index == served[0]);
+        }
+        let others = [4, 5, 6]
+            .into_iter()
+            .filter(|index| *index != served[0])
+            .collect::<Vec<_>>();
+        assert_eq!(root.public_refreshing_accounts(), ids(&others));
+        reads()
+    });
+    // Let the follow-up start its wait before the clock moves.
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(400));
+    cx.run_until_parked();
+    assert_eq!(reads(), started, "the next account waits at least 0.5 s");
+    cx.executor().advance_clock(Duration::from_millis(2_700));
+    cx.run_until_parked();
+    assert_eq!(reads(), started + 1, "then one read starts");
+
+    // A scope change during the wait finishes the follow-up without a read.
+    let waiting = root.update(cx, |root, cx| {
+        let scope = root.current_public_balance_scope(20).unwrap();
+        let ticket = root
+            .public_balance_cache
+            .begin_refresh(&scope, ["account-4", "account-5"])
+            .unwrap();
+        root.apply_public_balance_refresh_result(
+            ticket,
+            Ok(Err(eyre::eyre!("rpc down"))),
+            None,
+            cx,
+        );
+        root.active_wallet_generation += 1;
+        root.publish_gateway_desktop_state();
+        reads()
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(3_100));
+    cx.run_until_parked();
+    assert_eq!(reads(), waiting);
     cx.update(|window, _| window.remove_window());
     drop(host);
     drop(root);
@@ -774,12 +845,6 @@ fn failed_account_refresh_stays_stale_after_another_account_succeeds(cx: &mut Te
         refresh(root, "account-0", Ok(recovered));
         assert!(!root.public_summary_status().1);
 
-        let both = read(root, &[0, 1]);
-        let ticket = root
-            .public_balance_cache
-            .begin_refresh(&scope, ["account-0", "account-1"])
-            .unwrap();
-        root.apply_public_balance_refresh_result(ticket, Ok(Ok(both)), None, cx);
         let ticket = root
             .public_balance_cache
             .begin_refresh(&scope, ["account-0"])
