@@ -21,7 +21,7 @@ use thiserror::Error;
 use tokio::time::timeout;
 
 use crate::settings::{EffectiveChainConfig, resolve_effective_chain_rpc_route};
-use crate::{HttpContext, RpcRoute, WalletRpcOrigin, query_rpc_pool_with_http_client};
+use crate::{HttpContext, RpcRoute, WalletRpcOrigin, query_rpc_pool_for_route};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MULTICALL_CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(64).unwrap();
@@ -787,10 +787,7 @@ fn provider_for_chain(
     http: &HttpContext,
 ) -> Result<(Arc<QueryRpcPool>, crate::RpcChainRoute)> {
     let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
-    Ok((
-        query_rpc_pool_with_http_client(route.endpoint_urls(), http),
-        route,
-    ))
+    Ok((query_rpc_pool_for_route(&route, http), route))
 }
 
 #[cfg(test)]

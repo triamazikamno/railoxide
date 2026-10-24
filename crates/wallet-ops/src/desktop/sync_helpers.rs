@@ -315,9 +315,9 @@ async fn fetch_effective_chain_head(
     // A one-shot read verifies every endpoint so the fallback covers all of them.
     let route =
         settings::resolve_effective_chain_rpc_route(effective_chain.chain_id, effective_chain)?
-            .verify_identity(&http.rpc_client)
+            .verify_identity(&http.rpc_clients())
             .await?;
-    let rpcs = query_rpc_pool_with_http_client(route.endpoint_urls(), http);
+    let rpcs = query_rpc_pool_for_route(&route, http);
     let providers = rpcs.available_providers();
     if providers.is_empty() {
         return Err(eyre!(
@@ -582,21 +582,24 @@ async fn verified_chain_config(
     progress_tx: Option<SyncProgressSender>,
 ) -> Result<ChainConfig> {
     let mut config = chain_config(effective_chain, http, progress_tx)?;
-    let archive = config.archive_rpc_url.clone().map(SensitiveUrl::from);
+    let private = effective_chain.require_railgun()?;
+    let archive = private
+        .archive_rpc_url
+        .clone()
+        .map(|url| (url, private.archive_rpc_transport));
+    let clients = http.rpc_clients();
     // Endpoints join the pool as their identity checks pass; the session starts with the first.
-    let mut pool = QueryRpcPool::with_http_client(
-        effective_chain.rpc_route.endpoint_urls(),
-        DEFAULT_QUERY_RPC_COOLDOWN,
-        http.rpc_client.clone(),
-    )
-    .with_pending_admission();
+    let mut pool = effective_chain
+        .rpc_route
+        .query_rpc_pool(&clients, DEFAULT_QUERY_RPC_COOLDOWN)
+        .with_pending_admission();
     if archive.is_some() {
         pool = pool.with_pending_archive();
     }
     let pool = Arc::new(pool);
     effective_chain
         .rpc_route
-        .admit_sync_pool(&http.rpc_client, &pool, archive)
+        .admit_sync_pool(&clients, &pool, archive)
         .await?;
     config.rpcs = pool;
     Ok(config)
@@ -617,11 +620,13 @@ pub(crate) fn chain_config(
     Ok(ChainConfig {
         deployment: private.deployment,
         sync,
-        rpcs: query_rpc_pool_with_http_client(route.endpoint_urls(), http),
+        rpcs: query_rpc_pool_for_route(&route, http),
         archive_rpc_url: private
             .archive_rpc_url
             .as_ref()
             .map(|url| url.expose_url().clone()),
+        archive_rpc_http_client: (private.archive_rpc_transport == RpcTransport::Direct)
+            .then(|| http.direct_rpc_client.clone()),
         block_time: effective_chain
             .block_time
             .ok_or_else(|| eyre!("private sync requires a block cadence"))?,
@@ -1187,6 +1192,7 @@ mod tests {
                             Duration::from_millis(1),
                         )),
                         archive_rpc_url: None,
+                        archive_rpc_http_client: None,
                         block_time: Duration::from_secs(12),
                         finality_depth: 0,
                         http_client: reqwest::Client::new(),

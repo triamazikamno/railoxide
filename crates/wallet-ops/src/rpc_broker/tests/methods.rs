@@ -494,7 +494,7 @@ async fn individual_job(read: RpcRead, endpoints: Vec<Url>, timeout: Duration) -
         waiters,
     };
     run_job(
-        JobResources::new(reqwest::Client::new(), 1),
+        test_resources(),
         ExecutionJob::Individual(Box::new(item)),
         endpoints,
         JobControl::granted(),
@@ -603,7 +603,7 @@ async fn aggregate_body_cap_is_terminal_without_partial_results_or_reduction() {
             })
             .collect();
         let output = run_job(
-            JobResources::new(reqwest::Client::new(), 1),
+            test_resources(),
             ExecutionJob::Aggregate(items),
             route.endpoints().to_vec(),
             JobControl::granted(),

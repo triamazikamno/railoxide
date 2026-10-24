@@ -66,7 +66,7 @@ pub(super) fn trace_step<T, E>(
 /// never rebuilds the pool and has no endpoints.
 pub(super) struct ObservationEndpoints {
     route: crate::RpcChainRoute,
-    client: reqwest::Client,
+    clients: crate::rpc_broker::RpcClients,
     /// Completes once the first admission returned, whether or not the pool was kept.
     admitted: tokio::sync::OnceCell<()>,
     /// Never locked across an await.
@@ -86,7 +86,7 @@ impl ObservationEndpoints {
     pub(super) fn new(chain: &EffectiveChainConfig, http: &HttpContext) -> Self {
         Self {
             route: chain.rpc_route.clone(),
-            client: http.rpc_client.clone(),
+            clients: http.rpc_clients(),
             admitted: tokio::sync::OnceCell::new(),
             pool: Mutex::new(PoolSlot::default()),
             preferred: AtomicUsize::new(usize::MAX),
@@ -125,17 +125,14 @@ impl ObservationEndpoints {
         self.admitted
             .get_or_init(|| async {
                 let pool = Arc::new(
-                    QueryRpcPool::with_http_client(
-                        self.route.endpoint_urls(),
-                        ENDPOINT_COOLDOWN,
-                        self.client.clone(),
-                    )
-                    .with_pending_admission(),
+                    self.route
+                        .query_rpc_pool(&self.clients, ENDPOINT_COOLDOWN)
+                        .with_pending_admission(),
                 );
                 // Returns at the first admitted endpoint or once every first check
                 // failed. The pool is kept either way and admits endpoints as they
                 // pass, unless the owner released it meanwhile.
-                let _ = self.route.admit_sync_pool(&self.client, &pool, None).await;
+                let _ = self.route.admit_sync_pool(&self.clients, &pool, None).await;
                 let mut slot = self.slot();
                 if !slot.released {
                     slot.pool = Some(pool);

@@ -25,7 +25,8 @@ pub fn chain_editor_snapshot(
             if let Some(chain) = settings.chains.custom.get(&id) {
                 summary.name.clone_from(&chain.name);
                 summary.enabled = chain.enabled;
-                summary.rpc_endpoints = chain.rpc_endpoints.len();
+                summary.rpc_endpoints =
+                    endpoint_count(id, &chain.rpc_endpoints, &chain.direct_rpc_endpoints);
             } else {
                 summary.built_in = true;
                 summary.railgun = railgun_ui::DEFAULT_CHAINS.contains(&id);
@@ -41,10 +42,14 @@ pub fn chain_editor_snapshot(
                     compared.enabled = unchanged.enabled;
                     compared != unchanged
                 });
+                let direct = overrides.map_or(&[][..], |chain| &chain.direct_rpc_endpoints);
                 summary.rpc_endpoints = match overrides {
-                    Some(chain) if !chain.rpc_endpoints.is_empty() => chain.rpc_endpoints.len(),
-                    _ => presets::EvmPreset::for_chain(id)
-                        .map_or(0, |preset| preset.rpc_endpoints.len()),
+                    Some(chain) if !chain.rpc_endpoints.is_empty() => {
+                        endpoint_count(id, &chain.rpc_endpoints, direct)
+                    }
+                    _ => presets::EvmPreset::for_chain(id).map_or(0, |preset| {
+                        endpoint_count(id, &preset.rpc_endpoints, direct)
+                    }),
                 };
             }
             summary
@@ -53,7 +58,23 @@ pub fn chain_editor_snapshot(
     snapshot.draft = selected
         .map(|id| chain_editor_draft(settings, id))
         .transpose()?;
+    snapshot.direct_network = settings.network.mode == super::NetworkModeSetting::Direct;
     Ok(snapshot)
+}
+
+/// Effective endpoint count, where a URL in both lists counts once.
+fn endpoint_count(id: u64, endpoints: &[String], direct: &[String]) -> usize {
+    // Repair loads unvalidated settings, so malformed URLs get a raw count instead of panicking.
+    if !endpoints
+        .iter()
+        .chain(direct)
+        .all(|url| url::Url::parse(url).is_ok())
+    {
+        return endpoints.len() + direct.len();
+    }
+    super::effective::route(id, endpoints, direct, None)
+        .endpoints()
+        .len()
 }
 
 pub fn chain_editor_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, String> {
@@ -89,6 +110,7 @@ fn stored_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, String
         &chain.name,
         &chain.native_currency,
         &chain.rpc_endpoints,
+        &chain.direct_rpc_endpoints,
         &chain.explorer_urls,
         chain.enabled,
         &chain.contracts,
@@ -125,6 +147,7 @@ fn built_in_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, Stri
         preset.name,
         &preset.native_currency,
         &chain.rpc_endpoints,
+        &chain.direct_rpc_endpoints,
         &[],
         chain.enabled,
         &chain.contracts,
@@ -137,6 +160,7 @@ fn built_in_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, Stri
     }
     let private = &chain.railgun;
     draft.quick_sync_enabled = private.quick_sync.enabled;
+    draft.archive_rpc_direct = private.deployment.archive_rpc_direct;
     draft.use_default_relays = private.sponsored_bundle_relays.is_none();
     for (field, value) in [
         (
@@ -367,6 +391,7 @@ fn fill_general_draft(
     name: &str,
     native: &NativeCurrency,
     endpoints: &[String],
+    direct_endpoints: &[String],
     explorers: &[String],
     enabled: bool,
     contracts: &ChainContractSettings,
@@ -380,6 +405,7 @@ fn fill_general_draft(
         (ChainField::NativeSymbol, native.symbol.clone()),
         (ChainField::NativeDecimals, native.decimals.to_string()),
         (ChainField::RpcEndpoints, endpoints.join("\n")),
+        (ChainField::DirectRpcEndpoints, direct_endpoints.join("\n")),
         (ChainField::ExplorerUrls, explorers.join("\n")),
         (
             ChainField::WrappedNativeToken,
@@ -559,6 +585,7 @@ fn draft_mutation(
                 deployment: ChainDeploymentSettings {
                     archive_until_block: optional_number(draft, ChainField::ArchiveUntilBlock)?,
                     archive_rpc_url: optional_text(draft, ChainField::ArchiveRpcUrl),
+                    archive_rpc_direct: draft.archive_rpc_direct,
                 },
                 block_range: optional_number(draft, ChainField::BlockRange)?,
                 poll_interval_secs: optional_number(draft, ChainField::PollIntervalSecs)?,
@@ -583,6 +610,7 @@ fn draft_mutation(
                 native_usd_pricing,
                 enabled: draft.enabled,
                 rpc_endpoints: lines(draft, ChainField::RpcEndpoints),
+                direct_rpc_endpoints: lines(draft, ChainField::DirectRpcEndpoints),
                 contracts,
                 finality_depth,
                 gas,
@@ -610,6 +638,7 @@ fn draft_mutation(
                     .map_err(|_| "Native currency decimals must be between 0 and 255")?,
             },
             rpc_endpoints: lines(draft, ChainField::RpcEndpoints),
+            direct_rpc_endpoints: lines(draft, ChainField::DirectRpcEndpoints),
             explorer_urls: lines(draft, ChainField::ExplorerUrls),
             enabled: draft.enabled,
             contracts,
@@ -822,6 +851,41 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_counts_malformed_stored_urls_without_panicking() {
+        let summary_count = |settings: &WalletSettings, id: u64| {
+            chain_editor_snapshot(settings, None)
+                .unwrap()
+                .chains
+                .into_iter()
+                .find(|summary| summary.chain_id == id.to_string())
+                .unwrap()
+                .rpc_endpoints
+        };
+        let mut settings = WalletSettings::default();
+        settings
+            .chains
+            .per_chain
+            .get_mut(&1)
+            .unwrap()
+            .direct_rpc_endpoints = vec!["not-a-url".into()];
+        assert_eq!(
+            summary_count(&settings, 1),
+            presets::EvmPreset::for_chain(1)
+                .unwrap()
+                .rpc_endpoints
+                .len()
+                + 1
+        );
+
+        settings.chains.per_chain.get_mut(&1).unwrap().rpc_endpoints = vec!["not-a-url".into()];
+        let mut custom = super::super::tests::custom_evm_chain();
+        custom.rpc_endpoints = vec!["not-a-url".into()];
+        settings.chains.custom.insert(31337, custom);
+        assert_eq!(summary_count(&settings, 1), 2);
+        assert_eq!(summary_count(&settings, 31337), 1);
+    }
+
+    #[test]
     fn public_preset_drafts_carry_no_railgun_settings() {
         let settings = WalletSettings::default();
         let draft = chain_editor_draft(&settings, 10).unwrap();
@@ -925,6 +989,8 @@ mod tests {
         chain.railgun.quick_sync.endpoint = Some("https://quick.example".into());
         chain.railgun.deployment.archive_until_block = Some(0);
         chain.railgun.deployment.archive_rpc_url = Some("https://archive.example".into());
+        chain.railgun.deployment.archive_rpc_direct = true;
+        chain.direct_rpc_endpoints = vec!["https://direct.example".into()];
         chain.gas.gas_price_buffer_numerator = Some(12);
         let draft = chain_editor_draft(&settings, 1).unwrap();
         let wire = serde_json::to_vec(&ChainEditorCommand::Save {

@@ -407,6 +407,7 @@ pub struct EffectiveRailgunConfig {
     pub deployment: broadcaster_core::deployment::RailgunDeployment,
     pub sync: sync_service::RailgunSyncOptions,
     pub archive_rpc_url: Option<SensitiveUrl>,
+    pub archive_rpc_transport: crate::RpcTransport,
     pub indexed_artifact_source_mode: IndexedArtifactSourceModeSetting,
     pub sponsored_bundle_relays: Vec<SensitiveUrl>,
     pub coinbase_payer: Option<Address>,

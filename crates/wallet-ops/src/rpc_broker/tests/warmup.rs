@@ -279,7 +279,7 @@ async fn warmup_outlives_foreground_sources_and_checks_each_endpoint_once() {
         .with_identity_verification();
     route
         .for_endpoint(cached.into())
-        .verify_identity(&http.rpc_client)
+        .verify_identity(&http.rpc_clients())
         .await
         .expect("a clone verifies the cached endpoint");
 
@@ -466,6 +466,7 @@ async fn warmup_prioritizes_selected_chain_and_reorders_only_queued_checks() {
     // Put the other chain first in the base order so startup preference is deterministic.
     let broker = crate::rpc_broker::RpcBroker::spawn_with_candidate_order(
         http.rpc_client.clone(),
+        http.direct_rpc_client.clone(),
         <[usize]>::reverse,
     )
     .expect("broker");

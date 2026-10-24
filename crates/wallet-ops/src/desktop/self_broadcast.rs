@@ -167,7 +167,7 @@ pub(super) async fn submit_self_broadcast_plan(
 ) -> Result<DesktopSelfBroadcastResult> {
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     let gas_payer = self_broadcast_gas_payer(vault_store, view_session, &public_account_uuid)?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
+    let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
     let signer =
         if let Some(authorization @ DesktopPrivateSpendAuthorization::HardwareExecutor(hardware)) =
             spend_authorization.as_ref()
@@ -1823,10 +1823,9 @@ pub async fn run_sponsored_self_broadcast_session(
         ));
     }
 
-    let rpc_urls =
-        settings::resolve_effective_chain_rpc_route(request.chain_id, &request.effective_chain)?
-            .endpoint_urls();
-    let query_rpc_pool = query_rpc_pool_with_http_client(rpc_urls, http);
+    let route =
+        settings::resolve_effective_chain_rpc_route(request.chain_id, &request.effective_chain)?;
+    let query_rpc_pool = query_rpc_pool_for_route(&route, http);
     let tx_hash = keccak256(&request.signed_raw_transaction);
     let signed_raw_transaction = Zeroizing::new(hex::encode_prefixed(
         Zeroizing::new(request.signed_raw_transaction).as_slice(),
@@ -1916,7 +1915,7 @@ pub(super) async fn submit_prepared_sponsored_self_broadcast(
         ));
     }
 
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
+    let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
     let provider_handle =
         sponsored_code_preflight_from_rpc_pool(&query_rpc_pool, payer, signer_address).await?;
     let nonce = provider_handle
@@ -2966,7 +2965,7 @@ mod tests {
     async fn sponsored_payer_mismatch_fails_through_active_query_rpc_pool() {
         let (url, task) = spawn_query_rpc_response(Ok(json!("0x")));
         let http = HttpContext::direct_for_tests();
-        let pool = query_rpc_pool_with_http_client(vec![url], &http);
+        let pool = query_rpc_pool_for_route(&RpcChainRoute::new(1, vec![url]), &http);
         let result = sponsored_code_preflight_from_rpc_pool(
             &pool,
             Address::from([0x13; 20]),
@@ -2989,7 +2988,7 @@ mod tests {
             "data": reflected,
         })));
         let http = HttpContext::direct_for_tests();
-        let pool = query_rpc_pool_with_http_client(vec![url], &http);
+        let pool = query_rpc_pool_for_route(&RpcChainRoute::new(1, vec![url]), &http);
         let provider_handle = pool
             .available_providers()
             .into_iter()

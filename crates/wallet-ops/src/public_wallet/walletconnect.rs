@@ -21,7 +21,7 @@ use super::types::{
 use crate::hardware::HardwareTypedDataSigningMode;
 use crate::hardware_typed_data::HardwareEip712Model;
 use crate::walletconnect::WalletConnectSupportedMethod;
-use crate::{HttpContext, query_rpc_pool_with_http_client, report_chain_string};
+use crate::{HttpContext, query_rpc_pool_for_route, report_chain_string};
 
 pub async fn walletconnect_sign_personal_message(
     request: WalletConnectPersonalSignRequest,
@@ -262,8 +262,7 @@ pub async fn submit_walletconnect_send_transaction(
     signer
         .while_active(async {
             let from_address = signer.address();
-            let query_rpc_pool =
-                query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
+            let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
             let tx_req = sanitize_walletconnect_transaction_request(
                 request.tx_req,
                 request.chain_id,

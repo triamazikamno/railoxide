@@ -6,7 +6,7 @@
 //! health or permits.
 
 use super::identity::{MAX_IDENTITY_PROBES, ProbeRunner};
-use super::{RpcBrokerError, RpcChainRoute};
+use super::{RpcBrokerError, RpcChainRoute, RpcClients};
 use crate::HttpContext;
 use crate::desktop::DEFAULT_QUERY_RPC_COOLDOWN;
 use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool, RpcAdmission};
@@ -52,7 +52,7 @@ impl RpcCandidates {
             .rpc_broker()
             .endpoint_candidates(route, deadline)
             .await?;
-        let pool = Arc::new(snapshot_pool(http, &snapshot).with_pending_admission());
+        let pool = Arc::new(snapshot_pool(http, route, &snapshot).with_pending_admission());
         let mut unverified = Vec::new();
         for (slot, endpoint) in snapshot.iter().enumerate() {
             if route.endpoint_identity_verified(endpoint) {
@@ -73,7 +73,7 @@ impl RpcCandidates {
         } else {
             let task = tokio::spawn(discover(
                 route.clone(),
-                http.rpc_client.clone(),
+                http.rpc_clients(),
                 Arc::clone(&pool),
                 unverified,
                 progress,
@@ -101,7 +101,7 @@ impl RpcCandidates {
             .await?;
         let (_, progress) = watch::channel(());
         Ok(Self(Arc::new(Inner {
-            pool: Arc::new(snapshot_pool(http, &snapshot)),
+            pool: Arc::new(snapshot_pool(http, route, &snapshot)),
             progress,
             discovery: None,
         })))
@@ -159,14 +159,24 @@ impl RpcCandidates {
     }
 }
 
-fn snapshot_pool(http: &HttpContext, snapshot: &[SensitiveUrl]) -> QueryRpcPool {
-    QueryRpcPool::with_http_client(
+/// Each snapshot endpoint sends through its transport's client on `route`.
+fn snapshot_pool(
+    http: &HttpContext,
+    route: &RpcChainRoute,
+    snapshot: &[SensitiveUrl],
+) -> QueryRpcPool {
+    QueryRpcPool::with_http_clients(
         snapshot
             .iter()
-            .map(|endpoint| endpoint.expose_url().clone())
+            .map(|endpoint| {
+                let url = endpoint.expose_url();
+                (
+                    url.clone(),
+                    http.rpc_client_for(route.endpoint_transport(url)).clone(),
+                )
+            })
             .collect(),
         DEFAULT_QUERY_RPC_COOLDOWN,
-        http.rpc_client.clone(),
     )
 }
 
@@ -174,15 +184,15 @@ fn snapshot_pool(http: &HttpContext, snapshot: &[SensitiveUrl]) -> QueryRpcPool 
 /// Probes log the configured index, never the URL.
 async fn discover(
     route: RpcChainRoute,
-    client: reqwest::Client,
+    clients: RpcClients,
     pool: Arc<QueryRpcPool>,
     unverified: Vec<(usize, usize)>,
     progress: watch::Sender<()>,
 ) {
-    let (route, client) = (&route, &client);
+    let (route, clients) = (&route, &clients);
     let start_probe = |configured: usize| async move {
         route
-            .verify_labeled_endpoint_identity(client, &route.endpoints()[configured], &configured)
+            .verify_labeled_endpoint_identity(clients, &route.endpoints()[configured], &configured)
             .await
     };
     let mut queued = unverified.into_iter();

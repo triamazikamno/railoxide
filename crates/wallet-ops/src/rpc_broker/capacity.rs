@@ -4,6 +4,7 @@
 //! releases either slot itself while it keeps running, and dropping the job releases whatever it
 //! still holds.
 
+use super::model::RpcClients;
 use super::resolution::WorkKey;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -14,7 +15,7 @@ pub(super) const DEFAULT_MAX_IDENTITY_PROBES: usize = 8;
 /// Broker-wide resources handed to every job.
 #[derive(Clone)]
 pub(super) struct JobResources {
-    pub(super) client: reqwest::Client,
+    pub(super) clients: RpcClients,
     /// Bounds physical read requests independently of identity probes.
     pub(super) http: Arc<Semaphore>,
     /// Bounds identity probes across all jobs and background warmup.
@@ -24,10 +25,10 @@ pub(super) struct JobResources {
 }
 
 impl JobResources {
-    pub(super) fn new(client: reqwest::Client, max_in_flight: usize) -> Self {
+    pub(super) fn new(clients: RpcClients, max_in_flight: usize) -> Self {
         let max_in_flight = max_in_flight.max(1);
         Self {
-            client,
+            clients,
             http: Arc::new(Semaphore::new(max_in_flight)),
             probes: Arc::new(Semaphore::new(DEFAULT_MAX_IDENTITY_PROBES)),
             probe_limit: DEFAULT_MAX_IDENTITY_PROBES,

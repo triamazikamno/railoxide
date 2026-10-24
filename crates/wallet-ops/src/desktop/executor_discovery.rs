@@ -11,7 +11,6 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use broadcaster_core::contracts::executor::EXECUTION_NONCE_STORAGE_SLOT;
 use broadcaster_core::contracts::railgun::RelayAdapt7702;
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, eyre};
 use futures_util::future::{join, join_all, join3};
 
@@ -130,11 +129,9 @@ async fn inspect_executor_state(
     assets: &[ExecutorAsset],
     recovery: bool,
 ) -> Result<ExecutorInspection> {
-    let pool = QueryRpcPool::with_http_client(
-        chain.rpc_route.endpoint_urls(),
-        Duration::from_secs(30),
-        http.rpc_client.clone(),
-    );
+    let pool = chain
+        .rpc_route
+        .query_rpc_pool(&http.rpc_clients(), Duration::from_secs(30));
     for provider in pool.available_providers() {
         // Avoid leaking the selected address to an endpoint serving a different chain.
         if provider.provider.get_chain_id().await.ok() != Some(chain.chain_id) {
@@ -389,11 +386,9 @@ async fn inspect_signing_state(
     ExecutorInspection,
     Option<crate::vault::ExecutorNonceObservation>,
 )> {
-    let pool = QueryRpcPool::with_http_client(
-        chain.rpc_route.endpoint_urls(),
-        Duration::from_secs(30),
-        http.rpc_client.clone(),
-    );
+    let pool = chain
+        .rpc_route
+        .query_rpc_pool(&http.rpc_clients(), Duration::from_secs(30));
     for endpoint in pool.available_providers() {
         let provider = &endpoint.provider;
         // The head read carries no address. Address reads wait for the chain check.

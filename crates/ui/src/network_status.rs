@@ -64,6 +64,7 @@ pub struct NetworkStatus {
     kind: NetworkStatusKind,
     detail: String,
     runtime_warning: bool,
+    direct_rpc_endpoints: usize,
 }
 impl NetworkStatus {
     #[must_use]
@@ -72,7 +73,14 @@ impl NetworkStatus {
             kind,
             detail,
             runtime_warning,
+            direct_rpc_endpoints: 0,
         }
+    }
+    /// Enabled-chain RPC and archive endpoints reached without Tor or the proxy.
+    #[must_use]
+    pub const fn with_direct_rpc_endpoints(mut self, count: usize) -> Self {
+        self.direct_rpc_endpoints = count;
+        self
     }
     #[must_use]
     pub const fn kind(&self) -> NetworkStatusKind {
@@ -554,6 +562,24 @@ pub fn network_status_popover_content(
                     )),
             )
         })
+        .when(
+            health.kind != NetworkStatusKind::Direct && health.direct_rpc_endpoints > 0,
+            |this| {
+                let count = health.direct_rpc_endpoints;
+                this.child(
+                    div()
+                        .debug_selector(|| "wallet-network-direct-rpc-disclosure".into())
+                        .text_size(gpui::rems(12.0 / 16.0))
+                        .line_height(gpui::relative(APP_TEXT_LINE_HEIGHT))
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .child(if count == 1 {
+                            "1 RPC endpoint bypasses Tor".to_owned()
+                        } else {
+                            format!("{count} RPC endpoints bypass Tor")
+                        }),
+                )
+            },
+        )
         .when_some(error, |this, error| {
             this.child(Alert::error("wallet-network-status-error", error.to_string()).small())
         })
@@ -799,7 +825,8 @@ mod tests {
                 self.kind,
                 String::new(),
                 self.kind == NetworkStatusKind::TorDegraded,
-            );
+            )
+            .with_direct_rpc_endpoints(2);
             let query = self.query.clone();
             let confirming = self.confirming;
             gpui_component::popover::Popover::new("network-probe")
@@ -904,6 +931,10 @@ mod tests {
             cx.debug_bounds("wallet-network-public-balance-disclosure")
                 .is_none()
         );
+        assert!(
+            cx.debug_bounds("wallet-network-direct-rpc-disclosure")
+                .is_some()
+        );
         click(cx, "wallet-network-new-tor-session");
         first.update(cx, |probe, _| {
             assert!(probe.open, "session recovery keeps the popover open");
@@ -952,6 +983,12 @@ mod tests {
             assert!(
                 cx.debug_bounds("wallet-network-public-balance-disclosure")
                     .is_some()
+            );
+            assert_eq!(
+                cx.debug_bounds("wallet-network-direct-rpc-disclosure")
+                    .is_some(),
+                kind == NetworkStatusKind::Proxy,
+                "only Tor and proxy modes disclose direct endpoints"
             );
             assert!(
                 cx.debug_bounds("wallet-network-confirm-tor-reset")

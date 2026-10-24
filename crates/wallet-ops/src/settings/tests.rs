@@ -24,8 +24,8 @@ use super::{
     decode_wallet_ui_state, encode_wallet_settings, load_wallet_settings, load_wallet_ui_state,
     resolve_effective_chain_rpc_route, save_wallet_settings, save_wallet_ui_state,
 };
-use crate::RpcChainRoute;
 use crate::WALLETCONNECT_DEFAULT_PROJECT_ID;
+use crate::{RpcChainRoute, RpcTransport};
 
 static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1905,6 +1905,46 @@ fn sponsored_settings_validate_relay_schemes() {
 }
 
 #[test]
+fn direct_endpoint_validation_names_the_field_without_the_url() {
+    let invalid = "ftp://user:secret@node.example";
+    let mut settings = WalletSettings::default();
+    let ethereum = settings
+        .chains
+        .per_chain
+        .get_mut(&1)
+        .expect("ethereum settings");
+    ethereum.direct_rpc_endpoints = vec![invalid.to_string()];
+    // Both lists count toward the shared cap.
+    ethereum.rpc_endpoints = (0..super::MAX_CHAIN_ENDPOINTS)
+        .map(|index| format!("https://rpc{index}.example"))
+        .collect();
+    let mut custom = custom_evm_chain();
+    custom.direct_rpc_endpoints = vec![invalid.to_string()];
+    settings.chains.custom.insert(999_999, custom);
+
+    let error = settings.validate().expect_err("invalid direct endpoints");
+    for field in [
+        "chains.per_chain.1.direct_rpc_endpoints[0] ",
+        "chains.custom.999999.direct_rpc_endpoints[0] ",
+        "chains.per_chain.1 has too many RPC endpoints",
+    ] {
+        assert!(
+            error
+                .messages
+                .iter()
+                .any(|message| message.starts_with(field)),
+            "{field}"
+        );
+    }
+    assert!(
+        error
+            .messages
+            .iter()
+            .all(|message| !message.contains("secret"))
+    );
+}
+
+#[test]
 fn sponsored_settings_roundtrip_all_override_states() {
     for relays in [
         None,
@@ -2198,6 +2238,64 @@ fn effective_chain_configs_apply_supported_overrides_in_order() {
         Some(Address::from_str("0x0000000000000000000000000000000000000001").unwrap())
     );
     assert_eq!(ethereum.gas.gas_limit_buffer, 250_000);
+}
+
+#[test]
+fn effective_chain_configs_join_direct_endpoints_after_the_base_list() {
+    let mut settings = WalletSettings::default();
+    let ethereum = settings
+        .chains
+        .per_chain
+        .get_mut(&1)
+        .expect("ethereum settings");
+    ethereum.direct_rpc_endpoints = vec!["http://127.0.0.1:8545".to_string()];
+    ethereum.railgun.deployment.archive_rpc_url = Some("http://127.0.0.1:8546".to_string());
+    ethereum.railgun.deployment.archive_rpc_direct = true;
+
+    let configs = build_effective_chain_configs(&settings).expect("build effective configs");
+    let ethereum = configs.get(1).expect("ethereum config");
+    let mut expected = super::presets::EvmPreset::for_chain(1)
+        .unwrap()
+        .rpc_endpoints
+        .iter()
+        .map(|url| (Url::parse(url).unwrap(), RpcTransport::Wallet))
+        .collect::<Vec<_>>();
+    expected.push((
+        Url::parse("http://127.0.0.1:8545").unwrap(),
+        RpcTransport::Direct,
+    ));
+    assert_eq!(
+        ethereum
+            .rpc_route
+            .transport_endpoints()
+            .map(|(endpoint, transport)| (endpoint.expose_url().clone(), transport))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(ethereum.rpc_route.requires_identity_verification());
+    assert_eq!(
+        ethereum.require_railgun().unwrap().archive_rpc_transport,
+        RpcTransport::Direct
+    );
+    assert_eq!(configs.direct_rpc_endpoint_count(), 2);
+
+    // A URL in both lists is one direct endpoint at its base position.
+    let ethereum = settings.chains.per_chain.get_mut(&1).unwrap();
+    ethereum.rpc_endpoints = vec!["http://127.0.0.1:8545/".to_string()];
+    let configs = build_effective_chain_configs(&settings).expect("build effective configs");
+    assert_eq!(
+        configs
+            .get(1)
+            .unwrap()
+            .rpc_route
+            .transport_endpoints()
+            .map(|(endpoint, transport)| (endpoint.expose_url().clone(), transport))
+            .collect::<Vec<_>>(),
+        vec![(
+            Url::parse("http://127.0.0.1:8545").unwrap(),
+            RpcTransport::Direct
+        )]
+    );
 }
 
 #[test]
@@ -2868,6 +2966,46 @@ fn encoded_settings_decode_without_db() {
 }
 
 #[test]
+fn settings_without_direct_endpoints_keep_the_released_shape() {
+    let mut settings = WalletSettings::default();
+    let ethereum = settings
+        .chains
+        .per_chain
+        .get_mut(&1)
+        .expect("ethereum settings");
+    ethereum.rpc_endpoints = vec!["https://rpc-a.example".to_string()];
+    ethereum.railgun.deployment.archive_rpc_url = Some("https://archive.example".to_string());
+    settings.chains.custom.insert(999_999, custom_evm_chain());
+
+    let payload = rmp_serde::to_vec_named(&settings).expect("encode settings");
+    // Released v11 builds reject unknown fields, so absent values must not be written.
+    for key in [
+        b"direct_rpc_endpoints".as_slice(),
+        b"archive_rpc_direct".as_slice(),
+    ] {
+        assert!(!payload.windows(key.len()).any(|window| window == key));
+    }
+    let decoded = decode_wallet_settings(&payload).expect("decode settings");
+    assert_eq!(decoded, settings);
+    let configs = build_effective_chain_configs(&decoded).expect("build effective configs");
+    assert!(configs.values().all(|chain| {
+        chain
+            .rpc_route
+            .transport_endpoints()
+            .all(|(_, transport)| transport == RpcTransport::Wallet)
+    }));
+    assert_eq!(
+        configs
+            .get(1)
+            .unwrap()
+            .require_railgun()
+            .unwrap()
+            .archive_rpc_transport,
+        RpcTransport::Wallet
+    );
+}
+
+#[test]
 fn released_waku_peer_choices_migrate_and_stay_independent_on_reload() {
     let root_dir = temp_db_root();
     let store = DbStore::open(DbConfig {
@@ -2964,6 +3102,7 @@ pub(super) fn custom_evm_chain() -> super::CustomChainSettings {
             decimals: 6,
         },
         rpc_endpoints: vec!["http://127.0.0.1:8545".into()],
+        direct_rpc_endpoints: Vec::new(),
         explorer_urls: vec![],
         enabled: true,
         contracts: super::ChainContractSettings::default(),

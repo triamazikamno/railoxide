@@ -20,7 +20,7 @@ use crate::settings::{EffectiveChainConfig, resolve_effective_chain_rpc_route};
 use crate::staking::{
     AccountSnapshot, MulticallChunkSize, chunk_indices, reward_staking_interval, snapshot_hint,
 };
-use crate::{HttpContext, RpcRoute, WalletRpcOrigin, query_rpc_pool_with_http_client};
+use crate::{HttpContext, RpcRoute, WalletRpcOrigin, query_rpc_pool_for_route};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1444,10 +1444,7 @@ fn provider_for_chain(
     http: &HttpContext,
 ) -> Result<(Arc<QueryRpcPool>, crate::RpcChainRoute)> {
     let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
-    Ok((
-        query_rpc_pool_with_http_client(chain_route.endpoint_urls(), http),
-        chain_route,
-    ))
+    Ok((query_rpc_pool_for_route(&chain_route, http), chain_route))
 }
 
 #[cfg(test)]

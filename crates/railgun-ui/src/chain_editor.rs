@@ -14,6 +14,7 @@ pub enum ChainField {
     NativeDecimals,
     NativeUsdOracle,
     RpcEndpoints,
+    DirectRpcEndpoints,
     ExplorerUrls,
     WrappedNativeToken,
     MulticallContract,
@@ -39,6 +40,7 @@ impl ChainField {
         Self::NativeDecimals,
         Self::NativeUsdOracle,
         Self::RpcEndpoints,
+        Self::DirectRpcEndpoints,
         Self::ExplorerUrls,
         Self::WrappedNativeToken,
         Self::MulticallContract,
@@ -65,6 +67,7 @@ impl ChainField {
             Self::NativeDecimals => "Native currency decimals",
             Self::NativeUsdOracle => "Oracle contract",
             Self::RpcEndpoints => "RPC endpoints",
+            Self::DirectRpcEndpoints => "Direct RPC endpoints (bypass Tor)",
             Self::ExplorerUrls => "Block explorers",
             Self::WrappedNativeToken => "Wrapped native token",
             Self::MulticallContract => "Multicall contract",
@@ -103,7 +106,10 @@ impl ChainField {
     pub const fn is_url_list(self) -> bool {
         matches!(
             self,
-            Self::RpcEndpoints | Self::ExplorerUrls | Self::SponsoredBundleRelays
+            Self::RpcEndpoints
+                | Self::DirectRpcEndpoints
+                | Self::ExplorerUrls
+                | Self::SponsoredBundleRelays
         )
     }
 
@@ -166,6 +172,9 @@ pub struct ChainDraft {
     pub quick_sync_enabled: bool,
     /// Distinguishes preset relays from an explicitly empty relay list.
     pub use_default_relays: bool,
+    /// Reach the archive endpoint without Tor or the proxy.
+    #[serde(default)]
+    pub archive_rpc_direct: bool,
     /// Inherited values for inheritable fields, for display only. The host owns resolution.
     #[serde(default)]
     pub defaults: BTreeMap<ChainField, String>,
@@ -239,6 +248,9 @@ pub struct ChainEditorSnapshot {
     pub chains: Vec<ChainSummary>,
     pub draft: Option<ChainDraft>,
     pub restart_required: bool,
+    /// The saved network mode is Direct, so direct endpoints change nothing.
+    #[serde(default)]
+    pub direct_network: bool,
 }
 
 /// Saved runtime pricing, delivered separately from editable chain configuration.

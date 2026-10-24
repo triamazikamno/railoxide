@@ -162,6 +162,9 @@ pub struct ChainSettingsOverride {
     pub native_usd_pricing: NativeUsdPricing,
     pub enabled: bool,
     pub rpc_endpoints: Vec<String>,
+    /// Endpoints reached without Tor or the proxy, joined after `rpc_endpoints` or the presets.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub direct_rpc_endpoints: Vec<String>,
     pub contracts: ChainContractSettings,
     pub finality_depth: Option<u64>,
     pub gas: ChainGasSettings,
@@ -174,6 +177,7 @@ impl Default for ChainSettingsOverride {
             native_usd_pricing: NativeUsdPricing::Default,
             enabled: true,
             rpc_endpoints: Vec::new(),
+            direct_rpc_endpoints: Vec::new(),
             contracts: ChainContractSettings::default(),
             finality_depth: None,
             gas: ChainGasSettings::default(),
@@ -202,6 +206,18 @@ impl ChainSettingsOverride {
                 &format!("{field}.rpc_endpoints[{index}]"),
                 endpoint,
                 &["http", "https"],
+                errors,
+            );
+        }
+        if !self.direct_rpc_endpoints.is_empty() {
+            validate_endpoint_cap(
+                &field,
+                self.rpc_endpoints.len() + self.direct_rpc_endpoints.len(),
+                errors,
+            );
+            validate_endpoints(
+                &format!("{field}.direct_rpc_endpoints"),
+                &self.direct_rpc_endpoints,
                 errors,
             );
         }
@@ -328,6 +344,9 @@ impl ChainContractSettings {
 pub struct ChainDeploymentSettings {
     pub archive_until_block: Option<u64>,
     pub archive_rpc_url: Option<String>,
+    /// Reach `archive_rpc_url` without Tor or the proxy; no effect without an archive URL.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub archive_rpc_direct: bool,
 }
 
 impl ChainDeploymentSettings {
@@ -354,6 +373,9 @@ pub struct CustomChainSettings {
     pub name: String,
     pub native_currency: NativeCurrency,
     pub rpc_endpoints: Vec<String>,
+    /// Endpoints reached without Tor or the proxy, joined after `rpc_endpoints`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct_rpc_endpoints: Vec<String>,
     #[serde(default)]
     pub explorer_urls: Vec<String>,
     pub enabled: bool,
@@ -365,16 +387,20 @@ pub struct CustomChainSettings {
     pub gas: ChainGasSettings,
 }
 
-fn validate_custom_endpoints(field: &str, endpoints: &[String], errors: &mut Vec<String>) {
-    if endpoints.len() > super::MAX_CHAIN_ENDPOINTS {
+/// The RPC and direct lists of one chain share the endpoint cap.
+fn validate_endpoint_cap(field: &str, endpoints: usize, errors: &mut Vec<String>) {
+    if endpoints > super::MAX_CHAIN_ENDPOINTS {
         errors.push(format!("{field} has too many RPC endpoints"));
     }
+}
+
+fn validate_endpoints(field: &str, endpoints: &[String], errors: &mut Vec<String>) {
     for (index, endpoint) in endpoints.iter().enumerate() {
         if endpoint.len() > 4096 {
-            errors.push(format!("{field}.rpc_endpoints[{index}] is too long"));
+            errors.push(format!("{field}[{index}] is too long"));
         }
         validate_url_scheme(
-            &format!("{field}.rpc_endpoints[{index}]"),
+            &format!("{field}[{index}]"),
             endpoint,
             &["http", "https"],
             errors,
@@ -400,7 +426,21 @@ impl CustomChainSettings {
         if self.rpc_endpoints.is_empty() {
             errors.push(format!("{field}.rpc_endpoints must not be empty"));
         }
-        validate_custom_endpoints(&field, &self.rpc_endpoints, errors);
+        validate_endpoint_cap(
+            &field,
+            self.rpc_endpoints.len() + self.direct_rpc_endpoints.len(),
+            errors,
+        );
+        validate_endpoints(
+            &format!("{field}.rpc_endpoints"),
+            &self.rpc_endpoints,
+            errors,
+        );
+        validate_endpoints(
+            &format!("{field}.direct_rpc_endpoints"),
+            &self.direct_rpc_endpoints,
+            errors,
+        );
         for (index, url) in self.explorer_urls.iter().enumerate() {
             validate_url_scheme(
                 &format!("{field}.explorer_urls[{index}]"),

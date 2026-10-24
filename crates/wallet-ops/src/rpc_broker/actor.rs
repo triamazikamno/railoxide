@@ -3,7 +3,7 @@ use super::capacity::{CapacityLedger, JobControl, JobResources, JobSlots, SlotKi
 use super::identity::CandidateOrder;
 use super::model::RpcResult;
 use super::model::{
-    JsonRpcFailurePolicy, RpcBrokerError, RpcChainRoute, RpcOrigin, RpcRead, RpcRoute,
+    JsonRpcFailurePolicy, RpcBrokerError, RpcChainRoute, RpcClients, RpcOrigin, RpcRead, RpcRoute,
     RpcSubmission,
 };
 use super::profile::EndpointProfile;
@@ -189,7 +189,7 @@ pub(super) struct Actor {
 
 impl Actor {
     pub(super) fn new(
-        client: reqwest::Client,
+        clients: RpcClients,
         rx: mpsc::Receiver<Command>,
         interval: Duration,
         max_in_flight: usize,
@@ -204,7 +204,7 @@ impl Actor {
             // Read slots and probe runners are counted by the ledger; these semaphores
             // independently cap physical HTTP attempts, including concurrent reduction fan-out
             // within one job, and identity probes.
-            resources: JobResources::new(client, max_in_flight),
+            resources: JobResources::new(clients, max_in_flight),
             executor,
             pending: Vec::new(),
             active: HashMap::new(),

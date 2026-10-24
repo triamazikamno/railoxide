@@ -36,7 +36,7 @@ use crate::settings::EffectiveChainConfig;
 use crate::vault::DesktopViewSession;
 use crate::{
     HttpContext, RpcChainRoute, RpcRoute, ShieldSendOutput, WalletRpcOrigin,
-    query_rpc_pool_with_http_client, report_chain_string,
+    query_rpc_pool_for_route, report_chain_string,
 };
 
 pub async fn submit_public_send(
@@ -120,7 +120,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
         dynamic_gas_preflight,
         gas_fee,
     )?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
+    let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
     let tx_req = public_send_transaction_request(chain_id, from_address, intent)?;
     let tx = submit_public_action_step_session(
         step,
@@ -377,8 +377,7 @@ pub async fn submit_public_shield_with_progress(
             .wrap_err("build public shield calldata")?;
 
             let from_address = signer.address();
-            let query_rpc_pool =
-                query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
+            let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
 
             let (wrap_gas_units, approval_gas_units, shield_gas_units) =
                 super::gas::public_shield_estimated_gas_units(
@@ -754,7 +753,7 @@ async fn submit_stealth_native_shield(
     } else {
         PublicActionStepFeePolicy::Custom
     };
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
+    let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
     let receipt = signer
         .while_active(async {
             Ok(submit_public_action_step_session(

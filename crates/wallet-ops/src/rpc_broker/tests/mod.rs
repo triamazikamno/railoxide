@@ -69,6 +69,14 @@ pub(super) fn rpc_read_from_request(
         .expect("typed test eth_call")
 }
 
+pub(super) fn test_clients() -> RpcClients {
+    RpcClients::new(reqwest::Client::new(), reqwest::Client::new())
+}
+
+pub(super) fn test_resources() -> JobResources {
+    JobResources::new(test_clients(), 1)
+}
+
 pub(super) fn test_executor() -> JobExecutor {
     Arc::new(|_resources, group, _endpoints, _control| {
         Box::pin(async move {
@@ -220,6 +228,18 @@ pub(crate) async fn spawn_rpc_mock_with_gate(
 
 /// Each request's `x-route` header, naming the client that sent it, and JSON body.
 pub(super) type RecordedRequests = Arc<Mutex<Vec<(Option<String>, Value)>>>;
+
+/// A client whose requests carry `x-route: <tag>`, as recorded by [`spawn_recording_rpc_mock`].
+pub(super) fn tagged_reqwest_client(tag: &'static str) -> reqwest::Client {
+    let headers = reqwest::header::HeaderMap::from_iter([(
+        reqwest::header::HeaderName::from_static("x-route"),
+        reqwest::header::HeaderValue::from_static(tag),
+    )]);
+    reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("tagged client")
+}
 
 /// Like [`spawn_rpc_mock`], also recording every request in arrival order.
 pub(super) async fn spawn_recording_rpc_mock(

@@ -29,15 +29,12 @@ pub(super) fn effective_desktop_chain_config(
     })
 }
 
-pub(crate) fn query_rpc_pool_with_http_client(
-    rpc_urls: Vec<Url>,
+/// A pool over `route`'s endpoints, each sending through its transport's client.
+pub(crate) fn query_rpc_pool_for_route(
+    route: &RpcChainRoute,
     http: &HttpContext,
 ) -> Arc<QueryRpcPool> {
-    Arc::new(QueryRpcPool::with_http_client(
-        rpc_urls,
-        DEFAULT_QUERY_RPC_COOLDOWN,
-        http.rpc_client.clone(),
-    ))
+    Arc::new(route.query_rpc_pool(&http.rpc_clients(), DEFAULT_QUERY_RPC_COOLDOWN))
 }
 
 /// Starts identity warmup for enabled privacy chains and `selected_chain`, prioritizing it.

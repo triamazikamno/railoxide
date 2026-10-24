@@ -2,8 +2,8 @@ use super::actor::{EndpointHealthOutcome, JobOutput, RequestEvent};
 use super::capacity::{JobControl, JobResources, SlotKind};
 use super::identity::ProbeRunner;
 use super::model::{
-    FailureClass, MAX_REDUCTION_ATTEMPTS_PER_ENDPOINT, RpcBrokerError, RpcRead, RpcRemoteError,
-    RpcResult, RpcRevert, RpcRoute,
+    FailureClass, MAX_REDUCTION_ATTEMPTS_PER_ENDPOINT, RpcBrokerError, RpcChainRoute, RpcRead,
+    RpcRemoteError, RpcResult, RpcRevert, RpcRoute,
 };
 use super::operation::RpcOperation;
 use super::resolution::{WaiterSnapshot, WaiterState, WorkItem};
@@ -118,7 +118,7 @@ pub(super) fn run_job(
                 let mut failover = SingleFailover::new(
                     &item.read,
                     item.waiters.clone(),
-                    route.chain_route().isolated_client(),
+                    route.chain_route(),
                     route.chain_id(),
                     route.attempt_timeout,
                 );
@@ -195,7 +195,7 @@ trait Failover {
 struct SingleFailover<'a> {
     read: &'a RpcRead,
     waiters: Arc<WaiterState>,
-    isolated_client: Option<&'a reqwest::Client>,
+    route: &'a RpcChainRoute,
     fallback_attempt_timeout: Duration,
     result: AttemptOutcome<RpcResult>,
     attempted: Vec<(Url, EndpointHealthOutcome)>,
@@ -205,14 +205,14 @@ impl<'a> SingleFailover<'a> {
     const fn new(
         read: &'a RpcRead,
         waiters: Arc<WaiterState>,
-        isolated_client: Option<&'a reqwest::Client>,
+        route: &'a RpcChainRoute,
         chain_id: u64,
         fallback_attempt_timeout: Duration,
     ) -> Self {
         Self {
             read,
             waiters,
-            isolated_client,
+            route,
             fallback_attempt_timeout,
             result: AttemptOutcome::CallerError(RpcBrokerError::NoEndpoint { chain_id }),
             attempted: Vec::new(),
@@ -250,7 +250,7 @@ impl Failover for SingleFailover<'_> {
         endpoint: &'b Url,
     ) -> BoxFuture<'b, Self::Outcome> {
         Box::pin(execute_single_shared_waiter_attempt(
-            self.isolated_client.unwrap_or(&resources.client),
+            self.route.read_client(&resources.clients, endpoint),
             &resources.http,
             self.read,
             endpoint,
@@ -372,8 +372,7 @@ impl Failover for AggregateFailover {
             client: self
                 .route
                 .chain_route()
-                .isolated_client()
-                .unwrap_or(&resources.client)
+                .read_client(&resources.clients, endpoint)
                 .clone(),
             semaphore: resources.http.clone(),
             route: self.route.clone(),
@@ -672,7 +671,7 @@ async fn probe_endpoint(
             timeout.min(deadline.saturating_duration_since(now))
         });
     match chain
-        .verify_endpoint_identity(&resources.client, endpoint, timeout)
+        .verify_endpoint_identity(&resources.clients, endpoint, timeout)
         .await
     {
         Ok(()) => ProbeOutcome::Verified,
@@ -715,7 +714,7 @@ async fn execute_aggregate_with_failover_attempt(
 ) -> ReductionOutput {
     let resources = JobResources {
         http: semaphore,
-        ..JobResources::new(client, 1)
+        ..JobResources::new(super::model::RpcClients::new(client.clone(), client), 1)
     };
     let mut failover = AggregateFailover::new(route, items);
     for endpoint in endpoints.iter().map(SensitiveUrl::expose_url) {
@@ -1228,9 +1227,14 @@ async fn execute_single_with_shared_waiters_attempt(
 ) -> (AttemptOutcome<RpcResult>, Vec<(Url, EndpointHealthOutcome)>) {
     let resources = JobResources {
         http: Arc::clone(semaphore),
-        ..JobResources::new(client.clone(), 1)
+        ..JobResources::new(
+            super::model::RpcClients::new(client.clone(), client.clone()),
+            1,
+        )
     };
-    let mut failover = SingleFailover::new(read, waiters, None, chain_id, fallback_attempt_timeout);
+    let route = RpcChainRoute::new(chain_id, endpoints.to_vec());
+    let mut failover =
+        SingleFailover::new(read, waiters, &route, chain_id, fallback_attempt_timeout);
     for endpoint in endpoints.iter().map(SensitiveUrl::expose_url) {
         let outcome = failover.attempt(&resources, endpoint).await;
         if !failover.apply(endpoint, outcome) {

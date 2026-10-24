@@ -72,7 +72,7 @@ async fn cached_and_gateway_candidates_are_ready_without_new_probes() {
         .with_identity_verification();
     route
         .for_endpoint(cached.clone().into())
-        .verify_identity(&http.rpc_client)
+        .verify_identity(&http.rpc_clients())
         .await
         .expect("a clone verifies the cached endpoint");
 

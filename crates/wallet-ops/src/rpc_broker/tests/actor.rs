@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn spawn_requires_tokio_runtime() {
     assert!(matches!(
-        RpcBroker::spawn(reqwest::Client::new()),
+        RpcBroker::spawn(reqwest::Client::new(), reqwest::Client::new()),
         Err(RpcBrokerSpawnError::NoRuntime(_))
     ));
 }
@@ -21,7 +21,7 @@ fn spawn_on_rejects_stale_explicit_handle() {
     };
 
     assert!(matches!(
-        RpcBroker::spawn_on(reqwest::Client::new(), &handle),
+        RpcBroker::spawn_on(reqwest::Client::new(), reqwest::Client::new(), &handle),
         Err(RpcBrokerSpawnError::ActorStartup)
     ));
 }
@@ -40,7 +40,7 @@ fn spawn_rejects_stale_entered_handle() {
     let _entered = handle.enter();
 
     assert!(matches!(
-        RpcBroker::spawn(reqwest::Client::new()),
+        RpcBroker::spawn(reqwest::Client::new(), reqwest::Client::new()),
         Err(RpcBrokerSpawnError::ActorStartup)
     ));
 }
@@ -53,7 +53,7 @@ fn spawn_on_schedules_actor_eagerly() {
         .unwrap();
     let handle = runtime.handle().clone();
     let before = handle.metrics().num_alive_tasks();
-    let broker = RpcBroker::spawn_on(reqwest::Client::new(), &handle)
+    let broker = RpcBroker::spawn_on(reqwest::Client::new(), reqwest::Client::new(), &handle)
         .expect("live runtime should schedule the broker actor");
     assert_eq!(handle.metrics().num_alive_tasks(), before + 2);
 
@@ -1094,7 +1094,7 @@ async fn aggregate_member_expiry_with_late_waiter(shutdown: bool) {
     let (tx, rx) = mpsc::channel(8);
     let (_block_tx, block_rx) = mpsc::unbounded_channel();
     let actor = Actor::new(
-        reqwest::Client::new(),
+        test_clients(),
         rx,
         Duration::from_secs(30),
         1,
@@ -1255,7 +1255,7 @@ async fn shutdown_drains_an_accepted_execution() {
     let (tx, rx) = mpsc::channel(8);
     let (_block_tx, block_rx) = mpsc::unbounded_channel();
     let actor = Actor::new(
-        reqwest::Client::new(),
+        test_clients(),
         rx,
         Duration::from_secs(30),
         1,

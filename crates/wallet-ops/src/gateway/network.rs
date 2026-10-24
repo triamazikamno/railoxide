@@ -38,6 +38,8 @@ pub struct GatewayNetworkView {
     pub runtime_warning: bool,
     pub activity: Option<GatewayNetworkActivity>,
     pub download_rate: Option<u64>,
+    /// Enabled-chain RPC and archive endpoints that bypass Tor or the proxy.
+    pub direct_rpc_endpoints: usize,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -113,6 +115,7 @@ impl GatewayNetworkView {
             } else {
                 None
             },
+            direct_rpc_endpoints: 0,
         }
     }
     #[must_use]

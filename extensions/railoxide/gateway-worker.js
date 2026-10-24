@@ -170,7 +170,8 @@ function networkPresentation(message) {
       !boundedNetworkText(value.context_revision, 128) ||
       !['tor_ready', 'tor_reconnecting', 'tor_degraded', 'proxy', 'direct'].includes(value.status) ||
       typeof value.detail !== 'string' || value.detail.length > 512 || typeof value.runtime_warning !== 'boolean' ||
-      (value.download_rate != null && !networkInteger(value.download_rate))) return null;
+      (value.download_rate != null && !networkInteger(value.download_rate)) ||
+      (value.direct_rpc_endpoints != null && !networkInteger(value.direct_rpc_endpoints))) return null;
   let activity = null;
   if (value.activity != null) {
     if (!value.status.startsWith('tor_')) return null;
@@ -187,7 +188,8 @@ function networkPresentation(message) {
     }
   }
   return { context_revision: value.context_revision, status: value.status, detail: value.detail,
-    runtime_warning: value.runtime_warning, activity, download_rate: value.download_rate ?? null };
+    runtime_warning: value.runtime_warning, activity, download_rate: value.download_rate ?? null,
+    direct_rpc_endpoints: value.direct_rpc_endpoints ?? 0 };
 }
 function closeNetworkView(port, send = true) {
   const view = networkViews.get(port);

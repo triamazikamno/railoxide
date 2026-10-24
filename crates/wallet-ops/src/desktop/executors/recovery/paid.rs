@@ -22,7 +22,7 @@ use crate::desktop::{
     ApproximateTransactionShape, PUBLIC_BROADCASTER_FEE_ATTEMPTS, acquire_fee_candidates,
     approximate_public_broadcaster_gas, artifact_source, bounded_public_broadcaster_fee,
     buffered_gas_price_from_candidates, effective_desktop_chain_config,
-    estimate_public_broadcaster_fee_from_rpc_pool, query_rpc_pool_with_http_client,
+    estimate_public_broadcaster_fee_from_rpc_pool, query_rpc_pool_for_route,
     submit_public_broadcaster_transaction, update_transaction_generation_stage,
 };
 use crate::poi_contexts::{
@@ -452,8 +452,7 @@ impl ExecutorOwner {
     ) -> Result<ExecutorPaidRecoveryOutcome> {
         preparation.require_broadcaster(candidate)?;
         let chain = effective_desktop_chain_config(self.chain.chain_id, &self.chain)?;
-        let query_rpc_pool =
-            query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), &self.http);
+        let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, &self.http);
         let min_gas_price = trace_step("paid_gas_price", async {
             let candidates = acquire_fee_candidates(&self.http, &chain.rpc_route, None).await?;
             buffered_gas_price_from_candidates(&candidates, &chain.gas).await

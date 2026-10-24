@@ -1352,6 +1352,25 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
         wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap(),
         saved
     );
+    // A new direct endpoint waits for confirmation, and declining saves nothing.
+    click(cx, "chain-add-direct-endpoint");
+    cx.simulate_input("https://direct.example");
+    click(cx, "chain-save");
+    assert!(
+        cx.debug_bounds("chain-direct-confirm").is_some(),
+        "a newly direct endpoint asks for confirmation before saving"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("chain-direct-confirm").is_none());
+    assert_eq!(
+        wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap(),
+        saved
+    );
+    // Reopen the confirmation so the host commit below lands while it is open.
+    click(cx, "chain-save");
+    assert!(cx.debug_bounds("chain-direct-confirm").is_some());
 
     // Pricing can be saved without a network runtime and still preserves draft/revision isolation.
     cx.update(|window, cx| {
@@ -1380,6 +1399,19 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
             );
         });
     });
+    // Confirming the now-stale direct draft must not overwrite that concurrent commit.
+    let concurrent = wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("chain-direct-confirm").is_none());
+    assert_eq!(
+        wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap(),
+        concurrent
+    );
+    // The draft stays open and stale, so Save is disabled rather than reopening the dialog.
+    click(cx, "chain-save");
+    assert!(cx.debug_bounds("chain-direct-confirm").is_none());
     // A Test validates the draft like Save but persists nothing and publishes no status.
     cx.update(|_, cx| {
         owner.update(cx, |editor, cx| {

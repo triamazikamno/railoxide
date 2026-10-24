@@ -364,6 +364,7 @@ fn chain_config_uses_effective_rpc_pool_and_sync_tuning() {
             .unwrap()
             .into(),
     );
+    private.archive_rpc_transport = crate::RpcTransport::Direct;
     private.sync.quick_sync_endpoint = None;
     private.sync.indexed_wallet_block_range = 12_345;
     private.deployment.v2_start_block = 13_000;
@@ -385,6 +386,8 @@ fn chain_config_uses_effective_rpc_pool_and_sync_tuning() {
         cfg.archive_rpc_url.as_ref().map(reqwest::Url::as_str),
         Some("https://archive.example/")
     );
+    // A direct archive gets its own client rather than the add-chain RPC client.
+    assert!(cfg.archive_rpc_http_client.is_some());
     assert_eq!(cfg.deployment.deployment_block, 12_000);
     assert_eq!(cfg.deployment.v2_start_block, 13_000);
     assert_eq!(cfg.deployment.legacy_shield_block, 14_000);

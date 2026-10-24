@@ -21,9 +21,7 @@ use tokio::time::timeout;
 use crate::rpc_broker::total_failure;
 use crate::settings::{EffectiveChainConfig, resolve_effective_chain_rpc_route};
 use crate::staking::{MulticallChunkSize, fetch_account_snapshots_multi, snapshot_hint};
-use crate::{
-    HttpContext, RpcBrokerError, RpcRoute, WalletRpcOrigin, query_rpc_pool_with_http_client,
-};
+use crate::{HttpContext, RpcBrokerError, RpcRoute, WalletRpcOrigin, query_rpc_pool_for_route};
 
 const GOVERNANCE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1182,10 +1180,7 @@ fn provider_for_chain(
     http: &HttpContext,
 ) -> Result<(Arc<QueryRpcPool>, crate::RpcChainRoute)> {
     let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
-    Ok((
-        query_rpc_pool_with_http_client(chain_route.endpoint_urls(), http),
-        chain_route,
-    ))
+    Ok((query_rpc_pool_for_route(&chain_route, http), chain_route))
 }
 
 async fn fetch_contract_summaries(

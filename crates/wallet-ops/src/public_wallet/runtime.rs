@@ -64,7 +64,7 @@ pub(super) async fn verified_public_chain_runtime_config(
     // Native dapp reads retain the route's verification flag and verify inside
     // gateway/broker admission, where retirement and deadlines can stop probes.
     if rpc_reads.is_none() {
-        chain.rpc_route = chain.rpc_route.verify_identity(&http.rpc_client).await?;
+        chain.rpc_route = chain.rpc_route.verify_identity(&http.rpc_clients()).await?;
     }
     Ok(chain)
 }

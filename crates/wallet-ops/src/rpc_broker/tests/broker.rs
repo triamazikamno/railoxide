@@ -5,7 +5,7 @@ use crate::rpc_broker::broker::{
 use crate::rpc_broker::identity::CandidateOrder;
 use crate::rpc_broker::model::{
     DEFAULT_INTERVAL, DEFAULT_MAX_ESTIMATED_GAS, DEFAULT_MAX_IN_FLIGHT, RpcBrokerError,
-    RpcBrokerSpawnError, RpcOrigin, RpcRead, RpcRoute, RpcSubmission,
+    RpcBrokerSpawnError, RpcClients, RpcOrigin, RpcRead, RpcRoute, RpcSubmission,
 };
 use crate::rpc_broker::tests::{data_result, read_calldata, test_origin, test_route};
 use alloy::eips::BlockNumberOrTag;
@@ -46,12 +46,13 @@ impl RpcBroker {
     /// Production defaults with a caller-chosen candidate order, so tests can fix tie order.
     pub(crate) fn spawn_with_candidate_order(
         client: reqwest::Client,
+        direct_client: reqwest::Client,
         candidate_order: CandidateOrder,
     ) -> Result<Arc<Self>, RpcBrokerSpawnError> {
         let handle =
             tokio::runtime::Handle::try_current().map_err(RpcBrokerSpawnError::NoRuntime)?;
         Self::spawn_primitive(
-            client,
+            RpcClients::new(client, direct_client),
             &handle,
             DEFAULT_INTERVAL,
             DEFAULT_MAX_IN_FLIGHT,
@@ -86,7 +87,7 @@ impl RpcBroker {
         let handle =
             tokio::runtime::Handle::try_current().map_err(RpcBrokerSpawnError::NoRuntime)?;
         Self::spawn_primitive(
-            client,
+            RpcClients::new(client.clone(), client),
             &handle,
             interval,
             max_in_flight,

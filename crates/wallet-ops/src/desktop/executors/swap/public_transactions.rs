@@ -64,7 +64,7 @@ use crate::vault::{
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, HardwareTrezorPinMatrixProvider, HttpContext,
     PublicActionGasFeeSelection, PublicActionProgressStep, PublicActionProgressUpdate,
-    PublicAssetId, query_rpc_pool_with_http_client,
+    PublicAssetId, query_rpc_pool_for_route,
     self_broadcast_send_raw_transaction_to_rpc_pool_with_logging,
 };
 
@@ -821,7 +821,7 @@ impl ExecutorOwner {
         if amount.is_zero() {
             return Err(eyre!("the proxy holds none of the token"));
         }
-        let pool = query_rpc_pool_with_http_client(origin.rpc_route.endpoint_urls(), &self.http);
+        let pool = query_rpc_pool_for_route(&origin.rpc_route, &self.http);
         let proxy_deployed = self.while_active(proxy_deployed(&pool, proxy)).await?;
         let gas_units = if proxy_deployed {
             PUBLIC_PROXY_WITHDRAWAL_GAS_UNITS
@@ -1299,7 +1299,7 @@ impl ExecutorOwner {
         if unresolved.is_empty() {
             return Ok(());
         }
-        let pool = query_rpc_pool_with_http_client(origin.rpc_route.endpoint_urls(), &self.http);
+        let pool = query_rpc_pool_for_route(&origin.rpc_route, &self.http);
         for (hash, signed) in unresolved {
             self.while_active(
                 self_broadcast_send_raw_transaction_to_rpc_pool_with_logging(
@@ -1371,7 +1371,7 @@ fn require_approved_gas_cost(plan: &PublicSwapGasPlan, approved: U256) -> Result
 
 /// The origin chain's head block number, from the first of its endpoints that answers.
 async fn origin_head(origin: &EffectiveChainConfig, http: &HttpContext) -> Result<u64> {
-    let pool = query_rpc_pool_with_http_client(origin.rpc_route.endpoint_urls(), http);
+    let pool = query_rpc_pool_for_route(&origin.rpc_route, http);
     for endpoint in pool.available_providers() {
         if let Ok(head) = endpoint.provider.get_block_number().await {
             return Ok(head);
@@ -1387,7 +1387,7 @@ async fn origin_block(
     http: &HttpContext,
     number: u64,
 ) -> Result<BlockNumHash> {
-    let pool = query_rpc_pool_with_http_client(origin.rpc_route.endpoint_urls(), http);
+    let pool = query_rpc_pool_for_route(&origin.rpc_route, http);
     for endpoint in pool.available_providers() {
         if let Ok(Some(block)) = endpoint.provider.get_block_by_number(number.into()).await {
             let identity = block.header.num_hash();

@@ -27,11 +27,11 @@ pub(crate) mod tests;
 mod warmup;
 pub use broker::RpcBroker;
 pub(crate) use candidates::RpcCandidates;
-pub(crate) use model::RpcBrokerViewCalls;
 pub(crate) use model::{BalanceRead, TransactionHashRead, total_failure};
 pub use model::{
     FailureClass, RpcBrokerError, RpcBrokerSpawnError, RpcChainRoute, RpcOrigin, RpcOriginError,
     RpcRead, RpcReadValidationError, RpcRemoteError, RpcResult, RpcRevert, RpcRoute, RpcSubmission,
-    WalletRpcOrigin,
+    RpcTransport, WalletRpcOrigin,
 };
+pub(crate) use model::{RpcBrokerViewCalls, RpcClients};
 pub use warmup::RpcIdentityWarmup;

@@ -1715,7 +1715,7 @@ async fn prepare_desktop_sponsored_calldata(
         .relay_adapt_contract
         .ok_or(SponsorshipError::MissingRelayAdapt)?;
     let signer_address = self_broadcast_gas_payer(vault_store, view_session, public_account_uuid)?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
+    let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
 
     let provider_handle =
         sponsored_code_preflight_from_rpc_pool(&query_rpc_pool, payer, signer_address).await?;

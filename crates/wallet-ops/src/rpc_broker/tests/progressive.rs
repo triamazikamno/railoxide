@@ -356,7 +356,7 @@ async fn warm_identity(route: &RpcRoute, url: &Url) {
         .expect("endpoint belongs to the route");
     route
         .chain_route()
-        .verify_endpoint_identity(&reqwest::Client::new(), endpoint, BOUND)
+        .verify_endpoint_identity(&test_clients(), endpoint, BOUND)
         .await
         .expect("warm endpoint identity");
 }
@@ -819,7 +819,7 @@ async fn parked_read_keeps_its_dispatched_failure_when_the_caller_expires() {
     let (_block_tx, block_rx) = mpsc::unbounded_channel();
     let actor = tokio::spawn(
         Actor::new(
-            reqwest::Client::new(),
+            test_clients(),
             rx,
             Duration::from_millis(1),
             DEFAULT_MAX_IN_FLIGHT,

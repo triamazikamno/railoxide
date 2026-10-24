@@ -781,14 +781,47 @@ impl RpcOrigin {
     }
 }
 
+/// How requests reach one RPC endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum RpcTransport {
+    /// The wallet network mode: built-in Tor, the configured proxy, or direct.
+    #[default]
+    Wallet,
+    /// A direct connection that bypasses Tor and the proxy.
+    Direct,
+}
+
+/// The shared HTTP client for each endpoint transport.
+#[derive(Clone)]
+pub(crate) struct RpcClients {
+    wallet: reqwest::Client,
+    direct: reqwest::Client,
+}
+
+impl RpcClients {
+    pub(crate) const fn new(wallet: reqwest::Client, direct: reqwest::Client) -> Self {
+        Self { wallet, direct }
+    }
+
+    pub(crate) const fn get(&self, transport: RpcTransport) -> &reqwest::Client {
+        match transport {
+            RpcTransport::Wallet => &self.wallet,
+            RpcTransport::Direct => &self.direct,
+        }
+    }
+}
+
 /// A clone-shared snapshot of chain endpoints and Multicall3 configuration.
 ///
-/// Equality and hashing compare contents, so independently built equivalent snapshots share
-/// deduplication keys. An isolated route equals only itself and its clones.
+/// Equality and hashing compare contents, including each endpoint's transport, so independently
+/// built equivalent snapshots share deduplication keys. An isolated route equals only itself and
+/// its clones.
 #[derive(Debug, Clone)]
 pub struct RpcChainRoute {
     chain_id: u64,
     endpoints: Arc<[SensitiveUrl]>,
+    /// Indexed like `endpoints`.
+    transports: Arc<[RpcTransport]>,
     multicall: Option<Address>,
     verify_identity: bool,
     pub(super) verified_identities: Arc<VerifiedIdentities>,
@@ -816,6 +849,7 @@ impl PartialEq for RpcChainRoute {
     fn eq(&self, other: &Self) -> bool {
         self.chain_id == other.chain_id
             && self.endpoints == other.endpoints
+            && self.transports == other.transports
             && self.multicall == other.multicall
             && self.verify_identity == other.verify_identity
             && self.isolation_id() == other.isolation_id()
@@ -830,21 +864,33 @@ impl Hash for RpcChainRoute {
         self.multicall.hash(state);
         self.verify_identity.hash(state);
         self.isolation_id().hash(state);
-        for endpoint in self.endpoints.iter() {
+        for (endpoint, transport) in self.transport_endpoints() {
             endpoint.expose_url().hash(state);
+            transport.hash(state);
         }
     }
 }
 
 impl RpcChainRoute {
-    /// Creates a chain route from a chain ID and RPC endpoints.
+    /// Creates a chain route from a chain ID and RPC endpoints that use the wallet transport.
     #[must_use]
     pub fn new<E: Into<SensitiveUrl>>(chain_id: u64, endpoints: Vec<E>) -> Self {
-        let endpoints: Arc<[SensitiveUrl]> = endpoints
-            .into_iter()
-            .map(Into::into)
-            .collect::<Vec<_>>()
-            .into();
+        Self::new_with_transports(
+            chain_id,
+            endpoints
+                .into_iter()
+                .map(|endpoint| (endpoint.into(), RpcTransport::Wallet))
+                .collect(),
+        )
+    }
+    /// Creates a chain route from a chain ID and RPC endpoints, each with its transport.
+    #[must_use]
+    pub fn new_with_transports(
+        chain_id: u64,
+        endpoints: Vec<(SensitiveUrl, RpcTransport)>,
+    ) -> Self {
+        let (endpoints, transports): (Vec<_>, Vec<_>) = endpoints.into_iter().unzip();
+        let endpoints: Arc<[SensitiveUrl]> = endpoints.into();
         let verified_identities = Arc::new(VerifiedIdentities {
             endpoints: endpoints
                 .iter()
@@ -855,6 +901,7 @@ impl RpcChainRoute {
         Self {
             chain_id,
             endpoints,
+            transports: transports.into(),
             multicall: None,
             verify_identity: false,
             verified_identities,
@@ -875,12 +922,18 @@ impl RpcChainRoute {
     pub(super) const fn is_isolated(&self) -> bool {
         self.isolation.is_some()
     }
-    /// The client for this route's reads when it is isolated. Identity checks always use the
-    /// broker's shared client.
-    pub(super) fn isolated_client(&self) -> Option<&reqwest::Client> {
-        self.isolation
-            .as_ref()
-            .map(|isolation| isolation.client.client())
+    /// The client for this route's reads sent to `endpoint`. On an isolated route, wallet
+    /// endpoints use the isolated client and direct endpoints the shared direct client. Identity
+    /// checks always use the broker's shared clients.
+    pub(super) fn read_client<'a>(
+        &'a self,
+        clients: &'a RpcClients,
+        endpoint: &Url,
+    ) -> &'a reqwest::Client {
+        match (self.endpoint_transport(endpoint), &self.isolation) {
+            (RpcTransport::Wallet, Some(isolation)) => isolation.client.client(),
+            (transport, _) => clients.get(transport),
+        }
     }
     fn isolation_id(&self) -> Option<u64> {
         self.isolation.as_ref().map(|isolation| isolation.id)
@@ -901,6 +954,7 @@ impl RpcChainRoute {
     pub(crate) fn for_endpoint(&self, endpoint: SensitiveUrl) -> Self {
         debug_assert!(self.endpoints.contains(&endpoint));
         let mut route = self.clone();
+        route.transports = vec![self.endpoint_transport(endpoint.expose_url())].into();
         route.endpoints = vec![endpoint].into();
         route
     }
@@ -923,6 +977,20 @@ impl RpcChainRoute {
             .iter()
             .map(|endpoint| endpoint.expose_url().clone())
             .collect()
+    }
+    /// The transport of `endpoint`; a URL outside this route uses the wallet transport.
+    #[must_use]
+    pub fn endpoint_transport(&self, endpoint: &Url) -> RpcTransport {
+        self.endpoints
+            .iter()
+            .position(|configured| configured.expose_url() == endpoint)
+            .map_or(RpcTransport::Wallet, |index| self.transports[index])
+    }
+    /// The endpoints in configured order, each with its transport.
+    pub(crate) fn transport_endpoints(
+        &self,
+    ) -> impl Iterator<Item = (&SensitiveUrl, RpcTransport)> {
+        self.endpoints.iter().zip(self.transports.iter().copied())
     }
     #[must_use]
     pub const fn multicall(&self) -> Option<Address> {

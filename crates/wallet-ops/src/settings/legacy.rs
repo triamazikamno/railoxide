@@ -160,6 +160,7 @@ impl From<ChainSettingsOverride> for super::ChainSettingsOverride {
             native_usd_pricing: super::NativeUsdPricing::Default,
             enabled: old.enabled,
             rpc_endpoints: old.rpc_endpoints,
+            direct_rpc_endpoints: Vec::new(),
             contracts: super::ChainContractSettings {
                 wrapped_native_token: old.contracts.wrapped_native_token,
                 multicall_contract: old.contracts.multicall_contract,
@@ -194,6 +195,7 @@ impl From<ChainDeploymentSettings> for super::ChainDeploymentSettings {
         Self {
             archive_until_block: old.archive_until_block,
             archive_rpc_url: old.archive_rpc_url,
+            archive_rpc_direct: false,
         }
     }
 }
@@ -346,6 +348,7 @@ impl From<ReleasedChainSettingsOverride> for super::ChainSettingsOverride {
             native_usd_pricing: old.native_usd_pricing,
             enabled: old.enabled,
             rpc_endpoints: old.rpc_endpoints,
+            direct_rpc_endpoints: Vec::new(),
             contracts: old.contracts,
             finality_depth: old.finality_depth,
             gas: old.gas,

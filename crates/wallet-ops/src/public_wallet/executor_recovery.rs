@@ -9,7 +9,7 @@ use super::{
     PublicAssetId, PublicShieldTransactionProfile, VaultedPublicSigner,
 };
 use crate::settings::EffectiveChainConfig;
-use crate::{HttpContext, TxReceiptOutput, query_rpc_pool_with_http_client};
+use crate::{HttpContext, TxReceiptOutput, query_rpc_pool_for_route};
 
 /// Reuse ordinary transaction preflight, signing and block-scoped receipt observation.
 /// The native owner supplies a durable handoff and deliberately no public-account tracker.
@@ -44,7 +44,7 @@ pub(crate) async fn submit_executor_recovery_step(
         PublicShieldTransactionProfile::Railoxide.gas_limit_strategy(),
         signer,
         "executor-recovery",
-        query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http),
+        query_rpc_pool_for_route(&chain.rpc_route, http),
         &chain.rpc_route,
         chain.finality_depth,
         http,

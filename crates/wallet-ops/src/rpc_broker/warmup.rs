@@ -294,12 +294,12 @@ async fn warm_endpoint(
     let _budget = resources.probes.acquire().await.ok()?;
     let result = if verify {
         route
-            .verify_labeled_endpoint_identity(&resources.client, endpoint, &index)
+            .verify_labeled_endpoint_identity(&resources.clients, endpoint, &index)
             .await
     } else {
         // A trusted route counts as verified, so its identity check would send nothing.
         route
-            .probe_labeled_endpoint_responsiveness(&resources.client, endpoint, &index)
+            .probe_labeled_endpoint_responsiveness(&resources.clients, endpoint, &index)
             .await
     };
     if result.is_ok() && !recovery {

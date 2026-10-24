@@ -210,7 +210,7 @@ mod tests {
             .with_identity_verification();
         route
             .for_endpoint(undecodable.into())
-            .verify_identity(&http.rpc_client)
+            .verify_identity(&http.rpc_clients())
             .await
             .expect("a clone verifies the undecodable endpoint");
         let candidates = RpcCandidates::acquire(&http, &route, None)

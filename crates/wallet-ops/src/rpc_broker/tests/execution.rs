@@ -7,7 +7,8 @@ use crate::rpc_broker::resolution::{WaiterPolicy, WorkKey};
 use crate::rpc_broker::tests::{
     RpcMockGate, RpcResponder, aggregate_response, data_result, read_calldata, remote_error,
     rpc_error, rpc_read_from_request, rpc_result, spawn_gated_rpc_mock, spawn_rpc_mock,
-    spawn_status_rpc_mock, test_broker, test_broker_with_executor, test_origin, test_route,
+    spawn_status_rpc_mock, test_broker, test_broker_with_executor, test_origin, test_resources,
+    test_route,
 };
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::{Address, U256, hex};
@@ -250,7 +251,7 @@ async fn empty_aggregate_job_completes_without_waiting_for_a_permit() {
         run_job(
             JobResources {
                 http: Arc::new(Semaphore::new(0)),
-                ..JobResources::new(reqwest::Client::new(), 1)
+                ..test_resources()
             },
             ExecutionJob::Aggregate(Vec::new()),
             Vec::new(),
@@ -1387,7 +1388,7 @@ async fn individual_read_fails_over_on_recoverable_error() {
     };
     let endpoints = item.execution_route.endpoints().to_vec();
     let output = run_job(
-        JobResources::new(reqwest::Client::new(), 1),
+        test_resources(),
         ExecutionJob::Individual(Box::new(item)),
         endpoints,
         JobControl::granted(),
@@ -1633,7 +1634,7 @@ async fn started_request_timeout_is_recorded_as_an_attributed_request() {
     };
     let endpoints = item.execution_route.endpoints().to_vec();
     let job = tokio::spawn(run_job(
-        JobResources::new(reqwest::Client::new(), 1),
+        test_resources(),
         ExecutionJob::Individual(Box::new(item)),
         endpoints,
         JobControl::granted(),

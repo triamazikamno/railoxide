@@ -60,7 +60,7 @@ use crate::cow::{
 };
 use crate::desktop::executor_observation::trace_step;
 use crate::desktop::{
-    acquire_fee_candidates, gas_price_from_candidates_with_policy, query_rpc_pool_with_http_client,
+    acquire_fee_candidates, gas_price_from_candidates_with_policy, query_rpc_pool_for_route,
 };
 use crate::public_wallet::{VaultedPublicSigner, query_erc20_balance, sign_public_swap_typed_data};
 use crate::settings::{EffectiveChainConfig, EffectiveTokenRegistry, PublicSwapProfile};
@@ -887,7 +887,7 @@ impl ExecutorOwner {
         let Some(profile) = origin.public_swap_profile() else {
             return Ok(false);
         };
-        let pool = query_rpc_pool_with_http_client(origin.rpc_route.endpoint_urls(), &self.http);
+        let pool = query_rpc_pool_for_route(&origin.rpc_route, &self.http);
         self.while_active(swap_math_deployed(&pool, profile.math()))
             .await
     }
@@ -1034,8 +1034,7 @@ impl ExecutorOwner {
                     profile.cow_shed_implementation(),
                     source,
                 );
-                let pool =
-                    query_rpc_pool_with_http_client(origin.rpc_route.endpoint_urls(), &self.http);
+                let pool = query_rpc_pool_for_route(&origin.rpc_route, &self.http);
                 // The first batch of an account deploys its proxy, which costs the hook more.
                 let deployed = proxy_deployed(&pool, proxy).await?;
                 // A permit travels in the order as a pre-hook, so the plan is read before the

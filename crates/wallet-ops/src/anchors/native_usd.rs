@@ -798,6 +798,7 @@ mod tests {
                 decimals: 6,
             },
             rpc_endpoints: vec!["https://rpc.example".into()],
+            direct_rpc_endpoints: Vec::new(),
             explorer_urls: vec![],
             enabled: true,
             contracts: crate::settings::ChainContractSettings::default(),

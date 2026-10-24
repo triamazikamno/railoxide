@@ -618,8 +618,12 @@ mod tests {
     }
 
     fn test_broker() -> Arc<RpcBroker> {
-        RpcBroker::spawn_with_candidate_order(reqwest::Client::new(), |_| {})
-            .expect("test broker requires an active Tokio runtime")
+        RpcBroker::spawn_with_candidate_order(
+            reqwest::Client::new(),
+            reqwest::Client::new(),
+            |_| {},
+        )
+        .expect("test broker requires an active Tokio runtime")
     }
 
     fn spawn_rpc_script<F>(

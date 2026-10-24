@@ -82,11 +82,16 @@ impl NetworkControl {
             self.close();
         }
         self.revision = revision;
-        self.status = Some(NetworkStatus::new(
-            kind,
-            text_field(&value, "detail"),
-            flag_field(&value, "runtime_warning"),
-        ));
+        self.status = Some(
+            NetworkStatus::new(
+                kind,
+                text_field(&value, "detail"),
+                flag_field(&value, "runtime_warning"),
+            )
+            .with_direct_rpc_endpoints(
+                chain_id_field(&value, "direct_rpc_endpoints").unwrap_or(0) as usize,
+            ),
+        );
         self.rate = chain_id_field(&value, "download_rate");
         let activity = field(&value, "activity");
         self.activity = if activity.is_null() || activity.is_undefined() {

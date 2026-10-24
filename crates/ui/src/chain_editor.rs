@@ -164,6 +164,7 @@ impl ChainEditor {
         }
         self.snapshot.revision = snapshot.revision;
         self.snapshot.chains = snapshot.chains;
+        self.snapshot.direct_network = snapshot.direct_network;
         cx.notify();
     }
 
@@ -310,17 +311,86 @@ impl ChainEditor {
         cx.notify();
     }
 
-    fn save(&mut self, cx: &mut Context<'_, Self>) {
+    fn save(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         let Some(draft) = self.collected_draft(cx) else {
             return;
         };
-        self.send(
-            ChainEditorCommand::Save {
-                draft,
-                existing: self.existing,
-            },
-            cx,
-        );
+        let command = ChainEditorCommand::Save {
+            draft: draft.clone(),
+            existing: self.existing,
+        };
+        let count = self.newly_direct(&draft);
+        if count == 0 {
+            self.send(command, cx);
+            return;
+        }
+        let editor = cx.entity();
+        // A host commit while the dialog is open makes this draft stale; don't stamp it.
+        let revision = self.snapshot.revision.clone();
+        let ok_text = self.save_label(&draft, cx);
+        let (title, body) = if count == 1 {
+            (
+                "Bypass Tor for this endpoint?".to_owned(),
+                "This endpoint will see your IP address and every request sent to it, \
+                 including public balance reads that are otherwise isolated per account.",
+            )
+        } else {
+            (
+                format!("Bypass Tor for {count} endpoints?"),
+                "These endpoints will see your IP address and every request sent to them, \
+                 including public balance reads that are otherwise isolated per account.",
+            )
+        };
+        window.open_alert_dialog(cx, move |dialog, _, _| {
+            let editor = editor.clone();
+            let command = command.clone();
+            let revision = revision.clone();
+            dialog
+                .width(CONFIRM_DIALOG_WIDTH)
+                .title(app_strong_text(title.clone()))
+                .child(
+                    app_muted_text(body)
+                        .debug_selector(|| "chain-direct-confirm".into())
+                        .whitespace_normal(),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(ok_text)
+                        .ok_variant(ButtonVariant::Primary)
+                        .cancel_variant(ButtonVariant::Secondary),
+                )
+                // After button_props, which would otherwise replace the Cancel flag.
+                .confirm()
+                .on_ok(move |_, _, cx| {
+                    let command = command.clone();
+                    editor.update(cx, |this, cx| {
+                        if this.snapshot.revision == revision {
+                            this.send(command, cx);
+                        }
+                    });
+                    true
+                })
+        });
+    }
+
+    /// Endpoints the draft reaches directly that the opened draft did not, archive included.
+    fn newly_direct(&self, draft: &ChainDraft) -> usize {
+        let Some(opened) = &self.opened_draft else {
+            return 0;
+        };
+        let field = ChainField::DirectRpcEndpoints;
+        let before: Vec<&str> = opened.value(field).lines().map(str::trim).collect();
+        let added = draft
+            .value(field)
+            .lines()
+            .map(str::trim)
+            .filter(|url| !url.is_empty() && !before.contains(url))
+            .count();
+        let archive = draft.value(ChainField::ArchiveRpcUrl).trim();
+        let archive_was_direct =
+            opened.archive_rpc_direct && opened.value(ChainField::ArchiveRpcUrl).trim() == archive;
+        let archive_added = draft.archive_rpc_direct && !archive.is_empty() && !archive_was_direct;
+        added + usize::from(archive_added)
     }
 
     /// The open draft with every input's current value, as the host receives it.
@@ -449,7 +519,10 @@ impl ChainEditor {
                     && self.changed_default(field, cx).is_some()
             })
             .count();
-        fields + usize::from(!draft.quick_sync_enabled) + usize::from(!draft.use_default_relays)
+        fields
+            + usize::from(!draft.quick_sync_enabled)
+            + usize::from(!draft.use_default_relays)
+            + usize::from(draft.archive_rpc_direct)
     }
 
     fn render_list(&self, root: gpui::Div, cx: &Context<'_, Self>) -> gpui::Div {
@@ -910,6 +983,18 @@ impl ChainEditor {
                 Some("Endpoints are checked against the chain ID before use."),
                 cx,
             ))
+            .child(meta_text(ChainField::DirectRpcEndpoints.label()))
+            .child(self.render_url_list(
+                ChainField::DirectRpcEndpoints,
+                false,
+                Some(if self.snapshot.direct_network {
+                    "Network mode is Direct, so all endpoints are already reached directly."
+                } else {
+                    "Used alongside the endpoints above, without Tor or the proxy. \
+                     Add only endpoints you trust."
+                }),
+                cx,
+            ))
     }
 
     fn render_advanced_section(&self, cx: &Context<'_, Self>) -> Collapsible {
@@ -984,7 +1069,20 @@ impl ChainEditor {
                 cx,
             ))
             .child(self.render_field(ChainField::ArchiveUntilBlock, false, None, cx))
-            .child(self.render_field(ChainField::ArchiveRpcUrl, false, None, cx));
+            .child(self.render_field(ChainField::ArchiveRpcUrl, false, None, cx))
+            .child(
+                Checkbox::new("chain-archive-direct")
+                    .debug_selector(|| "chain-archive-direct".into())
+                    .label("Bypass Tor for the archive endpoint")
+                    .checked(draft.archive_rpc_direct)
+                    .disabled(self.pending)
+                    .on_click(cx.listener(|this, checked, _, cx| {
+                        if let Some(draft) = this.draft.as_mut() {
+                            draft.archive_rpc_direct = *checked;
+                        }
+                        cx.notify();
+                    })),
+            );
         Collapsible::new()
             .w_full()
             .open(self.railgun_open)
@@ -1105,8 +1203,18 @@ impl ChainEditor {
         let key = field as usize;
         let noun = url_noun(field);
         let last = rows.len().saturating_sub(1);
+        let direct = match field {
+            ChainField::RpcEndpoints | ChainField::DirectRpcEndpoints => self
+                .fields
+                .get(&ChainField::DirectRpcEndpoints)
+                .map(|input| input.value(cx))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
         let mut list = div().flex().flex_col().gap_2().min_w_0();
         for (index, input) in rows.iter().enumerate() {
+            let value = input.read(cx).value().trim().to_owned();
+            let is_direct = !value.is_empty() && direct.lines().any(|url| url == value);
             list = list.child(
                 div()
                     .flex()
@@ -1121,6 +1229,15 @@ impl ChainEditor {
                                 .disabled(self.pending),
                         ),
                     )
+                    .when(is_direct, |row| {
+                        row.child(
+                            Tag::warning()
+                                .small()
+                                .rounded_full()
+                                .flex_none()
+                                .child("Direct"),
+                        )
+                    })
                     .child(row_icon_button(
                         SharedString::from(format!("chain-url-{key}-{index}-up")),
                         IconName::ArrowUp,
@@ -1147,6 +1264,9 @@ impl ChainEditor {
         list.child(
             div().flex().child(
                 app_button(("chain-add-url", key), format!("Add {noun}"))
+                    .when(field == ChainField::DirectRpcEndpoints, |button| {
+                        button.debug_selector(|| "chain-add-direct-endpoint".into())
+                    })
                     .icon(IconName::Plus)
                     .small()
                     .disabled(readonly || self.pending)
@@ -1165,6 +1285,7 @@ impl ChainEditor {
         draft.enabled == opened.enabled
             && draft.quick_sync_enabled == opened.quick_sync_enabled
             && draft.use_default_relays == opened.use_default_relays
+            && draft.archive_rpc_direct == opened.archive_rpc_direct
             && self.fields.iter().all(|(&field, input)| {
                 field == ChainField::NativeUsdOracle || input.value(cx) == opened.value(field)
             })
@@ -1373,21 +1494,22 @@ impl ChainEditor {
                     .on_click(cx.listener(|this, _, window, cx| this.discard(window, cx))),
             )
             .child(
-                app_button(
-                    "chain-save",
-                    if draft.built_in && !self.only_pricing_differs(draft, cx) {
-                        "Save and restart"
-                    } else if self.existing {
-                        "Save"
-                    } else {
-                        "Add chain"
-                    },
-                )
-                .primary()
-                .debug_selector(|| "chain-save".into())
-                .disabled(unavailable || self.stale)
-                .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                app_button("chain-save", self.save_label(draft, cx))
+                    .primary()
+                    .debug_selector(|| "chain-save".into())
+                    .disabled(unavailable || self.stale)
+                    .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
             )
+    }
+
+    fn save_label(&self, draft: &ChainDraft, cx: &App) -> &'static str {
+        if draft.built_in && !self.only_pricing_differs(draft, cx) {
+            "Save and restart"
+        } else if self.existing {
+            "Save"
+        } else {
+            "Add chain"
+        }
     }
 
     fn reset_button(draft: &ChainDraft, unavailable: bool, cx: &Context<'_, Self>) -> Button {
@@ -1609,6 +1731,7 @@ const fn url_noun(field: ChainField) -> &'static str {
     match field {
         ChainField::ExplorerUrls => "explorer",
         ChainField::SponsoredBundleRelays => "relay",
+        ChainField::DirectRpcEndpoints => "direct endpoint",
         _ => "endpoint",
     }
 }

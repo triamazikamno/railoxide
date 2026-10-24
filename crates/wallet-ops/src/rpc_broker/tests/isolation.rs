@@ -1,20 +1,12 @@
 use super::*;
 use crate::http::{OperationHttpClient, OperationNetworkIsolation};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
 const MULTICALL: Address = Address::repeat_byte(0x33);
 
 /// An operation client whose requests carry `x-route: <tag>`.
 fn tagged_client(tag: &'static str) -> OperationHttpClient {
-    let headers = HeaderMap::from_iter([(
-        HeaderName::from_static("x-route"),
-        HeaderValue::from_static(tag),
-    )]);
     OperationHttpClient::for_tests(
-        reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .expect("tagged client"),
+        tagged_reqwest_client(tag),
         OperationNetworkIsolation::Dedicated,
     )
 }
@@ -132,6 +124,78 @@ async fn isolated_and_shared_reads_share_neither_requests_nor_cached_results() {
     assert_eq!(tags()[2..], [isolated_tag.clone(), isolated_tag, None]);
     drop(broker);
     server.abort();
+}
+
+#[tokio::test]
+async fn failover_sends_each_endpoint_over_its_own_transport() {
+    let failing: RpcResponder = Arc::new(|request| rpc_error(&request, -32000));
+    let (direct_down, direct_down_requests, direct_down_server) =
+        spawn_recording_rpc_mock(failing.clone()).await;
+    let (wallet_up, wallet_up_requests, wallet_up_server) =
+        spawn_recording_rpc_mock(echo_responder()).await;
+    let (other_down, other_down_requests, other_down_server) =
+        spawn_recording_rpc_mock(failing).await;
+    let (direct_up, direct_up_requests, direct_up_server) =
+        spawn_recording_rpc_mock(echo_responder()).await;
+    let broker = RpcBroker::spawn_with_candidate_order(
+        tagged_reqwest_client("wallet"),
+        tagged_reqwest_client("direct"),
+        |_| {},
+    )
+    .expect("test broker requires an active Tokio runtime");
+    let route = |endpoints: [(Url, RpcTransport); 2]| {
+        RpcChainRoute::new_with_transports(
+            1,
+            endpoints
+                .into_iter()
+                .map(|(url, transport)| (url.into(), transport))
+                .collect(),
+        )
+    };
+    // On an isolated route only the wallet endpoint uses the isolated client.
+    let mixed = route([
+        (direct_down, RpcTransport::Direct),
+        (wallet_up, RpcTransport::Wallet),
+    ])
+    .isolated(tagged_client("isolated"));
+    let both_direct = route([
+        (other_down, RpcTransport::Direct),
+        (direct_up, RpcTransport::Direct),
+    ]);
+
+    for chain in [mixed, both_direct] {
+        let results = broker
+            .submit(RpcSubmission::new(
+                RpcRoute::from(chain),
+                vec![read_at(1, 1)],
+                test_origin(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(results, vec![Ok(data_result(Bytes::from(vec![1])))]);
+    }
+    let tags = |requests: &RecordedRequests| {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(tag, _)| tag.clone())
+            .collect::<Vec<_>>()
+    };
+    let direct = vec![Some("direct".to_owned())];
+    assert_eq!(tags(&direct_down_requests), direct);
+    assert_eq!(tags(&wallet_up_requests), vec![Some("isolated".to_owned())]);
+    assert_eq!(tags(&other_down_requests), direct);
+    assert_eq!(tags(&direct_up_requests), direct);
+    drop(broker);
+    for server in [
+        direct_down_server,
+        wallet_up_server,
+        other_down_server,
+        direct_up_server,
+    ] {
+        server.abort();
+    }
 }
 
 #[tokio::test]

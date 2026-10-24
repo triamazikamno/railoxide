@@ -27,9 +27,7 @@ use super::simulation::{Execution, execute};
 use crate::public_wallet::{PublicErc20, VaultedPublicSigner, sign_public_swap_typed_data};
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{ExecutorOperationId, PublicSwapPermit, PublicSwapRecord, SwapUseId};
-use crate::{
-    ExecutorOwner, RpcBrokerError, RpcRoute, WalletRpcOrigin, query_rpc_pool_with_http_client,
-};
+use crate::{ExecutorOwner, RpcBrokerError, RpcRoute, WalletRpcOrigin, query_rpc_pool_for_route};
 
 const ALLOWANCE_READ: &str = "read the Public account's allowance for the swap";
 const PERMIT_UNUSABLE: &str = "the token's permit couldn't be used; review the swap again";
@@ -542,7 +540,7 @@ impl ExecutorOwner {
                 hash_fallback_confirmed,
             ))
             .await?;
-        let pool = query_rpc_pool_with_http_client(origin.rpc_route.endpoint_urls(), &self.http);
+        let pool = query_rpc_pool_for_route(&origin.rpc_route, &self.http);
         let call = TransactionRequest::default()
             .to(token)
             .input(permit_calldata(&permit, &signature).into());

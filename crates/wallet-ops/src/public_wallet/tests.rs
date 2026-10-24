@@ -830,6 +830,7 @@ async fn custom_balance_refresh_preserves_partial_results_without_multicall() {
                 decimals: 6,
             },
             rpc_endpoints: vec![endpoint.to_string()],
+            direct_rpc_endpoints: Vec::new(),
             explorer_urls: vec![],
             enabled: true,
             contracts: crate::settings::ChainContractSettings::default(),
@@ -1899,8 +1900,8 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
         max_priority_fee_per_gas: 2,
     };
     let http = http_context_for_route(WalletNetworkMode::Direct, "direct");
-    let pool = crate::query_rpc_pool_with_http_client(
-        vec![Url::parse(&server.url).expect("mock RPC URL")],
+    let pool = crate::query_rpc_pool_for_route(
+        &RpcChainRoute::new(1, vec![Url::parse(&server.url).expect("mock RPC URL")]),
         &http,
     );
     let recognized_request = TransactionRequest::default()
@@ -3295,7 +3296,7 @@ async fn shield_speedup_funding_uses_the_previously_signed_gas_limit() {
     let native_balance = U256::from(1_000_000_000_000_000_000_000_u128);
     let value = native_balance - U256::from(model_gas) * U256::from(100);
     let http = HttpContext::direct_for_tests();
-    let pool = crate::query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), &http);
+    let pool = crate::query_rpc_pool_for_route(&chain.rpc_route, &http);
     for (max_fee_per_gas, affordable) in [(125_u128, true), (300, false)] {
         let actual_cost = value + U256::from(signed_gas_limit) * U256::from(max_fee_per_gas);
         assert_eq!(actual_cost <= native_balance, affordable);
@@ -3368,7 +3369,7 @@ async fn native_preflight_filters_broker_withdrawals_and_tries_each_candidate_on
     );
     let http = HttpContext::direct_for_tests();
     // The original transaction pool predates the broker's withdrawal and still contains both.
-    let pool = crate::query_rpc_pool_with_http_client(route.endpoint_urls(), &http);
+    let pool = crate::query_rpc_pool_for_route(&route, &http);
     let warmup = http.rpc_broker().warm_identities(vec![route.clone()], None);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
@@ -4110,7 +4111,7 @@ async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_prefli
     assert_eq!(calls[before].route.as_deref(), Some("admitted"));
     assert_eq!(calls[before].params[1], json!("pending"));
 
-    let pool = crate::query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), &http);
+    let pool = crate::query_rpc_pool_for_route(&chain.rpc_route, &http);
     let before = server.calls().len();
     let before_callbacks = callback_calls.load(Ordering::SeqCst);
     super::submission::public_action_preflight_from_rpc_pool_with_reads(
@@ -4229,7 +4230,7 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
     )
     .with_identity_verification();
     let http = HttpContext::direct_for_tests();
-    let pool = crate::query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), &http);
+    let pool = crate::query_rpc_pool_for_route(&chain.rpc_route, &http);
     let from = Address::repeat_byte(1);
     let to = Address::repeat_byte(2);
     let gas_fee = PublicActionGasFeeSelection::Custom {
@@ -4608,7 +4609,7 @@ async fn native_preflight_logs_failure_stage_without_sensitive_payloads() {
         second_endpoint.set_path("/private-rpc-path/second");
         chain.rpc_route = RpcChainRoute::new(42161, vec![endpoint, second_endpoint]);
         let http = HttpContext::direct_for_tests_with_candidate_order(<[usize]>::reverse);
-        let pool = crate::query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), &http);
+        let pool = crate::query_rpc_pool_for_route(&chain.rpc_route, &http);
         let logs = Arc::new(Mutex::new(Vec::new()));
         let writer = LogWriter(logs.clone());
         let subscriber = tracing_subscriber::fmt()
@@ -4720,8 +4721,10 @@ async fn dapp_raw_broadcast_does_not_log_or_return_remote_payloads() {
 
     let server = MockRpcServer::spawn(true, 21_000).await;
     let http = HttpContext::direct_for_tests();
-    let pool =
-        crate::query_rpc_pool_with_http_client(vec![Url::parse(&server.url).unwrap()], &http);
+    let pool = crate::query_rpc_pool_for_route(
+        &RpcChainRoute::new(1, vec![Url::parse(&server.url).unwrap()]),
+        &http,
+    );
     let tx_hash = B256::repeat_byte(0xab);
     for log_transaction_details in [true, false] {
         let logs = Arc::new(Mutex::new(Vec::new()));

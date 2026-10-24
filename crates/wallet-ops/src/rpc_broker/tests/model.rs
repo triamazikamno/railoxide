@@ -751,7 +751,7 @@ async fn route_selection_spreads_requests_across_configured_endpoints() {
 fn route_selection_orders_ties_by_hook_after_health_and_count() {
     let (_tx, rx) = mpsc::channel(1);
     let mut actor = Actor::new(
-        reqwest::Client::new(),
+        test_clients(),
         rx,
         Duration::from_secs(30),
         1,

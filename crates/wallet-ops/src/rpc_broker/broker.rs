@@ -3,7 +3,7 @@ use super::execution::run_job;
 use super::identity::{CandidateOrder, random_candidate_order};
 use super::model::{
     DEFAULT_INTERVAL, DEFAULT_MAX_IN_FLIGHT, RpcBrokerError, RpcBrokerSpawnError, RpcChainRoute,
-    RpcOrigin, RpcRead, RpcResult, RpcRoute, RpcSubmission,
+    RpcClients, RpcOrigin, RpcRead, RpcResult, RpcRoute, RpcSubmission,
 };
 use super::warmup::{InstalledWarmup, RpcIdentityWarmup, WarmupRequest, same_installation};
 use alloy::eips::BlockId;
@@ -40,12 +40,16 @@ impl fmt::Debug for RpcBroker {
 }
 
 impl RpcBroker {
-    /// Starts the broker on the current Tokio runtime.
-    pub fn spawn(client: reqwest::Client) -> Result<Arc<Self>, RpcBrokerSpawnError> {
+    /// Starts the broker on the current Tokio runtime. Wallet endpoints use `client` and direct
+    /// endpoints `direct_client`.
+    pub fn spawn(
+        client: reqwest::Client,
+        direct_client: reqwest::Client,
+    ) -> Result<Arc<Self>, RpcBrokerSpawnError> {
         let handle =
             tokio::runtime::Handle::try_current().map_err(RpcBrokerSpawnError::NoRuntime)?;
         Self::spawn_primitive(
-            client,
+            RpcClients::new(client, direct_client),
             &handle,
             DEFAULT_INTERVAL,
             DEFAULT_MAX_IN_FLIGHT,
@@ -55,13 +59,14 @@ impl RpcBroker {
         )
     }
 
-    /// Starts the broker on an explicit Tokio runtime handle.
+    /// Starts the broker on an explicit Tokio runtime handle, with clients as for `spawn`.
     pub fn spawn_on(
         client: reqwest::Client,
+        direct_client: reqwest::Client,
         handle: &tokio::runtime::Handle,
     ) -> Result<Arc<Self>, RpcBrokerSpawnError> {
         Self::spawn_primitive(
-            client,
+            RpcClients::new(client, direct_client),
             handle,
             DEFAULT_INTERVAL,
             DEFAULT_MAX_IN_FLIGHT,
@@ -72,7 +77,7 @@ impl RpcBroker {
     }
 
     fn spawn_primitive(
-        client: reqwest::Client,
+        clients: RpcClients,
         handle: &tokio::runtime::Handle,
         interval: Duration,
         max_in_flight: usize,
@@ -86,7 +91,7 @@ impl RpcBroker {
         let (tx, rx) = mpsc::channel(submission_capacity.get());
         let (block_tx, block_rx) = mpsc::unbounded_channel();
         let actor = Actor::new(
-            client,
+            clients,
             rx,
             interval,
             max_in_flight.max(1),

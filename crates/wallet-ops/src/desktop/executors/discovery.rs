@@ -7,7 +7,6 @@ use alloy::providers::{Provider as _, bindings::IMulticall3};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall as _;
 use broadcaster_core::contracts::railgun::RelayAdapt7702;
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, eyre};
 
 use super::ExecutorOwner;
@@ -153,11 +152,10 @@ impl ExecutorOwner {
                 })
                 .collect(),
         };
-        let pool = QueryRpcPool::with_http_client(
-            self.chain.rpc_route.endpoint_urls(),
-            Duration::from_secs(30),
-            self.http.rpc_client.clone(),
-        );
+        let pool = self
+            .chain
+            .rpc_route
+            .query_rpc_pool(&self.http.rpc_clients(), Duration::from_secs(30));
         for provider in pool.available_providers() {
             // Validate the chain before disclosing the derived range.
             if provider.provider.get_chain_id().await.ok() != Some(self.chain.chain_id) {

@@ -1091,7 +1091,7 @@ pub(super) async fn public_broadcaster_setup(
         anchor_rate,
         executor_delivery,
     )?;
-    let query_rpc_pool = query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http);
+    let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
     // Refresh after approval, then keep this price stable while building the proof.
     let fee_candidates = acquire_fee_candidates(http, &chain.rpc_route, None).await?;
     let min_gas_price = buffered_gas_price_from_candidates(&fee_candidates, &chain.gas).await?;

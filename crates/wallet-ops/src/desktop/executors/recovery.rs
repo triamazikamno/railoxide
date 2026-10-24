@@ -8,7 +8,6 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
 use broadcaster_core::contracts::railgun::{Call, ShieldRequest, TokenData, shieldCall};
 use broadcaster_core::contracts::shield::build_shield_request;
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, eyre};
 use railgun_wallet::tx::{GasEstimateMode, RailgunGasModel};
 use zeroize::Zeroizing;
@@ -558,11 +557,9 @@ pub(super) async fn recovery_allowance(
         }
         .abi_encode()
     };
-    let pool = QueryRpcPool::with_http_client(
-        chain.rpc_route.endpoint_urls(),
-        Duration::from_secs(30),
-        http.rpc_client.clone(),
-    );
+    let pool = chain
+        .rpc_route
+        .query_rpc_pool(&http.rpc_clients(), Duration::from_secs(30));
     for endpoint in pool.available_providers() {
         let provider = &endpoint.provider;
         if provider.get_chain_id().await.ok() != Some(chain.chain_id) {

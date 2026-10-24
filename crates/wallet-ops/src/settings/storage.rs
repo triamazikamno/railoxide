@@ -94,6 +94,7 @@ fn migrate_custom_chains_to_public_presets(settings: &mut WalletSettings) -> boo
                 native_usd_pricing: custom.native_usd_pricing,
                 enabled: custom.enabled,
                 rpc_endpoints: custom.rpc_endpoints,
+                direct_rpc_endpoints: custom.direct_rpc_endpoints,
                 contracts: custom.contracts,
                 finality_depth: custom.finality_depth,
                 gas: custom.gas,

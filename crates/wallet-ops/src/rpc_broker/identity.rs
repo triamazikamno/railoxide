@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use super::{RpcBrokerError, RpcChainRoute};
+use super::{RpcBrokerError, RpcChainRoute, RpcClients, RpcTransport};
 
 const IDENTITY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Upper bound on concurrent identity probes for one pool admission or candidate source.
@@ -173,7 +173,7 @@ impl RpcChainRoute {
     /// remain retryable; replacing the configuration starts with no verified endpoints.
     pub(super) async fn verify_endpoint_identity(
         &self,
-        client: &reqwest::Client,
+        clients: &RpcClients,
         endpoint: &SensitiveUrl,
         timeout: Duration,
     ) -> Result<(), RpcBrokerError> {
@@ -183,7 +183,7 @@ impl RpcChainRoute {
         let result = tokio::time::timeout(
             timeout,
             self.endpoint_verification(endpoint)
-                .get_or_try_init(|| self.check_chain_id(client, endpoint)),
+                .get_or_try_init(|| self.check_chain_id(clients, endpoint)),
         )
         .await
         .map_err(|_| RpcBrokerError::Timeout)?
@@ -198,13 +198,13 @@ impl RpcChainRoute {
     /// Logs the outcome under `label` (a configured index or `archive`), never the URL.
     pub(super) async fn verify_labeled_endpoint_identity(
         &self,
-        client: &reqwest::Client,
+        clients: &RpcClients,
         endpoint: &SensitiveUrl,
         label: &(dyn Display + Sync),
     ) -> Result<(), RpcBrokerError> {
         let started = tokio::time::Instant::now();
         let result = self
-            .verify_endpoint_identity(client, endpoint, IDENTITY_TIMEOUT)
+            .verify_endpoint_identity(clients, endpoint, IDENTITY_TIMEOUT)
             .await;
         if self.requires_identity_verification() {
             tracing::debug!(
@@ -223,12 +223,12 @@ impl RpcChainRoute {
     /// admission. Logs the outcome under `label`, never the URL.
     pub(super) async fn probe_labeled_endpoint_responsiveness(
         &self,
-        client: &reqwest::Client,
+        clients: &RpcClients,
         endpoint: &SensitiveUrl,
         label: &(dyn Display + Sync),
     ) -> Result<(), RpcBrokerError> {
         let started = tokio::time::Instant::now();
-        let result = tokio::time::timeout(IDENTITY_TIMEOUT, self.check_chain_id(client, endpoint))
+        let result = tokio::time::timeout(IDENTITY_TIMEOUT, self.check_chain_id(clients, endpoint))
             .await
             .unwrap_or(Err(RpcBrokerError::Timeout));
         tracing::debug!(
@@ -241,14 +241,16 @@ impl RpcChainRoute {
         result
     }
 
-    /// Asks `endpoint` for its chain ID and compares it with this route's, without a timeout.
+    /// Asks `endpoint` over its transport's client for its chain ID and compares it with this
+    /// route's, without a timeout.
     async fn check_chain_id(
         &self,
-        client: &reqwest::Client,
+        clients: &RpcClients,
         endpoint: &SensitiveUrl,
     ) -> Result<(), RpcBrokerError> {
-        let provider =
-            ProviderBuilder::new().connect_reqwest(client.clone(), endpoint.expose_url().clone());
+        let url = endpoint.expose_url();
+        let client = clients.get(self.endpoint_transport(url)).clone();
+        let provider = ProviderBuilder::new().connect_reqwest(client, url.clone());
         let id = provider
             .get_chain_id()
             .await
@@ -263,18 +265,16 @@ impl RpcChainRoute {
     /// timeout. The returned route keeps the configured order of the endpoints that passed.
     pub(crate) async fn verify_identity(
         &self,
-        client: &reqwest::Client,
+        clients: &RpcClients,
     ) -> Result<Self, RpcBrokerError> {
-        let checks = self
-            .endpoints()
-            .iter()
-            .enumerate()
-            .map(|(index, endpoint)| async move {
-                self.verify_labeled_endpoint_identity(client, endpoint, &index)
+        let checks = self.transport_endpoints().enumerate().map(
+            |(index, (endpoint, transport))| async move {
+                self.verify_labeled_endpoint_identity(clients, endpoint, &index)
                     .await
                     .is_ok()
-                    .then(|| endpoint.clone())
-            });
+                    .then(|| (endpoint.clone(), transport))
+            },
+        );
         let endpoints = join_all(checks)
             .await
             .into_iter()
@@ -285,7 +285,7 @@ impl RpcChainRoute {
                 chain_id: self.chain_id(),
             });
         }
-        let mut route = Self::new(self.chain_id(), endpoints);
+        let mut route = Self::new_with_transports(self.chain_id(), endpoints);
         if let Some(multicall) = self.multicall() {
             route = route.with_multicall(multicall);
         }
@@ -293,18 +293,35 @@ impl RpcChainRoute {
         Ok(route)
     }
 
+    /// A pool over this route's endpoints in configured order, each sending through its
+    /// transport's client.
+    pub(crate) fn query_rpc_pool(&self, clients: &RpcClients, cooldown: Duration) -> QueryRpcPool {
+        QueryRpcPool::with_http_clients(
+            self.transport_endpoints()
+                .map(|(endpoint, transport)| {
+                    (
+                        endpoint.expose_url().clone(),
+                        clients.get(transport).clone(),
+                    )
+                })
+                .collect(),
+            cooldown,
+        )
+    }
+
     /// Admits `pool` endpoints in the background as their identity checks pass. `pool` must be
-    /// built from `endpoint_urls()` in order with pending admission, and with a pending archive
-    /// when `archive` is set. Returns once any regular endpoint is admitted, or fails once every
-    /// regular endpoint's first check failed; the archive never affects the result.
+    /// built by `query_rpc_pool` with pending admission, and with a pending archive when
+    /// `archive` is set. The archive is checked over its own transport. Returns once any regular
+    /// endpoint is admitted, or fails once every regular endpoint's first check failed; the
+    /// archive never affects the result.
     pub(crate) async fn admit_sync_pool(
         &self,
-        client: &reqwest::Client,
+        clients: &RpcClients,
         pool: &Arc<QueryRpcPool>,
-        archive: Option<SensitiveUrl>,
+        archive: Option<(SensitiveUrl, RpcTransport)>,
     ) -> Result<(), RpcBrokerError> {
         self.admit_pool(
-            client,
+            clients,
             pool,
             archive,
             SYNC_ADMISSION_BACKOFF,
@@ -315,9 +332,9 @@ impl RpcChainRoute {
 
     async fn admit_pool(
         &self,
-        client: &reqwest::Client,
+        clients: &RpcClients,
         pool: &Arc<QueryRpcPool>,
-        archive: Option<SensitiveUrl>,
+        archive: Option<(SensitiveUrl, RpcTransport)>,
         backoff: AdmissionBackoff,
         order: CandidateOrder,
     ) -> Result<(), RpcBrokerError> {
@@ -327,7 +344,7 @@ impl RpcChainRoute {
         }
         let (report, admitted) = oneshot::channel();
         tokio::spawn(self.clone().run_pool_admission(
-            client.clone(),
+            clients.clone(),
             Arc::downgrade(pool),
             archive,
             backoff,
@@ -346,15 +363,16 @@ impl RpcChainRoute {
     /// initial regular probes once; retries and the archive are not reordered.
     async fn run_pool_admission(
         self,
-        client: reqwest::Client,
+        clients: RpcClients,
         pool: Weak<QueryRpcPool>,
-        archive: Option<SensitiveUrl>,
+        archive: Option<(SensitiveUrl, RpcTransport)>,
         backoff: AdmissionBackoff,
         order: CandidateOrder,
         report: oneshot::Sender<bool>,
     ) {
-        let archive = archive.map(|url| {
-            let route = Self::new(self.chain_id(), vec![url.clone()]).with_identity_verification();
+        let archive = archive.map(|(url, transport)| {
+            let route = Self::new_with_transports(self.chain_id(), vec![(url.clone(), transport)])
+                .with_identity_verification();
             (route, url)
         });
         let regular_count = self.endpoints().len();
@@ -372,7 +390,7 @@ impl RpcChainRoute {
                 first: true,
             })
             .collect::<Vec<_>>();
-        let client = &client;
+        let clients = &clients;
         let start_probe = |slot: AdmissionSlot| {
             let (route, endpoint) = match slot {
                 AdmissionSlot::Provider(index) => (&self, &self.endpoints()[index]),
@@ -383,7 +401,7 @@ impl RpcChainRoute {
             };
             async move {
                 route
-                    .verify_labeled_endpoint_identity(client, endpoint, &slot)
+                    .verify_labeled_endpoint_identity(clients, endpoint, &slot)
                     .await
             }
         };
@@ -449,7 +467,10 @@ impl RpcChainRoute {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{RpcMockGate, RpcResponder, spawn_gated_rpc_mock, spawn_rpc_mock};
+    use super::super::tests::{
+        RecordedRequests, RpcMockGate, RpcResponder, spawn_gated_rpc_mock,
+        spawn_recording_rpc_mock, spawn_rpc_mock, tagged_reqwest_client,
+    };
     use super::*;
     use alloy::primitives::U64;
     use serde_json::json;
@@ -516,15 +537,12 @@ mod tests {
 
     fn pending_pool(
         route: &RpcChainRoute,
-        client: &reqwest::Client,
+        clients: &RpcClients,
         archive: bool,
     ) -> Arc<QueryRpcPool> {
-        let pool = QueryRpcPool::with_http_client(
-            route.endpoint_urls(),
-            Duration::from_secs(5),
-            client.clone(),
-        )
-        .with_pending_admission();
+        let pool = route
+            .query_rpc_pool(clients, Duration::from_secs(5))
+            .with_pending_admission();
         Arc::new(if archive {
             pool.with_pending_archive()
         } else {
@@ -572,7 +590,7 @@ mod tests {
             tokio::time::pause();
         });
         let verified = route
-            .verify_identity(&http.rpc_client)
+            .verify_identity(&http.rpc_clients())
             .await
             .expect("slow and fast endpoints verify");
 
@@ -591,12 +609,16 @@ mod tests {
         let (archive, archive_server, archive_gate) = held_chain_id_mock(CHAIN_ID).await;
         let http = crate::HttpContext::direct_for_tests();
         let route = RpcChainRoute::new(CHAIN_ID, vec![held, fast]).with_identity_verification();
-        let pool = pending_pool(&route, &http.rpc_client, true);
+        let pool = pending_pool(&route, &http.rpc_clients(), true);
 
         // The held endpoint and archive answer only after the gates open below.
         tokio::time::timeout(
             Duration::from_secs(5),
-            route.admit_sync_pool(&http.rpc_client, &pool, Some(archive.into())),
+            route.admit_sync_pool(
+                &http.rpc_clients(),
+                &pool,
+                Some((archive.into(), RpcTransport::Wallet)),
+            ),
         )
         .await
         .expect("admission does not wait for held endpoints")
@@ -629,13 +651,13 @@ mod tests {
             counted_chain_id_mock(1, Arc::default()).await;
         let http = crate::HttpContext::direct_for_tests();
         let route = RpcChainRoute::new(CHAIN_ID, vec![wrong, good]).with_identity_verification();
-        let pool = pending_pool(&route, &http.rpc_client, true);
+        let pool = pending_pool(&route, &http.rpc_clients(), true);
 
         route
             .admit_pool(
-                &http.rpc_client,
+                &http.rpc_clients(),
                 &pool,
-                Some(wrong_archive.into()),
+                Some((wrong_archive.into(), RpcTransport::Wallet)),
                 FAST_BACKOFF,
                 |_| {},
             )
@@ -669,11 +691,11 @@ mod tests {
         };
         let http = crate::HttpContext::direct_for_tests();
         let route = RpcChainRoute::new(CHAIN_ID, vec![wrong, refused]).with_identity_verification();
-        let pool = pending_pool(&route, &http.rpc_client, false);
+        let pool = pending_pool(&route, &http.rpc_clients(), false);
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            route.admit_sync_pool(&http.rpc_client, &pool, None),
+            route.admit_sync_pool(&http.rpc_clients(), &pool, None),
         )
         .await
         .expect("admission reports after the first failed checks");
@@ -699,12 +721,12 @@ mod tests {
         endpoints.push(fast);
         let http = crate::HttpContext::direct_for_tests();
         let route = RpcChainRoute::new(CHAIN_ID, endpoints).with_identity_verification();
-        let pool = pending_pool(&route, &http.rpc_client, false);
+        let pool = pending_pool(&route, &http.rpc_clients(), false);
 
         // In configured order the held prefix would occupy every probe slot until it times out.
         tokio::time::timeout(
             Duration::from_secs(5),
-            route.admit_pool(&http.rpc_client, &pool, None, FAST_BACKOFF, |indices| {
+            route.admit_pool(&http.rpc_clients(), &pool, None, FAST_BACKOFF, |indices| {
                 indices.reverse();
             }),
         )
@@ -730,10 +752,10 @@ mod tests {
         let http = crate::HttpContext::direct_for_tests();
         let route =
             RpcChainRoute::new(CHAIN_ID, vec![flaky, good, broken]).with_identity_verification();
-        let pool = pending_pool(&route, &http.rpc_client, false);
+        let pool = pending_pool(&route, &http.rpc_clients(), false);
 
         route
-            .admit_pool(&http.rpc_client, &pool, None, FAST_BACKOFF, |_| {})
+            .admit_pool(&http.rpc_clients(), &pool, None, FAST_BACKOFF, |_| {})
             .await
             .expect("the good endpoint admits the pool");
         // A second request proves the failed check is retried; failures keep it pending.
@@ -768,7 +790,7 @@ mod tests {
         let http = crate::HttpContext::direct_for_tests();
         let route =
             RpcChainRoute::new(999_999, vec![endpoint.clone()]).with_identity_verification();
-        assert!(route.verify_identity(&http.rpc_client).await.is_err());
+        assert!(route.verify_identity(&http.rpc_clients()).await.is_err());
         returned_id.store(999_999, Ordering::SeqCst);
         let equivalent =
             RpcChainRoute::new(999_999, route.endpoint_urls()).with_identity_verification();
@@ -781,7 +803,7 @@ mod tests {
         let before_verification = fingerprint(&route);
         assert_eq!(
             route
-                .verify_identity(&http.rpc_client)
+                .verify_identity(&http.rpc_clients())
                 .await
                 .unwrap()
                 .endpoint_urls(),
@@ -795,7 +817,12 @@ mod tests {
         .await;
         let replacement =
             RpcChainRoute::new(999_999, vec![replacement]).with_identity_verification();
-        assert!(replacement.verify_identity(&http.rpc_client).await.is_err());
+        assert!(
+            replacement
+                .verify_identity(&http.rpc_clients())
+                .await
+                .is_err()
+        );
         // Populating a cache must not change broker grouping or authority equality.
         assert_eq!(route, equivalent);
         assert_eq!(fingerprint(&route), before_verification);
@@ -805,14 +832,82 @@ mod tests {
         assert!(
             route
                 .clone()
-                .verify_identity(&http.rpc_client)
+                .verify_identity(&http.rpc_clients())
                 .await
                 .is_ok()
         );
         let rebuilt =
             RpcChainRoute::new(999_999, route.endpoint_urls()).with_identity_verification();
-        assert!(rebuilt.verify_identity(&http.rpc_client).await.is_err());
+        assert!(rebuilt.verify_identity(&http.rpc_clients()).await.is_err());
         server.abort();
         replacement_server.abort();
+    }
+
+    #[tokio::test]
+    async fn identity_checks_and_sync_pools_use_each_endpoint_transport_client() {
+        let (wallet, wallet_requests, wallet_server) =
+            spawn_recording_rpc_mock(chain_id_responder(CHAIN_ID)).await;
+        let (direct, direct_requests, direct_server) =
+            spawn_recording_rpc_mock(chain_id_responder(CHAIN_ID)).await;
+        let (archive, archive_requests, archive_server) =
+            spawn_recording_rpc_mock(chain_id_responder(CHAIN_ID)).await;
+        let clients = RpcClients::new(
+            tagged_reqwest_client("wallet"),
+            tagged_reqwest_client("direct"),
+        );
+        let route = RpcChainRoute::new_with_transports(
+            CHAIN_ID,
+            vec![
+                (wallet.clone().into(), RpcTransport::Wallet),
+                (direct.clone().into(), RpcTransport::Direct),
+            ],
+        )
+        .with_identity_verification();
+
+        let verified = route
+            .verify_identity(&clients)
+            .await
+            .expect("both endpoints verify");
+        assert_eq!(verified.endpoint_transport(&wallet), RpcTransport::Wallet);
+        assert_eq!(verified.endpoint_transport(&direct), RpcTransport::Direct);
+        // The checks above are cached, so admission sends only the direct archive's check.
+        let pool = Arc::new(
+            route
+                .query_rpc_pool(&clients, Duration::from_secs(5))
+                .with_pending_admission()
+                .with_pending_archive(),
+        );
+        route
+            .admit_sync_pool(
+                &clients,
+                &pool,
+                Some((archive.into(), RpcTransport::Direct)),
+            )
+            .await
+            .expect("verified endpoints admit the pool");
+        eventually(|| available(&pool) == vec![0, 1] && pool.archive_admitted()).await;
+        for provider in pool.available_providers() {
+            assert_eq!(provider.provider.get_chain_id().await.unwrap(), CHAIN_ID);
+        }
+
+        let tags = |requests: &RecordedRequests| {
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(tag, _)| tag.clone())
+                .collect::<Vec<_>>()
+        };
+        let wallet_tag = Some("wallet".to_owned());
+        let direct_tag = Some("direct".to_owned());
+        assert_eq!(tags(&wallet_requests), vec![wallet_tag.clone(), wallet_tag]);
+        assert_eq!(
+            tags(&direct_requests),
+            vec![direct_tag.clone(), direct_tag.clone()]
+        );
+        assert_eq!(tags(&archive_requests), vec![direct_tag]);
+        wallet_server.abort();
+        direct_server.abort();
+        archive_server.abort();
     }
 }

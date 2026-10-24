@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 use tor_rtcompat::PreferredRuntime;
 use trustless_artifacts::GatewayPool;
 
-use crate::rpc_broker::RpcBroker;
+use crate::rpc_broker::{RpcBroker, RpcClients, RpcTransport};
 
 const ARTI_DIR: &str = "arti";
 const ARTI_STATE_DIR: &str = "state";
@@ -622,6 +622,9 @@ pub struct HttpContext {
     pub client: reqwest::Client,
     /// Shared EVM JSON-RPC client used by the RPC broker and pool-backed workflows.
     pub rpc_client: reqwest::Client,
+    /// JSON-RPC client for user-marked direct endpoints. It never uses Tor or a proxy; in direct
+    /// mode it is `rpc_client`.
+    pub direct_rpc_client: reqwest::Client,
     broker: Arc<RpcBroker>,
     gateway_pool: GatewayPool,
     /// Proxy URL retained for components that need an endpoint value. In Tor
@@ -642,6 +645,19 @@ impl HttpContext {
     #[must_use]
     pub fn rpc_broker(&self) -> Arc<RpcBroker> {
         self.broker.clone()
+    }
+
+    /// The JSON-RPC client for an endpoint with `transport`.
+    #[must_use]
+    pub const fn rpc_client_for(&self, transport: RpcTransport) -> &reqwest::Client {
+        match transport {
+            RpcTransport::Wallet => &self.rpc_client,
+            RpcTransport::Direct => &self.direct_rpc_client,
+        }
+    }
+
+    pub(crate) fn rpc_clients(&self) -> RpcClients {
+        RpcClients::new(self.rpc_client.clone(), self.direct_rpc_client.clone())
     }
 
     #[must_use]
@@ -894,8 +910,13 @@ impl HttpContext {
         Self {
             client: reqwest::Client::new(),
             rpc_client: rpc_client.clone(),
-            broker: RpcBroker::spawn_with_candidate_order(rpc_client, candidate_order)
-                .expect("HttpContext test constructor requires an active Tokio runtime"),
+            direct_rpc_client: rpc_client.clone(),
+            broker: RpcBroker::spawn_with_candidate_order(
+                rpc_client.clone(),
+                rpc_client,
+                candidate_order,
+            )
+            .expect("HttpContext test constructor requires an active Tokio runtime"),
             gateway_pool: GatewayPool::new(),
             proxy_url: None,
             user_proxy_url: None,
@@ -913,10 +934,12 @@ impl HttpContext {
         rpc_client: reqwest::Client,
         mode: WalletNetworkMode,
     ) -> Self {
-        let broker = RpcBroker::spawn_with_candidate_order(rpc_client.clone(), |_| {})
-            .expect("HttpContext test constructor requires an active Tokio runtime");
+        let broker =
+            RpcBroker::spawn_with_candidate_order(rpc_client.clone(), rpc_client.clone(), |_| {})
+                .expect("HttpContext test constructor requires an active Tokio runtime");
         Self {
             client: reqwest::Client::new(),
+            direct_rpc_client: rpc_client.clone(),
             rpc_client,
             broker,
             gateway_pool: GatewayPool::new(),
@@ -1336,10 +1359,22 @@ fn build_reqwest_context(
         .timeout(rpc_request_timeout(mode))
         .build()
         .wrap_err("build RPC HTTP client")?;
-    let broker = RpcBroker::spawn(rpc_client.clone()).wrap_err("start RPC broker")?;
+    let direct_rpc_client = if mode == WalletNetworkMode::Direct {
+        rpc_client.clone()
+    } else {
+        // `no_proxy` also keeps proxy environment variables from redirecting it.
+        reqwest::Client::builder()
+            .no_proxy()
+            .timeout(rpc_request_timeout(WalletNetworkMode::Direct))
+            .build()
+            .wrap_err("build direct RPC HTTP client")?
+    };
+    let broker = RpcBroker::spawn(rpc_client.clone(), direct_rpc_client.clone())
+        .wrap_err("start RPC broker")?;
     Ok(HttpContext {
         client,
         rpc_client,
+        direct_rpc_client,
         broker,
         gateway_pool: GatewayPool::new(),
         proxy_url,
@@ -2342,6 +2377,94 @@ mod tests {
             tor_without_bridge.operation_http_client().await.is_err(),
             "Tor mode without its bridge fails closed"
         );
+    }
+
+    #[tokio::test]
+    async fn direct_rpc_client_bypasses_tor_and_proxy() {
+        use std::sync::atomic::AtomicUsize;
+
+        let answered = Arc::new(AtomicUsize::new(0));
+        let (rpc, rpc_server) = crate::rpc_broker::tests::spawn_rpc_mock(
+            Arc::new({
+                let answered = answered.clone();
+                move |request: serde_json::Value| {
+                    answered.fetch_add(1, Ordering::SeqCst);
+                    serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": "0x1"})
+                }
+            }),
+            Arc::default(),
+            Arc::default(),
+        )
+        .await;
+        // Stands in for the Tor bridge or proxy: counts connections and closes them unanswered.
+        let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+        let proxied = Arc::new(AtomicUsize::new(0));
+        let proxy_server = tokio::spawn({
+            let proxied = proxied.clone();
+            async move {
+                while let Ok((stream, _)) = proxy.accept().await {
+                    proxied.fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                }
+            }
+        });
+        let send = |client: &reqwest::Client| {
+            client
+                .post(rpc.clone())
+                .header("content-type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}"#)
+                .send()
+        };
+
+        for (mode, scheme) in [
+            (WalletNetworkMode::Tor, "socks5h"),
+            (WalletNetworkMode::Proxy, "http"),
+        ] {
+            let proxy_url = Url::parse(&format!("{scheme}://{proxy_address}")).unwrap();
+            let user_proxy_url = (mode == WalletNetworkMode::Proxy).then(|| proxy_url.clone());
+            let context = build_reqwest_context(
+                mode,
+                Some(proxy_url),
+                user_proxy_url,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("context");
+            let proxied_before = proxied.load(Ordering::SeqCst);
+            assert!(
+                send(context.rpc_client_for(RpcTransport::Direct))
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(proxied.load(Ordering::SeqCst), proxied_before);
+            assert!(
+                send(context.rpc_client_for(RpcTransport::Wallet))
+                    .await
+                    .is_err()
+            );
+            assert!(proxied.load(Ordering::SeqCst) > proxied_before);
+        }
+        assert_eq!(answered.load(Ordering::SeqCst), 2);
+
+        let direct = build_reqwest_context(
+            WalletNetworkMode::Direct,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("direct context");
+        for transport in [RpcTransport::Wallet, RpcTransport::Direct] {
+            assert!(send(direct.rpc_client_for(transport)).await.is_ok());
+        }
+        assert_eq!(answered.load(Ordering::SeqCst), 4);
+        rpc_server.abort();
+        proxy_server.abort();
     }
 
     #[test]

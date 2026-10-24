@@ -58,6 +58,7 @@ pub(super) fn proposed_chain(
             decimals: metadata.native_currency.decimals,
         },
         rpc_endpoints: metadata.rpc_urls,
+        direct_rpc_endpoints: Vec::new(),
         explorer_urls: metadata.block_explorer_urls,
         enabled: true,
         contracts: crate::settings::ChainContractSettings::default(),
@@ -106,6 +107,7 @@ async fn verify_chain_endpoints(
     if endpoints.is_empty() {
         return Err(RpcBrokerError::NoEndpoint { chain_id });
     }
+    let clients = http.rpc_clients();
     for endpoint in &endpoints {
         control.ensure_current()?;
         let route = crate::RpcChainRoute::new(chain_id, vec![endpoint.clone()])
@@ -113,7 +115,7 @@ async fn verify_chain_endpoints(
         tokio::select! {
             biased;
             () = control.cancelled() => return Err(RpcBrokerError::OriginRejected),
-            result = route.verify_identity(&http.rpc_client) => { result?; }
+            result = route.verify_identity(&clients) => { result?; }
         }
         control.ensure_current()?;
     }

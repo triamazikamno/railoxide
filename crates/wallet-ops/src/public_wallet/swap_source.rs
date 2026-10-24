@@ -12,7 +12,7 @@ use super::{
 };
 use crate::hardware_typed_data::HardwareEip712Model;
 use crate::settings::EffectiveChainConfig;
-use crate::{HttpContext, TxReceiptOutput, query_rpc_pool_with_http_client};
+use crate::{HttpContext, TxReceiptOutput, query_rpc_pool_for_route};
 
 /// What one transaction of a swap's Public account came to. A reverted transaction is an
 /// outcome too: its `receipt.status` is false.
@@ -56,7 +56,7 @@ pub(crate) async fn submit_public_swap_step(
         PublicShieldTransactionProfile::Railoxide.gas_limit_strategy(),
         signer,
         "public-swap",
-        query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), http),
+        query_rpc_pool_for_route(&chain.rpc_route, http),
         &chain.rpc_route,
         chain.finality_depth,
         http,

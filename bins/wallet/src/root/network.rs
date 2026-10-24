@@ -170,12 +170,14 @@ impl WalletRoot {
     }
 
     pub(super) fn gateway_network_view(&self) -> GatewayNetworkView {
-        GatewayNetworkView::new(
+        let mut view = GatewayNetworkView::new(
             self.network_context_revision(),
             &self.network_health,
             self.tor_bridge_activity.as_ref(),
             self.tor_download_rate,
-        )
+        );
+        view.direct_rpc_endpoints = self.effective_chain_configs.direct_rpc_endpoint_count();
+        view
     }
 
     pub(super) fn network_status_presentation(&self) -> NetworkStatus {
@@ -201,6 +203,7 @@ impl WalletRoot {
                     | WalletNetworkHealthCause::TorRuntimeUnreliable
             ),
         )
+        .with_direct_rpc_endpoints(self.effective_chain_configs.direct_rpc_endpoint_count())
     }
 
     pub(super) fn network_activity_presentation(&self) -> Option<NetworkActivity> {

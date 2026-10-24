@@ -1509,6 +1509,7 @@ mod tests {
                     decimals: 6,
                 },
                 rpc_endpoints: vec!["http://127.0.0.1:9".into()],
+                direct_rpc_endpoints: Vec::new(),
                 explorer_urls: vec![],
                 enabled: true,
                 contracts: crate::settings::ChainContractSettings::default(),
@@ -1526,7 +1527,7 @@ mod tests {
         assert_eq!(chain.native_currency.format_amount(amount), "1.25 CSTM");
         assert!(chain.railgun.is_none() && chain.wrapped_native_token.is_none());
         let http = HttpContext::direct_for_tests();
-        let pool = crate::query_rpc_pool_with_http_client(chain.rpc_route.endpoint_urls(), &http);
+        let pool = crate::query_rpc_pool_for_route(&chain.rpc_route, &http);
         let signer = VaultedPublicSigner::Software(
             crate::signer::SoftwareEvmSigner::from_private_key([7; 32]).unwrap(),
         );
@@ -1649,7 +1650,8 @@ mod tests {
         )
         .await;
         let http = HttpContext::direct_for_tests();
-        let pool = crate::query_rpc_pool_with_http_client(vec![endpoint.clone()], &http);
+        let pool =
+            crate::query_rpc_pool_for_route(&RpcChainRoute::new(1, vec![endpoint.clone()]), &http);
         let mut observer = BlockObserver::establish(pool, 1, http.rpc_broker(), 1)
             .await
             .unwrap()
@@ -1660,7 +1662,10 @@ mod tests {
             (original, 10, None),
             (replacement, 20, None),
         ] {
-            let pool = crate::query_rpc_pool_with_http_client(vec![endpoint.clone()], &http);
+            let pool = crate::query_rpc_pool_for_route(
+                &RpcChainRoute::new(1, vec![endpoint.clone()]),
+                &http,
+            );
             let result = broadcast_signed_public_action_transaction(
                 &pool,
                 http.network_mode(),
@@ -1802,7 +1807,7 @@ mod tests {
             gas_limit_strategy,
             &signer,
             "public action session test",
-            crate::query_rpc_pool_with_http_client(vec![endpoint], &http),
+            crate::query_rpc_pool_for_route(&RpcChainRoute::new(1, vec![endpoint]), &http),
             &chain.rpc_route,
             1,
             &http,
