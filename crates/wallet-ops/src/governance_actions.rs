@@ -19,11 +19,11 @@ use crate::public_wallet::{
     admitted_public_signer_authorized, estimate_public_advanced_transaction_with_fee,
     simulate_public_advanced_transaction_with_fee, submit_public_action_step_with_signer,
 };
-use crate::settings::EffectiveChainConfig;
+use crate::settings::{EffectiveChainConfig, resolve_effective_chain_rpc_route};
 use crate::{
-    DEFAULT_MULTICALL_CHUNK_SIZE, MulticallChunkSize, StakePlan, UndelegateFirstPlan,
-    continue_stake_after_approval, continue_unlock_after_undelegation, fetch_account_stakes,
-    fetch_governance_token_balance_allowance, fetch_staking_global_metrics,
+    DEFAULT_MULTICALL_CHUNK_SIZE, MulticallChunkSize, RpcTrafficClass, StakePlan,
+    UndelegateFirstPlan, continue_stake_after_approval, continue_unlock_after_undelegation,
+    fetch_account_stakes, fetch_governance_token_balance_allowance, fetch_staking_global_metrics,
 };
 use railgun_ui::governance_contracts;
 
@@ -824,15 +824,16 @@ pub async fn submit_governance_workflow_with_progress(
             .await?;
             let mut transactions = vec![PublicSendResult { tx: first }];
 
+            // One isolated route carries every continuation read for this actor.
+            let client = http.operation_http_client().await?;
+            let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
+                .for_class(RpcTrafficClass::Sensitive)?
+                .isolated(client);
             let (next_intent, next_context, next_step) = match &workflow {
                 GovernanceWorkflow::StakeApproval(plan) => {
-                    let Some((balance, allowance)) = fetch_governance_token_balance_allowance(
-                        chain_id,
-                        actor,
-                        effective_chain,
-                        http,
-                    )
-                    .await?
+                    let Some((balance, allowance)) =
+                        fetch_governance_token_balance_allowance(chain_id, actor, &route, http)
+                            .await?
                     else {
                         return Err(eyre!(GovernanceActionError::FreshStateUnavailable));
                     };
@@ -853,21 +854,18 @@ pub async fn submit_governance_workflow_with_progress(
                     (intent, context, PublicActionProgressStep::Stake)
                 }
                 GovernanceWorkflow::UndelegateThenUnlock(plan) => {
-                    let metrics = fetch_staking_global_metrics(chain_id, effective_chain, http)
+                    let metrics = fetch_staking_global_metrics(chain_id, &route, http)
                         .await?
                         .ok_or_else(|| eyre!(GovernanceActionError::FreshStateUnavailable))?;
                     let account = fetch_account_stakes(
                         chain_id,
-                        &[actor],
+                        actor,
                         metrics.chain_time,
-                        effective_chain,
+                        &route,
                         http,
                         MulticallChunkSize::new(DEFAULT_MULTICALL_CHUNK_SIZE),
                     )
-                    .await?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| eyre!(GovernanceActionError::FreshStateUnavailable))?;
+                    .await?;
                     let stakes = account.stakes.map_err(|error| {
                         eyre!("{}: {error}", GovernanceActionError::FreshStateUnavailable)
                     })?;
@@ -889,6 +887,7 @@ pub async fn submit_governance_workflow_with_progress(
                     (continued.intent, context, PublicActionProgressStep::Unlock)
                 }
             };
+            drop(route);
             let resolved = next_intent
                 .resolve(&next_context)
                 .map_err(|error| eyre!(error))?;

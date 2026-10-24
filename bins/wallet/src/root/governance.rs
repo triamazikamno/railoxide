@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, B256, U256};
-use futures_util::{StreamExt, future::BoxFuture};
+use futures_util::StreamExt;
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, Focusable, InteractiveElement, IntoElement,
     KeyDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity,
@@ -27,6 +27,7 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 use railgun_ui::{format_usd_micro_value, governance_contracts, short_address};
+use rand::seq::SliceRandom as _;
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{
     app_button, app_button_base, app_button_label, app_input, app_muted_text, app_strong_text,
@@ -36,10 +37,9 @@ use ui::format::format_compact_duration;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use wallet_ops::{
     AccountStakeResult, GovernorRewardsIntervalMetadata, RewardEvidence, StakePosition, StakeState,
-    StakingGlobalMetrics, TokenAnchorRateCache, fetch_account_snapshots,
-    fetch_account_snapshots_multi, fetch_account_stakes, fetch_interval_metadata,
-    fetch_reward_batch_evidence, fetch_reward_evidence, fetch_reward_evidence_multi,
-    fetch_staking_global_metrics, validate_governance_deployment,
+    StakingGlobalMetrics, TokenAnchorRateCache, fetch_account_snapshots, fetch_account_stakes,
+    fetch_interval_metadata, fetch_reward_batch_evidence, fetch_reward_evidence,
+    fetch_reward_evidence_multi, fetch_staking_global_metrics, validate_governance_deployment,
     vault::{PublicAccountMetadata, PublicAccountStatus},
 };
 use wallet_ops::{
@@ -61,6 +61,7 @@ use super::governance_action::{
 use super::participant::normalize_participant_ids;
 use super::proposals::{format_compact_rail_amount, format_date_short};
 use super::public_account::public_account_display_label;
+use super::public_balances::isolated_read_jitter;
 use super::tokens::{
     format_send_amount_input, format_token_amount_for_display, token_display_metadata,
 };
@@ -112,6 +113,37 @@ pub(super) enum GovernanceTab {
     Staking,
 }
 
+/// The shared route for one traffic class of `chain_id`, as used by dashboard General reads.
+pub(super) fn governance_route(
+    chain_id: u64,
+    effective_chain: &wallet_ops::settings::EffectiveChainConfig,
+    class: wallet_ops::RpcTrafficClass,
+) -> Result<wallet_ops::ClassRoute, String> {
+    wallet_ops::settings::resolve_effective_chain_rpc_route(chain_id, effective_chain)
+        .map_err(|error| error.to_string())?
+        .for_class(class)
+        .map_err(|error| error.to_string())
+}
+
+/// Opens an isolated Sensitive route for one participant or acting account. A failure is
+/// returned as is; there is no fallback to the shared route.
+pub(super) async fn open_isolated_governance_route(
+    chain_id: u64,
+    effective_chain: &wallet_ops::settings::EffectiveChainConfig,
+    http: &wallet_ops::HttpContext,
+) -> Result<wallet_ops::ClassRoute, String> {
+    let route = governance_route(
+        chain_id,
+        effective_chain,
+        wallet_ops::RpcTrafficClass::Sensitive,
+    )?;
+    let client = http
+        .operation_http_client()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(route.isolated(client))
+}
+
 pub(super) async fn build_staking_action_draft(
     selection: StakingActionSelection,
     context_key: GovernanceContextKey,
@@ -127,7 +159,10 @@ pub(super) async fn build_staking_action_draft(
     reward_evidence_mode: RewardEvidenceMode,
     gas_fee_selection: PublicActionGasFeeSelection,
 ) -> Result<GovernanceSpendDraft, String> {
-    validate_governance_deployment(context_key.chain_id, &effective_chain, &http)
+    // Every governance read of this preparation shares one isolated route for the actor.
+    let route =
+        open_isolated_governance_route(context_key.chain_id, &effective_chain, &http).await?;
+    validate_governance_deployment(context_key.chain_id, &route, &http)
         .await
         .map_err(|error| error.to_string())?;
     let recipe = GovernanceDraftRecipe::Staking {
@@ -151,15 +186,13 @@ pub(super) async fn build_staking_action_draft(
                 let amount = (!amount.is_zero())
                     .then_some(amount)
                     .ok_or_else(|| "Amount must be greater than zero".to_owned())?;
-                let (balance, allowance) = fetch_governance_token_balance_allowance(
-                    chain_id,
-                    actor,
-                    &effective_chain,
-                    &http,
-                )
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "Governance token is not deployed on this chain".to_owned())?;
+                let (balance, allowance) =
+                    fetch_governance_token_balance_allowance(chain_id, actor, &route, &http)
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| {
+                            "Governance token is not deployed on this chain".to_owned()
+                        })?;
                 let plan = plan_stake(actor, contracts.staking, balance, allowance, amount)
                     .map_err(|error| error.to_string())?;
                 let (contract, intent, workflow) = if let Some(approval) = plan.approval.clone() {
@@ -194,8 +227,7 @@ pub(super) async fn build_staking_action_draft(
                 let delegate = Address::from_str(delegate_input.trim())
                     .map_err(|_| "Enter a valid delegate address".to_owned())?;
                 let position =
-                    fresh_stake_position(chain_id, actor, stake_id, &effective_chain, &http)
-                        .await?;
+                    fresh_stake_position(chain_id, actor, stake_id, &route, &http).await?;
                 let plan =
                     plan_delegate(actor, &position, delegate).map_err(|error| error.to_string())?;
                 (
@@ -210,8 +242,7 @@ pub(super) async fn build_staking_action_draft(
             }
             StakingActionKind::Undelegate { stake_id } => {
                 let position =
-                    fresh_stake_position(chain_id, actor, stake_id, &effective_chain, &http)
-                        .await?;
+                    fresh_stake_position(chain_id, actor, stake_id, &route, &http).await?;
                 let plan = plan_undelegate(actor, &position).map_err(|error| error.to_string())?;
                 (
                     contracts.staking,
@@ -225,9 +256,8 @@ pub(super) async fn build_staking_action_draft(
             }
             StakingActionKind::Unlock { stake_id } => {
                 let position =
-                    fresh_stake_position(chain_id, actor, stake_id, &effective_chain, &http)
-                        .await?;
-                let metrics = fetch_staking_global_metrics(chain_id, &effective_chain, &http)
+                    fresh_stake_position(chain_id, actor, stake_id, &route, &http).await?;
+                let metrics = fetch_staking_global_metrics(chain_id, &route, &http)
                     .await
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| "Staking is not deployed on this chain".to_owned())?;
@@ -274,9 +304,8 @@ pub(super) async fn build_staking_action_draft(
             }
             StakingActionKind::PrincipalClaim { stake_id } => {
                 let position =
-                    fresh_stake_position(chain_id, actor, stake_id, &effective_chain, &http)
-                        .await?;
-                let metrics = fetch_staking_global_metrics(chain_id, &effective_chain, &http)
+                    fresh_stake_position(chain_id, actor, stake_id, &route, &http).await?;
+                let metrics = fetch_staking_global_metrics(chain_id, &route, &http)
                     .await
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| "Staking is not deployed on this chain".to_owned())?;
@@ -306,6 +335,7 @@ pub(super) async fn build_staking_action_draft(
                     chain_id,
                     actor,
                     &tokens,
+                    &route,
                     &effective_chain,
                     &http,
                     reward_evidence_mode,
@@ -325,6 +355,7 @@ pub(super) async fn build_staking_action_draft(
                 )
             }
         };
+    drop(route);
     build_typed_governance_spend_draft(
         target,
         wallet_id,
@@ -353,6 +384,7 @@ async fn plan_reward_claim_draft(
     chain_id: u64,
     actor: Address,
     requested_tokens: &[Address],
+    route: &wallet_ops::ClassRoute,
     effective_chain: &wallet_ops::settings::EffectiveChainConfig,
     http: &wallet_ops::HttpContext,
     reward_evidence_mode: RewardEvidenceMode,
@@ -375,14 +407,7 @@ async fn plan_reward_claim_draft(
             (*evidence, steps.filter(|steps| !steps.is_empty()))
         }
         RewardEvidenceMode::Fresh => (
-            fetch_reward_selection_evidence(
-                chain_id,
-                actor,
-                requested_tokens,
-                effective_chain,
-                http,
-            )
-            .await?,
+            fetch_reward_selection_evidence(chain_id, actor, requested_tokens, route, http).await?,
             None,
         ),
     };
@@ -391,7 +416,7 @@ async fn plan_reward_claim_draft(
     let steps = match reviewed_steps {
         Some(steps) => steps,
         None => {
-            plan_reward_steps_for_evidence(chain_id, actor, &evidence, effective_chain, http)
+            plan_reward_steps_for_evidence(chain_id, actor, &evidence, route, effective_chain, http)
                 .await?
         }
     };
@@ -411,17 +436,17 @@ async fn fetch_reward_selection_evidence(
     chain_id: u64,
     actor: Address,
     requested_tokens: &[Address],
-    effective_chain: &wallet_ops::settings::EffectiveChainConfig,
+    route: &wallet_ops::ClassRoute,
     http: &wallet_ops::HttpContext,
 ) -> Result<wallet_ops::RewardBatchEvidence, String> {
-    let metadata = fetch_interval_metadata(chain_id, requested_tokens, effective_chain, http)
+    let metadata = fetch_interval_metadata(chain_id, requested_tokens, route, http)
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Reward metadata unavailable".to_owned())?;
     let snapshots = fetch_account_snapshots(
         chain_id,
         actor,
-        effective_chain,
+        route,
         http,
         wallet_ops::MulticallChunkSize::default(),
     )
@@ -434,7 +459,7 @@ async fn fetch_reward_selection_evidence(
             token,
             &metadata,
             &snapshots,
-            effective_chain,
+            route,
             http,
             wallet_ops::MulticallChunkSize::default(),
         )
@@ -449,7 +474,7 @@ async fn fetch_reward_selection_evidence(
         requested_tokens,
         &metadata,
         &snapshots,
-        effective_chain,
+        route,
         http,
         wallet_ops::MulticallChunkSize::default(),
     )
@@ -462,24 +487,27 @@ async fn plan_reward_steps_for_evidence(
     chain_id: u64,
     actor: Address,
     evidence: &wallet_ops::RewardBatchEvidence,
+    route: &wallet_ops::ClassRoute,
     effective_chain: &wallet_ops::settings::EffectiveChainConfig,
     http: &wallet_ops::HttpContext,
 ) -> Result<Vec<wallet_ops::RewardClaimStep>, String> {
-    plan_reward_steps_with_fee(chain_id, actor, evidence, effective_chain, http)
+    plan_reward_steps_with_fee(chain_id, actor, evidence, route, effective_chain, http)
         .await
         .map(|(steps, _)| steps)
 }
 
 /// Plan the claim steps for this evidence and report the fee per gas the estimates were priced
-/// at, which is what the selection form multiplies by the planned gas.
+/// at, which is what the selection form multiplies by the planned gas. Governance reads use
+/// `route`; gas estimates stay on the Public action path of `effective_chain`.
 async fn plan_reward_steps_with_fee(
     chain_id: u64,
     actor: Address,
     evidence: &wallet_ops::RewardBatchEvidence,
+    route: &wallet_ops::ClassRoute,
     effective_chain: &wallet_ops::settings::EffectiveChainConfig,
     http: &wallet_ops::HttpContext,
 ) -> Result<(Vec<wallet_ops::RewardClaimStep>, u128), String> {
-    let gas_ceiling = wallet_ops::fetch_latest_block_gas_limit(chain_id, effective_chain, http)
+    let gas_ceiling = wallet_ops::fetch_latest_block_gas_limit(route, http)
         .await
         .map_err(|error| error.to_string())?;
     let contract = contracts_for_reward(chain_id)?;
@@ -511,6 +539,7 @@ async fn plan_reward_steps_with_fee(
         actor,
         evidence,
         gas_ceiling,
+        route,
         effective_chain,
         http,
     )
@@ -523,6 +552,7 @@ async fn estimate_reward_selection(
     actor: Address,
     tokens: &[Address],
     available: wallet_ops::RewardBatchEvidence,
+    route: &wallet_ops::ClassRoute,
     effective_chain: &wallet_ops::settings::EffectiveChainConfig,
     http: &wallet_ops::HttpContext,
 ) -> Result<RewardSelectionEstimate, Arc<str>> {
@@ -545,7 +575,7 @@ async fn estimate_reward_selection(
     };
     let (steps, expected_fee_per_gas) = match &evidence {
         Some(evidence) => {
-            plan_reward_steps_with_fee(chain_id, actor, evidence, effective_chain, http)
+            plan_reward_steps_with_fee(chain_id, actor, evidence, route, effective_chain, http)
                 .await
                 .map_err(Arc::from)?
         }
@@ -581,7 +611,7 @@ async fn estimate_reward_selection(
             let alternative_gas = if alternative.is_empty() {
                 baseline.map(|estimate| estimate.raw_gas_limit)
             } else if let Ok(evidence) = available.project(&alternative) {
-                plan_reward_steps_with_fee(chain_id, actor, &evidence, effective_chain, http)
+                plan_reward_steps_with_fee(chain_id, actor, &evidence, route, effective_chain, http)
                     .await
                     .ok()
                     .and_then(|(steps, _)| reward_selection_gas(&steps))
@@ -714,6 +744,7 @@ async fn exact_reward_steps(
     actor: Address,
     evidence: &wallet_ops::RewardBatchEvidence,
     gas_ceiling: u64,
+    route: &wallet_ops::ClassRoute,
     effective_chain: &wallet_ops::settings::EffectiveChainConfig,
     http: &wallet_ops::HttpContext,
 ) -> Result<(Vec<wallet_ops::RewardClaimStep>, u128), String> {
@@ -721,7 +752,7 @@ async fn exact_reward_steps(
         chain_id,
         actor,
         evidence,
-        effective_chain,
+        route,
         http,
         wallet_ops::MulticallChunkSize::default(),
     )
@@ -811,31 +842,105 @@ async fn fresh_stake_position(
     chain_id: u64,
     actor: Address,
     stake_id: U256,
-    effective_chain: &wallet_ops::settings::EffectiveChainConfig,
+    route: &wallet_ops::ClassRoute,
     http: &wallet_ops::HttpContext,
 ) -> Result<StakePosition, String> {
-    let metrics = fetch_staking_global_metrics(chain_id, effective_chain, http)
+    let metrics = fetch_staking_global_metrics(chain_id, route, http)
         .await
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "Staking is not deployed on this chain".to_owned())?;
     let result = fetch_account_stakes(
         chain_id,
-        &[actor],
+        actor,
         metrics.chain_time,
-        effective_chain,
+        route,
         http,
         wallet_ops::MulticallChunkSize::default(),
     )
     .await
-    .map_err(|error| error.to_string())?
-    .into_iter()
-    .next()
-    .ok_or_else(|| "Stake owner read returned no account".to_owned())?;
+    .map_err(|error| error.to_string())?;
     let stakes = result.stakes?;
     stakes
         .into_iter()
         .find(|stake| stake.id == stake_id)
         .ok_or_else(|| "Stake no longer exists; refresh before authorizing".to_owned())
+}
+
+/// Fresh evidence and claim steps for continuing a reward claim after a confirmed split step,
+/// read over the actor's `route`. `None` means nothing is left to claim.
+async fn read_reward_continuation(
+    chain_id: u64,
+    actor: Address,
+    reward_tokens: &[Address],
+    route: &wallet_ops::ClassRoute,
+    effective_chain: &wallet_ops::settings::EffectiveChainConfig,
+    http: &wallet_ops::HttpContext,
+) -> Result<
+    Option<(
+        wallet_ops::RewardBatchEvidence,
+        Vec<wallet_ops::RewardClaimStep>,
+    )>,
+    String,
+> {
+    validate_governance_deployment(chain_id, route, http)
+        .await
+        .map_err(|error| error.to_string())?;
+    let metadata = fetch_interval_metadata(chain_id, reward_tokens, route, http)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "Reward metadata unavailable".to_owned())?;
+    let snapshots = fetch_account_snapshots(
+        chain_id,
+        actor,
+        route,
+        http,
+        wallet_ops::MulticallChunkSize::default(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let fresh = fetch_reward_batch_evidence(
+        chain_id,
+        actor,
+        reward_tokens,
+        &metadata,
+        &snapshots,
+        route,
+        http,
+        wallet_ops::MulticallChunkSize::default(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let Some(fresh) = fresh else {
+        return Ok(None);
+    };
+    let steps =
+        plan_reward_steps_for_evidence(chain_id, actor, &fresh, route, effective_chain, http)
+            .await?;
+    Ok(Some((fresh, steps)))
+}
+
+/// Reads each participant over a route of its own, one at a time in random order. Before every
+/// participant after the first it awaits `jitter`, and it stops once `is_current` reports that
+/// the refresh was superseded. A route that fails to open reaches `read` as that participant's
+/// error, with no shared-route fallback. `read` owns the route, so it closes when `read` ends.
+async fn read_participants_isolated<P>(
+    mut participants: Vec<P>,
+    mut jitter: impl AsyncFnMut(),
+    mut is_current: impl FnMut() -> bool,
+    mut open_route: impl AsyncFnMut() -> Result<wallet_ops::ClassRoute, String>,
+    mut read: impl AsyncFnMut(P, Result<wallet_ops::ClassRoute, String>),
+) {
+    participants.shuffle(&mut rand::rng());
+    for (index, participant) in participants.into_iter().enumerate() {
+        if index > 0 {
+            jitter().await;
+        }
+        if !is_current() {
+            return;
+        }
+        let route = open_route().await;
+        read(participant, route).await;
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -884,19 +989,6 @@ fn reward_evidence_mode_for_selection(
             steps: None,
         }
     })
-}
-
-enum StakingRewardRefreshResult {
-    PerToken {
-        participant: GovernanceParticipantIdentity,
-        tokens: Vec<Address>,
-        rewards: Result<Vec<wallet_ops::RewardEvidenceResult>, Arc<str>>,
-    },
-    Bulk {
-        participant: GovernanceParticipantIdentity,
-        tokens: Vec<Address>,
-        evidence: Result<Option<wallet_ops::RewardBatchEvidence>, Arc<str>>,
-    },
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1480,6 +1572,28 @@ impl StakingReadState {
         );
         self.current_bulk_reward_keys.insert(uuid);
         true
+    }
+
+    /// Fails every cell of one participant so none stays loading.
+    pub(super) fn fail_participant(
+        &mut self,
+        key: &GovernanceContextKey,
+        generation: u64,
+        uuid: String,
+        tokens: &[Address],
+        error: Arc<str>,
+    ) {
+        self.apply_account(key, generation, uuid.clone(), Err(Arc::clone(&error)));
+        for &token in tokens {
+            self.apply_reward(
+                key,
+                generation,
+                uuid.clone(),
+                token,
+                Err(Arc::clone(&error)),
+            );
+        }
+        self.apply_bulk_reward(key, generation, uuid, tokens.to_vec(), &Err(error));
     }
 
     /// The row this read produced for an account and token, or `None` while it is still loading.
@@ -2546,32 +2660,35 @@ impl WalletRoot {
             let Ok(Some(cached)) = current else {
                 return;
             };
-            let available = match cached {
-                Some(evidence) => Ok(evidence),
-                None => fetch_reward_selection_evidence(
+            let result = async {
+                // One isolated route for the actor carries every governance read of this estimate.
+                let route = open_isolated_governance_route(chain_id, &effective_chain, &http)
+                    .await
+                    .map_err(Arc::<str>::from)?;
+                let available = match cached {
+                    Some(evidence) => evidence,
+                    None => fetch_reward_selection_evidence(
+                        chain_id,
+                        actor,
+                        &available_tokens,
+                        &route,
+                        &http,
+                    )
+                    .await
+                    .map_err(Arc::<str>::from)?,
+                };
+                estimate_reward_selection(
                     chain_id,
                     actor,
-                    &available_tokens,
+                    &tokens,
+                    available,
+                    &route,
                     &effective_chain,
                     &http,
                 )
                 .await
-                .map_err(Arc::from),
-            };
-            let result = match available {
-                Ok(available) => {
-                    estimate_reward_selection(
-                        chain_id,
-                        actor,
-                        &tokens,
-                        available,
-                        &effective_chain,
-                        &http,
-                    )
-                    .await
-                }
-                Err(error) => Err(error),
-            };
+            }
+            .await;
             let _ = this.update(cx, |root, cx| {
                 if root
                     .governance
@@ -2885,9 +3002,6 @@ impl WalletRoot {
         self.governance.action_flow.draft = None;
         cx.spawn_in(window, async move |this, cx| {
             let result: Result<Option<GovernanceSpendDraft>, String> = Box::pin(async {
-                validate_governance_deployment(context.chain_id, &effective_chain, &http)
-                    .await
-                    .map_err(|error| error.to_string())?;
                 let contracts = governance_contracts(context.chain_id)
                     .ok_or_else(|| "Staking is not deployed on this chain".to_owned())?;
                 let confirmed_hash = confirmed_hash
@@ -2902,47 +3016,23 @@ impl WalletRoot {
                     confirmed_hash,
                 )
                 .map_err(|error| error.to_string())?;
-                let metadata = fetch_interval_metadata(
-                    context.chain_id,
-                    &progress.plan.reward_tokens,
-                    &effective_chain,
-                    &http,
-                )
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "Reward metadata unavailable".to_owned())?;
-                let snapshots = fetch_account_snapshots(
-                    context.chain_id,
-                    context.actor,
-                    &effective_chain,
-                    &http,
-                    wallet_ops::MulticallChunkSize::default(),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-                let fresh = fetch_reward_batch_evidence(
+                // The continuation reads fresh state over a route of its own.
+                let route =
+                    open_isolated_governance_route(context.chain_id, &effective_chain, &http)
+                        .await?;
+                let continued = read_reward_continuation(
                     context.chain_id,
                     context.actor,
                     &progress.plan.reward_tokens,
-                    &metadata,
-                    &snapshots,
-                    &effective_chain,
-                    &http,
-                    wallet_ops::MulticallChunkSize::default(),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-                let Some(fresh) = fresh else {
-                    return Ok(None);
-                };
-                let fresh_steps = plan_reward_steps_for_evidence(
-                    context.chain_id,
-                    context.actor,
-                    &fresh,
+                    &route,
                     &effective_chain,
                     &http,
                 )
                 .await?;
+                drop(route);
+                let Some((fresh, fresh_steps)) = continued else {
+                    return Ok(None);
+                };
                 let rebuilt = wallet_ops::rebuild_reward_claim_batch_continuation(
                     &progress,
                     &fresh,
@@ -3082,35 +3172,44 @@ impl WalletRoot {
         };
         let http = self.http.clone();
         let proposal = proposal.clone();
+        let chain_id = key.context.chain_id;
         cx.spawn(async move |this, cx| {
-            let result = wallet_ops::fetch_governance_participation(
-                key.context.chain_id,
-                &proposal,
-                &accounts,
-                &effective_chain,
-                &http,
+            let executor = cx.background_executor().clone();
+            let current_cx = cx.clone();
+            read_participants_isolated(
+                accounts,
+                async || executor.timer(isolated_read_jitter()).await,
+                || {
+                    this.read_with(&current_cx, |root, _| {
+                        root.governance
+                            .proposal_participation
+                            .current(&key, generation)
+                    })
+                    .unwrap_or(false)
+                },
+                async || open_isolated_governance_route(chain_id, &effective_chain, &http).await,
+                async |account, route| {
+                    let row = match route {
+                        Ok(route) => wallet_ops::fetch_governance_participation(
+                            chain_id, &proposal, account, &route, &http,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|row| row.state.map_err(|error| error.to_string())),
+                        Err(error) => Err(error),
+                    };
+                    let _ = this.update(&mut *cx, |root, cx| {
+                        root.governance.proposal_participation.apply(
+                            &key,
+                            generation,
+                            account,
+                            row.map_err(Arc::from),
+                        );
+                        cx.notify();
+                    });
+                },
             )
-            .await
-            .map_err(|error| error.to_string());
-            let _ = this.update(cx, |root, cx| {
-                root.governance.proposal_participation.apply(
-                    &key,
-                    generation,
-                    result.unwrap_or_else(|error| {
-                        accounts
-                            .iter()
-                            .map(|&account| wallet_ops::GovernanceParticipationRow {
-                                account,
-                                state: Err(wallet_ops::GovernanceParticipationError::Read {
-                                    field: "participation",
-                                    reason: error.clone(),
-                                }),
-                            })
-                            .collect()
-                    }),
-                );
-                cx.notify();
-            });
+            .await;
         })
         .detach();
     }
@@ -3205,12 +3304,20 @@ impl WalletRoot {
             .unwrap_or_default();
         tokens.sort();
         cx.spawn(async move |this, cx| {
-            let global = fetch_staking_global_metrics(chain_id, &effective_chain, &http)
-                .await
-                .map_err(|error| Arc::from(error.to_string()))
-                .and_then(|metrics| {
-                    metrics.ok_or_else(|| Arc::from("Staking is not deployed on this chain"))
-                });
+            let general = governance_route(
+                chain_id,
+                &effective_chain,
+                wallet_ops::RpcTrafficClass::General,
+            );
+            let global = match &general {
+                Ok(route) => fetch_staking_global_metrics(chain_id, route, &http)
+                    .await
+                    .map_err(|error| Arc::from(error.to_string()))
+                    .and_then(|metrics| {
+                        metrics.ok_or_else(|| Arc::from("Staking is not deployed on this chain"))
+                    }),
+                Err(error) => Err(Arc::from(error.as_str())),
+            };
             let global_metrics = global.as_ref().ok().cloned();
             let Ok(accepted) = this.update(cx, |root, cx| {
                 let accepted = root
@@ -3225,10 +3332,10 @@ impl WalletRoot {
             if !accepted {
                 return;
             }
-            let Some(metrics) = global_metrics else {
+            let (Some(metrics), Ok(general)) = (global_metrics, general) else {
                 return;
             };
-            let metadata = fetch_interval_metadata(chain_id, &tokens, &effective_chain, &http)
+            let metadata = fetch_interval_metadata(chain_id, &tokens, &general, &http)
                 .await
                 .ok()
                 .flatten();
@@ -3258,148 +3365,103 @@ impl WalletRoot {
                 });
                 return;
             }
-            let addresses = participant_ids
-                .iter()
-                .map(|participant| participant.address)
-                .collect::<Vec<_>>();
-            let account_results = fetch_account_stakes(
-                chain_id,
-                &addresses,
-                metrics.chain_time,
-                &effective_chain,
-                &http,
-                wallet_ops::MulticallChunkSize::default(),
-            )
-            .await;
-            match account_results {
-                Ok(results) => {
-                    for (participant, account) in participant_ids.iter().zip(results) {
-                        let _ = this.update(cx, |root, cx| {
-                            root.governance.staking.apply_account(
-                                &key,
-                                generation,
-                                participant.uuid.clone(),
-                                Ok(account),
-                            );
-                            cx.notify();
-                        });
-                    }
-                }
-                Err(error) => {
-                    let message = Arc::from(error.to_string());
-                    for participant in &participant_ids {
-                        let error = Arc::clone(&message);
-                        let _ = this.update(cx, |root, cx| {
-                            root.governance.staking.apply_account(
-                                &key,
-                                generation,
-                                participant.uuid.clone(),
-                                Err(error),
-                            );
-                            cx.notify();
-                        });
-                    }
-                }
-            }
-            let addresses = participant_ids
-                .iter()
-                .map(|participant| participant.address)
-                .collect::<Vec<_>>();
-            let snapshot_results = fetch_account_snapshots_multi(
-                chain_id,
-                &addresses,
-                &effective_chain,
-                &http,
-                wallet_ops::MulticallChunkSize::default(),
-            )
-            .await;
-            let snapshot_results = snapshot_results.unwrap_or_else(|error| {
-                addresses
-                    .iter()
-                    .map(|&account| wallet_ops::AccountSnapshotsResult {
-                        account,
-                        snapshots: Err(error.to_string()),
+            let executor = cx.background_executor().clone();
+            let current_cx = cx.clone();
+            let chunk_size = wallet_ops::MulticallChunkSize::default();
+            read_participants_isolated(
+                participant_ids,
+                async || executor.timer(isolated_read_jitter()).await,
+                || {
+                    this.read_with(&current_cx, |root, _| {
+                        root.governance.staking.current(&key, generation)
                     })
-                    .collect()
-            });
-            let reward_jobs = participant_ids
-                .iter()
-                .cloned()
-                .zip(snapshot_results)
-                .flat_map(|(participant, snapshot_result)| {
-                    let snapshots = snapshot_result.snapshots;
-                    let per_token_participant = participant.clone();
-                    let per_token_metadata = metadata.clone();
-                    let per_token_tokens = tokens.clone();
-                    let per_token_effective_chain = effective_chain.clone();
-                    let per_token_http = http.clone();
-                    let per_token_snapshots = snapshots.clone();
-                    let per_token_job: BoxFuture<'static, StakingRewardRefreshResult> =
-                        Box::pin(async move {
-                            let rewards = match (per_token_metadata.as_ref(), per_token_snapshots) {
-                                (Some(metadata), Ok(snapshots)) => fetch_reward_evidence_multi(
-                                    chain_id,
-                                    per_token_participant.address,
-                                    &per_token_tokens,
-                                    metadata,
-                                    &snapshots,
-                                    &per_token_effective_chain,
-                                    &per_token_http,
-                                    wallet_ops::MulticallChunkSize::default(),
-                                )
-                                .await
-                                .map_err(|error| Arc::from(error.to_string())),
-                                (None, _) => Err(Arc::from("Reward interval metadata unavailable")),
-                                (_, Err(error)) => Err(Arc::from(error)),
-                            };
-                            StakingRewardRefreshResult::PerToken {
-                                participant: per_token_participant,
-                                tokens: per_token_tokens,
-                                rewards,
-                            }
-                        });
-
-                    let bulk_participant = participant;
-                    let bulk_metadata = metadata.clone();
-                    let bulk_tokens = tokens.clone();
-                    let bulk_effective_chain = effective_chain.clone();
-                    let bulk_http = http.clone();
-                    let bulk_job: BoxFuture<'static, StakingRewardRefreshResult> =
-                        Box::pin(async move {
-                            let evidence = match (bulk_metadata.as_ref(), snapshots) {
-                                (Some(metadata), Ok(snapshots)) => fetch_reward_batch_evidence(
-                                    chain_id,
-                                    bulk_participant.address,
-                                    &bulk_tokens,
-                                    metadata,
-                                    &snapshots,
-                                    &bulk_effective_chain,
-                                    &bulk_http,
-                                    wallet_ops::MulticallChunkSize::default(),
-                                )
-                                .await
-                                .map_err(|error| Arc::from(error.to_string())),
-                                (None, _) => Err(Arc::from("Reward interval metadata unavailable")),
-                                (_, Err(error)) => Err(Arc::from(error)),
-                            };
-                            StakingRewardRefreshResult::Bulk {
-                                participant: bulk_participant,
-                                tokens: bulk_tokens,
-                                evidence,
-                            }
-                        });
-                    [per_token_job, bulk_job]
-                })
-                .collect::<Vec<_>>();
-            let mut reward_results = futures_util::stream::iter(reward_jobs)
-                .buffer_unordered(STAKING_REWARD_EVIDENCE_CONCURRENCY.saturating_mul(2));
-            while let Some(result) = reward_results.next().await {
-                match result {
-                    StakingRewardRefreshResult::PerToken {
-                        participant,
-                        tokens,
-                        rewards,
-                    } => {
+                    .unwrap_or(false)
+                },
+                async || open_isolated_governance_route(chain_id, &effective_chain, &http).await,
+                async |participant: GovernanceParticipantIdentity, route| {
+                    let route = match route {
+                        Ok(route) => route,
+                        Err(error) => {
+                            let _ = this.update(&mut *cx, |root, cx| {
+                                root.governance.staking.fail_participant(
+                                    &key,
+                                    generation,
+                                    participant.uuid.clone(),
+                                    &tokens,
+                                    Arc::from(error),
+                                );
+                                cx.notify();
+                            });
+                            return;
+                        }
+                    };
+                    let account = fetch_account_stakes(
+                        chain_id,
+                        participant.address,
+                        metrics.chain_time,
+                        &route,
+                        &http,
+                        chunk_size,
+                    )
+                    .await
+                    .map_err(|error| Arc::<str>::from(error.to_string()));
+                    let _ = this.update(&mut *cx, |root, cx| {
+                        root.governance.staking.apply_account(
+                            &key,
+                            generation,
+                            participant.uuid.clone(),
+                            account,
+                        );
+                        cx.notify();
+                    });
+                    let snapshots = fetch_account_snapshots(
+                        chain_id,
+                        participant.address,
+                        &route,
+                        &http,
+                        chunk_size,
+                    )
+                    .await
+                    .map_err(|error| Arc::<str>::from(error.to_string()));
+                    let per_token = async {
+                        match (metadata.as_ref(), &snapshots) {
+                            (Some(metadata), Ok(snapshots)) => fetch_reward_evidence_multi(
+                                chain_id,
+                                participant.address,
+                                &tokens,
+                                metadata,
+                                snapshots,
+                                &route,
+                                &http,
+                                chunk_size,
+                            )
+                            .await
+                            .map_err(|error| Arc::<str>::from(error.to_string())),
+                            (None, _) => Err(Arc::from("Reward interval metadata unavailable")),
+                            (_, Err(error)) => Err(Arc::clone(error)),
+                        }
+                    };
+                    let bulk = async {
+                        match (metadata.as_ref(), &snapshots) {
+                            (Some(metadata), Ok(snapshots)) => fetch_reward_batch_evidence(
+                                chain_id,
+                                participant.address,
+                                &tokens,
+                                metadata,
+                                snapshots,
+                                &route,
+                                &http,
+                                chunk_size,
+                            )
+                            .await
+                            .map_err(|error| Arc::<str>::from(error.to_string())),
+                            (None, _) => Err(Arc::from("Reward interval metadata unavailable")),
+                            (_, Err(error)) => Err(Arc::clone(error)),
+                        }
+                    };
+                    let (rewards, evidence) = futures_util::future::join(per_token, bulk).await;
+                    drop(route);
+                    let _ = this.update(&mut *cx, |root, cx| {
                         for (token_index, &token) in tokens.iter().enumerate() {
                             let reward = match &rewards {
                                 Ok(results) => results.get(token_index).map_or_else(
@@ -3408,36 +3470,26 @@ impl WalletRoot {
                                 ),
                                 Err(error) => Err(Arc::clone(error)),
                             };
-                            let _ = this.update(cx, |root, cx| {
-                                root.governance.staking.apply_reward(
-                                    &key,
-                                    generation,
-                                    participant.uuid.clone(),
-                                    token,
-                                    reward,
-                                );
-                                cx.notify();
-                            });
-                        }
-                    }
-                    StakingRewardRefreshResult::Bulk {
-                        participant,
-                        tokens,
-                        evidence,
-                    } => {
-                        let _ = this.update(cx, |root, cx| {
-                            root.governance.staking.apply_bulk_reward(
+                            root.governance.staking.apply_reward(
                                 &key,
                                 generation,
-                                participant.uuid,
-                                tokens,
-                                &evidence,
+                                participant.uuid.clone(),
+                                token,
+                                reward,
                             );
-                            cx.notify();
-                        });
-                    }
-                }
-            }
+                        }
+                        root.governance.staking.apply_bulk_reward(
+                            &key,
+                            generation,
+                            participant.uuid.clone(),
+                            tokens.clone(),
+                            &evidence,
+                        );
+                        cx.notify();
+                    });
+                },
+            )
+            .await;
             let _ = this.update(cx, |root, cx| {
                 let finished = root.governance.staking.finish(&key, generation);
                 if finished {
@@ -8129,5 +8181,590 @@ mod tests {
         assert!(governance_boundary_crossed(&state, U256::from(20)));
         state.invalidate();
         assert!(!governance_boundary_crossed(&state, U256::from(20)));
+    }
+
+    fn isolated_test_route() -> wallet_ops::ClassRoute {
+        wallet_ops::RpcChainRoute::new(1, vec![reqwest::Url::parse("http://127.0.0.1:1").unwrap()])
+            .for_class(wallet_ops::RpcTrafficClass::Sensitive)
+            .unwrap()
+            .isolated(wallet_ops::OperationHttpClient::for_tests(
+                reqwest::Client::new(),
+                wallet_ops::OperationNetworkIsolation::Unavailable(
+                    wallet_ops::WalletNetworkMode::Direct,
+                ),
+            ))
+    }
+
+    #[tokio::test]
+    async fn participant_reads_each_get_one_participant_and_their_own_route() {
+        let jitters = std::cell::Cell::new(0);
+        let mut reads = Vec::new();
+        read_participants_isolated(
+            vec!["a", "b"],
+            async || jitters.set(jitters.get() + 1),
+            || true,
+            async || Ok(isolated_test_route()),
+            async |participant, route: Result<wallet_ops::ClassRoute, String>| {
+                reads.push((participant, route.unwrap()));
+            },
+        )
+        .await;
+        assert_eq!(jitters.get(), 1);
+        let mut participants = reads
+            .iter()
+            .map(|(participant, _)| *participant)
+            .collect::<Vec<_>>();
+        participants.sort_unstable();
+        assert_eq!(participants, ["a", "b"]);
+        assert_ne!(reads[0].1, reads[1].1);
+    }
+
+    #[tokio::test]
+    async fn failed_route_open_fails_only_that_participant() {
+        let opens = std::cell::Cell::new(0);
+        let mut reads = Vec::new();
+        read_participants_isolated(
+            vec!["a", "b"],
+            async || {},
+            || true,
+            async || {
+                opens.set(opens.get() + 1);
+                if opens.get() == 1 {
+                    Err("isolated route unavailable".to_owned())
+                } else {
+                    Ok(isolated_test_route())
+                }
+            },
+            async |participant, route: Result<wallet_ops::ClassRoute, String>| {
+                reads.push((participant, route.is_ok()));
+            },
+        )
+        .await;
+        assert_eq!(reads.len(), 2);
+        assert_ne!(reads[0].0, reads[1].0);
+        assert_eq!([reads[0].1, reads[1].1], [false, true]);
+    }
+
+    #[tokio::test]
+    async fn superseded_participant_refresh_stops_before_the_next_participant() {
+        let a = GovernanceParticipantIdentity {
+            uuid: "a".to_owned(),
+            address: Address::from([1; 20]),
+        };
+        let b = GovernanceParticipantIdentity {
+            uuid: "b".to_owned(),
+            address: Address::from([2; 20]),
+        };
+        let proposal_key =
+            |participants: Vec<GovernanceParticipantIdentity>| ProposalParticipationKey {
+                version: wallet_ops::GovernanceContractVersion::V2,
+                contract: Address::from([9; 20]),
+                index: U256::ZERO,
+                context: GovernanceContextKey {
+                    wallet_id: Some("wallet".to_owned()),
+                    chain_id: 1,
+                    participants,
+                },
+            };
+        let key_ab = proposal_key(vec![a.clone(), b.clone()]);
+        let key_a = proposal_key(vec![a.clone()]);
+        let state = std::cell::RefCell::new(ProposalParticipationState::default());
+        let g1 = state.borrow_mut().begin(&key_ab);
+        let g2 = std::cell::Cell::new(None);
+        let opens = std::cell::Cell::new(0);
+        let mut reads = Vec::new();
+        read_participants_isolated(
+            vec![a.address, b.address],
+            async || {},
+            || state.borrow().current(&key_ab, g1),
+            async || {
+                opens.set(opens.get() + 1);
+                Ok(isolated_test_route())
+            },
+            async |account, _route: Result<wallet_ops::ClassRoute, String>| {
+                reads.push(account);
+                // The participant set changes while the first participant is being read.
+                g2.set(Some(state.borrow_mut().begin(&key_a)));
+            },
+        )
+        .await;
+        assert_eq!(opens.get(), 1);
+        assert_eq!(reads.len(), 1);
+
+        let mut state = state.into_inner();
+        let g2 = g2.get().unwrap();
+        assert!(!state.apply(&key_ab, g1, b.address, Err(Arc::from("late"))));
+        assert!(state.apply(&key_a, g2, a.address, Err(Arc::from("route unavailable"))));
+        assert!(matches!(
+            state.rows.get(&a.address),
+            Some(super::super::governance_action::ProposalParticipationRow::Unavailable(_))
+        ));
+        assert!(!state.loading);
+    }
+
+    #[test]
+    fn failed_participant_fails_only_its_own_cells() {
+        let tokens = [Address::from([2; 20]), Address::from([3; 20])];
+        let key = GovernanceContextKey {
+            wallet_id: Some("wallet".to_owned()),
+            chain_id: 1,
+            participants: vec![
+                GovernanceParticipantIdentity {
+                    uuid: "a".to_owned(),
+                    address: Address::from([1; 20]),
+                },
+                GovernanceParticipantIdentity {
+                    uuid: "b".to_owned(),
+                    address: Address::from([4; 20]),
+                },
+            ],
+        };
+        let mut state = StakingReadState::default();
+        let generation = state.begin(key.clone());
+        let error: Arc<str> = Arc::from("route unavailable");
+
+        state.fail_participant(
+            &key,
+            generation.wrapping_sub(1),
+            "a".into(),
+            &tokens,
+            Arc::clone(&error),
+        );
+        assert!(state.accounts.is_empty() && state.current_account_ids.is_empty());
+        assert!(state.rewards.is_empty() && state.current_reward_keys.is_empty());
+        assert!(state.bulk_reward_readiness.is_empty());
+
+        state.fail_participant(&key, generation, "a".into(), &tokens, error);
+        let account = &state.accounts["a"];
+        assert!(
+            account.voting_power.is_err() && account.balance.is_err() && account.stakes.is_err()
+        );
+        for token in tokens {
+            assert!(matches!(
+                state.resolved_reward("a", token),
+                Some(RewardView::Unavailable(_))
+            ));
+            assert!(state.current_reward_keys.contains(&("a".to_owned(), token)));
+        }
+        assert_eq!(
+            state.bulk_reward_readiness.get("a"),
+            Some(&BulkRewardReadiness {
+                tokens: tokens.to_vec(),
+                ready: false,
+            })
+        );
+        assert!(!state.accounts.contains_key("b"));
+        assert!(state.rewards.keys().all(|(uuid, _)| uuid == "a"));
+        assert!(!state.bulk_reward_readiness.contains_key("b"));
+    }
+
+    alloy::sol! {
+        interface GovernanceRpcFixture {
+            function stakingToken() external view returns (address);
+            function staking() external view returns (address);
+            function proposalsLength() external view returns (uint256);
+            function VOTING_START_OFFSET() external view returns (uint256);
+            function VOTING_YAY_END_OFFSET() external view returns (uint256);
+            function VOTING_NAY_END_OFFSET() external view returns (uint256);
+            function EXECUTION_START_OFFSET() external view returns (uint256);
+            function EXECUTION_END_OFFSET() external view returns (uint256);
+            function proposals(uint256 index) external view returns (
+                bool executed,
+                address proposer,
+                string proposalDocument,
+                uint256 publishTime,
+                uint256 voteCallTime,
+                uint256 sponsorship,
+                uint256 yayVotes,
+                uint256 nayVotes,
+                uint256 sponsorInterval,
+                uint256 votingInterval
+            );
+            function getActions(uint256 id) external view returns (tuple(address, bytes, uint256)[]);
+            function accountSnapshotLength(address owner) external view returns (uint256);
+            function accountSnapshotAt(address owner, uint256 index, uint256 hint)
+                external view returns (uint256 interval, uint256 votingPower);
+            function lastSponsored(address account)
+                external view returns (uint256 lastSponsorTime, uint256 proposalID);
+            function getClaimed(address account, address token, uint256 interval)
+                external view returns (bool);
+            function calculateRewards(
+                address[] tokens,
+                address account,
+                uint256 startingInterval,
+                uint256 endingInterval,
+                uint256[] hints,
+                bool ignoreClaimed
+            ) external view returns (uint256[]);
+        }
+    }
+
+    /// One JSON-RPC call seen by the governance RPC mock.
+    #[derive(Debug)]
+    struct SeenRpcCall {
+        endpoint: &'static str,
+        client: String,
+        method: String,
+    }
+
+    /// A chain whose only General endpoint and only Sensitive endpoint are separate mocks, with a
+    /// shared wallet client and an isolated client that tag their requests.
+    struct GovernanceRpcMock {
+        seen: Arc<std::sync::Mutex<Vec<SeenRpcCall>>>,
+        effective_chain: wallet_ops::settings::EffectiveChainConfig,
+        http: wallet_ops::HttpContext,
+        isolated: wallet_ops::ClassRoute,
+    }
+
+    impl GovernanceRpcMock {
+        fn take(&self) -> Vec<SeenRpcCall> {
+            std::mem::take(&mut *self.seen.lock().unwrap())
+        }
+    }
+
+    fn tagged_client(tag: &'static str) -> reqwest::Client {
+        let headers = reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::HeaderName::from_static("x-test-client"),
+            reqwest::header::HeaderValue::from_static(tag),
+        )]);
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap()
+    }
+
+    fn governance_call_output(to: Address, input: &[u8]) -> Vec<u8> {
+        use GovernanceRpcFixture as F;
+        use alloy::sol_types::{SolCall, SolValue};
+
+        let contracts = governance_contracts(1).unwrap();
+        let selector: [u8; 4] = input[..4].try_into().unwrap();
+        let uint = |value: u64| U256::from(value).abi_encode();
+        match selector {
+            F::stakingTokenCall::SELECTOR => contracts.governance_token.abi_encode(),
+            F::stakingCall::SELECTOR => contracts.staking.abi_encode(),
+            F::proposalsLengthCall::SELECTOR => uint(u64::from(to == contracts.voting)),
+            F::VOTING_START_OFFSETCall::SELECTOR => uint(1),
+            F::VOTING_YAY_END_OFFSETCall::SELECTOR => uint(2),
+            F::VOTING_NAY_END_OFFSETCall::SELECTOR => uint(3),
+            F::EXECUTION_START_OFFSETCall::SELECTOR => uint(4),
+            F::EXECUTION_END_OFFSETCall::SELECTOR => uint(5),
+            F::proposalsCall::SELECTOR => {
+                F::proposalsCall::abi_encode_returns(&F::proposalsReturn {
+                    executed: false,
+                    proposer: Address::ZERO,
+                    proposalDocument: String::new(),
+                    publishTime: U256::ONE,
+                    voteCallTime: U256::ZERO,
+                    sponsorship: U256::ZERO,
+                    yayVotes: U256::ZERO,
+                    nayVotes: U256::ZERO,
+                    sponsorInterval: U256::ONE,
+                    votingInterval: U256::ZERO,
+                })
+            }
+            F::getActionsCall::SELECTOR => F::getActionsCall::abi_encode_returns(&Vec::new()),
+            F::accountSnapshotLengthCall::SELECTOR => uint(0),
+            F::accountSnapshotAtCall::SELECTOR => (U256::from(1_000), U256::ONE).abi_encode(),
+            F::lastSponsoredCall::SELECTOR => (U256::ZERO, U256::ZERO).abi_encode(),
+            F::getClaimedCall::SELECTOR => false.abi_encode(),
+            F::calculateRewardsCall::SELECTOR => {
+                let call = F::calculateRewardsCall::abi_decode(input).unwrap();
+                F::calculateRewardsCall::abi_encode_returns(&vec![U256::ONE; call.tokens.len()])
+            }
+            // Balances, voting power, reward metadata and the other governance values.
+            _ => uint(1),
+        }
+    }
+
+    fn governance_rpc_answer(
+        endpoint: &str,
+        client: &str,
+        request: &serde_json::Value,
+    ) -> serde_json::Value {
+        let result = match request["method"].as_str().unwrap_or_default() {
+            "eth_call" => {
+                let call = &request["params"][0];
+                let to = call["to"].as_str().unwrap().parse::<Address>().unwrap();
+                let input = call
+                    .get("input")
+                    .or_else(|| call.get("data"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap()
+                    .parse::<alloy::primitives::Bytes>()
+                    .unwrap();
+                Some(serde_json::json!(alloy::primitives::Bytes::from(
+                    governance_call_output(to, &input)
+                )))
+            }
+            // A shared-client block read on the Sensitive endpoint comes only from the Public gas
+            // estimate. Refusing it ends that estimate at once, so the tests needn't model fees.
+            "eth_getBlockByNumber" if !(endpoint == "sensitive" && client == "shared") => {
+                Some(serde_json::json!({
+                    "number": "0x1",
+                    "hash": B256::repeat_byte(1),
+                    "parentHash": B256::ZERO,
+                    "sha3Uncles": B256::ZERO,
+                    "miner": Address::ZERO,
+                    "stateRoot": B256::ZERO,
+                    "transactionsRoot": B256::ZERO,
+                    "receiptsRoot": B256::ZERO,
+                    "logsBloom": format!("0x{}", "00".repeat(256)),
+                    "difficulty": "0x0",
+                    "gasLimit": "0x1c9c380",
+                    "gasUsed": "0x0",
+                    "timestamp": "0x2",
+                    "extraData": "0x",
+                    "mixHash": B256::ZERO,
+                    "nonce": "0x0000000000000000",
+                    "baseFeePerGas": "0x1",
+                    "uncles": [],
+                    "transactions": [],
+                }))
+            }
+            _ => None,
+        };
+        match result {
+            Some(result) => {
+                serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+            }
+            None => serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "error": {"code": -32601, "message": "not served by the governance mock"},
+            }),
+        }
+    }
+
+    /// Serves governance reads on a local port and records each call with the client's tag.
+    fn spawn_governance_rpc_endpoint(
+        endpoint: &'static str,
+        seen: Arc<std::sync::Mutex<Vec<SeenRpcCall>>>,
+    ) -> reqwest::Url {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let url =
+            reqwest::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    return;
+                };
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let (header_end, length) = loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break (0, 0);
+                    }
+                    bytes.extend_from_slice(&buffer[..read]);
+                    if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..index]).to_ascii_lowercase();
+                        let length = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .map_or(0, |value| value.trim().parse().unwrap());
+                        break (index + 4, length);
+                    }
+                };
+                if header_end == 0 {
+                    continue;
+                }
+                while bytes.len() < header_end + length {
+                    let read = stream.read(&mut buffer).unwrap();
+                    bytes.extend_from_slice(&buffer[..read]);
+                }
+                let headers = String::from_utf8_lossy(&bytes[..header_end]).to_ascii_lowercase();
+                let client = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("x-test-client:"))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                let requests = body
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_else(|| vec![body.clone()]);
+                let answers = requests
+                    .iter()
+                    .map(|request| {
+                        seen.lock().unwrap().push(SeenRpcCall {
+                            endpoint,
+                            client: client.clone(),
+                            method: request["method"].as_str().unwrap_or_default().to_owned(),
+                        });
+                        governance_rpc_answer(endpoint, &client, request)
+                    })
+                    .collect::<Vec<_>>();
+                let response = if body.is_array() {
+                    serde_json::Value::Array(answers)
+                } else {
+                    answers.into_iter().next().unwrap()
+                };
+                let response = response.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                );
+            }
+        });
+        url
+    }
+
+    fn governance_rpc_mock() -> GovernanceRpcMock {
+        let seen = Arc::default();
+        let general = spawn_governance_rpc_endpoint("general", Arc::clone(&seen));
+        let sensitive = spawn_governance_rpc_endpoint("sensitive", Arc::clone(&seen));
+        let only = |general, sensitive| wallet_ops::RpcEndpointRoles {
+            general,
+            sensitive,
+            submit: sensitive,
+        };
+        let route = wallet_ops::RpcChainRoute::new_with_transports(
+            1,
+            vec![
+                (
+                    general.into(),
+                    wallet_ops::RpcTransport::Wallet,
+                    only(true, false),
+                ),
+                (
+                    sensitive.into(),
+                    wallet_ops::RpcTransport::Wallet,
+                    only(false, true),
+                ),
+            ],
+        );
+        let mut effective_chain = wallet_ops::settings::build_effective_chain_configs(
+            &wallet_ops::settings::WalletSettings::default(),
+        )
+        .unwrap()
+        .get(1)
+        .cloned()
+        .unwrap();
+        effective_chain.rpc_route = route.clone();
+        let http = wallet_ops::HttpContext::with_rpc_client_for_tests(
+            tagged_client("shared"),
+            wallet_ops::WalletNetworkMode::Direct,
+        );
+        let isolated = route
+            .for_class(wallet_ops::RpcTrafficClass::Sensitive)
+            .unwrap()
+            .isolated(wallet_ops::OperationHttpClient::for_tests(
+                tagged_client("isolated"),
+                wallet_ops::OperationNetworkIsolation::Unavailable(
+                    wallet_ops::WalletNetworkMode::Direct,
+                ),
+            ));
+        GovernanceRpcMock {
+            seen,
+            effective_chain,
+            http,
+            isolated,
+        }
+    }
+
+    #[tokio::test]
+    async fn action_preparation_sends_governance_reads_only_over_the_actor_route() {
+        let mock = governance_rpc_mock();
+        let contracts = governance_contracts(1).unwrap();
+        let actor = Address::from([7; 20]);
+        let tokens = [contracts.reward_tokens[0].token];
+
+        // Both reward runs read everything and then stop at the refused gas estimate.
+        let _ = plan_reward_claim_draft(
+            1,
+            actor,
+            &tokens,
+            &mock.isolated,
+            &mock.effective_chain,
+            &mock.http,
+            RewardEvidenceMode::Fresh,
+        )
+        .await;
+        let fresh_reward = mock.take();
+        let _ = read_reward_continuation(
+            1,
+            actor,
+            &tokens,
+            &mock.isolated,
+            &mock.effective_chain,
+            &mock.http,
+        )
+        .await;
+        let continued_reward = mock.take();
+        let proposal = wallet_ops::GovernanceProposal {
+            contract_version: wallet_ops::GovernanceContractVersion::V2,
+            index: U256::ZERO,
+            contract_address: contracts.voting,
+            proposer: Address::ZERO,
+            proposal_document: String::new(),
+            publish_time: U256::ONE,
+            vote_call_time: U256::ZERO,
+            sponsorship: U256::ZERO,
+            executed: false,
+            yay_votes: U256::ZERO,
+            nay_votes: U256::ZERO,
+            sponsor_snapshot_interval: U256::ONE,
+            voting_snapshot_interval: U256::ZERO,
+            actions: Vec::new(),
+        };
+        let sponsor = super::super::governance_action::read_proposal_action_state(
+            1,
+            &proposal,
+            actor,
+            &mock.isolated,
+            &mock.http,
+        )
+        .await;
+        assert!(sponsor.is_ok(), "{:?}", sponsor.err());
+        let sponsor_reads = mock.take();
+
+        for reads in [fresh_reward, continued_reward, sponsor_reads] {
+            // Chain time or the block gas limit was read through the actor's client.
+            assert!(
+                reads
+                    .iter()
+                    .any(|read| read.method == "eth_getBlockByNumber" && read.client == "isolated"),
+                "{reads:?}"
+            );
+            for read in &reads {
+                assert_eq!(read.endpoint, "sensitive", "{read:?}");
+                if read.method == "eth_call" {
+                    assert_eq!(read.client, "isolated", "{read:?}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dashboard_general_reads_use_the_shared_general_route() {
+        let mock = governance_rpc_mock();
+        let general = governance_route(
+            1,
+            &mock.effective_chain,
+            wallet_ops::RpcTrafficClass::General,
+        )
+        .unwrap();
+        let loaded = super::super::proposals::load_initial(1, 0, &general, &mock.http).await;
+        assert!(loaded.is_ok(), "{:?}", loaded.err());
+        let reads = mock.take();
+        assert!(
+            reads
+                .iter()
+                .any(|read| read.method == "eth_getBlockByNumber")
+        );
+        assert!(reads.iter().any(|read| read.method == "eth_call"));
+        for read in &reads {
+            assert_eq!(
+                (read.endpoint, read.client.as_str()),
+                ("general", "shared"),
+                "{read:?}"
+            );
+        }
     }
 }

@@ -1,28 +1,19 @@
 //! `GovernorRewards` read models and checked reward-claim planning.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::time::Duration;
 
 use alloy::consensus::BlockHeader as _;
-use alloy::network::BlockResponse as _;
 use alloy::primitives::{Address, Bytes, U256};
-use alloy::providers::Provider;
-use alloy::rpc::types::BlockNumberOrTag;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, eyre};
 use railgun_ui::governance_contracts;
-use tokio::time::timeout;
 
-use crate::settings::{EffectiveChainConfig, resolve_effective_chain_rpc_route};
 use crate::staking::{
-    AccountSnapshot, MulticallChunkSize, chunk_indices, reward_staking_interval, snapshot_hint,
+    AccountSnapshot, MulticallChunkSize, chunk_indices, fetch_latest_block,
+    reward_staking_interval, snapshot_hint,
 };
-use crate::{HttpContext, RpcRoute, RpcTrafficClass, WalletRpcOrigin, query_rpc_pool_for_route};
-
-const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::{ClassRoute, HttpContext, RpcRoute, WalletRpcOrigin};
 
 sol! {
     interface GovernorRewards {
@@ -603,15 +594,13 @@ pub fn reward_batch_positive_split_boundary(
 pub async fn fetch_interval_metadata(
     chain_id: u64,
     tokens: &[Address],
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
 ) -> Result<Option<GovernorRewardsIntervalMetadata>> {
     let Some(contracts) = governance_contracts(chain_id) else {
         return Ok(None);
     };
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
-        .for_class(RpcTrafficClass::General)?;
-    let route = RpcRoute::from(chain_route);
+    let route = RpcRoute::from(route.clone());
     let mut calls = vec![
         GovernorRewards::STAKING_DISTRIBUTION_INTERVAL_MULTIPLIERCall {}
             .abi_encode()
@@ -683,7 +672,7 @@ pub async fn fetch_reward_evidence(
     token: Address,
     metadata: &GovernorRewardsIntervalMetadata,
     snapshots: &[AccountSnapshot],
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Option<RewardEvidence>> {
@@ -693,7 +682,7 @@ pub async fn fetch_reward_evidence(
         &[token],
         metadata,
         snapshots,
-        effective_chain,
+        route,
         http,
         chunk_size,
     )
@@ -712,7 +701,7 @@ pub async fn fetch_reward_evidence_multi(
     tokens: &[Address],
     metadata: &GovernorRewardsIntervalMetadata,
     snapshots: &[AccountSnapshot],
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Vec<RewardEvidenceResult>> {
@@ -729,9 +718,7 @@ pub async fn fetch_reward_evidence_multi(
             .collect());
     };
     let lower_bound = reward_starting_interval(snapshots, metadata.multiplier)?;
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
-        .for_class(RpcTrafficClass::Sensitive)?;
-    let route = RpcRoute::from(chain_route);
+    let route = RpcRoute::from(route.clone());
     let mut claimed: Vec<Option<Vec<Option<bool>>>> = Vec::with_capacity(tokens.len());
     let mut errors: Vec<Option<String>> = vec![None; tokens.len()];
     let mut calls = Vec::new();
@@ -917,7 +904,7 @@ pub async fn fetch_reward_batch_evidence(
     tokens: &[Address],
     metadata: &GovernorRewardsIntervalMetadata,
     snapshots: &[AccountSnapshot],
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Option<RewardBatchEvidence>> {
@@ -957,9 +944,7 @@ pub async fn fetch_reward_batch_evidence(
         .ok()
         .and_then(|value| value.checked_add(1))
         .ok_or_else(|| eyre!("reward interval range exceeds platform limits"))?;
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
-        .for_class(RpcTrafficClass::Sensitive)?;
-    let route = RpcRoute::from(chain_route);
+    let route = RpcRoute::from(route.clone());
     let mut claimed = vec![vec![None; count]; tokens.len()];
     let calls = tokens
         .iter()
@@ -1098,7 +1083,7 @@ pub async fn fetch_reward_batch_claimed_intervals(
     chain_id: u64,
     account: Address,
     evidence: &RewardBatchEvidence,
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Vec<Vec<U256>>> {
@@ -1114,9 +1099,7 @@ pub async fn fetch_reward_batch_claimed_intervals(
             .ok_or_else(|| eyre!("reward interval range is invalid"))?,
     )
     .map_err(|_| eyre!("reward interval range exceeds platform limits"))?;
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
-        .for_class(RpcTrafficClass::Sensitive)?;
-    let route = RpcRoute::from(chain_route);
+    let route = RpcRoute::from(route.clone());
     let mut claimed = vec![vec![None; count]; evidence.reward_tokens.len()];
     let calls = evidence
         .reward_tokens
@@ -1190,26 +1173,18 @@ pub async fn fetch_reward_batch_authorization_state(
     chain_id: u64,
     account: Address,
     evidence: &RewardBatchEvidence,
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<RewardBatchAuthorizationState> {
     validate_reward_batch_authorization_evidence(evidence)?;
-    let claimed_intervals = fetch_reward_batch_claimed_intervals(
-        chain_id,
-        account,
-        evidence,
-        effective_chain,
-        http,
-        chunk_size,
-    )
-    .await?;
+    let claimed_intervals =
+        fetch_reward_batch_claimed_intervals(chain_id, account, evidence, route, http, chunk_size)
+            .await?;
     let Some(contracts) = governance_contracts(chain_id) else {
         return Err(eyre!("reward contracts are unavailable"));
     };
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
-        .for_class(RpcTrafficClass::Sensitive)?;
-    let route = RpcRoute::from(chain_route);
+    let route = RpcRoute::from(route.clone());
     let values = http
         .rpc_broker()
         .submit_calls_decoded_as::<GovernorRewards::calculateRewardsCall>(
@@ -1247,48 +1222,16 @@ pub async fn fetch_reward_batch_authorization_state(
     Ok(state)
 }
 
-/// Fetch the latest block gas limit from the configured query pool.
-pub async fn fetch_latest_block_gas_limit(
-    chain_id: u64,
-    effective_chain: &EffectiveChainConfig,
-    http: &HttpContext,
-) -> Result<u64> {
-    let (pool, _) = provider_for_chain(chain_id, effective_chain, http)?;
-    let mut last_error = None;
-    for _ in 0..pool.len() {
-        let Some(handle) = pool.random_provider() else {
-            break;
-        };
-        match timeout(
-            RPC_TIMEOUT,
-            handle
-                .provider
-                .get_block_by_number(BlockNumberOrTag::Latest),
-        )
-        .await
-        {
-            Ok(Ok(Some(block))) if block.header().gas_limit() > 0 => {
-                return Ok(block.header().gas_limit());
-            }
-            Ok(Ok(Some(_))) => {
-                pool.mark_bad_provider(&handle);
-                last_error = Some(eyre!("latest block gas limit was zero"));
-            }
-            Ok(Ok(None)) => {
-                pool.mark_bad_provider(&handle);
-                last_error = Some(eyre!("latest block was unavailable"));
-            }
-            Ok(Err(_)) => {
-                pool.mark_bad_provider(&handle);
-                last_error = Some(eyre!("latest block RPC request failed"));
-            }
-            Err(_) => {
-                pool.mark_bad_provider(&handle);
-                last_error = Some(eyre!("latest block RPC request timed out"));
-            }
-        }
+/// Fetch the latest block gas limit over `route`.
+pub async fn fetch_latest_block_gas_limit(route: &ClassRoute, http: &HttpContext) -> Result<u64> {
+    let gas_limit = fetch_latest_block(route, http, WalletRpcOrigin::GovernorRewards)
+        .await?
+        .header
+        .gas_limit();
+    if gas_limit == 0 {
+        return Err(eyre!("latest block gas limit was zero"));
     }
-    Err(last_error.unwrap_or_else(|| eyre!("no healthy query RPC available")))
+    Ok(gas_limit)
 }
 
 /// Calculate the exact reward subtotal for every interval in the evidence.
@@ -1296,16 +1239,14 @@ pub async fn fetch_reward_interval_amounts(
     chain_id: u64,
     account: Address,
     evidence: &RewardEvidence,
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Vec<RewardIntervalAmount>> {
     let Some(contracts) = governance_contracts(chain_id) else {
         return Err(eyre!("reward contracts are unavailable"));
     };
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
-        .for_class(RpcTrafficClass::Sensitive)?;
-    let route = RpcRoute::from(chain_route);
+    let route = RpcRoute::from(route.clone());
     let count = usize::try_from(evidence.ending_interval - evidence.starting_interval)
         .ok()
         .and_then(|value| value.checked_add(1))
@@ -1371,7 +1312,7 @@ pub async fn fetch_reward_batch_interval_amounts(
     chain_id: u64,
     account: Address,
     evidence: &RewardBatchEvidence,
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Vec<RewardBatchIntervalAmount>> {
@@ -1399,9 +1340,7 @@ pub async fn fetch_reward_batch_interval_amounts(
     if evidence.hints.len() != count {
         return Err(eyre!("reward evidence hints do not match interval range"));
     }
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
-        .for_class(RpcTrafficClass::Sensitive)?;
-    let route = RpcRoute::from(chain_route);
+    let route = RpcRoute::from(route.clone());
     let mut amounts = Vec::with_capacity(count);
     for chunk in chunk_indices(count, chunk_size) {
         let calldata: Vec<(Address, Bytes)> = chunk
@@ -1443,16 +1382,6 @@ pub async fn fetch_reward_batch_interval_amounts(
         }
     }
     Ok(amounts)
-}
-
-fn provider_for_chain(
-    chain_id: u64,
-    effective_chain: &EffectiveChainConfig,
-    http: &HttpContext,
-) -> Result<(Arc<QueryRpcPool>, crate::ClassRoute)> {
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
-        .for_class(RpcTrafficClass::General)?;
-    Ok((query_rpc_pool_for_route(&chain_route, http), chain_route))
 }
 
 #[cfg(test)]
@@ -1613,8 +1542,8 @@ mod tests {
 
     #[tokio::test]
     async fn reward_reads_skip_ineligible_history_and_advance_after_claims() {
-        use std::sync::Mutex;
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
 
         use serde_json::json;
 
@@ -1677,12 +1606,9 @@ mod tests {
             Arc::default(),
         )
         .await;
-        let mut chains = crate::settings::build_effective_chain_configs(
-            &crate::settings::WalletSettings::default(),
-        )
-        .unwrap();
-        let chain = chains.get_mut(1).unwrap();
-        chain.rpc_route = crate::RpcChainRoute::new(1, vec![endpoint]);
+        let route = crate::RpcChainRoute::new(1, vec![endpoint])
+            .for_class(crate::RpcTrafficClass::Sensitive)
+            .unwrap();
         let http = HttpContext::direct_for_tests();
         let snapshots = [
             AccountSnapshot {
@@ -1718,7 +1644,7 @@ mod tests {
                         &tokens,
                         &metadata,
                         &snapshots,
-                        chain,
+                        &route,
                         &http,
                         chunk_size,
                     )
@@ -1749,7 +1675,7 @@ mod tests {
                         &tokens,
                         &metadata,
                         &snapshots,
-                        chain,
+                        &route,
                         &http,
                         chunk_size,
                     )

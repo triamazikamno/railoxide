@@ -4,26 +4,19 @@
 //! chain timestamps and all arithmetic which is part of a contract query is checked.
 
 use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::time::Duration;
 
 use alloy::consensus::BlockHeader as _;
 use alloy::eips::BlockNumberOrTag;
-use alloy::network::BlockResponse as _;
+use alloy::network::AnyRpcBlock;
 use alloy::primitives::{Address, Bytes, U256};
-use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, eyre};
 use railgun_ui::governance_contracts;
 use thiserror::Error;
-use tokio::time::timeout;
 
-use crate::settings::{EffectiveChainConfig, resolve_effective_chain_rpc_route};
-use crate::{HttpContext, RpcRoute, RpcTrafficClass, WalletRpcOrigin, query_rpc_pool_for_route};
+use crate::{ClassRoute, HttpContext, RpcRead, RpcRoute, RpcSubmission, WalletRpcOrigin};
 
-const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MULTICALL_CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(64).unwrap();
 
 sol! {
@@ -202,19 +195,15 @@ pub fn validate_deployment_relationships(
 /// Validate both contract relationships before exposing staking actions.
 pub async fn validate_deployment(
     chain_id: u64,
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
 ) -> std::result::Result<(), DeploymentValidationError> {
     let contracts = governance_contracts(chain_id)
         .ok_or(DeploymentValidationError::UnsupportedChain { chain_id })?;
-    let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)
-        .map_err(|error| DeploymentValidationError::Read(error.to_string()))?
-        .for_class(RpcTrafficClass::General)
-        .map_err(|error| DeploymentValidationError::Read(error.to_string()))?;
     let broker = http.rpc_broker();
     let values = broker
         .submit_calls_decoded_as::<Staking::stakingTokenCall>(
-            RpcRoute::from(route),
+            RpcRoute::from(route.clone()),
             vec![
                 (
                     contracts.staking,
@@ -249,28 +238,27 @@ pub async fn validate_deployment(
 
 pub async fn validate_governance_deployment(
     chain_id: u64,
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
 ) -> std::result::Result<(), DeploymentValidationError> {
-    validate_deployment(chain_id, effective_chain, http).await
+    validate_deployment(chain_id, route, http).await
 }
 
 pub async fn fetch_staking_global_metrics(
     chain_id: u64,
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
 ) -> Result<Option<StakingGlobalMetrics>> {
     let Some(contracts) = governance_contracts(chain_id) else {
         return Ok(None);
     };
-    validate_deployment(chain_id, effective_chain, http)
+    validate_deployment(chain_id, route, http)
         .await
         .map_err(|e| eyre!("{e}"))?;
-    let (pool, route) = provider_for_chain(chain_id, effective_chain, http)?;
     let broker = http.rpc_broker();
     let values = broker
         .submit_calls_decoded_as::<Staking::totalStakedCall>(
-            RpcRoute::from(route),
+            RpcRoute::from(route.clone()),
             vec![
                 (
                     contracts.staking,
@@ -322,7 +310,12 @@ pub async fn fetch_staking_global_metrics(
     let stake_locktime = decoded
         .next()
         .ok_or_else(|| eyre!("staking global result 5 is missing"))??;
-    let chain_time = fetch_chain_time(&pool).await?;
+    let chain_time = U256::from(
+        fetch_latest_block(route, http, WalletRpcOrigin::Staking)
+            .await?
+            .header
+            .timestamp(),
+    );
     let metrics = StakingGlobalMetrics {
         total_staked,
         total_voting_power,
@@ -343,18 +336,16 @@ pub async fn fetch_staking_global_metrics(
 pub async fn fetch_governance_token_balance_allowance(
     chain_id: u64,
     actor: Address,
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
 ) -> Result<Option<(U256, U256)>> {
     let Some(contracts) = governance_contracts(chain_id) else {
         return Ok(None);
     };
-    let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
-        .for_class(RpcTrafficClass::Sensitive)?;
     let broker = http.rpc_broker();
     let values = broker
         .submit_calls_decoded_as::<GovernanceToken::balanceOfCall>(
-            RpcRoute::from(route),
+            RpcRoute::from(route.clone()),
             vec![
                 (
                     contracts.governance_token,
@@ -393,56 +384,42 @@ pub struct AccountStakeResult {
     pub stakes: std::result::Result<Vec<StakePosition>, String>,
 }
 
-/// Enumerate all reported stake indices. A count or record failure only affects that account.
+/// Enumerate all of one account's reported stake indices. A count or record failure only affects
+/// that account's stakes.
 pub async fn fetch_account_stakes(
     chain_id: u64,
-    accounts: &[Address],
+    account: Address,
     chain_time: U256,
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
-) -> Result<Vec<AccountStakeResult>> {
-    if accounts.is_empty() {
-        return Ok(Vec::new());
-    }
-    let Some(contracts) = governance_contracts(chain_id) else {
-        return Ok(Vec::new());
-    };
-    let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
-        .for_class(RpcTrafficClass::Sensitive)?;
+) -> Result<AccountStakeResult> {
+    let contracts = governance_contracts(chain_id)
+        .ok_or_else(|| eyre!("unsupported governance chain {chain_id}"))?;
     let broker = http.rpc_broker();
-    let route = RpcRoute::from(route);
-    let metadata_plan: Vec<(Address, Bytes)> = accounts
-        .iter()
-        .flat_map(|&account| {
-            [
-                (
-                    contracts.staking,
-                    Staking::stakesLengthCall { owner: account }
-                        .abi_encode()
-                        .into(),
-                ),
-                (
-                    contracts.staking,
-                    Staking::votingPowerCall { owner: account }
-                        .abi_encode()
-                        .into(),
-                ),
-                (
-                    contracts.governance_token,
-                    GovernanceToken::balanceOfCall { account }
-                        .abi_encode()
-                        .into(),
-                ),
-            ]
-        })
-        .collect();
-    let mut metadata: Vec<std::result::Result<U256, String>> = metadata_plan
-        .iter()
-        .map(|_| Err("metadata result is missing".into()))
-        .collect();
-    for (offset, call_chunk) in metadata_plan.chunks(chunk_size.get()).enumerate() {
-        let start = offset * chunk_size.get();
+    let route = RpcRoute::from(route.clone());
+    let metadata_plan: Vec<(Address, Bytes)> = vec![
+        (
+            contracts.staking,
+            Staking::stakesLengthCall { owner: account }
+                .abi_encode()
+                .into(),
+        ),
+        (
+            contracts.staking,
+            Staking::votingPowerCall { owner: account }
+                .abi_encode()
+                .into(),
+        ),
+        (
+            contracts.governance_token,
+            GovernanceToken::balanceOfCall { account }
+                .abi_encode()
+                .into(),
+        ),
+    ];
+    let mut metadata: Vec<std::result::Result<U256, String>> = Vec::with_capacity(3);
+    for call_chunk in metadata_plan.chunks(chunk_size.get()) {
         match broker
             .submit_calls_decoded_as::<Staking::stakesLengthCall>(
                 route.clone(),
@@ -452,58 +429,34 @@ pub async fn fetch_account_stakes(
             .await
             .map_err(|error| eyre!("RPC broker submission failed: {error}"))
         {
-            Ok(values) => {
-                for (index, value) in values.into_iter().enumerate() {
-                    metadata[start + index] =
-                        value.map_err(|error| format!("metadata call failed: {error:?}"));
-                }
-            }
-            Err(error) => {
-                for index in 0..call_chunk.len() {
-                    metadata[start + index] = Err(error.to_string());
-                }
-            }
+            Ok(values) => metadata.extend(
+                values
+                    .into_iter()
+                    .map(|value| value.map_err(|error| format!("metadata call failed: {error:?}"))),
+            ),
+            Err(error) => metadata.extend(call_chunk.iter().map(|_| Err(error.to_string()))),
         }
     }
-    let mut counts = vec![None; accounts.len()];
-    let mut voting_power = vec![Err(String::new()); accounts.len()];
-    let mut balances = vec![Err(String::new()); accounts.len()];
-    let mut failures = vec![None; accounts.len()];
-    for (account_index, triple) in metadata.as_chunks::<3>().0.iter().enumerate() {
-        match &triple[0] {
-            Ok(count) => match usize::try_from(*count) {
-                Ok(count) => counts[account_index] = Some(count),
-                Err(_) => {
-                    failures[account_index] = Some("stake count exceeds platform limits".into());
-                }
-            },
-            Err(error) => failures[account_index] = Some(error.clone()),
+    metadata.resize(3, Err("metadata result is missing".into()));
+    let voting_power = metadata[1]
+        .clone()
+        .map_err(|error| format!("voting power call failed: {error}"));
+    let balance = metadata[2]
+        .clone()
+        .map_err(|error| format!("governance token balance call failed: {error}"));
+    let count = match &metadata[0] {
+        Ok(count) => {
+            usize::try_from(*count).map_err(|_| "stake count exceeds platform limits".to_string())
         }
-        voting_power[account_index] = triple[1]
-            .as_ref()
-            .map(|value| *value)
-            .map_err(|error| format!("voting power call failed: {error}"));
-        balances[account_index] = triple[2]
-            .as_ref()
-            .map(|value| *value)
-            .map_err(|error| format!("governance token balance call failed: {error}"));
-    }
+        Err(error) => Err(error.clone()),
+    };
 
-    let mut records = vec![Vec::new(); accounts.len()];
-    let mut record_calls = Vec::new();
-    for (account_index, (&account, count)) in accounts.iter().zip(&counts).enumerate() {
-        if let Some(count) = count {
-            for index in 0..*count {
-                record_calls.push((account_index, account, index));
-            }
-        } else if failures[account_index].is_none() {
-            failures[account_index] = Some("stake count read failed".into());
-        }
-    }
-    for chunk in record_calls.chunks(chunk_size.get()) {
+    let mut records = Vec::new();
+    let mut failure = count.as_ref().err().cloned();
+    for chunk in chunk_indices(count.unwrap_or(0), chunk_size) {
         let calls: Vec<(Address, Bytes)> = chunk
             .iter()
-            .map(|&(_, account, index)| {
+            .map(|&index| {
                 (
                     contracts.staking,
                     Staking::stakesCall {
@@ -525,9 +478,9 @@ pub async fn fetch_account_stakes(
             .map_err(|error| eyre!("RPC broker submission failed: {error}"))
         {
             Ok(values) => {
-                for (&(account_index, account, index), value) in chunk.iter().zip(values) {
+                for (&index, value) in chunk.iter().zip(values) {
                     match value {
-                        Ok(record) => records[account_index].push(StakePosition {
+                        Ok(record) => records.push(StakePosition {
                             owner: account,
                             id: U256::from(index),
                             delegate: record.delegate,
@@ -541,47 +494,31 @@ pub async fn fetch_account_stakes(
                                 chain_time,
                             ),
                         }),
-                        Err(error) if failures[account_index].is_none() => {
-                            failures[account_index] =
-                                Some(format!("stake {index} call failed: {error:?}"));
+                        Err(error) => {
+                            failure.get_or_insert_with(|| {
+                                format!("stake {index} call failed: {error:?}")
+                            });
                         }
-                        Err(_) => {}
                     }
                 }
             }
             Err(error) => {
-                for &(account_index, _, _) in chunk {
-                    if failures[account_index].is_none() {
-                        failures[account_index] = Some(error.to_string());
-                    }
-                }
+                failure.get_or_insert_with(|| error.to_string());
             }
         }
     }
-    Ok(accounts
-        .iter()
-        .enumerate()
-        .map(|(index, &account)| AccountStakeResult {
-            account,
-            voting_power: voting_power[index].clone(),
-            balance: balances[index].clone(),
-            stakes: failures[index]
-                .clone()
-                .map_or_else(|| Ok(records[index].clone()), Err),
-        })
-        .collect())
+    Ok(AccountStakeResult {
+        account,
+        voting_power,
+        balance,
+        stakes: failure.map_or(Ok(records), Err),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountSnapshot {
     pub interval: U256,
     pub voting_power: U256,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AccountSnapshotsResult {
-    pub account: Address,
-    pub snapshots: std::result::Result<Vec<AccountSnapshot>, String>,
 }
 
 pub fn snapshot_hint(snapshots: &[AccountSnapshot], target: U256) -> Result<U256> {
@@ -601,107 +538,43 @@ pub fn reward_staking_interval(distribution_interval: U256, multiplier: U256) ->
         .ok_or_else(|| eyre!("reward interval conversion overflows U256"))
 }
 
+/// Fetch one account's snapshots with a count read and bounded record batches.
 pub async fn fetch_account_snapshots(
     chain_id: u64,
     account: Address,
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
     chunk_size: MulticallChunkSize,
 ) -> Result<Vec<AccountSnapshot>> {
-    if governance_contracts(chain_id).is_none() {
-        return Ok(Vec::new());
-    }
-    let mut results =
-        fetch_account_snapshots_multi(chain_id, &[account], effective_chain, http, chunk_size)
-            .await?;
-    results
-        .pop()
-        .ok_or_else(|| eyre!("account snapshot result is missing"))?
-        .snapshots
-        .map_err(|error| eyre!("{error}"))
-}
-
-/// Fetch snapshots for all accounts with shared count and bounded record batches.
-pub async fn fetch_account_snapshots_multi(
-    chain_id: u64,
-    accounts: &[Address],
-    effective_chain: &EffectiveChainConfig,
-    http: &HttpContext,
-    chunk_size: MulticallChunkSize,
-) -> Result<Vec<AccountSnapshotsResult>> {
-    if accounts.is_empty() {
-        return Ok(Vec::new());
-    }
     let Some(contracts) = governance_contracts(chain_id) else {
         return Ok(Vec::new());
     };
-    let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
-        .for_class(RpcTrafficClass::Sensitive)?;
     let broker = http.rpc_broker();
-    let route = RpcRoute::from(route);
-    let mut count_values: Vec<std::result::Result<U256, String>> = accounts
-        .iter()
-        .map(|_| Err("snapshot count result is missing".into()))
-        .collect();
-    for (offset, account_chunk) in accounts.chunks(chunk_size.get()).enumerate() {
-        let calls: Vec<(Address, Bytes)> = account_chunk
-            .iter()
-            .map(|&account| {
-                (
-                    contracts.staking,
-                    Staking::accountSnapshotLengthCall { owner: account }
-                        .abi_encode()
-                        .into(),
-                )
-            })
-            .collect();
-        let start = offset * chunk_size.get();
-        match broker
-            .submit_calls_decoded_as::<Staking::accountSnapshotLengthCall>(
-                route.clone(),
-                calls,
-                WalletRpcOrigin::Staking.into(),
-            )
-            .await
-            .map_err(|error| eyre!("RPC broker submission failed: {error}"))
-        {
-            Ok(values) => {
-                for (index, value) in values.into_iter().enumerate() {
-                    count_values[start + index] = value
-                        .map_err(|error| format!("account snapshot length call failed: {error:?}"));
-                }
-            }
-            Err(error) => {
-                for index in 0..account_chunk.len() {
-                    count_values[start + index] = Err(error.to_string());
-                }
-            }
-        }
-    }
-    let mut counts = vec![None; accounts.len()];
-    let mut failures = vec![None; accounts.len()];
-    for (index, value) in count_values.into_iter().enumerate() {
-        match value {
-            Ok(count) => match usize::try_from(count) {
-                Ok(count) => counts[index] = Some(count),
-                Err(_) => failures[index] = Some("snapshot count exceeds platform limits".into()),
-            },
-            Err(error) => failures[index] = Some(error),
-        }
-    }
-    let mut snapshots = vec![Vec::new(); accounts.len()];
-    let mut record_calls = Vec::new();
-    for (account_index, (&account, count)) in accounts.iter().zip(&counts).enumerate() {
-        if let Some(count) = count {
-            for index in 0..*count {
-                record_calls.push((account_index, account, index));
-            }
-        }
-    }
-    for chunk in record_calls.chunks(chunk_size.get()) {
+    let route = RpcRoute::from(route.clone());
+    let count = broker
+        .submit_calls_decoded_as::<Staking::accountSnapshotLengthCall>(
+            route.clone(),
+            vec![(
+                contracts.staking,
+                Staking::accountSnapshotLengthCall { owner: account }
+                    .abi_encode()
+                    .into(),
+            )],
+            WalletRpcOrigin::Staking.into(),
+        )
+        .await
+        .map_err(|error| eyre!("RPC broker submission failed: {error}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre!("snapshot count result is missing"))?
+        .map_err(|error| eyre!("account snapshot length call failed: {error:?}"))?;
+    let count =
+        usize::try_from(count).map_err(|_| eyre!("snapshot count exceeds platform limits"))?;
+    let mut snapshots = Vec::new();
+    for chunk in chunk_indices(count, chunk_size) {
         let calls: Vec<(Address, Bytes)> = chunk
             .iter()
-            .map(|&(_, account, index)| {
+            .map(|&index| {
                 (
                     contracts.staking,
                     Staking::accountSnapshotCall {
@@ -713,87 +586,52 @@ pub async fn fetch_account_snapshots_multi(
                 )
             })
             .collect();
-        match broker
+        let values = broker
             .submit_calls_decoded_as::<Staking::accountSnapshotCall>(
                 route.clone(),
                 calls,
                 WalletRpcOrigin::Staking.into(),
             )
             .await
-            .map_err(|error| eyre!("RPC broker submission failed: {error}"))
-        {
-            Ok(values) => {
-                for (&(account_index, _, index), value) in chunk.iter().zip(values) {
-                    match value {
-                        Ok(snapshot) => snapshots[account_index].push(AccountSnapshot {
-                            interval: snapshot.interval,
-                            voting_power: snapshot.votingPower,
-                        }),
-                        Err(error) if failures[account_index].is_none() => {
-                            failures[account_index] =
-                                Some(format!("account snapshot {index} call failed: {error:?}"));
-                        }
-                        Err(_) => {}
-                    }
-                }
-            }
-            Err(error) => {
-                for &(account_index, _, _) in chunk {
-                    if failures[account_index].is_none() {
-                        failures[account_index] = Some(error.to_string());
-                    }
-                }
-            }
+            .map_err(|error| eyre!("RPC broker submission failed: {error}"))?;
+        for (&index, value) in chunk.iter().zip(values) {
+            let snapshot =
+                value.map_err(|error| eyre!("account snapshot {index} call failed: {error:?}"))?;
+            snapshots.push(AccountSnapshot {
+                interval: snapshot.interval,
+                voting_power: snapshot.votingPower,
+            });
         }
     }
-    Ok(accounts
-        .iter()
-        .enumerate()
-        .map(|(index, &account)| {
-            let state = failures[index].clone().map_or_else(
-                || {
-                    snapshot_hint(&snapshots[index], U256::ZERO)
-                        .map_err(|error| error.to_string())
-                        .map(|_| snapshots[index].clone())
-                },
-                Err,
-            );
-            AccountSnapshotsResult {
-                account,
-                snapshots: state,
-            }
-        })
-        .collect())
+    snapshot_hint(&snapshots, U256::ZERO)?;
+    Ok(snapshots)
 }
 
-async fn fetch_chain_time(pool: &QueryRpcPool) -> Result<U256> {
-    for _ in 0..pool.len() {
-        let Some(handle) = pool.random_provider() else {
-            break;
-        };
-        match timeout(
-            RPC_TIMEOUT,
-            handle
-                .provider
-                .get_block_by_number(BlockNumberOrTag::Latest),
-        )
-        .await
-        {
-            Ok(Ok(Some(block))) => return Ok(U256::from(block.header().timestamp())),
-            _ => pool.mark_bad_provider(&handle),
-        }
-    }
-    Err(eyre!("latest chain block timestamp unavailable"))
-}
-
-fn provider_for_chain(
-    chain_id: u64,
-    effective_chain: &EffectiveChainConfig,
+/// Read the latest block over `route` through the broker, which keeps an isolated route's reads
+/// on its own client. A query pool would not.
+pub(crate) async fn fetch_latest_block(
+    route: &ClassRoute,
     http: &HttpContext,
-) -> Result<(Arc<QueryRpcPool>, crate::ClassRoute)> {
-    let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
-        .for_class(RpcTrafficClass::General)?;
-    Ok((query_rpc_pool_for_route(&route, http), route))
+    origin: WalletRpcOrigin,
+) -> Result<AnyRpcBlock> {
+    let result = http
+        .rpc_broker()
+        .submit(RpcSubmission::new(
+            RpcRoute::from(route.clone()),
+            vec![RpcRead::get_block_by_number(
+                BlockNumberOrTag::Latest,
+                false,
+            )],
+            origin.into(),
+        ))
+        .await
+        .map_err(|error| eyre!("latest block RPC request failed: {error}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre!("latest block result is missing"))?
+        .map_err(|error| eyre!("latest block RPC request failed: {error}"))?;
+    serde_json::from_value(result.into_value())
+        .map_err(|error| eyre!("latest block was unavailable: {error}"))
 }
 
 #[cfg(test)]

@@ -474,6 +474,11 @@ impl ClassRoute {
     /// A pool over this class's endpoints in configured order, each sending through its
     /// transport's client.
     pub(crate) fn query_rpc_pool(&self, clients: &RpcClients, cooldown: Duration) -> QueryRpcPool {
+        // A pool ignores isolation, and its raw clients could outlive the operation's bridge.
+        assert!(
+            !self.route().is_isolated(),
+            "an isolated route cannot back a query pool"
+        );
         self.route().query_rpc_pool(clients, cooldown)
     }
 

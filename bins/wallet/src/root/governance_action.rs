@@ -198,33 +198,39 @@ impl ProposalParticipationState {
     pub(super) fn begin(&mut self, key: &ProposalParticipationKey) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.key = Some(key.clone());
-        self.loading = true;
         self.rows = key
             .context
             .participants
             .iter()
             .map(|participant| (participant.address, ProposalParticipationRow::Loading))
             .collect();
+        self.loading = !self.rows.is_empty();
         self.generation
+    }
+
+    pub(super) fn current(&self, key: &ProposalParticipationKey, generation: u64) -> bool {
+        self.generation == generation && self.key.as_ref() == Some(key)
     }
 
     pub(super) fn apply(
         &mut self,
         key: &ProposalParticipationKey,
         generation: u64,
-        rows: Vec<wallet_ops::GovernanceParticipationRow>,
+        account: Address,
+        row: Result<GovernanceParticipation, Arc<str>>,
     ) -> bool {
-        if self.generation != generation || self.key.as_ref() != Some(key) {
+        if !self.current(key, generation) {
             return false;
         }
-        for row in rows {
-            let state = match row.state {
-                Ok(value) => ProposalParticipationRow::Ready(Box::new(value)),
-                Err(error) => ProposalParticipationRow::Unavailable(Arc::from(error.to_string())),
-            };
-            self.rows.insert(row.account, state);
-        }
-        self.loading = false;
+        let state = match row {
+            Ok(value) => ProposalParticipationRow::Ready(Box::new(value)),
+            Err(error) => ProposalParticipationRow::Unavailable(error),
+        };
+        self.rows.insert(account, state);
+        self.loading = self
+            .rows
+            .values()
+            .any(|row| matches!(row, ProposalParticipationRow::Loading));
         true
     }
 
@@ -1026,28 +1032,27 @@ fn proposal_participation_key_matches(
         && current_key == Some(expected_key)
 }
 
-async fn build_governance_spend_draft(
-    proposal: GovernanceProposal,
-    key: ProposalParticipationKey,
-    selection: ProposalActionSelection,
-    amount: Option<U256>,
-    wallet_id: Arc<str>,
-    actor_uuid: Arc<str>,
-    actor_source: PublicAccountSource,
-    view_session: Arc<wallet_ops::vault::DesktopViewSession>,
-    vault_store: Arc<wallet_ops::vault::DesktopVaultStore>,
-    effective_chain: wallet_ops::settings::EffectiveChainConfig,
-    http: wallet_ops::HttpContext,
-    gas_fee_selection: PublicActionGasFeeSelection,
-) -> Result<GovernanceSpendDraft, String> {
-    let recipe_proposal = proposal.clone();
-    let recipe_key = key.clone();
-    let recipe_amount = amount;
-    let overview =
-        wallet_ops::fetch_governance_overview(key.context.chain_id, &effective_chain, &http)
-            .await
-            .map_err(|error| format_report_chain(&error))?
-            .ok_or_else(|| "Governance is not deployed on this chain".to_owned())?;
+/// The fresh proposal, its rules, the chain time and the actor's participation, all read over
+/// the actor's `route`.
+pub(super) async fn read_proposal_action_state(
+    chain_id: u64,
+    proposal: &GovernanceProposal,
+    actor: Address,
+    route: &wallet_ops::ClassRoute,
+    http: &wallet_ops::HttpContext,
+) -> Result<
+    (
+        GovernanceProposal,
+        GovernanceContractRules,
+        U256,
+        GovernanceParticipation,
+    ),
+    String,
+> {
+    let overview = wallet_ops::fetch_governance_overview(chain_id, route, http)
+        .await
+        .map_err(|error| format_report_chain(&error))?
+        .ok_or_else(|| "Governance is not deployed on this chain".to_owned())?;
     let v2_count = usize::try_from(overview.v2.proposal_count)
         .map_err(|_| "Governance proposal count is too large".to_owned())?;
     let (global_index, expected_address) = match proposal.contract_version {
@@ -1087,8 +1092,8 @@ async fn build_governance_spend_draft(
         &overview,
         page,
         NonZeroUsize::new(super::proposals::PROPOSALS_PAGE_SIZE).expect("nonzero page size"),
-        &effective_chain,
-        &http,
+        route,
+        http,
     )
     .await
     .map_err(|error| format_report_chain(&error))?;
@@ -1111,27 +1116,50 @@ async fn build_governance_spend_draft(
             .rules
             .clone(),
     };
-    let chain_time =
-        wallet_ops::fetch_governance_chain_time(key.context.chain_id, &effective_chain, &http)
+    let chain_time = wallet_ops::fetch_governance_chain_time(route, http)
+        .await
+        .map_err(|error| format_report_chain(&error))?;
+    let participation =
+        wallet_ops::fetch_governance_participation(chain_id, &fresh, actor, route, http)
             .await
-            .map_err(|error| format_report_chain(&error))?;
-    let rows = wallet_ops::fetch_governance_participation(
+            .map_err(|error| format_report_chain(&error))?
+            .state
+            .map_err(|error| error.to_string())?;
+    Ok((fresh, rules, chain_time, participation))
+}
+
+async fn build_governance_spend_draft(
+    proposal: GovernanceProposal,
+    key: ProposalParticipationKey,
+    selection: ProposalActionSelection,
+    amount: Option<U256>,
+    wallet_id: Arc<str>,
+    actor_uuid: Arc<str>,
+    actor_source: PublicAccountSource,
+    view_session: Arc<wallet_ops::vault::DesktopViewSession>,
+    vault_store: Arc<wallet_ops::vault::DesktopVaultStore>,
+    effective_chain: wallet_ops::settings::EffectiveChainConfig,
+    http: wallet_ops::HttpContext,
+    gas_fee_selection: PublicActionGasFeeSelection,
+) -> Result<GovernanceSpendDraft, String> {
+    let recipe_proposal = proposal.clone();
+    let recipe_key = key.clone();
+    let recipe_amount = amount;
+    let route = super::governance::open_isolated_governance_route(
         key.context.chain_id,
-        &fresh,
-        &[selection.actor],
         &effective_chain,
         &http,
     )
-    .await
-    .map_err(|error| format_report_chain(&error))?;
-    let participation = rows
-        .into_iter()
-        .find(|row| row.account == selection.actor)
-        .ok_or_else(|| {
-            "Selected account participation is unavailable; refresh before authorizing".to_owned()
-        })?
-        .state
-        .map_err(|error| error.to_string())?;
+    .await?;
+    let (fresh, rules, chain_time, participation) = read_proposal_action_state(
+        key.context.chain_id,
+        &proposal,
+        selection.actor,
+        &route,
+        &http,
+    )
+    .await?;
+    drop(route);
     let amount = amount.unwrap_or_default();
     validate_proposal_action(
         &fresh,

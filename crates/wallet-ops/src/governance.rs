@@ -2,31 +2,20 @@
 
 use std::cmp::Ordering;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::time::Duration;
 
 use alloy::consensus::BlockHeader as _;
-use alloy::eips::BlockNumberOrTag;
-use alloy::network::BlockResponse as _;
 use alloy::primitives::{Address, Bytes, U256};
-use alloy::providers::Provider;
 use alloy::sol;
 use alloy::sol_types::SolCall;
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr, eyre};
 use railgun_ui::governance_contracts;
 use thiserror::Error;
-use tokio::time::timeout;
 
 use crate::rpc_broker::total_failure;
-use crate::settings::{EffectiveChainConfig, resolve_effective_chain_rpc_route};
-use crate::staking::{MulticallChunkSize, fetch_account_snapshots_multi, snapshot_hint};
-use crate::{
-    HttpContext, RpcBrokerError, RpcRoute, RpcTrafficClass, WalletRpcOrigin,
-    query_rpc_pool_for_route,
+use crate::staking::{
+    MulticallChunkSize, fetch_account_snapshots, fetch_latest_block, snapshot_hint,
 };
-
-const GOVERNANCE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::{ClassRoute, HttpContext, RpcBrokerError, RpcRoute, WalletRpcOrigin};
 
 sol! {
     interface GovernanceVoting {
@@ -606,17 +595,16 @@ pub fn guard_nay_vote(
     }
 }
 
-/// Fetch account-specific proposal state. Snapshot discovery reads the configured Staking
-/// contract first, then one bounded multicall reads Staking's current and historical power plus
-/// the proposal's version-specific Voting contract state. A failed account row does not discard
-/// the proposal or other account rows.
+/// Fetch one account's proposal state. Snapshot discovery reads the configured Staking contract
+/// first, then one multicall reads Staking's current and historical power plus the proposal's
+/// version-specific Voting contract state. A snapshot failure becomes the row's error state.
 pub async fn fetch_governance_participation(
     chain_id: u64,
     proposal: &GovernanceProposal,
-    accounts: &[Address],
-    effective_chain: &EffectiveChainConfig,
+    account: Address,
+    route: &ClassRoute,
     http: &HttpContext,
-) -> Result<Vec<GovernanceParticipationRow>> {
+) -> Result<GovernanceParticipationRow> {
     let contracts = governance_contracts(chain_id)
         .ok_or_else(|| eyre!("unsupported governance chain {chain_id}"))?;
     let voting_address = governance_voting_address(chain_id, proposal.contract_version)
@@ -629,136 +617,107 @@ pub async fn fetch_governance_participation(
         ));
     }
 
-    let mut rows = vec![None; accounts.len()];
-    let mut prepared = Vec::new();
-    let snapshot_results = fetch_account_snapshots_multi(
+    let snapshots = match fetch_account_snapshots(
         chain_id,
-        accounts,
-        effective_chain,
+        account,
+        route,
         http,
         MulticallChunkSize::default(),
     )
-    .await?;
-    for (row_index, (&account, snapshot_result)) in
-        accounts.iter().zip(snapshot_results).enumerate()
+    .await
     {
-        match snapshot_result.snapshots {
-            Ok(snapshots) => {
-                let sponsor_hint = snapshot_hint(&snapshots, proposal.sponsor_snapshot_interval);
-                let voting_hint = snapshot_hint(&snapshots, proposal.voting_snapshot_interval);
-                match (sponsor_hint, voting_hint) {
-                    (Ok(sponsor_hint), Ok(voting_hint)) => {
-                        prepared.push((row_index, account, sponsor_hint, voting_hint));
-                    }
-                    (Err(error), _) | (_, Err(error)) => {
-                        rows[row_index] = Some(GovernanceParticipationRow {
-                            account,
-                            state: Err(GovernanceParticipationError::InvalidSnapshotHint(
-                                error.to_string(),
-                            )),
-                        });
-                    }
-                }
-            }
-            Err(error) => {
-                rows[row_index] = Some(GovernanceParticipationRow {
-                    account,
-                    state: Err(GovernanceParticipationError::SnapshotUnavailable(error)),
-                });
-            }
-        }
-    }
-    if prepared.is_empty() {
-        return Ok(rows.into_iter().flatten().collect());
-    }
-
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
-    let accounts_per_batch = (MulticallChunkSize::default().get() / 6).max(1);
-    let mut values = Vec::new();
-    for prepared_batch in prepared.chunks(accounts_per_batch) {
-        let calls = prepared_batch
-            .iter()
-            .flat_map(|&(_, account, sponsor_hint, voting_hint)| {
-                [
-                    (
-                        contracts.staking,
-                        GovernanceStaking::votingPowerCall { owner: account }
-                            .abi_encode()
-                            .into(),
-                    ),
-                    (
-                        contracts.staking,
-                        GovernanceStaking::accountSnapshotAtCall {
-                            owner: account,
-                            index: proposal.sponsor_snapshot_interval,
-                            hint: sponsor_hint,
-                        }
-                        .abi_encode()
-                        .into(),
-                    ),
-                    (
-                        contracts.staking,
-                        GovernanceStaking::accountSnapshotAtCall {
-                            owner: account,
-                            index: proposal.voting_snapshot_interval,
-                            hint: voting_hint,
-                        }
-                        .abi_encode()
-                        .into(),
-                    ),
-                    (
-                        voting_address,
-                        GovernanceVoting::getSponsoredCall {
-                            proposalID: proposal.index,
-                            account,
-                        }
-                        .abi_encode()
-                        .into(),
-                    ),
-                    (
-                        voting_address,
-                        GovernanceVoting::getVotesCall {
-                            proposalID: proposal.index,
-                            account,
-                        }
-                        .abi_encode()
-                        .into(),
-                    ),
-                    (
-                        voting_address,
-                        GovernanceVoting::lastSponsoredCall { account }
-                            .abi_encode()
-                            .into(),
-                    ),
-                ]
-            })
-            .collect();
-        let batch_values = fetch_governance_multicall_raw(
-            &chain_route,
-            RpcTrafficClass::Sensitive,
-            http,
-            calls,
-            "governance participation",
-        )
-        .await?;
-        values.extend(batch_values);
-    }
-    for (position, &(_row_index, account, sponsor_hint, voting_hint)) in prepared.iter().enumerate()
-    {
-        let start = position * 6;
-        rows[_row_index] = Some(GovernanceParticipationRow {
-            account,
-            state: decode_governance_participation(
-                proposal,
-                voting_address,
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            return Ok(GovernanceParticipationRow {
                 account,
-                sponsor_hint,
-                voting_hint,
-                &values[start..start + 6],
-            ),
+                state: Err(GovernanceParticipationError::SnapshotUnavailable(
+                    error.to_string(),
+                )),
+            });
+        }
+    };
+    let hints =
+        snapshot_hint(&snapshots, proposal.sponsor_snapshot_interval).and_then(|sponsor_hint| {
+            snapshot_hint(&snapshots, proposal.voting_snapshot_interval)
+                .map(|voting_hint| (sponsor_hint, voting_hint))
         });
-    }
-    Ok(rows.into_iter().flatten().collect())
+    let (sponsor_hint, voting_hint) = match hints {
+        Ok(hints) => hints,
+        Err(error) => {
+            return Ok(GovernanceParticipationRow {
+                account,
+                state: Err(GovernanceParticipationError::InvalidSnapshotHint(
+                    error.to_string(),
+                )),
+            });
+        }
+    };
+
+    let calls = vec![
+        (
+            contracts.staking,
+            GovernanceStaking::votingPowerCall { owner: account }
+                .abi_encode()
+                .into(),
+        ),
+        (
+            contracts.staking,
+            GovernanceStaking::accountSnapshotAtCall {
+                owner: account,
+                index: proposal.sponsor_snapshot_interval,
+                hint: sponsor_hint,
+            }
+            .abi_encode()
+            .into(),
+        ),
+        (
+            contracts.staking,
+            GovernanceStaking::accountSnapshotAtCall {
+                owner: account,
+                index: proposal.voting_snapshot_interval,
+                hint: voting_hint,
+            }
+            .abi_encode()
+            .into(),
+        ),
+        (
+            voting_address,
+            GovernanceVoting::getSponsoredCall {
+                proposalID: proposal.index,
+                account,
+            }
+            .abi_encode()
+            .into(),
+        ),
+        (
+            voting_address,
+            GovernanceVoting::getVotesCall {
+                proposalID: proposal.index,
+                account,
+            }
+            .abi_encode()
+            .into(),
+        ),
+        (
+            voting_address,
+            GovernanceVoting::lastSponsoredCall { account }
+                .abi_encode()
+                .into(),
+        ),
+    ];
+    let values =
+        fetch_governance_multicall_raw(route, http, calls, "governance participation").await?;
+    Ok(GovernanceParticipationRow {
+        account,
+        state: decode_governance_participation(
+            proposal,
+            voting_address,
+            account,
+            sponsor_hint,
+            voting_hint,
+            &values,
+        ),
+    })
 }
 
 fn decode_governance_participation(
@@ -873,10 +832,8 @@ fn decode_governance_participation(
 /// A member revert is reported to the caller as `Err(RpcBrokerError::InnerRevert(_))` so it can be
 /// distinguished from a transport or JSON-RPC failure; only a whole-batch failure is an outer
 /// error.
-/// Participant reads pass `Sensitive`; proposal lists and overviews pass `General`.
 async fn fetch_governance_multicall_raw(
-    chain_route: &crate::RpcChainRoute,
-    class: RpcTrafficClass,
+    route: &ClassRoute,
     http: &HttpContext,
     calls: Vec<(Address, Bytes)>,
     caller: &'static str,
@@ -884,7 +841,7 @@ async fn fetch_governance_multicall_raw(
     let results = http
         .rpc_broker()
         .submit_eth_calls(
-            RpcRoute::from(chain_route.for_class(class)?),
+            RpcRoute::from(route.clone()),
             calls,
             WalletRpcOrigin::Governance.into(),
         )
@@ -1041,64 +998,30 @@ pub fn derive_governance_proposal_stage(
 /// Unsupported chains return `Ok(None)` without issuing an RPC request.
 pub async fn fetch_governance_overview(
     chain_id: u64,
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
 ) -> Result<Option<GovernanceOverview>> {
     let Some(contracts) = governance_contracts(chain_id) else {
         return Ok(None);
     };
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
     let mut targets = vec![(GovernanceContractVersion::V2, contracts.voting)];
     if let Some(address) = contracts.voting_legacy {
         targets.push((GovernanceContractVersion::V1, address));
     }
-    let summaries = fetch_contract_summaries(&chain_route, http, &targets).await?;
+    let summaries = fetch_contract_summaries(route, http, &targets).await?;
     let v2 = summaries[0].clone();
     let v1 = summaries.get(1).cloned();
     Ok(Some(GovernanceOverview { chain_id, v2, v1 }))
 }
 
-/// Fetch the latest block timestamp from a configured governance RPC.
-pub async fn fetch_governance_chain_time(
-    chain_id: u64,
-    effective_chain: &EffectiveChainConfig,
-    http: &HttpContext,
-) -> Result<U256> {
-    let (query_rpc_pool, _) = provider_for_chain(chain_id, effective_chain, http)?;
-    let mut last_error = None;
-    for _ in 0..query_rpc_pool.len() {
-        let Some(provider_handle) = query_rpc_pool.random_provider() else {
-            break;
-        };
-        match timeout(
-            GOVERNANCE_RPC_TIMEOUT,
-            provider_handle
-                .provider
-                .get_block_by_number(BlockNumberOrTag::Latest),
-        )
-        .await
-        {
-            Ok(Ok(Some(block))) => {
-                return Ok(U256::from(block.header().timestamp()));
-            }
-            Ok(Ok(None)) => {
-                query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(eyre!("governance latest block was unavailable"));
-            }
-            Ok(Err(_)) => {
-                query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(eyre!("governance latest block RPC request failed"));
-            }
-            Err(_) => {
-                query_rpc_pool.mark_bad_provider(&provider_handle);
-                last_error = Some(eyre!(
-                    "governance latest block RPC request timed out after {} milliseconds",
-                    GOVERNANCE_RPC_TIMEOUT.as_millis()
-                ));
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| eyre!("no healthy query RPC available")))
+/// Fetch the latest block timestamp over `route`.
+pub async fn fetch_governance_chain_time(route: &ClassRoute, http: &HttpContext) -> Result<U256> {
+    Ok(U256::from(
+        fetch_latest_block(route, http, WalletRpcOrigin::Governance)
+            .await?
+            .header
+            .timestamp(),
+    ))
 }
 
 /// Fetch one newest-first page from an overview.
@@ -1109,7 +1032,7 @@ pub async fn fetch_governance_page(
     overview: &GovernanceOverview,
     page: usize,
     page_size: NonZeroUsize,
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
 ) -> Result<Vec<GovernanceProposal>> {
     let v2_count = usize::try_from(overview.v2.proposal_count)
@@ -1160,8 +1083,7 @@ pub async fn fetch_governance_page(
         return Ok(Vec::new());
     }
 
-    let chain_route = resolve_effective_chain_rpc_route(overview.chain_id, effective_chain)?;
-    let proposals = fetch_proposal_calls(&chain_route, http, &planned).await?;
+    let proposals = fetch_proposal_calls(route, http, &planned).await?;
     for proposal in &proposals {
         let rules = match proposal.contract_version {
             GovernanceContractVersion::V2 => &overview.v2.rules,
@@ -1184,18 +1106,8 @@ pub async fn fetch_governance_page(
     Ok(proposals)
 }
 
-fn provider_for_chain(
-    chain_id: u64,
-    effective_chain: &EffectiveChainConfig,
-    http: &HttpContext,
-) -> Result<(Arc<QueryRpcPool>, crate::ClassRoute)> {
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
-        .for_class(RpcTrafficClass::General)?;
-    Ok((query_rpc_pool_for_route(&chain_route, http), chain_route))
-}
-
 async fn fetch_contract_summaries(
-    chain_route: &crate::RpcChainRoute,
+    route: &ClassRoute,
     http: &HttpContext,
     targets: &[(GovernanceContractVersion, Address)],
 ) -> Result<Vec<GovernanceContractSummary>> {
@@ -1217,14 +1129,7 @@ async fn fetch_contract_summaries(
             .map(move |call| (voting_address, call.into()))
         })
         .collect();
-    let values = fetch_governance_multicall_raw(
-        chain_route,
-        RpcTrafficClass::General,
-        http,
-        calls,
-        "governance overview",
-    )
-    .await?;
+    let values = fetch_governance_multicall_raw(route, http, calls, "governance overview").await?;
     let mut summaries = Vec::with_capacity(targets.len());
     for (target_index, &(version, address)) in targets.iter().enumerate() {
         let fields = &values[target_index * 9..target_index * 9 + 9];
@@ -1266,7 +1171,7 @@ async fn fetch_contract_summaries(
 }
 
 async fn fetch_proposal_calls(
-    chain_route: &crate::RpcChainRoute,
+    route: &ClassRoute,
     http: &HttpContext,
     planned: &[(GovernanceContractVersion, Address, U256)],
 ) -> Result<Vec<GovernanceProposal>> {
@@ -1289,14 +1194,7 @@ async fn fetch_proposal_calls(
             ]
         })
         .collect();
-    let values = fetch_governance_multicall_raw(
-        chain_route,
-        RpcTrafficClass::General,
-        http,
-        calls,
-        "governance proposal",
-    )
-    .await?;
+    let values = fetch_governance_multicall_raw(route, http, calls, "governance proposal").await?;
     let mut proposals = Vec::with_capacity(planned.len());
     for (position, (version, address, index)) in planned.iter().enumerate() {
         let proposal_result = &values[position * 2];
@@ -1407,15 +1305,17 @@ mod tests {
 
     struct ParticipationFixture {
         url: String,
-        calls: mpsc::Receiver<ParticipationObservation>,
+        calls: mpsc::Receiver<Vec<(&'static str, Address)>>,
         shutdown: mpsc::Sender<()>,
         task: thread::JoinHandle<()>,
     }
 
-    struct ParticipationObservation {
-        aggregate_call_counts: Vec<usize>,
-        individual_request_count: usize,
-        later_high_level_chunks: usize,
+    sol! {
+        interface SnapshotReads {
+            function accountSnapshotLength(address owner) external view returns (uint256);
+            function accountSnapshot(address owner, uint256 index)
+                external view returns (uint256 interval, uint256 votingPower);
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -1693,7 +1593,8 @@ mod tests {
         let (calls_tx, calls_rx) = mpsc::channel();
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let task = thread::spawn(move || {
-            let serve = |mut stream: std::net::TcpStream, request_number: usize| {
+            let serve = |mut stream: std::net::TcpStream,
+                         observed: &mut Vec<(&'static str, Address)>| {
                 let request = read_request(&mut stream);
                 let call_data = request["params"][0]
                     .get("input")
@@ -1702,58 +1603,81 @@ mod tests {
                     .expect("eth_call data")
                     .parse::<alloy::primitives::Bytes>()
                     .expect("call bytes");
-                let Ok(decoded) = IMulticall3::tryAggregateCall::abi_decode(&call_data) else {
-                    let body = serde_json::to_string(&json!({
-                        "jsonrpc": "2.0", "id": request["id"],
-                        "error": {"code": -32099, "message": "individual recovery failure"}
-                    }))
-                    .expect("serialize individual recovery response");
-                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("write individual recovery response");
-                    return None;
-                };
-                let call_count = decoded.calls.len();
+                let decoded = IMulticall3::tryAggregateCall::abi_decode(&call_data)
+                    .expect("tryAggregate calldata");
                 let target = request["params"][0]["to"]
                     .as_str()
                     .expect("multicall target")
                     .parse::<Address>()
                     .expect("multicall address");
                 assert_eq!(target, MULTICALL);
-                let later_high_level_chunk = decoded.calls.iter().any(|call| {
-                    GovernanceStaking::votingPowerCall::abi_decode(&call.callData)
-                        .is_ok_and(|decoded| decoded.owner == Address::from([11_u8; 20]))
-                });
-                if request_number >= 2 {
-                    let body = serde_json::to_string(&json!({
-                        "jsonrpc": "2.0", "id": request["id"],
-                        "error": {"code": -32099, "message": "reduction failure"}
-                    }))
-                    .expect("serialize reduction response");
-                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("write reduction response");
-                    return Some((call_count, later_high_level_chunk));
-                }
-                let returned_results = if request_number == 1 { 54 } else { call_count };
-                let returns = if returned_results == call_count {
-                    (0..returned_results)
-                        .map(|_| IMulticall3::Result {
-                            success: true,
-                            returnData:
-                                <alloy::sol_types::sol_data::Uint<256> as alloy::sol_types::SolType>::abi_encode(
-                                    &U256::ZERO,
-                                )
-                                .into(),
-                        })
-                        .collect()
-                } else {
-                    let templates = encoded_participation_values();
-                    (0..returned_results)
-                        .map(|index| IMulticall3::Result {
-                            success: true,
-                            returnData: templates[index % templates.len()]
-                                .clone()
-                                .expect("participation template"),
-                        })
-                        .collect()
+                let uint = |value: u64| -> Bytes {
+                    <alloy::sol_types::sol_data::Uint<256> as alloy::sol_types::SolType>::abi_encode(
+                        &U256::from(value),
+                    )
+                    .into()
                 };
+                let returns = decoded
+                    .calls
+                    .iter()
+                    .map(|call| {
+                        let data = &call.callData;
+                        let (name, account, return_data) = if let Ok(call) =
+                            SnapshotReads::accountSnapshotLengthCall::abi_decode(data)
+                        {
+                            ("accountSnapshotLength", call.owner, uint(2))
+                        } else if let Ok(call) =
+                            SnapshotReads::accountSnapshotCall::abi_decode(data)
+                        {
+                            let interval = U256::from(4) * (call.index + U256::ONE);
+                            let snapshot = SnapshotReads::accountSnapshotCall::abi_encode_returns(
+                                &SnapshotReads::accountSnapshotReturn {
+                                    interval,
+                                    votingPower: U256::ONE,
+                                },
+                            );
+                            ("accountSnapshot", call.owner, snapshot.into())
+                        } else if let Ok(call) =
+                            GovernanceStaking::votingPowerCall::abi_decode(data)
+                        {
+                            ("votingPower", call.owner, uint(40))
+                        } else if let Ok(call) =
+                            GovernanceStaking::accountSnapshotAtCall::abi_decode(data)
+                        {
+                            let snapshot =
+                                GovernanceStaking::accountSnapshotAtCall::abi_encode_returns(
+                                    &GovernanceStaking::accountSnapshotAtReturn {
+                                        interval: call.index,
+                                        votingPower: U256::from(15),
+                                    },
+                                );
+                            ("accountSnapshotAt", call.owner, snapshot.into())
+                        } else if let Ok(call) =
+                            GovernanceVoting::getSponsoredCall::abi_decode(data)
+                        {
+                            ("getSponsored", call.account, uint(3))
+                        } else if let Ok(call) = GovernanceVoting::getVotesCall::abi_decode(data) {
+                            ("getVotes", call.account, uint(5))
+                        } else if let Ok(call) =
+                            GovernanceVoting::lastSponsoredCall::abi_decode(data)
+                        {
+                            let last = GovernanceVoting::lastSponsoredCall::abi_encode_returns(
+                                &GovernanceVoting::lastSponsoredReturn {
+                                    lastSponsorTime: U256::from(10),
+                                    proposalID: U256::from(6),
+                                },
+                            );
+                            ("lastSponsored", call.account, last.into())
+                        } else {
+                            panic!("unexpected participation call");
+                        };
+                        observed.push((name, account));
+                        IMulticall3::Result {
+                            success: true,
+                            returnData: return_data,
+                        }
+                    })
+                    .collect::<Vec<_>>();
                 let response_data = IMulticall3::tryAggregateCall::abi_encode_returns(&returns);
                 let body = json!({
                     "jsonrpc": "2.0",
@@ -1767,35 +1691,20 @@ mod tests {
                     body.len()
                 )
                 .expect("write fixture response");
-                Some((call_count, later_high_level_chunk))
             };
 
             listener
                 .set_nonblocking(true)
                 .expect("set fixture listener nonblocking");
-            let mut aggregate_call_counts = Vec::new();
-            let mut individual_request_count = 0;
-            let mut later_high_level_chunks = 0;
-            let mut request_number = 0;
+            let mut observed = Vec::new();
             loop {
                 if shutdown_rx.try_recv().is_ok() {
                     break;
                 }
                 match listener.accept() {
-                    Ok((stream, _)) => {
-                        if let Some((count, later_high_level_chunk)) = serve(stream, request_number)
-                        {
-                            request_number += 1;
-                            aggregate_call_counts.push(count);
-                            if later_high_level_chunk {
-                                later_high_level_chunks += 1;
-                            }
-                        } else {
-                            individual_request_count += 1;
-                        }
-                    }
+                    Ok((stream, _)) => serve(stream, &mut observed),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        match shutdown_rx.recv_timeout(Duration::from_millis(10)) {
+                        match shutdown_rx.recv_timeout(std::time::Duration::from_millis(10)) {
                             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                             Err(mpsc::RecvTimeoutError::Timeout) => {}
                         }
@@ -1803,13 +1712,7 @@ mod tests {
                     Err(error) => panic!("accept fixture request: {error}"),
                 }
             }
-            calls_tx
-                .send(ParticipationObservation {
-                    aggregate_call_counts,
-                    individual_request_count,
-                    later_high_level_chunks,
-                })
-                .expect("send fixture calls");
+            calls_tx.send(observed).expect("send fixture calls");
         });
         ParticipationFixture {
             url,
@@ -1828,15 +1731,13 @@ mod tests {
             false,
             ActionFault::None,
         );
-        let settings = crate::settings::WalletSettings::default();
-        let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
-            .expect("effective chain configs");
-        let effective_chain = effective_chains.get_mut(1).expect("Ethereum config");
-        effective_chain.rpc_route =
-            RpcChainRoute::new(1, vec![Url::parse(&url).unwrap()]).with_multicall(MULTICALL);
+        let route = RpcChainRoute::new(1, vec![Url::parse(&url).unwrap()])
+            .with_multicall(MULTICALL)
+            .for_class(crate::RpcTrafficClass::General)
+            .unwrap();
         let http = HttpContext::direct_for_tests();
 
-        let overview = fetch_governance_overview(1, effective_chain, &http)
+        let overview = fetch_governance_overview(1, &route, &http)
             .await
             .expect("overview request")
             .expect("Ethereum governance");
@@ -1850,7 +1751,7 @@ mod tests {
             &overview,
             0,
             NonZeroUsize::new(3).expect("nonzero page size"),
-            effective_chain,
+            &route,
             &http,
         )
         .await
@@ -1908,15 +1809,13 @@ mod tests {
             true,
             ActionFault::None,
         );
-        let settings = crate::settings::WalletSettings::default();
-        let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
-            .expect("effective chain configs");
-        let effective_chain = effective_chains.get_mut(1).expect("Ethereum config");
-        effective_chain.rpc_route =
-            RpcChainRoute::new(1, vec![Url::parse(&url).unwrap()]).with_multicall(MULTICALL);
+        let route = RpcChainRoute::new(1, vec![Url::parse(&url).unwrap()])
+            .with_multicall(MULTICALL)
+            .for_class(crate::RpcTrafficClass::General)
+            .unwrap();
         let http = HttpContext::direct_for_tests();
 
-        let overview = fetch_governance_overview(1, effective_chain, &http)
+        let overview = fetch_governance_overview(1, &route, &http)
             .await
             .expect("overview request")
             .expect("Ethereum governance");
@@ -1924,7 +1823,7 @@ mod tests {
             &overview,
             0,
             NonZeroUsize::new(3).expect("nonzero page size"),
-            effective_chain,
+            &route,
             &http,
         )
         .await
@@ -1949,14 +1848,12 @@ mod tests {
             false,
             action_fault,
         );
-        let settings = crate::settings::WalletSettings::default();
-        let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
-            .expect("effective chain configs");
-        let effective_chain = effective_chains.get_mut(1).expect("Ethereum config");
-        effective_chain.rpc_route =
-            RpcChainRoute::new(1, vec![Url::parse(&url).unwrap()]).with_multicall(MULTICALL);
+        let route = RpcChainRoute::new(1, vec![Url::parse(&url).unwrap()])
+            .with_multicall(MULTICALL)
+            .for_class(crate::RpcTrafficClass::General)
+            .unwrap();
         let http = HttpContext::direct_for_tests();
-        let overview = fetch_governance_overview(1, effective_chain, &http)
+        let overview = fetch_governance_overview(1, &route, &http)
             .await
             .expect("overview request")
             .expect("Ethereum governance");
@@ -1964,7 +1861,7 @@ mod tests {
             &overview,
             0,
             NonZeroUsize::new(3).expect("nonzero page size"),
-            effective_chain,
+            &route,
             &http,
         )
         .await
@@ -2245,40 +2142,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn participation_rejects_short_first_batch_before_fetching_next_batch() {
+    async fn participation_reads_carry_only_the_requested_account() {
         let fixture = spawn_governance_participation_fixture();
-        let settings = crate::settings::WalletSettings::default();
-        let mut effective_chains = crate::settings::build_effective_chain_configs(&settings)
-            .expect("effective chain configs");
-        let effective_chain = effective_chains.get_mut(1).expect("Ethereum config");
-        effective_chain.rpc_route = RpcChainRoute::new(1, vec![Url::parse(&fixture.url).unwrap()])
-            .with_multicall(MULTICALL);
-        let accounts: Vec<_> = (1_u8..=11)
-            .map(|marker| Address::from([marker; 20]))
-            .collect();
+        let route = RpcChainRoute::new(1, vec![Url::parse(&fixture.url).unwrap()])
+            .with_multicall(MULTICALL)
+            .for_class(crate::RpcTrafficClass::Sensitive)
+            .unwrap();
+        let account = Address::from([3_u8; 20]);
         let http = HttpContext::direct_for_tests();
-        let error = fetch_governance_participation(
+        let row = fetch_governance_participation(
             1,
             &participation_proposal(GovernanceContractVersion::V2),
-            &accounts,
-            effective_chain,
+            account,
+            &route,
             &http,
         )
         .await
-        .expect_err("short participation batch should be rejected");
-        let error = error.to_string();
-        assert!(error.contains("governance participation multicall failed"));
-        assert!(error.contains(&RpcBrokerError::InvalidResponse.to_string()));
+        .expect("participation row");
+        assert_eq!(row.account, account);
+        assert!(row.state.is_ok());
 
         fixture.shutdown.send(()).expect("stop fixture");
-        let ParticipationObservation {
-            aggregate_call_counts,
-            individual_request_count,
-            later_high_level_chunks,
-        } = fixture.calls.recv().expect("fixture calls");
-        assert_eq!(aggregate_call_counts, [11, 60]);
-        assert_eq!(individual_request_count, 0);
-        assert_eq!(later_high_level_chunks, 0);
+        let observed = fixture.calls.recv().expect("fixture calls");
+        assert_eq!(
+            observed,
+            [
+                "accountSnapshotLength",
+                "accountSnapshot",
+                "accountSnapshot",
+                "votingPower",
+                "accountSnapshotAt",
+                "accountSnapshotAt",
+                "getSponsored",
+                "getVotes",
+                "lastSponsored",
+            ]
+            .map(|name| (name, account))
+        );
         fixture.task.join().expect("fixture task");
     }
 

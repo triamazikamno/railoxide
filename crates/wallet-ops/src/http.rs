@@ -929,14 +929,19 @@ impl HttpContext {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_rpc_client_for_tests(
-        rpc_client: reqwest::Client,
-        mode: WalletNetworkMode,
-    ) -> Self {
+    /// # Panics
+    ///
+    /// Panics without an active Tokio runtime.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_rpc_client_for_tests(rpc_client: reqwest::Client, mode: WalletNetworkMode) -> Self {
+        #[cfg(test)]
         let broker =
-            RpcBroker::spawn_with_candidate_order(rpc_client.clone(), rpc_client.clone(), |_| {})
-                .expect("HttpContext test constructor requires an active Tokio runtime");
+            RpcBroker::spawn_with_candidate_order(rpc_client.clone(), rpc_client.clone(), |_| {});
+        // The fixed-order constructor is crate-test-only; downstream tests use the default order.
+        #[cfg(not(test))]
+        let broker = RpcBroker::spawn(rpc_client.clone(), rpc_client.clone());
+        let broker = broker.expect("HttpContext test constructor requires an active Tokio runtime");
         Self {
             client: reqwest::Client::new(),
             direct_rpc_client: rpc_client.clone(),
@@ -997,11 +1002,9 @@ impl OperationHttpClient {
         self.bridge.as_ref().map(|bridge| bridge.local_addr())
     }
 
-    #[cfg(test)]
-    pub(crate) const fn for_tests(
-        client: reqwest::Client,
-        isolation: OperationNetworkIsolation,
-    ) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub const fn for_tests(client: reqwest::Client, isolation: OperationNetworkIsolation) -> Self {
         Self {
             client,
             isolation,

@@ -557,7 +557,7 @@ pub fn network_status_popover_content(
                     .line_height(gpui::relative(APP_TEXT_LINE_HEIGHT))
                     .text_color(rgb(theme::TEXT_MUTED))
                     .child(format!(
-                        "Public balance reads are not isolated in {}.",
+                        "Public balance and governance reads are not isolated in {}.",
                         health.kind.label().to_lowercase()
                     )),
             )

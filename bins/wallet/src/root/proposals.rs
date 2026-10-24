@@ -38,14 +38,16 @@ use ui::controls::{
 use ui::format::format_compact_duration;
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
-    GovernanceContractRules, GovernanceDocument, GovernanceOverview, GovernanceProposal,
-    GovernanceProposalStage, GovernanceProposalStatus, HttpContext, TokenAnchorRateCache,
-    derive_governance_proposal_status, fetch_governance_chain_time, fetch_governance_overview,
-    fetch_governance_page, resolve_governance_document,
+    ClassRoute, GovernanceContractRules, GovernanceDocument, GovernanceOverview,
+    GovernanceProposal, GovernanceProposalStage, GovernanceProposalStatus, HttpContext,
+    RpcTrafficClass, TokenAnchorRateCache, derive_governance_proposal_status,
+    fetch_governance_chain_time, fetch_governance_overview, fetch_governance_page,
+    resolve_governance_document,
     settings::{EffectiveChainConfig, load_wallet_settings},
     vault::{DesktopVaultStore, PublicAccountMetadata, PublicAddressBookEntry},
 };
 
+use super::governance::governance_route;
 use super::governance_action::{
     ProposalActionKind, ProposalParticipationRow, proposal_participation_key,
     validate_proposal_action,
@@ -996,7 +998,7 @@ impl ProposalsState {
     }
 }
 
-struct InitialLoad {
+pub(super) struct InitialLoad {
     overview: Option<GovernanceOverview>,
     chain_time_anchor: Option<ChainTimeAnchor>,
     total_pages: usize,
@@ -1181,7 +1183,11 @@ impl WalletRoot {
         };
         let (result_tx, result_rx) = oneshot::channel();
         let join = self.runtime.spawn(async move {
-            let result = load_initial(chain_id, requested_page, &effective_chain, &http).await;
+            let result =
+                match governance_route(chain_id, &effective_chain, RpcTrafficClass::General) {
+                    Ok(route) => load_initial(chain_id, requested_page, &route, &http).await,
+                    Err(error) => Err(eyre::eyre!(error)),
+                };
             let _ = result_tx.send(result);
         });
         self.proposals.task_tracker.track(join);
@@ -1385,7 +1391,11 @@ impl WalletRoot {
         tracing::debug!(chain_id, page, prefetch, "loading governance proposal page");
         let (result_tx, result_rx) = oneshot::channel();
         let join = self.runtime.spawn(async move {
-            let result = load_page(&overview, page, &effective_chain, &http).await;
+            let result =
+                match governance_route(chain_id, &effective_chain, RpcTrafficClass::General) {
+                    Ok(route) => load_page(&overview, page, &route, &http).await,
+                    Err(error) => Err(eyre::eyre!(error)),
+                };
             let _ = result_tx.send(result);
         });
         if prefetch {
@@ -2129,13 +2139,13 @@ fn proposal_copy_control(
         )
 }
 
-async fn load_initial(
+pub(super) async fn load_initial(
     chain_id: u64,
     requested_page: usize,
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
 ) -> eyre::Result<InitialLoad> {
-    let overview = fetch_governance_overview(chain_id, effective_chain, http).await?;
+    let overview = fetch_governance_overview(chain_id, route, http).await?;
     let Some(overview) = overview else {
         return Ok(InitialLoad {
             overview: None,
@@ -2145,7 +2155,7 @@ async fn load_initial(
             rows: Vec::new(),
         });
     };
-    let chain_time = fetch_governance_chain_time(overview.chain_id, effective_chain, http).await?;
+    let chain_time = fetch_governance_chain_time(route, http).await?;
     let chain_time_anchor = ChainTimeAnchor {
         chain_time,
         captured_at: Instant::now(),
@@ -2160,7 +2170,7 @@ async fn load_initial(
     let rows = if total == 0 {
         Vec::new()
     } else {
-        load_page(&overview, page, effective_chain, http).await?
+        load_page(&overview, page, route, http).await?
     };
     Ok(InitialLoad {
         overview: Some(overview),
@@ -2173,11 +2183,11 @@ async fn load_initial(
 async fn load_page(
     overview: &GovernanceOverview,
     page: usize,
-    effective_chain: &EffectiveChainConfig,
+    route: &ClassRoute,
     http: &HttpContext,
 ) -> eyre::Result<Vec<ResolvedProposal>> {
     let size = std::num::NonZeroUsize::new(PROPOSALS_PAGE_SIZE).expect("non-zero page size");
-    let proposals = fetch_governance_page(overview, page, size, effective_chain, http).await?;
+    let proposals = fetch_governance_page(overview, page, size, route, http).await?;
     let mut rows = Vec::with_capacity(proposals.len());
     for proposal in proposals {
         let rules = rules_for(overview, proposal.contract_version)?;

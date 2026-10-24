@@ -273,13 +273,12 @@ pub use rpc_broker::{
 pub use sponsored_bundle::*;
 pub use sponsorship::*;
 pub use staking::{
-    AccountSnapshot, AccountSnapshotsResult, AccountStakeResult, DEFAULT_MULTICALL_CHUNK_SIZE,
-    DeploymentValidationError, MulticallChunkSize, StakePosition, StakeState,
-    StakingDeploymentValidationError, StakingGlobalMetrics, chunk_indices, classify_stake_state,
-    decode_stake_position, fetch_account_snapshots, fetch_account_snapshots_multi,
-    fetch_account_stakes, fetch_governance_token_balance_allowance, fetch_staking_global_metrics,
-    reward_staking_interval, snapshot_hint, validate_deployment, validate_deployment_relationships,
-    validate_governance_deployment,
+    AccountSnapshot, AccountStakeResult, DEFAULT_MULTICALL_CHUNK_SIZE, DeploymentValidationError,
+    MulticallChunkSize, StakePosition, StakeState, StakingDeploymentValidationError,
+    StakingGlobalMetrics, chunk_indices, classify_stake_state, decode_stake_position,
+    fetch_account_snapshots, fetch_account_stakes, fetch_governance_token_balance_allowance,
+    fetch_staking_global_metrics, reward_staking_interval, snapshot_hint, validate_deployment,
+    validate_deployment_relationships, validate_governance_deployment,
 };
 pub use utxos::{
     ActivityUtxoClassification, BlockedShieldRescueInfo, ListUtxosOutput, TokenTotal, UtxoOutput,

@@ -19,6 +19,12 @@ use super::{WalletRoot, format_report_chain, token_display_metadata};
 
 use crate::assets::WalletIconSource;
 
+/// A random 0.5-3 s wait before the next account's isolated reads, so successive accounts'
+/// reads aren't timed together.
+pub(super) fn isolated_read_jitter() -> Duration {
+    Duration::from_millis(rand::rng().random_range(500..=3_000))
+}
+
 pub(super) fn public_asset_label(
     chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
     asset: PublicAssetId,
@@ -596,7 +602,7 @@ impl WalletRoot {
         window: Option<gpui::AnyWindowHandle>,
         cx: &Context<'_, Self>,
     ) {
-        let delay = Duration::from_millis(rand::rng().random_range(500..=3_000));
+        let delay = isolated_read_jitter();
         let cache = self.public_balance_cache.clone();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
