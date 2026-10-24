@@ -494,7 +494,12 @@ async fn private_delivery_allowance(
             (0, U256::ZERO)
         } else {
             let chain = effective_desktop_chain_config(chain_id, destination_chain)?;
-            let fee_candidates = acquire_fee_candidates(http, &chain.rpc_route, None).await?;
+            let fee_candidates = acquire_fee_candidates(
+                http,
+                &chain.rpc_route.for_class(crate::RpcTrafficClass::General)?,
+                None,
+            )
+            .await?;
             // The data cost counts two hex characters per byte, as in app data.
             let message_len = placeholder_private_delivery_message_len(delivery)?;
             let (gas_price_wei, data_cost_wei) = tokio::try_join!(

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use alloy::network::TransactionBuilder as _;
 use alloy::primitives::{Address, U256};
 use alloy::rpc::types::TransactionRequest;
@@ -19,9 +17,9 @@ use super::signer::{
     VaultedPublicSigner, admitted_gas_payer_signer, admitted_public_signer_authorized,
 };
 use super::submission::{
-    PublicActionHandoff, PublicActionStepEnd, PublicShieldFundingBudget, emit_public_action_event,
-    emit_refreshed_public_action_hardware_session, public_action_progress_update,
-    recv_public_action_command, submit_public_action_step_session,
+    PublicActionHandoff, PublicActionPools, PublicActionStepEnd, PublicShieldFundingBudget,
+    emit_public_action_event, emit_refreshed_public_action_hardware_session, public_action_pools,
+    public_action_progress_update, recv_public_action_command, submit_public_action_step_session,
 };
 use super::types::{
     PublicActionCommandReceiver, PublicActionGasFeeMode, PublicActionGasFeeSelection,
@@ -34,10 +32,7 @@ use super::types::{
 use crate::block_observer::resolve_source_transaction_by_block;
 use crate::settings::EffectiveChainConfig;
 use crate::vault::DesktopViewSession;
-use crate::{
-    HttpContext, RpcChainRoute, RpcRoute, ShieldSendOutput, WalletRpcOrigin,
-    query_rpc_pool_for_route, report_chain_string,
-};
+use crate::{HttpContext, RpcRoute, ShieldSendOutput, WalletRpcOrigin, report_chain_string};
 
 pub async fn submit_public_send(
     request: PublicSendRequest,
@@ -120,7 +115,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
         dynamic_gas_preflight,
         gas_fee,
     )?;
-    let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
+    let pools = public_action_pools(&chain.rpc_route, http)?;
     let tx_req = public_send_transaction_request(chain_id, from_address, intent)?;
     let tx = submit_public_action_step_session(
         step,
@@ -130,8 +125,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
         PublicShieldTransactionProfile::Railoxide.gas_limit_strategy(),
         signer,
         operation_label,
-        query_rpc_pool,
-        &chain.rpc_route,
+        &pools,
         chain.finality_depth,
         http,
         transaction_tracking,
@@ -264,6 +258,7 @@ pub async fn submit_public_shield_with_progress(
         None,
     )
     .await?;
+    let pools = public_action_pools(&chain.rpc_route, http)?;
     let token = public_shield_token(request.asset, &chain)?;
     let addr_data = public_shield_recipient(&request.view_session)?;
     let signer = if native_prepared
@@ -299,6 +294,7 @@ pub async fn submit_public_shield_with_progress(
             &preparation,
             signer,
             &chain,
+            &pools,
             &addr_data,
             http,
             &mut progress,
@@ -377,7 +373,6 @@ pub async fn submit_public_shield_with_progress(
             .wrap_err("build public shield calldata")?;
 
             let from_address = signer.address();
-            let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
 
             let (wrap_gas_units, approval_gas_units, shield_gas_units) =
                 super::gas::public_shield_estimated_gas_units(
@@ -403,8 +398,7 @@ pub async fn submit_public_shield_with_progress(
                     request.profile.gas_limit_strategy(),
                     &signer,
                     "public-shield-wrap",
-                    query_rpc_pool.clone(),
-                    &chain.rpc_route,
+                    &pools,
                     chain.finality_depth,
                     http,
                     request.transaction_tracking.as_ref(),
@@ -457,7 +451,7 @@ pub async fn submit_public_shield_with_progress(
                         None,
                     ));
                     match query_erc20_allowance(
-                        &chain.rpc_route,
+                        &pools.route,
                         http,
                         shield_asset,
                         from_address,
@@ -538,8 +532,7 @@ pub async fn submit_public_shield_with_progress(
                     request.profile.gas_limit_strategy(),
                     &signer,
                     "public-shield-approve",
-                    query_rpc_pool.clone(),
-                    &chain.rpc_route,
+                    &pools,
                     chain.finality_depth,
                     http,
                     request.transaction_tracking.as_ref(),
@@ -606,8 +599,7 @@ pub async fn submit_public_shield_with_progress(
                 request.profile.gas_limit_strategy(),
                 &signer,
                 "public-shield",
-                query_rpc_pool,
-                &chain.rpc_route,
+                &pools,
                 chain.finality_depth,
                 http,
                 request.transaction_tracking.as_ref(),
@@ -656,6 +648,7 @@ async fn submit_stealth_native_shield(
     preparation: &NativeShieldPreparation,
     signer: VaultedPublicSigner,
     chain: &PublicChainRuntimeConfig,
+    pools: &PublicActionPools,
     recipient: &broadcaster_core::crypto::railgun::AddressData,
     http: &HttpContext,
     progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
@@ -753,7 +746,6 @@ async fn submit_stealth_native_shield(
     } else {
         PublicActionStepFeePolicy::Custom
     };
-    let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
     let receipt = signer
         .while_active(async {
             Ok(submit_public_action_step_session(
@@ -767,8 +759,7 @@ async fn submit_stealth_native_shield(
                 },
                 &signer,
                 "public-shield",
-                Arc::clone(&query_rpc_pool),
-                &chain.rpc_route,
+                pools,
                 chain.finality_depth,
                 http,
                 request.transaction_tracking.as_ref(),
@@ -812,8 +803,7 @@ async fn submit_stealth_native_shield(
             .parse()
             .wrap_err("read the native shield receipt")?;
         let source =
-            resolve_source_transaction_by_block(&query_rpc_pool, receipt.block_number, hash)
-                .await?;
+            resolve_source_transaction_by_block(&pools.observe, receipt.block_number, hash).await?;
         Ok::<_, eyre::Report>(source.logs)
     }
     .await;
@@ -889,7 +879,7 @@ pub(super) fn public_shield_approval_required(
 }
 
 pub(crate) async fn query_erc20_allowance(
-    chain_route: &RpcChainRoute,
+    chain_route: &crate::ClassRoute,
     http: &HttpContext,
     asset: PublicAssetId,
     owner: Address,
@@ -924,7 +914,7 @@ pub(crate) async fn query_erc20_allowance(
 /// `owner`'s balance of the ERC-20 `token`, read as [`query_erc20_allowance`] reads an
 /// allowance.
 pub(crate) async fn query_erc20_balance(
-    chain_route: &RpcChainRoute,
+    chain_route: &crate::ClassRoute,
     http: &HttpContext,
     token: Address,
     owner: Address,

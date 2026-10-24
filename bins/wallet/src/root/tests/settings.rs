@@ -348,7 +348,7 @@ fn settings_apply_classifier_tracks_restart_and_request_changes() {
             .operationally_matches(new_chain.get(1).unwrap())
     );
     pricing.chains.per_chain.get_mut(&1).unwrap().rpc_endpoints =
-        vec!["https://rpc.example".into()];
+        vec!["https://rpc.example".to_owned().into()];
     assert_eq!(
         classify_settings_apply_mode(&saved, &pricing),
         SettingsApplyMode::NetworkingRestart
@@ -1260,7 +1260,7 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
         AppContext as _, IntoElement, ParentElement as _, Render, Styled as _, VisualTestContext,
         div,
     };
-    use railgun_ui::chain_editor::{ChainDraft, ChainEditorCommand, ChainField};
+    use railgun_ui::chain_editor::{ChainDraft, ChainEditorCommand, ChainField, RpcEndpointDraft};
     use std::{cell::RefCell, rc::Rc};
 
     /// Mounts the shared editor under `Root`, which hosts its confirmation dialogs.
@@ -1352,14 +1352,14 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
         wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap(),
         saved
     );
-    // A new direct endpoint waits for confirmation, and declining saves nothing.
-    click(cx, "chain-add-direct-endpoint");
-    cx.simulate_input("https://direct.example");
+    // A newly direct endpoint waits for confirmation, and declining saves nothing.
+    click(cx, "chain-endpoint-0-direct");
     click(cx, "chain-save");
     assert!(
         cx.debug_bounds("chain-direct-confirm").is_some(),
         "a newly direct endpoint asks for confirmation before saving"
     );
+    assert!(cx.debug_bounds("chain-submit-direct-confirm").is_none());
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -1368,9 +1368,40 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
         wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap(),
         saved
     );
+    click(cx, "chain-save");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    saved = wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap();
+    let endpoints = &saved.chains.per_chain[&1].rpc_endpoints;
+    assert!(
+        endpoints[0].direct && !endpoints[0].submit,
+        "turning Direct on clears Submit"
+    );
+    assert!(
+        endpoints[1..]
+            .iter()
+            .all(|endpoint| !endpoint.direct && endpoint.submit)
+    );
+    // Turning Submit back on for that Direct endpoint waits for its own confirmation.
+    click(cx, "edit-chain-1");
+    click(cx, "chain-endpoint-0-submit");
+    click(cx, "chain-save");
+    assert!(
+        cx.debug_bounds("chain-submit-direct-confirm").is_some(),
+        "submitting through a direct endpoint asks for confirmation before saving"
+    );
+    assert!(cx.debug_bounds("chain-direct-confirm").is_none());
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap(),
+        saved
+    );
     // Reopen the confirmation so the host commit below lands while it is open.
     click(cx, "chain-save");
-    assert!(cx.debug_bounds("chain-direct-confirm").is_some());
+    assert!(cx.debug_bounds("chain-submit-direct-confirm").is_some());
 
     // Pricing can be saved without a network runtime and still preserves draft/revision isolation.
     cx.update(|window, cx| {
@@ -1404,14 +1435,14 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(cx.debug_bounds("chain-direct-confirm").is_none());
+    assert!(cx.debug_bounds("chain-submit-direct-confirm").is_none());
     assert_eq!(
         wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap(),
         concurrent
     );
     // The draft stays open and stale, so Save is disabled rather than reopening the dialog.
     click(cx, "chain-save");
-    assert!(cx.debug_bounds("chain-direct-confirm").is_none());
+    assert!(cx.debug_bounds("chain-submit-direct-confirm").is_none());
     // A Test validates the draft like Save but persists nothing and publishes no status.
     cx.update(|_, cx| {
         owner.update(cx, |editor, cx| {
@@ -1451,13 +1482,12 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
                 (ChainField::NativeName, "Custom coin"),
                 (ChainField::NativeSymbol, "CSTM"),
                 (ChainField::NativeDecimals, "6"),
-                (
-                    ChainField::RpcEndpoints,
-                    "https://synthetic:credential@rpc.example",
-                ),
             ] {
                 draft.fields.insert(field, value.into());
             }
+            draft.rpc_endpoints = vec![RpcEndpointDraft::new(
+                "https://synthetic:credential@rpc.example".into(),
+            )];
             editor
                 .handle_chain_editor_command(
                     &revision,
@@ -1523,7 +1553,7 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
             .custom
             .contains_key(&9_007_199_254_740_993)
     );
-    // Leaving the reset draft returns the shared list, which already carries that addition.
+    // Leaving the stale draft returns the shared list, which already carries that addition.
     click(cx, "chain-discard");
     assert!(
         cx.debug_bounds("edit-chain-9007199254740993").is_some(),

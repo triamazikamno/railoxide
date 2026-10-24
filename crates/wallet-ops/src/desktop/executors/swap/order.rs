@@ -1932,7 +1932,12 @@ impl ExecutorOwner {
         let sell_amount = order_sell_amount(plan.amount(), unshield_fee_bps)?;
         let chain = effective_desktop_chain_config(self.chain.chain_id, &self.chain)?;
         // The gas price and data cost reads share this quote's candidates.
-        let fee_candidates = acquire_fee_candidates(&self.http, &chain.rpc_route, None).await?;
+        let fee_candidates = acquire_fee_candidates(
+            &self.http,
+            &chain.rpc_route.for_class(crate::RpcTrafficClass::General)?,
+            None,
+        )
+        .await?;
         // Before setup the quote names the reserved executor or, for a preview, a stand-in
         // with no code, just as a fresh executor has none.
         let quote = async {

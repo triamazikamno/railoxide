@@ -22,7 +22,7 @@ use super::types::{
 use crate::block_observer::BlockObserver;
 use crate::settings::EffectiveChainGasSettings;
 use crate::{
-    HttpContext, RpcChainRoute, SelfBroadcastResolvedGasFee, TxReceiptOutput, report_chain_string,
+    ClassRoute, HttpContext, SelfBroadcastResolvedGasFee, TxReceiptOutput, report_chain_string,
     self_broadcast_replacement_bumped_fee,
     self_broadcast_send_raw_transaction_to_rpc_pool_with_logging,
 };
@@ -148,9 +148,33 @@ impl PublicActionStepResult {
     }
 }
 
-/// Each preflight, including a replacement's, quotes fees from its own candidates on
-/// `rpc_route`, including its nonce, estimate and balance reads. Broadcast and observation
-/// continue using `query_rpc_pool`.
+/// The routes of a Public action. Callers resolve them before the transaction is signed, so a
+/// route without a Sensitive or Submit endpoint fails before that signature.
+pub(super) struct PublicActionPools {
+    /// The Sensitive route preflights and estimates read through.
+    pub(super) route: ClassRoute,
+    /// A pool over `route`, for preflight fallbacks and block observation.
+    pub(super) observe: Arc<QueryRpcPool>,
+    /// The Submit endpoints a signed transaction fans out to.
+    pub(super) submit: Arc<QueryRpcPool>,
+}
+
+pub(super) fn public_action_pools(
+    route: &crate::RpcChainRoute,
+    http: &HttpContext,
+) -> Result<PublicActionPools> {
+    let sensitive = route.for_class(crate::RpcTrafficClass::Sensitive)?;
+    let submit = route.for_class(crate::RpcTrafficClass::Submission)?;
+    Ok(PublicActionPools {
+        observe: crate::query_rpc_pool_for_route(&sensitive, http),
+        submit: crate::query_rpc_pool_for_route(&submit, http),
+        route: sensitive,
+    })
+}
+
+/// Each preflight, including a replacement's, quotes fees from its own candidates on the
+/// Sensitive route of `pools`, including its nonce, estimate and balance reads. Observation
+/// continues on that class and broadcast goes to the Submit pool.
 pub(super) async fn submit_public_action_step_session(
     step: PublicActionProgressStep,
     base_tx_req: TransactionRequest,
@@ -159,8 +183,7 @@ pub(super) async fn submit_public_action_step_session(
     gas_limit_strategy: PublicActionGasLimitStrategy,
     signer: &VaultedPublicSigner,
     label: &str,
-    query_rpc_pool: Arc<QueryRpcPool>,
-    rpc_route: &RpcChainRoute,
+    pools: &PublicActionPools,
     finality_depth: u64,
     http: &HttpContext,
     transaction_tracking: Option<&crate::PublicTransactionTrackingContext>,
@@ -179,6 +202,8 @@ pub(super) async fn submit_public_action_step_session(
     end: PublicActionStepEnd,
     progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
 ) -> Result<PublicActionStepResult> {
+    let (query_rpc_pool, submit_pool, rpc_route) =
+        (&pools.observe, pools.submit.as_ref(), &pools.route);
     let private_handoff = handoff.is_some();
     if end == PublicActionStepEnd::HandOff && !private_handoff {
         return Err(eyre!(
@@ -291,7 +316,7 @@ pub(super) async fn submit_public_action_step_session(
 
         if observer.is_none() {
             let established = BlockObserver::establish(
-                Arc::clone(&query_rpc_pool),
+                Arc::clone(query_rpc_pool),
                 finality_depth,
                 http.rpc_broker(),
                 chain_id,
@@ -313,7 +338,7 @@ pub(super) async fn submit_public_action_step_session(
         let result = submit_public_action_attempt(
             step,
             preflight,
-            query_rpc_pool.as_ref(),
+            submit_pool,
             http.network_mode(),
             signer,
             label,
@@ -462,7 +487,7 @@ pub(super) async fn submit_public_action_step_session(
                         match submit_public_action_attempt(
                             step,
                             replacement,
-                            query_rpc_pool.as_ref(),
+                            submit_pool,
                             http.network_mode(),
                             signer,
                             label,
@@ -729,7 +754,7 @@ impl PublicActionAttemptError {
 pub(super) async fn public_action_preflight_from_rpc_pool(
     query_rpc_pool: &QueryRpcPool,
     http: &HttpContext,
-    rpc_route: &RpcChainRoute,
+    rpc_route: &ClassRoute,
     chain_id: u64,
     from: Address,
     base_tx_req: TransactionRequest,
@@ -774,7 +799,7 @@ pub(super) async fn public_action_preflight_from_rpc_pool(
 pub(super) async fn public_action_preflight_from_rpc_pool_with_reads(
     query_rpc_pool: &QueryRpcPool,
     http: &HttpContext,
-    rpc_route: &RpcChainRoute,
+    rpc_route: &ClassRoute,
     chain_id: u64,
     from: Address,
     base_tx_req: TransactionRequest,
@@ -1484,7 +1509,8 @@ pub(super) const fn public_action_progress_update(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PublicTransactionLookup;
+    use crate::rpc_broker::tests::general;
+    use crate::{PublicTransactionLookup, RpcChainRoute, RpcTrafficClass};
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -1508,8 +1534,7 @@ mod tests {
                     symbol: "CSTM".into(),
                     decimals: 6,
                 },
-                rpc_endpoints: vec!["http://127.0.0.1:9".into()],
-                direct_rpc_endpoints: Vec::new(),
+                rpc_endpoints: vec!["http://127.0.0.1:9".to_owned().into()],
                 explorer_urls: vec![],
                 enabled: true,
                 contracts: crate::settings::ChainContractSettings::default(),
@@ -1527,7 +1552,11 @@ mod tests {
         assert_eq!(chain.native_currency.format_amount(amount), "1.25 CSTM");
         assert!(chain.railgun.is_none() && chain.wrapped_native_token.is_none());
         let http = HttpContext::direct_for_tests();
-        let pool = crate::query_rpc_pool_for_route(&chain.rpc_route, &http);
+        let route = chain
+            .rpc_route
+            .for_class(RpcTrafficClass::Sensitive)
+            .unwrap();
+        let pool = crate::query_rpc_pool_for_route(&route, &http);
         let signer = VaultedPublicSigner::Software(
             crate::signer::SoftwareEvmSigner::from_private_key([7; 32]).unwrap(),
         );
@@ -1563,7 +1592,7 @@ mod tests {
             let prepared = public_action_preflight_from_rpc_pool_with_reads(
                 &pool,
                 &http,
-                &chain.rpc_route,
+                &route,
                 CHAIN,
                 from,
                 TransactionRequest::default()
@@ -1650,8 +1679,10 @@ mod tests {
         )
         .await;
         let http = HttpContext::direct_for_tests();
-        let pool =
-            crate::query_rpc_pool_for_route(&RpcChainRoute::new(1, vec![endpoint.clone()]), &http);
+        let pool = crate::query_rpc_pool_for_route(
+            &general(&RpcChainRoute::new(1, vec![endpoint.clone()])),
+            &http,
+        );
         let mut observer = BlockObserver::establish(pool, 1, http.rpc_broker(), 1)
             .await
             .unwrap()
@@ -1663,7 +1694,7 @@ mod tests {
             (replacement, 20, None),
         ] {
             let pool = crate::query_rpc_pool_for_route(
-                &RpcChainRoute::new(1, vec![endpoint.clone()]),
+                &general(&RpcChainRoute::new(1, vec![endpoint.clone()])),
                 &http,
             );
             let result = broadcast_signed_public_action_transaction(
@@ -1776,9 +1807,10 @@ mod tests {
         (endpoint, server, methods)
     }
 
-    /// Runs a chain-1 native shield step session against `endpoint` with a software signer.
+    /// Runs a chain-1 native shield step session on `route`'s Public action pools with a
+    /// software signer.
     async fn shield_session(
-        endpoint: url::Url,
+        route: RpcChainRoute,
         gas_limit_strategy: PublicActionGasLimitStrategy,
         gas_fee: PublicActionGasFeeSelection,
         command_rx: &mut Option<PublicActionCommandReceiver>,
@@ -1786,14 +1818,14 @@ mod tests {
         handoff: &mut PublicActionHandoff<'_>,
     ) -> Result<PublicActionStepResult> {
         let http = HttpContext::direct_for_tests();
-        let mut chain = crate::settings::build_effective_chain_configs(
+        let chain = crate::settings::build_effective_chain_configs(
             &crate::settings::WalletSettings::default(),
         )
         .unwrap()
         .get(1)
         .cloned()
         .unwrap();
-        chain.rpc_route = RpcChainRoute::new(1, vec![endpoint.clone()]);
+        let pools = public_action_pools(&route, &http).expect("route has every class");
         let signer = VaultedPublicSigner::Software(
             crate::signer::SoftwareEvmSigner::from_private_key([7; 32]).unwrap(),
         );
@@ -1807,8 +1839,7 @@ mod tests {
             gas_limit_strategy,
             &signer,
             "public action session test",
-            crate::query_rpc_pool_for_route(&RpcChainRoute::new(1, vec![endpoint]), &http),
-            &chain.rpc_route,
+            &pools,
             1,
             &http,
             None,
@@ -1887,7 +1918,7 @@ mod tests {
         let mut events = Vec::new();
         let mut submitted = Vec::new();
         let session = Box::pin(shield_session(
-            endpoint,
+            RpcChainRoute::new(1, vec![endpoint]),
             PublicActionGasLimitStrategy::ChainBuffer,
             fee(100),
             &mut command_rx,
@@ -1978,7 +2009,7 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(30),
             Box::pin(shield_session(
-                endpoint,
+                RpcChainRoute::new(1, vec![endpoint]),
                 PublicActionGasLimitStrategy::NativeShieldPrepared {
                     reviewed_gas_limit: REVIEWED_GAS_LIMIT,
                     profile: PublicShieldTransactionProfile::Railoxide,
@@ -2007,5 +2038,90 @@ mod tests {
         assert!(!handed_off.load(std::sync::atomic::Ordering::SeqCst));
         drop(command_tx);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn public_action_reads_go_to_sensitive_endpoints_and_broadcast_to_submit_ones() {
+        let (general_only, general_server, general_methods) =
+            session_endpoint(21_000, |_| {}).await;
+        let (reader, reader_server, reader_methods) = session_endpoint(21_000, |_| {}).await;
+        let (submitter, submitter_server, submitter_methods) =
+            session_endpoint(21_000, |_| {}).await;
+        let roles = |general, sensitive, submit| crate::RpcEndpointRoles {
+            general,
+            sensitive,
+            submit,
+        };
+        let route = RpcChainRoute::new_with_transports(
+            1,
+            vec![
+                (
+                    general_only.into(),
+                    crate::RpcTransport::Wallet,
+                    roles(true, false, false),
+                ),
+                (
+                    reader.into(),
+                    crate::RpcTransport::Wallet,
+                    roles(false, true, false),
+                ),
+                (
+                    submitter.into(),
+                    crate::RpcTransport::Wallet,
+                    roles(false, false, true),
+                ),
+            ],
+        );
+        let mut command_rx = None;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handoff =
+            |_: FixedBytes<32>, _: &TransactionRequest, _: &[u8]| -> Result<()> { Ok(()) };
+        let session = Box::pin(shield_session(
+            route,
+            PublicActionGasLimitStrategy::ChainBuffer,
+            PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas: 100,
+                max_priority_fee_per_gas: 2,
+            },
+            &mut command_rx,
+            Some(&event_tx),
+            &mut handoff,
+        ));
+        let submitted = async {
+            while !matches!(
+                event_rx.recv().await.unwrap(),
+                PublicActionSessionEvent::AttemptSubmitted { .. }
+            ) {}
+        };
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                result = session => panic!("session ended early: {:?}", result.err()),
+                () = submitted => {}
+            }
+        })
+        .await
+        .expect("the attempt is submitted");
+
+        assert!(general_methods.lock().unwrap().is_empty());
+        let reader_methods = reader_methods.lock().unwrap().clone();
+        let read = |method: &str| reader_methods.iter().any(|read| read == method);
+        assert!(
+            ["eth_gasPrice", "eth_maxPriorityFeePerGas", "eth_feeHistory"]
+                .into_iter()
+                .any(read)
+        );
+        assert!(read("eth_getTransactionCount") && read("eth_estimateGas"));
+        assert!(
+            !reader_methods
+                .iter()
+                .any(|read| read == "eth_sendRawTransaction")
+        );
+        assert_eq!(
+            *submitter_methods.lock().unwrap(),
+            vec!["eth_sendRawTransaction".to_owned()]
+        );
+        general_server.abort();
+        reader_server.abort();
+        submitter_server.abort();
     }
 }

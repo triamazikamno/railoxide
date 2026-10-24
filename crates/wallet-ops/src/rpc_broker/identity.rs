@@ -11,7 +11,9 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 
-use super::{RpcBrokerError, RpcChainRoute, RpcClients, RpcTransport};
+use super::{
+    ClassRoute, RpcBrokerError, RpcChainRoute, RpcClients, RpcEndpointRoles, RpcTransport,
+};
 
 const IDENTITY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Upper bound on concurrent identity probes for one pool admission or candidate source.
@@ -267,12 +269,12 @@ impl RpcChainRoute {
         &self,
         clients: &RpcClients,
     ) -> Result<Self, RpcBrokerError> {
-        let checks = self.transport_endpoints().enumerate().map(
-            |(index, (endpoint, transport))| async move {
+        let checks = self.configured_settings().enumerate().map(
+            |(index, (endpoint, transport, roles))| async move {
                 self.verify_labeled_endpoint_identity(clients, endpoint, &index)
                     .await
                     .is_ok()
-                    .then(|| (endpoint.clone(), transport))
+                    .then(|| (endpoint.clone(), transport, roles))
             },
         );
         let endpoints = join_all(checks)
@@ -295,7 +297,7 @@ impl RpcChainRoute {
 
     /// A pool over this route's endpoints in configured order, each sending through its
     /// transport's client.
-    pub(crate) fn query_rpc_pool(&self, clients: &RpcClients, cooldown: Duration) -> QueryRpcPool {
+    pub(super) fn query_rpc_pool(&self, clients: &RpcClients, cooldown: Duration) -> QueryRpcPool {
         QueryRpcPool::with_http_clients(
             self.transport_endpoints()
                 .map(|(endpoint, transport)| {
@@ -314,7 +316,7 @@ impl RpcChainRoute {
     /// `archive` is set. The archive is checked over its own transport. Returns once any regular
     /// endpoint is admitted, or fails once every regular endpoint's first check failed; the
     /// archive never affects the result.
-    pub(crate) async fn admit_sync_pool(
+    pub(super) async fn admit_sync_pool(
         &self,
         clients: &RpcClients,
         pool: &Arc<QueryRpcPool>,
@@ -371,8 +373,11 @@ impl RpcChainRoute {
         report: oneshot::Sender<bool>,
     ) {
         let archive = archive.map(|(url, transport)| {
-            let route = Self::new_with_transports(self.chain_id(), vec![(url.clone(), transport)])
-                .with_identity_verification();
+            let route = Self::new_with_transports(
+                self.chain_id(),
+                vec![(url.clone(), transport, RpcEndpointRoles::default())],
+            )
+            .with_identity_verification();
             (route, url)
         });
         let regular_count = self.endpoints().len();
@@ -462,6 +467,26 @@ impl RpcChainRoute {
                 queued.push(probe.retry(backoff));
             }
         }
+    }
+}
+
+impl ClassRoute {
+    /// A pool over this class's endpoints in configured order, each sending through its
+    /// transport's client.
+    pub(crate) fn query_rpc_pool(&self, clients: &RpcClients, cooldown: Duration) -> QueryRpcPool {
+        self.route().query_rpc_pool(clients, cooldown)
+    }
+
+    /// Admits the slots of a pool built by [`Self::query_rpc_pool`] as this class's endpoints
+    /// pass their identity checks, reading and filling the full route's shared identity cache.
+    /// See [`RpcChainRoute::admit_sync_pool`].
+    pub(crate) async fn admit_sync_pool(
+        &self,
+        clients: &RpcClients,
+        pool: &Arc<QueryRpcPool>,
+        archive: Option<(SensitiveUrl, RpcTransport)>,
+    ) -> Result<(), RpcBrokerError> {
+        self.route().admit_sync_pool(clients, pool, archive).await
     }
 }
 
@@ -858,8 +883,19 @@ mod tests {
         let route = RpcChainRoute::new_with_transports(
             CHAIN_ID,
             vec![
-                (wallet.clone().into(), RpcTransport::Wallet),
-                (direct.clone().into(), RpcTransport::Direct),
+                (
+                    wallet.clone().into(),
+                    RpcTransport::Wallet,
+                    RpcEndpointRoles::default(),
+                ),
+                (
+                    direct.clone().into(),
+                    RpcTransport::Direct,
+                    RpcEndpointRoles {
+                        general: false,
+                        ..RpcEndpointRoles::default()
+                    },
+                ),
             ],
         )
         .with_identity_verification();
@@ -870,6 +906,14 @@ mod tests {
             .expect("both endpoints verify");
         assert_eq!(verified.endpoint_transport(&wallet), RpcTransport::Wallet);
         assert_eq!(verified.endpoint_transport(&direct), RpcTransport::Direct);
+        // The verified route keeps each endpoint's roles.
+        assert_eq!(
+            verified
+                .for_class(crate::RpcTrafficClass::General)
+                .unwrap()
+                .endpoint_urls(),
+            vec![wallet.clone()]
+        );
         // The checks above are cached, so admission sends only the direct archive's check.
         let pool = Arc::new(
             route
@@ -909,5 +953,56 @@ mod tests {
         wallet_server.abort();
         direct_server.abort();
         archive_server.abort();
+    }
+
+    #[tokio::test]
+    async fn class_pool_admission_uses_identities_verified_on_the_full_route() {
+        let (wrong, _wrong_requests, wrong_server) =
+            spawn_recording_rpc_mock(chain_id_responder(CHAIN_ID + 1)).await;
+        let (first, first_requests, first_server) =
+            spawn_recording_rpc_mock(chain_id_responder(CHAIN_ID)).await;
+        let (second, second_requests, second_server) =
+            spawn_recording_rpc_mock(chain_id_responder(CHAIN_ID)).await;
+        let clients = crate::HttpContext::direct_for_tests().rpc_clients();
+        let general_only = RpcEndpointRoles {
+            sensitive: false,
+            ..RpcEndpointRoles::default()
+        };
+        let sensitive_only = RpcEndpointRoles {
+            general: false,
+            ..RpcEndpointRoles::default()
+        };
+        let route = RpcChainRoute::new_with_transports(
+            CHAIN_ID,
+            vec![
+                (wrong.into(), RpcTransport::Wallet, general_only),
+                (first.into(), RpcTransport::Wallet, sensitive_only),
+                (second.into(), RpcTransport::Wallet, sensitive_only),
+            ],
+        )
+        .with_identity_verification();
+        route
+            .verify_identity(&clients)
+            .await
+            .expect("the Sensitive endpoints verify");
+
+        // Pool slots follow the class route, so slot 0 is the first Sensitive endpoint, not
+        // the General one that serves another chain.
+        let sensitive = route.for_class(crate::RpcTrafficClass::Sensitive).unwrap();
+        let pool = Arc::new(
+            sensitive
+                .query_rpc_pool(&clients, Duration::from_secs(5))
+                .with_pending_admission(),
+        );
+        sensitive
+            .admit_sync_pool(&clients, &pool, None)
+            .await
+            .expect("cached identities admit the pool");
+        eventually(|| available(&pool) == vec![0, 1]).await;
+        let checks = |requests: &RecordedRequests| requests.lock().unwrap().len();
+        assert_eq!((checks(&first_requests), checks(&second_requests)), (1, 1));
+        wrong_server.abort();
+        first_server.abort();
+        second_server.abort();
     }
 }

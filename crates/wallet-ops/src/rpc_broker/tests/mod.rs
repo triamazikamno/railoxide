@@ -36,10 +36,17 @@ pub(crate) fn data_result(bytes: Bytes) -> RpcResult {
 }
 
 pub(super) fn test_route() -> RpcRoute {
-    RpcRoute::from(RpcChainRoute::new(
+    RpcRoute::new(RpcChainRoute::new(
         1,
         vec![Url::parse("https://test.invalid").unwrap()],
     ))
+}
+
+/// `route` restricted to General traffic, which its default-role endpoints all accept.
+pub(crate) fn general(route: &RpcChainRoute) -> ClassRoute {
+    route
+        .for_class(RpcTrafficClass::General)
+        .expect("route has a General endpoint")
 }
 
 pub(super) fn test_origin() -> RpcOrigin {
@@ -47,7 +54,7 @@ pub(super) fn test_origin() -> RpcOrigin {
 }
 
 fn test_route_with_multicall(address: Address) -> RpcRoute {
-    RpcRoute::from(
+    RpcRoute::new(
         RpcChainRoute::new(1, vec![Url::parse("https://test.invalid").unwrap()])
             .with_multicall(address),
     )

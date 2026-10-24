@@ -13,8 +13,6 @@ pub enum ChainField {
     NativeSymbol,
     NativeDecimals,
     NativeUsdOracle,
-    RpcEndpoints,
-    DirectRpcEndpoints,
     ExplorerUrls,
     WrappedNativeToken,
     MulticallContract,
@@ -39,8 +37,6 @@ impl ChainField {
         Self::NativeSymbol,
         Self::NativeDecimals,
         Self::NativeUsdOracle,
-        Self::RpcEndpoints,
-        Self::DirectRpcEndpoints,
         Self::ExplorerUrls,
         Self::WrappedNativeToken,
         Self::MulticallContract,
@@ -66,8 +62,6 @@ impl ChainField {
             Self::NativeSymbol => "Native currency symbol",
             Self::NativeDecimals => "Native currency decimals",
             Self::NativeUsdOracle => "Oracle contract",
-            Self::RpcEndpoints => "RPC endpoints",
-            Self::DirectRpcEndpoints => "Direct RPC endpoints (bypass Tor)",
             Self::ExplorerUrls => "Block explorers",
             Self::WrappedNativeToken => "Wrapped native token",
             Self::MulticallContract => "Multicall contract",
@@ -104,13 +98,7 @@ impl ChainField {
     /// Newline-joined URL lists. The wire value stays one string; presentation may split it.
     #[must_use]
     pub const fn is_url_list(self) -> bool {
-        matches!(
-            self,
-            Self::RpcEndpoints
-                | Self::DirectRpcEndpoints
-                | Self::ExplorerUrls
-                | Self::SponsoredBundleRelays
-        )
+        matches!(self, Self::ExplorerUrls | Self::SponsoredBundleRelays)
     }
 
     #[must_use]
@@ -154,6 +142,33 @@ pub enum NativeUsdChoice {
     Oracle,
 }
 
+/// One RPC endpoint row: its transport and the traffic classes it accepts.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[non_exhaustive]
+pub struct RpcEndpointDraft {
+    pub url: String,
+    /// Reached without Tor or the proxy.
+    pub direct: bool,
+    pub general: bool,
+    pub sensitive: bool,
+    pub submit: bool,
+}
+
+impl RpcEndpointDraft {
+    /// An endpoint with the default flags: General, Sensitive and Submit on, Direct off.
+    #[must_use]
+    pub const fn new(url: String) -> Self {
+        Self {
+            url,
+            direct: false,
+            general: true,
+            sensitive: true,
+            submit: true,
+        }
+    }
+}
+
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[non_exhaustive]
@@ -169,6 +184,9 @@ pub struct ChainDraft {
     pub railgun: bool,
     pub enabled: bool,
     pub fields: BTreeMap<ChainField, String>,
+    /// RPC endpoints in preference order. Built-in chains without an override carry the presets.
+    #[serde(default)]
+    pub rpc_endpoints: Vec<RpcEndpointDraft>,
     pub quick_sync_enabled: bool,
     /// Distinguishes preset relays from an explicitly empty relay list.
     pub use_default_relays: bool,

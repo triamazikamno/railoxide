@@ -43,6 +43,13 @@ use crate::{
 use crate::{WalletConnectDecodedCallKind, WalletConnectSupportedMethod};
 
 const TEST_PASSWORD: &str = "correct horse battery staple";
+
+/// `route` restricted to Sensitive traffic, which its default-role endpoints all accept.
+fn sensitive(route: &RpcChainRoute) -> crate::ClassRoute {
+    route
+        .for_class(crate::RpcTrafficClass::Sensitive)
+        .expect("route has a Sensitive endpoint")
+}
 const TEST_MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 const TEST_IMPORTED_PRIVATE_KEY: &str =
@@ -550,10 +557,10 @@ async fn balance_refresh_submits_more_wallet_reads_than_the_dapp_cap() {
     );
 
     let (broker, _executions) = crate::rpc_broker::tests::spawn_counting_test_broker();
-    let route = RpcRoute::from(RpcChainRoute::new(
+    let route = RpcRoute::from(sensitive(&RpcChainRoute::new(
         1,
         vec![Url::parse("https://balances.invalid").expect("route URL")],
-    ));
+    )));
     let results = broker
         .submit(RpcSubmission::new(
             route,
@@ -829,8 +836,7 @@ async fn custom_balance_refresh_preserves_partial_results_without_multicall() {
                 symbol: "CUSTOM".into(),
                 decimals: 6,
             },
-            rpc_endpoints: vec![endpoint.to_string()],
-            direct_rpc_endpoints: Vec::new(),
+            rpc_endpoints: vec![endpoint.to_string().into()],
             explorer_urls: vec![],
             enabled: true,
             contracts: crate::settings::ChainContractSettings::default(),
@@ -1813,7 +1819,7 @@ async fn public_shield_allowance_uses_shared_rpc_client_and_decodes_result() {
     let spender = address!("3333333333333333333333333333333333333333");
 
     let allowance = super::actions::query_erc20_allowance(
-        &chain_route,
+        &sensitive(&chain_route),
         &http,
         PublicAssetId::Erc20(token),
         owner,
@@ -1843,7 +1849,7 @@ async fn public_shield_allowance_propagates_rpc_member_error() {
     let chain_route = RpcChainRoute::new(1, vec![Url::parse(&server.url).expect("mock RPC URL")]);
     let http = http_context_for_route(WalletNetworkMode::Tor, "tor");
     let error = super::actions::query_erc20_allowance(
-        &chain_route,
+        &sensitive(&chain_route),
         &http,
         PublicAssetId::Erc20(address!("1111111111111111111111111111111111111111")),
         address!("2222222222222222222222222222222222222222"),
@@ -1901,7 +1907,10 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
     };
     let http = http_context_for_route(WalletNetworkMode::Direct, "direct");
     let pool = crate::query_rpc_pool_for_route(
-        &RpcChainRoute::new(1, vec![Url::parse(&server.url).expect("mock RPC URL")]),
+        &sensitive(&RpcChainRoute::new(
+            1,
+            vec![Url::parse(&server.url).expect("mock RPC URL")],
+        )),
         &http,
     );
     let recognized_request = TransactionRequest::default()
@@ -1910,7 +1919,7 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
     super::submission::public_action_preflight_from_rpc_pool(
         &pool,
         &http,
-        &chain.rpc_route,
+        &sensitive(&chain.rpc_route),
         1,
         from,
         recognized_request,
@@ -1938,7 +1947,7 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
     super::submission::public_action_preflight_from_rpc_pool(
         &pool,
         &http,
-        &chain.rpc_route,
+        &sensitive(&chain.rpc_route),
         1,
         from,
         unknown_request,
@@ -3296,7 +3305,7 @@ async fn shield_speedup_funding_uses_the_previously_signed_gas_limit() {
     let native_balance = U256::from(1_000_000_000_000_000_000_000_u128);
     let value = native_balance - U256::from(model_gas) * U256::from(100);
     let http = HttpContext::direct_for_tests();
-    let pool = crate::query_rpc_pool_for_route(&chain.rpc_route, &http);
+    let pool = crate::query_rpc_pool_for_route(&sensitive(&chain.rpc_route), &http);
     for (max_fee_per_gas, affordable) in [(125_u128, true), (300, false)] {
         let actual_cost = value + U256::from(signed_gas_limit) * U256::from(max_fee_per_gas);
         assert_eq!(actual_cost <= native_balance, affordable);
@@ -3304,7 +3313,7 @@ async fn shield_speedup_funding_uses_the_previously_signed_gas_limit() {
         let result = super::submission::public_action_preflight_from_rpc_pool(
             &pool,
             &http,
-            &chain.rpc_route,
+            &sensitive(&chain.rpc_route),
             42161,
             Address::repeat_byte(1),
             TransactionRequest::default()
@@ -3369,7 +3378,7 @@ async fn native_preflight_filters_broker_withdrawals_and_tries_each_candidate_on
     );
     let http = HttpContext::direct_for_tests();
     // The original transaction pool predates the broker's withdrawal and still contains both.
-    let pool = crate::query_rpc_pool_for_route(&route, &http);
+    let pool = crate::query_rpc_pool_for_route(&sensitive(&route), &http);
     let warmup = http.rpc_broker().warm_identities(vec![route.clone()], None);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
@@ -3396,7 +3405,7 @@ async fn native_preflight_filters_broker_withdrawals_and_tries_each_candidate_on
         let error = super::submission::public_action_preflight_from_rpc_pool(
             &pool,
             http,
-            &route,
+            &sensitive(&route),
             1,
             Address::repeat_byte(1),
             TransactionRequest::default().with_to(Address::repeat_byte(2)),
@@ -4045,7 +4054,7 @@ async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_prefli
             let mut results = http
                 .rpc_broker()
                 .submit(RpcSubmission::new(
-                    route.into(),
+                    RpcRoute::from(sensitive(&route)),
                     vec![read],
                     crate::RpcOrigin::dapp("test-peer", "https://example.test").unwrap(),
                 ))
@@ -4111,13 +4120,13 @@ async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_prefli
     assert_eq!(calls[before].route.as_deref(), Some("admitted"));
     assert_eq!(calls[before].params[1], json!("pending"));
 
-    let pool = crate::query_rpc_pool_for_route(&chain.rpc_route, &http);
+    let pool = crate::query_rpc_pool_for_route(&sensitive(&chain.rpc_route), &http);
     let before = server.calls().len();
     let before_callbacks = callback_calls.load(Ordering::SeqCst);
     super::submission::public_action_preflight_from_rpc_pool_with_reads(
         &pool,
         &http,
-        &chain.rpc_route,
+        &sensitive(&chain.rpc_route),
         1,
         from,
         TransactionRequest::default()
@@ -4180,7 +4189,7 @@ async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_prefli
     let error = super::submission::public_action_preflight_from_rpc_pool_with_reads(
         &pool,
         &http,
-        &chain.rpc_route,
+        &sensitive(&chain.rpc_route),
         1,
         from,
         TransactionRequest::default()
@@ -4230,7 +4239,7 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
     )
     .with_identity_verification();
     let http = HttpContext::direct_for_tests();
-    let pool = crate::query_rpc_pool_for_route(&chain.rpc_route, &http);
+    let pool = crate::query_rpc_pool_for_route(&sensitive(&chain.rpc_route), &http);
     let from = Address::repeat_byte(1);
     let to = Address::repeat_byte(2);
     let gas_fee = PublicActionGasFeeSelection::Custom {
@@ -4299,7 +4308,7 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
         let error = super::submission::public_action_preflight_from_rpc_pool_with_reads(
             &pool,
             &http,
-            &chain.rpc_route,
+            &sensitive(&chain.rpc_route),
             1,
             from,
             TransactionRequest::default().with_to(to),
@@ -4348,7 +4357,7 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
             Box::pin(async move { Err(error) })
         });
         let error = super::submission::public_action_preflight_from_rpc_pool_with_reads(
-            &pool, &http, &chain.rpc_route, 1, from, TransactionRequest::default().with_to(to),
+            &pool, &http, &sensitive(&chain.rpc_route), 1, from, TransactionRequest::default().with_to(to),
             gas_fee, &chain.gas, PublicShieldTransactionProfile::Railoxide,
             PublicAssetId::Native,
             super::types::PublicActionGasLimitStrategy::ChainBuffer,
@@ -4468,7 +4477,7 @@ async fn dapp_send_invalidation_stops_before_baseline_or_raw_broadcast() {
                 let mut results = http
                     .rpc_broker()
                     .submit(RpcSubmission::new(
-                        route.into(),
+                        RpcRoute::from(sensitive(&route)),
                         vec![read],
                         crate::RpcOrigin::dapp("test-peer", "https://example.test").unwrap(),
                     ))
@@ -4609,7 +4618,7 @@ async fn native_preflight_logs_failure_stage_without_sensitive_payloads() {
         second_endpoint.set_path("/private-rpc-path/second");
         chain.rpc_route = RpcChainRoute::new(42161, vec![endpoint, second_endpoint]);
         let http = HttpContext::direct_for_tests_with_candidate_order(<[usize]>::reverse);
-        let pool = crate::query_rpc_pool_for_route(&chain.rpc_route, &http);
+        let pool = crate::query_rpc_pool_for_route(&sensitive(&chain.rpc_route), &http);
         let logs = Arc::new(Mutex::new(Vec::new()));
         let writer = LogWriter(logs.clone());
         let subscriber = tracing_subscriber::fmt()
@@ -4620,7 +4629,7 @@ async fn native_preflight_logs_failure_stage_without_sensitive_payloads() {
         let error = super::submission::public_action_preflight_from_rpc_pool(
             &pool,
             &http,
-            &chain.rpc_route,
+            &sensitive(&chain.rpc_route),
             42161,
             from,
             TransactionRequest::default()
@@ -4722,7 +4731,10 @@ async fn dapp_raw_broadcast_does_not_log_or_return_remote_payloads() {
     let server = MockRpcServer::spawn(true, 21_000).await;
     let http = HttpContext::direct_for_tests();
     let pool = crate::query_rpc_pool_for_route(
-        &RpcChainRoute::new(1, vec![Url::parse(&server.url).unwrap()]),
+        &sensitive(&RpcChainRoute::new(
+            1,
+            vec![Url::parse(&server.url).unwrap()],
+        )),
         &http,
     );
     let tx_hash = B256::repeat_byte(0xab);

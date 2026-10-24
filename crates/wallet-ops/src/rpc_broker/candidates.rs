@@ -6,7 +6,7 @@
 //! health or permits.
 
 use super::identity::{MAX_IDENTITY_PROBES, ProbeRunner};
-use super::{RpcBrokerError, RpcChainRoute, RpcClients};
+use super::{ClassRoute, RpcBrokerError, RpcChainRoute, RpcClients};
 use crate::HttpContext;
 use crate::desktop::DEFAULT_QUERY_RPC_COOLDOWN;
 use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool, RpcAdmission};
@@ -45,9 +45,10 @@ impl RpcCandidates {
     /// pass. Any failed probe excludes its endpoint from this source only.
     pub(crate) async fn acquire(
         http: &HttpContext,
-        route: &RpcChainRoute,
+        route: &ClassRoute,
         deadline: Option<Instant>,
     ) -> Result<Self, RpcBrokerError> {
+        let route = route.route();
         let snapshot = http
             .rpc_broker()
             .endpoint_candidates(route, deadline)
@@ -92,9 +93,10 @@ impl RpcCandidates {
     /// identity per read.
     pub(crate) async fn acquire_for_gateway(
         http: &HttpContext,
-        route: &RpcChainRoute,
+        route: &ClassRoute,
         deadline: Option<Instant>,
     ) -> Result<Self, RpcBrokerError> {
+        let route = route.route();
         let snapshot = http
             .rpc_broker()
             .endpoint_candidates(route, deadline)

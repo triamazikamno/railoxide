@@ -53,6 +53,7 @@ impl WalletRoot {
                 .effective_chain_configs
                 .get(chain_id)
                 .and_then(|chain| resolve_effective_chain_rpc_route(chain_id, chain).ok())
+                .and_then(|route| route.for_class(wallet_ops::RpcTrafficClass::Sensitive).ok())
                 .and_then(|route| route.endpoints().first().cloned());
             let control = request.request_control.clone().expect("gateway request");
             let review_token = request.review_token;

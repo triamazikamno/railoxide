@@ -193,7 +193,7 @@ async fn check_failed_warmup_recovery(verify_identity: bool) {
     .expect("failed warmup excludes the only endpoint from snapshots");
     for _ in 0..3 {
         assert!(matches!(
-            RpcCandidates::acquire(&http, &route, None).await,
+            RpcCandidates::acquire(&http, &super::general(&route), None).await,
             Err(RpcBrokerError::NoEndpoint { .. })
         ));
     }
@@ -205,7 +205,7 @@ async fn check_failed_warmup_recovery(verify_identity: bool) {
         .expect("background recovery starts without a foreground read");
     // Expired cooldown is not proof of recovery, even for a trusted endpoint.
     assert!(matches!(
-        RpcCandidates::acquire(&http, &route, None).await,
+        RpcCandidates::acquire(&http, &super::general(&route), None).await,
         Err(RpcBrokerError::NoEndpoint { .. })
     ));
     held.release_response.notify_one();
@@ -239,7 +239,7 @@ async fn check_failed_warmup_recovery(verify_identity: bool) {
     })
     .await
     .expect("successful background recovery restores the endpoint");
-    let candidates = RpcCandidates::acquire(&http, &route, None)
+    let candidates = RpcCandidates::acquire(&http, &super::general(&route), None)
         .await
         .expect("a new fee refresh uses the recovered endpoint");
     assert_eq!(ready(&candidates), vec![0]);
@@ -301,7 +301,7 @@ async fn warmup_outlives_foreground_sources_and_checks_each_endpoint_once() {
     // A foreground source uses the cached endpoint at once and only waits on the held check,
     // then ends with the source. That one failed check already withdrew the failing endpoint, so
     // the fresh snapshot leaves it out and nothing checks it again.
-    let foreground = RpcCandidates::acquire(&http, &route, None)
+    let foreground = RpcCandidates::acquire(&http, &super::general(&route), None)
         .await
         .expect("candidates");
     assert_eq!(foreground.len(), 2);
@@ -317,7 +317,7 @@ async fn warmup_outlives_foreground_sources_and_checks_each_endpoint_once() {
     assert_eq!(held_requests.load(Ordering::SeqCst), 1);
 
     // A later source reuses both checks without another request.
-    let later = RpcCandidates::acquire(&http, &route, None)
+    let later = RpcCandidates::acquire(&http, &super::general(&route), None)
         .await
         .expect("candidates");
     assert_eq!(later.len(), 2);
@@ -346,7 +346,7 @@ async fn replacement_warms_rebuilt_routes_without_retiring_live_consumers() {
         .await
         .expect("warmup checks the endpoint");
     // A live source on the outgoing route waits on the same check.
-    let consumer = RpcCandidates::acquire(&http, &outgoing, None)
+    let consumer = RpcCandidates::acquire(&http, &super::general(&outgoing), None)
         .await
         .expect("candidates");
     let consumer =

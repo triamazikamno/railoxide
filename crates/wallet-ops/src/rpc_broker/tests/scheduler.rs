@@ -44,9 +44,9 @@ fn route(multicall: bool) -> RpcRoute {
         vec![Url::parse("https://scheduler-test.invalid").unwrap()],
     );
     if multicall {
-        RpcRoute::from(chain.with_multicall(Address::from([9; 20])))
+        RpcRoute::new(chain.with_multicall(Address::from([9; 20])))
     } else {
-        RpcRoute::from(chain)
+        RpcRoute::new(chain)
     }
 }
 

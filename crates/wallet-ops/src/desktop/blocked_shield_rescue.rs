@@ -99,7 +99,10 @@ pub async fn resolve_source_tx_origin(
         .require_railgun()?
         .deployment
         .relay_adapt_history;
-    let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
+    let query_rpc_pool = query_rpc_pool_for_route(
+        &chain.rpc_route.for_class(RpcTrafficClass::Sensitive)?,
+        http,
+    );
     let source =
         resolve_source_transaction_by_block(&query_rpc_pool, source_block_number, source_tx_hash)
             .await?;

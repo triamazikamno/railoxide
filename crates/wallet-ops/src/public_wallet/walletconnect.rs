@@ -21,7 +21,7 @@ use super::types::{
 use crate::hardware::HardwareTypedDataSigningMode;
 use crate::hardware_typed_data::HardwareEip712Model;
 use crate::walletconnect::WalletConnectSupportedMethod;
-use crate::{HttpContext, query_rpc_pool_for_route, report_chain_string};
+use crate::{HttpContext, report_chain_string};
 
 pub async fn walletconnect_sign_personal_message(
     request: WalletConnectPersonalSignRequest,
@@ -247,6 +247,7 @@ pub async fn submit_walletconnect_send_transaction(
         request.rpc_reads.as_ref(),
     )
     .await?;
+    let pools = super::submission::public_action_pools(&chain.rpc_route, http)?;
     let signer = admitted_public_signer_authorized(
         &request.vault_store,
         &request.view_session,
@@ -262,7 +263,6 @@ pub async fn submit_walletconnect_send_transaction(
     signer
         .while_active(async {
             let from_address = signer.address();
-            let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
             let tx_req = sanitize_walletconnect_transaction_request(
                 request.tx_req,
                 request.chain_id,
@@ -302,9 +302,9 @@ pub async fn submit_walletconnect_send_transaction(
                 None
             };
             let preflight = public_action_preflight_from_rpc_pool_with_reads(
-                &query_rpc_pool,
+                &pools.observe,
                 http,
-                &chain.rpc_route,
+                &pools.route,
                 request.chain_id,
                 from_address,
                 tx_req,
@@ -330,7 +330,7 @@ pub async fn submit_walletconnect_send_transaction(
             let mut observation = match request.transaction_tracking.as_ref() {
                 Some(context) => {
                     let observer = crate::block_observer::BlockObserver::establish(
-                        query_rpc_pool.clone(),
+                        pools.observe.clone(),
                         chain.finality_depth,
                         http.rpc_broker(),
                         request.chain_id,
@@ -356,7 +356,7 @@ pub async fn submit_walletconnect_send_transaction(
             let attempt = submit_public_action_attempt(
                 PublicActionProgressStep::Send,
                 preflight,
-                &query_rpc_pool,
+                &pools.submit,
                 http.network_mode(),
                 &signer,
                 "WalletConnect eth_sendTransaction",

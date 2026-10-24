@@ -42,7 +42,6 @@ use tracing::Instrument as _;
 
 use super::bridge::SwapBridgeClients;
 use super::settlement::{SwapHandoffHint, Transfer};
-use crate::ExecutorOwner;
 use crate::block_observer::{BlockReceiptsError, fetch_checked_block_receipts};
 use crate::bridge::{
     AcrossClient, AcrossDepositStatus, BridgeApiError, NearIntentsClient, OneClickExecutionStatus,
@@ -54,6 +53,7 @@ use crate::vault::{
     BridgeSurplus, ExecutorOperationId, ExecutorRecord, SwapBridgeOutcome, SwapDelivery,
     SwapObservation, SwapUseId, SwapUseRecord, SwapUseRole,
 };
+use crate::{ExecutorOwner, RpcTrafficClass};
 
 /// What a private delivery's reported fill block shows on the destination chain before
 /// finality depth. A hint for display: never persisted, never an outcome.
@@ -310,7 +310,8 @@ impl ExecutorOwner {
             handler: destination.bridge_profile()?.multicall_handler(),
             railgun: destination.require_railgun().ok()?.deployment.contract,
         };
-        let endpoints = ObservationEndpoints::new(destination, &self.http);
+        let endpoints =
+            ObservationEndpoints::new(destination, &self.http, RpcTrafficClass::Sensitive).ok()?;
         let read = self
             .while_active(async {
                 Ok(Box::pin(read_fill_from_endpoints(
@@ -480,7 +481,8 @@ impl ExecutorOwner {
         let endpoints = if let Some(endpoints) = endpoints {
             endpoints
         } else {
-            opened = ObservationEndpoints::new(destination, &self.http);
+            opened =
+                ObservationEndpoints::new(destination, &self.http, RpcTrafficClass::Sensitive)?;
             &opened
         };
         let read = Box::pin(read_fill_from_endpoints(
@@ -505,11 +507,11 @@ impl ExecutorOwner {
             Err(unsupported) => unsupported,
         };
         // Endpoints that weren't admitted or sit out a cool-down didn't answer, so the count is
-        // taken against the whole route. One endpoint failing another way keeps the swap
-        // unresolved: a timeout must not become a final label.
+        // taken against every endpoint of the observation's class. One endpoint failing another
+        // way keeps the swap unresolved: a timeout must not become a final label.
         if let Some(reported) = reported
             && unsupported > 0
-            && unsupported == destination.rpc_route.endpoints().len()
+            && unsupported == endpoints.configured_count()
         {
             return Ok((Some(reported), None));
         }
@@ -759,7 +761,7 @@ impl ExecutorOwner {
             payee: claimed.source,
             amount: deposited.input_amount,
         };
-        let endpoints = ObservationEndpoints::new(origin, &self.http);
+        let endpoints = ObservationEndpoints::new(origin, &self.http, RpcTrafficClass::Sensitive)?;
         let Some(found) = self
             .read_refund_from_endpoints(&endpoints, origin.finality_depth, refund_tx, &refund)
             .await?
@@ -873,7 +875,7 @@ async fn read_fill_from_endpoints(
     shield: Option<ExpectedShield>,
     final_only: bool,
 ) -> Result<FillRead, usize> {
-    let configured = destination.rpc_route.endpoints().len();
+    let configured = endpoints.configured_count();
     // By pool index, so that each configured endpoint is tried and counted once.
     let mut tried = BTreeSet::new();
     let mut unsupported = 0;

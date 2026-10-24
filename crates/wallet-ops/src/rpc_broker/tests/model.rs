@@ -392,7 +392,7 @@ fn ready_origins_round_robin_across_aggregate_and_individual_work() {
     let origin_a = RpcOrigin::from(WalletRpcOrigin::PublicWallet);
     let origin_b = RpcOrigin::from(WalletRpcOrigin::Staking);
     let route_a = test_route_with_multicall(Address::from([3_u8; 20]));
-    let route_b = RpcRoute::from(
+    let route_b = RpcRoute::new(
         RpcChainRoute::new(1, vec![Url::parse("https://other.invalid").unwrap()])
             .with_multicall(Address::from([3_u8; 20])),
     );
@@ -584,7 +584,7 @@ fn ready_shared_aggregate_is_claimed_once_by_the_attached_origin_lane() {
     let origin_a = RpcOrigin::from(WalletRpcOrigin::PublicWallet);
     let origin_b = RpcOrigin::from(WalletRpcOrigin::Staking);
     let route = |endpoint: &str| {
-        RpcRoute::from(
+        RpcRoute::new(
             RpcChainRoute::new(1, vec![Url::parse(endpoint).unwrap()])
                 .with_multicall(Address::from([4_u8; 20])),
         )
@@ -725,7 +725,7 @@ async fn route_selection_spreads_requests_across_configured_endpoints() {
         spawn_rpc_mock(first_responder, active.clone(), maximum.clone()).await;
     let (second, second_server) = spawn_rpc_mock(second_responder, active, maximum).await;
     let broker = test_broker(Duration::from_millis(1), 1);
-    let route = RpcRoute::from(RpcChainRoute::new(1, vec![first, second]));
+    let route = RpcRoute::new(RpcChainRoute::new(1, vec![first, second]));
     for marker in 0_u8..2 {
         assert!(
             broker
@@ -761,7 +761,7 @@ fn route_selection_orders_ties_by_hook_after_health_and_count() {
     let urls = (0..4)
         .map(|index| Url::parse(&format!("https://endpoint-{index}.invalid")).unwrap())
         .collect::<Vec<_>>();
-    let route = RpcRoute::from(RpcChainRoute::new(1, urls.clone()));
+    let route = RpcRoute::new(RpcChainRoute::new(1, urls.clone()));
     let cooldown = Instant::now() + Duration::from_secs(60);
     // Endpoints 0 and 1 tie, 2 has a higher count, and 3 is withdrawn despite the lowest count.
     for (index, request_count) in [1, 1, 5, 0].into_iter().enumerate() {
@@ -1208,7 +1208,7 @@ async fn struck_endpoints_are_withdrawn_but_request_blamed_failures_keep_receivi
         let (first, first_server) = spawn_rpc_mock(failing, active.clone(), maximum.clone()).await;
         let (second, second_server) = spawn_rpc_mock(succeeding, active, maximum).await;
         let broker = test_broker(Duration::from_millis(1), 1);
-        let route = RpcRoute::from(RpcChainRoute::new(1, vec![first, second]));
+        let route = RpcRoute::new(RpcChainRoute::new(1, vec![first, second]));
         for marker in 0..=u8::try_from(HEALTH_STRIKE_THRESHOLD).expect("strike threshold") {
             assert!(
                 broker
@@ -1232,6 +1232,128 @@ async fn struck_endpoints_are_withdrawn_but_request_blamed_failures_keep_receivi
         first_server.abort();
         second_server.abort();
     }
+}
+
+#[tokio::test]
+async fn class_route_failover_and_withdrawn_fallback_stay_within_the_class() {
+    let class_calls = Arc::new(AtomicUsize::new(0));
+    let other_calls = Arc::new(AtomicUsize::new(0));
+    let failing = |calls: Arc<AtomicUsize>| -> RpcResponder {
+        Arc::new(move |request| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            rpc_error(&request, -32603)
+        })
+    };
+    let other_counter = other_calls.clone();
+    let succeeding: RpcResponder = Arc::new(move |request| {
+        other_counter.fetch_add(1, Ordering::SeqCst);
+        rpc_result(&request, &json!("0x01"))
+    });
+    let (first, first_server) =
+        spawn_rpc_mock(failing(class_calls.clone()), Arc::default(), Arc::default()).await;
+    let (second, second_server) =
+        spawn_rpc_mock(failing(class_calls.clone()), Arc::default(), Arc::default()).await;
+    let (general, general_server) =
+        spawn_rpc_mock(succeeding, Arc::default(), Arc::default()).await;
+    let sensitive_only = RpcEndpointRoles {
+        general: false,
+        ..RpcEndpointRoles::default()
+    };
+    let general_only = RpcEndpointRoles {
+        sensitive: false,
+        ..RpcEndpointRoles::default()
+    };
+    let chain = RpcChainRoute::new_with_transports(
+        1,
+        vec![
+            (first.into(), RpcTransport::Wallet, sensitive_only),
+            (general.into(), RpcTransport::Wallet, general_only),
+            (second.into(), RpcTransport::Wallet, sensitive_only),
+        ],
+    );
+    let route = RpcRoute::from(chain.for_class(RpcTrafficClass::Sensitive).unwrap());
+    let broker = test_broker(Duration::from_millis(1), 1);
+    // Strikes withdraw both Sensitive endpoints; the last read runs on the all-withdrawn
+    // fallback.
+    for marker in 0..=u8::try_from(HEALTH_STRIKE_THRESHOLD).expect("strike threshold") {
+        let before = class_calls.load(Ordering::SeqCst);
+        let results = broker
+            .submit(RpcSubmission::new(
+                route.clone(),
+                vec![RpcRead::eth_call(Address::ZERO, Bytes::from(vec![marker]))],
+                test_origin(),
+            ))
+            .await;
+        assert!(!matches!(results.as_deref(), Ok([Ok(_)])));
+        assert!(class_calls.load(Ordering::SeqCst) > before);
+    }
+    assert_eq!(other_calls.load(Ordering::SeqCst), 0);
+    drop(broker);
+    first_server.abort();
+    second_server.abort();
+    general_server.abort();
+}
+
+#[test]
+fn class_routes_keep_flagged_endpoints_and_name_a_missing_class() {
+    let url = |name: &str| Url::parse(&format!("https://{name}.example")).unwrap();
+    let (general, node, both) = (url("general"), url("node"), url("both"));
+    let route = RpcChainRoute::new_with_transports(
+        7,
+        vec![
+            (
+                general.clone().into(),
+                RpcTransport::Wallet,
+                RpcEndpointRoles {
+                    sensitive: false,
+                    submit: false,
+                    ..RpcEndpointRoles::default()
+                },
+            ),
+            (
+                node.clone().into(),
+                RpcTransport::Direct,
+                RpcEndpointRoles {
+                    general: false,
+                    submit: false,
+                    ..RpcEndpointRoles::default()
+                },
+            ),
+            (
+                both.clone().into(),
+                RpcTransport::Wallet,
+                RpcEndpointRoles {
+                    submit: false,
+                    ..RpcEndpointRoles::default()
+                },
+            ),
+        ],
+    )
+    .with_identity_verification();
+
+    let sensitive = route.for_class(RpcTrafficClass::Sensitive).unwrap();
+    assert_eq!(sensitive.endpoint_urls(), vec![node.clone(), both.clone()]);
+    assert_eq!(sensitive.endpoint_transport(&node), RpcTransport::Direct);
+    assert!(sensitive.route().shares_identity_cache(&route));
+    assert_eq!(
+        route
+            .for_class(RpcTrafficClass::General)
+            .unwrap()
+            .endpoint_urls(),
+        vec![general, both]
+    );
+    let missing = route.for_class(RpcTrafficClass::Submission).unwrap_err();
+    assert_eq!(
+        missing,
+        RpcClassUnavailable {
+            chain_id: 7,
+            class: RpcTrafficClass::Submission,
+        }
+    );
+    assert_eq!(
+        missing.to_string(),
+        "no RPC endpoint on chain 7 accepts transaction submission"
+    );
 }
 
 #[test]

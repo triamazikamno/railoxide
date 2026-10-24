@@ -679,7 +679,8 @@ impl ExecutorOwner {
             destination_chain: self.chain.chain_id,
             terms,
         };
-        let endpoints = ObservationEndpoints::new(origin, &self.http);
+        let endpoints =
+            ObservationEndpoints::new(origin, &self.http, crate::RpcTrafficClass::Sensitive)?;
         for endpoint in endpoints.providers().await {
             let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = endpoint.index);
             let result = trace_step(
@@ -809,19 +810,17 @@ impl ExecutorOwner {
                 "the withdrawal's priority fee is above its maximum fee"
             ));
         }
+        let route = origin
+            .rpc_route
+            .for_class(crate::RpcTrafficClass::Sensitive)?;
         let amount = self
-            .while_active(query_erc20_balance(
-                &origin.rpc_route,
-                &self.http,
-                token,
-                proxy,
-            ))
+            .while_active(query_erc20_balance(&route, &self.http, token, proxy))
             .await
             .wrap_err("read the proxy's balance of the bought token")?;
         if amount.is_zero() {
             return Err(eyre!("the proxy holds none of the token"));
         }
-        let pool = query_rpc_pool_for_route(&origin.rpc_route, &self.http);
+        let pool = query_rpc_pool_for_route(&route, &self.http);
         let proxy_deployed = self.while_active(proxy_deployed(&pool, proxy)).await?;
         let gas_units = if proxy_deployed {
             PUBLIC_PROXY_WITHDRAWAL_GAS_UNITS
@@ -1140,7 +1139,9 @@ impl ExecutorOwner {
         spender: Address,
     ) -> Result<U256> {
         self.while_active(query_erc20_allowance(
-            &origin.rpc_route,
+            &origin
+                .rpc_route
+                .for_class(crate::RpcTrafficClass::Sensitive)?,
             &self.http,
             PublicAssetId::Erc20(token),
             source,
@@ -1299,7 +1300,13 @@ impl ExecutorOwner {
         if unresolved.is_empty() {
             return Ok(());
         }
-        let pool = query_rpc_pool_for_route(&origin.rpc_route, &self.http);
+        // Stored signed deposits are resent only where submission is allowed.
+        let pool = query_rpc_pool_for_route(
+            &origin
+                .rpc_route
+                .for_class(crate::RpcTrafficClass::Submission)?,
+            &self.http,
+        );
         for (hash, signed) in unresolved {
             self.while_active(
                 self_broadcast_send_raw_transaction_to_rpc_pool_with_logging(
@@ -1371,7 +1378,12 @@ fn require_approved_gas_cost(plan: &PublicSwapGasPlan, approved: U256) -> Result
 
 /// The origin chain's head block number, from the first of its endpoints that answers.
 async fn origin_head(origin: &EffectiveChainConfig, http: &HttpContext) -> Result<u64> {
-    let pool = query_rpc_pool_for_route(&origin.rpc_route, http);
+    let pool = query_rpc_pool_for_route(
+        &origin
+            .rpc_route
+            .for_class(crate::RpcTrafficClass::Sensitive)?,
+        http,
+    );
     for endpoint in pool.available_providers() {
         if let Ok(head) = endpoint.provider.get_block_number().await {
             return Ok(head);
@@ -1387,7 +1399,12 @@ async fn origin_block(
     http: &HttpContext,
     number: u64,
 ) -> Result<BlockNumHash> {
-    let pool = query_rpc_pool_for_route(&origin.rpc_route, http);
+    let pool = query_rpc_pool_for_route(
+        &origin
+            .rpc_route
+            .for_class(crate::RpcTrafficClass::Sensitive)?,
+        http,
+    );
     for endpoint in pool.available_providers() {
         if let Ok(Some(block)) = endpoint.provider.get_block_by_number(number.into()).await {
             let identity = block.header.num_hash();

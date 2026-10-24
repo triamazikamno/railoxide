@@ -253,7 +253,7 @@ impl WalletRoot {
                         ),
                     ));
                 for endpoint in &chain.rpc_endpoints {
-                    if let Ok(url) = reqwest::Url::parse(endpoint) {
+                    if let Ok(url) = reqwest::Url::parse(&endpoint.url) {
                         content = content.child(walletconnect_kv_row(
                             "RPC destination",
                             url.origin().ascii_serialization(),

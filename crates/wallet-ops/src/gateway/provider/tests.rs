@@ -3981,7 +3981,7 @@ async fn proposed_chain_requires_current_approval_and_runtime_before_add_then_sw
                     ID,
                     RpcChainRoute::new(
                         ID,
-                        vec![url::Url::parse(&definition.rpc_endpoints[0]).unwrap()],
+                        vec![url::Url::parse(&definition.rpc_endpoints[0].url).unwrap()],
                     )
                     .with_identity_verification(),
                 );

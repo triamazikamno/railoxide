@@ -2,11 +2,12 @@
 use super::{
     ChainContractSettings, ChainDeploymentSettings, ChainGasSettings, ChainMutation,
     ChainSettingsOverride, CustomChainSettings, MAX_CHAIN_MUTATION_BYTES, NativeCurrency,
-    NativeUsdPricing, QuickSyncSettings, RailgunSettingsOverride, WalletSettings, presets,
-    settings_revision,
+    NativeUsdPricing, QuickSyncSettings, RailgunSettingsOverride, RpcEndpointSetting,
+    WalletSettings, presets, settings_revision,
 };
 use railgun_ui::chain_editor::{
     ChainDraft, ChainEditorCommand, ChainEditorSnapshot, ChainField, ChainSummary, NativeUsdChoice,
+    RpcEndpointDraft,
 };
 
 pub fn chain_editor_snapshot(
@@ -25,8 +26,7 @@ pub fn chain_editor_snapshot(
             if let Some(chain) = settings.chains.custom.get(&id) {
                 summary.name.clone_from(&chain.name);
                 summary.enabled = chain.enabled;
-                summary.rpc_endpoints =
-                    endpoint_count(id, &chain.rpc_endpoints, &chain.direct_rpc_endpoints);
+                summary.rpc_endpoints = chain.rpc_endpoints.len();
             } else {
                 summary.built_in = true;
                 summary.railgun = railgun_ui::DEFAULT_CHAINS.contains(&id);
@@ -42,14 +42,10 @@ pub fn chain_editor_snapshot(
                     compared.enabled = unchanged.enabled;
                     compared != unchanged
                 });
-                let direct = overrides.map_or(&[][..], |chain| &chain.direct_rpc_endpoints);
                 summary.rpc_endpoints = match overrides {
-                    Some(chain) if !chain.rpc_endpoints.is_empty() => {
-                        endpoint_count(id, &chain.rpc_endpoints, direct)
-                    }
-                    _ => presets::EvmPreset::for_chain(id).map_or(0, |preset| {
-                        endpoint_count(id, &preset.rpc_endpoints, direct)
-                    }),
+                    Some(chain) if !chain.rpc_endpoints.is_empty() => chain.rpc_endpoints.len(),
+                    _ => presets::EvmPreset::for_chain(id)
+                        .map_or(0, |preset| preset.rpc_endpoints.len()),
                 };
             }
             summary
@@ -60,21 +56,6 @@ pub fn chain_editor_snapshot(
         .transpose()?;
     snapshot.direct_network = settings.network.mode == super::NetworkModeSetting::Direct;
     Ok(snapshot)
-}
-
-/// Effective endpoint count, where a URL in both lists counts once.
-fn endpoint_count(id: u64, endpoints: &[String], direct: &[String]) -> usize {
-    // Repair loads unvalidated settings, so malformed URLs get a raw count instead of panicking.
-    if !endpoints
-        .iter()
-        .chain(direct)
-        .all(|url| url::Url::parse(url).is_ok())
-    {
-        return endpoints.len() + direct.len();
-    }
-    super::effective::route(id, endpoints, direct, None)
-        .endpoints()
-        .len()
 }
 
 pub fn chain_editor_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, String> {
@@ -88,6 +69,9 @@ pub fn chain_editor_draft(settings: &WalletSettings, id: u64) -> Result<ChainDra
         );
     }
     draft.defaults = defaults.fields.clone();
+    if draft.rpc_endpoints.is_empty() {
+        draft.rpc_endpoints = defaults.rpc_endpoints;
+    }
     for (field, value) in defaults.fields {
         if draft.value(field).is_empty()
             && (field != ChainField::SponsoredBundleRelays || draft.use_default_relays)
@@ -110,7 +94,6 @@ fn stored_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, String
         &chain.name,
         &chain.native_currency,
         &chain.rpc_endpoints,
-        &chain.direct_rpc_endpoints,
         &chain.explorer_urls,
         chain.enabled,
         &chain.contracts,
@@ -147,7 +130,6 @@ fn built_in_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, Stri
         preset.name,
         &preset.native_currency,
         &chain.rpc_endpoints,
-        &chain.direct_rpc_endpoints,
         &[],
         chain.enabled,
         &chain.contracts,
@@ -245,17 +227,17 @@ fn inherited_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, Str
     if !chain.built_in {
         return Ok(draft);
     }
+    // With the override removed above, a built-in chain resolves to its preset endpoints.
+    draft.rpc_endpoints = presets::EvmPreset::for_chain(id)
+        .map(|preset| {
+            preset
+                .rpc_endpoints
+                .into_iter()
+                .map(RpcEndpointDraft::new)
+                .collect()
+        })
+        .unwrap_or_default();
     for (field, value) in [
-        (
-            ChainField::RpcEndpoints,
-            chain
-                .rpc_route
-                .endpoints()
-                .iter()
-                .map(|url| url.expose_url().as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
         (
             ChainField::WrappedNativeToken,
             chain
@@ -337,6 +319,9 @@ fn remove_inherited_values(
             defaults.fields.insert(field, range.to_string());
         }
     }
+    if same_endpoints(&draft.rpc_endpoints, &defaults.rpc_endpoints) {
+        draft.rpc_endpoints.clear();
+    }
     for (field, value) in defaults.fields {
         if field == ChainField::NativeUsdOracle {
             continue;
@@ -355,6 +340,23 @@ fn remove_inherited_values(
     Ok(())
 }
 
+/// Equal flags in the same order, with URLs compared like other inherited URL fields.
+fn same_endpoints(left: &[RpcEndpointDraft], right: &[RpcEndpointDraft]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            (left.direct, left.general, left.sensitive, left.submit)
+                == (right.direct, right.general, right.sensitive, right.submit)
+                && same_url(&left.url, &right.url)
+        })
+}
+
+fn same_url(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    left == right
+        || matches!((url::Url::parse(left), url::Url::parse(right)), (Ok(left), Ok(right)) if left == right)
+}
+
 fn same_field_value(field: ChainField, left: &str, right: &str) -> bool {
     let left = left.trim();
     let right = right.trim();
@@ -365,7 +367,7 @@ fn same_field_value(field: ChainField, left: &str, right: &str) -> bool {
         ChainField::WrappedNativeToken | ChainField::MulticallContract => {
             matches!((left.parse::<alloy::primitives::Address>(), right.parse::<alloy::primitives::Address>()), (Ok(left), Ok(right)) if left == right)
         }
-        ChainField::RpcEndpoints | ChainField::SponsoredBundleRelays => {
+        ChainField::SponsoredBundleRelays => {
             let parse = |value: &str| {
                 value
                     .lines()
@@ -376,9 +378,7 @@ fn same_field_value(field: ChainField, left: &str, right: &str) -> bool {
             };
             matches!((parse(left), parse(right)), (Ok(left), Ok(right)) if left == right)
         }
-        ChainField::QuickSyncEndpoint => {
-            matches!((url::Url::parse(left), url::Url::parse(right)), (Ok(left), Ok(right)) if left == right)
-        }
+        ChainField::QuickSyncEndpoint => same_url(left, right),
         _ => {
             matches!((left.parse::<u64>(), right.parse::<u64>()), (Ok(left), Ok(right)) if left == right)
         }
@@ -390,8 +390,7 @@ fn fill_general_draft(
     draft: &mut ChainDraft,
     name: &str,
     native: &NativeCurrency,
-    endpoints: &[String],
-    direct_endpoints: &[String],
+    endpoints: &[RpcEndpointSetting],
     explorers: &[String],
     enabled: bool,
     contracts: &ChainContractSettings,
@@ -399,13 +398,22 @@ fn fill_general_draft(
     gas: &ChainGasSettings,
 ) {
     draft.enabled = enabled;
+    draft.rpc_endpoints = endpoints
+        .iter()
+        .map(|endpoint| {
+            let mut row = RpcEndpointDraft::new(endpoint.url.clone());
+            row.direct = endpoint.direct;
+            row.general = endpoint.general;
+            row.sensitive = endpoint.sensitive;
+            row.submit = endpoint.submit;
+            row
+        })
+        .collect();
     for (field, value) in [
         (ChainField::Name, name.to_owned()),
         (ChainField::NativeName, native.name.clone()),
         (ChainField::NativeSymbol, native.symbol.clone()),
         (ChainField::NativeDecimals, native.decimals.to_string()),
-        (ChainField::RpcEndpoints, endpoints.join("\n")),
-        (ChainField::DirectRpcEndpoints, direct_endpoints.join("\n")),
         (ChainField::ExplorerUrls, explorers.join("\n")),
         (
             ChainField::WrappedNativeToken,
@@ -519,6 +527,22 @@ fn lines(draft: &ChainDraft, field: ChainField) -> Vec<String> {
         .collect()
 }
 
+/// Endpoint rows with a URL, as settings entries. Empty rows are dropped like empty list lines.
+fn endpoint_settings(draft: &ChainDraft) -> Vec<RpcEndpointSetting> {
+    draft
+        .rpc_endpoints
+        .iter()
+        .filter(|endpoint| !endpoint.url.trim().is_empty())
+        .map(|endpoint| RpcEndpointSetting {
+            url: endpoint.url.trim().to_owned(),
+            direct: endpoint.direct,
+            general: endpoint.general,
+            sensitive: endpoint.sensitive,
+            submit: endpoint.submit,
+        })
+        .collect()
+}
+
 fn draft_mutation(
     settings: &WalletSettings,
     draft: &ChainDraft,
@@ -609,8 +633,7 @@ fn draft_mutation(
             overrides: ChainSettingsOverride {
                 native_usd_pricing,
                 enabled: draft.enabled,
-                rpc_endpoints: lines(draft, ChainField::RpcEndpoints),
-                direct_rpc_endpoints: lines(draft, ChainField::DirectRpcEndpoints),
+                rpc_endpoints: endpoint_settings(draft),
                 contracts,
                 finality_depth,
                 gas,
@@ -637,8 +660,7 @@ fn draft_mutation(
                     .parse()
                     .map_err(|_| "Native currency decimals must be between 0 and 255")?,
             },
-            rpc_endpoints: lines(draft, ChainField::RpcEndpoints),
-            direct_rpc_endpoints: lines(draft, ChainField::DirectRpcEndpoints),
+            rpc_endpoints: endpoint_settings(draft),
             explorer_urls: lines(draft, ChainField::ExplorerUrls),
             enabled: draft.enabled,
             contracts,
@@ -748,14 +770,15 @@ mod tests {
                 settings.gas.gas_limit_buffer.to_string(),
                 "the draft carries the inherited value the editor shows as the default"
             );
-            assert_eq!(
-                lines(&draft, ChainField::RpcEndpoints),
-                config
-                    .rpc_route
-                    .endpoints()
-                    .iter()
-                    .map(|url| url.expose_url().to_string())
-                    .collect::<Vec<_>>()
+            let preset_rows: Vec<_> = presets::EvmPreset::for_chain(id)
+                .unwrap()
+                .rpc_endpoints
+                .into_iter()
+                .map(RpcEndpointDraft::new)
+                .collect();
+            assert!(
+                draft.rpc_endpoints == preset_rows,
+                "presets prefill with the default flags"
             );
             assert_eq!(
                 draft
@@ -791,6 +814,25 @@ mod tests {
             );
             assert_eq!(save_draft(&settings, draft.clone()), settings);
 
+            // Flagging one preset makes the whole preset list the override.
+            let mut flagged = draft.clone();
+            flagged.rpc_endpoints[0].sensitive = false;
+            let mut expected = settings.clone();
+            expected
+                .chains
+                .per_chain
+                .get_mut(&id)
+                .unwrap()
+                .rpc_endpoints = preset_rows
+                .iter()
+                .enumerate()
+                .map(|(index, preset)| RpcEndpointSetting {
+                    sensitive: index != 0,
+                    ..preset.url.clone().into()
+                })
+                .collect();
+            assert_eq!(save_draft(&settings, flagged), expected);
+
             draft.fields.insert(
                 ChainField::GasLimitBuffer,
                 (settings.gas.gas_limit_buffer + 1).to_string(),
@@ -822,7 +864,7 @@ mod tests {
             );
             assert_eq!(
                 summary(id).rpc_endpoints,
-                config.rpc_route.endpoints().len(),
+                preset_rows.len(),
                 "summaries count effective endpoints without carrying the URLs"
             );
             let untouched = railgun_ui::DEFAULT_CHAINS
@@ -862,26 +904,12 @@ mod tests {
                 .rpc_endpoints
         };
         let mut settings = WalletSettings::default();
-        settings
-            .chains
-            .per_chain
-            .get_mut(&1)
-            .unwrap()
-            .direct_rpc_endpoints = vec!["not-a-url".into()];
-        assert_eq!(
-            summary_count(&settings, 1),
-            presets::EvmPreset::for_chain(1)
-                .unwrap()
-                .rpc_endpoints
-                .len()
-                + 1
-        );
-
-        settings.chains.per_chain.get_mut(&1).unwrap().rpc_endpoints = vec!["not-a-url".into()];
+        settings.chains.per_chain.get_mut(&1).unwrap().rpc_endpoints =
+            vec![String::from("not-a-url").into()];
         let mut custom = super::super::tests::custom_evm_chain();
-        custom.rpc_endpoints = vec!["not-a-url".into()];
+        custom.rpc_endpoints = vec![String::from("not-a-url").into()];
         settings.chains.custom.insert(31337, custom);
-        assert_eq!(summary_count(&settings, 1), 2);
+        assert_eq!(summary_count(&settings, 1), 1);
         assert_eq!(summary_count(&settings, 31337), 1);
     }
 
@@ -892,13 +920,12 @@ mod tests {
         assert!(draft.built_in && !draft.railgun);
         assert!(draft.enabled, "built-in presets ship enabled");
         assert_eq!(
-            lines(&draft, ChainField::RpcEndpoints),
-            presets::EvmPreset::for_chain(10)
-                .unwrap()
+            draft
                 .rpc_endpoints
                 .iter()
-                .map(|endpoint| url::Url::parse(endpoint).unwrap().to_string())
-                .collect::<Vec<_>>()
+                .map(|endpoint| endpoint.url.clone())
+                .collect::<Vec<_>>(),
+            presets::EvmPreset::for_chain(10).unwrap().rpc_endpoints
         );
 
         let mut private = draft;
@@ -981,8 +1008,14 @@ mod tests {
         let mut settings = WalletSettings::default();
         let chain = settings.chains.per_chain.get_mut(&1).unwrap();
         chain.rpc_endpoints = vec![
-            "https://synthetic:credential@first.example".into(),
-            "https://second.example".into(),
+            String::from("https://synthetic:credential@first.example").into(),
+            String::from("https://second.example").into(),
+            RpcEndpointSetting {
+                url: "https://direct.example".into(),
+                direct: true,
+                submit: false,
+                ..RpcEndpointSetting::default()
+            },
         ];
         chain.railgun.sponsored_bundle_relays = Some(vec![]);
         chain.railgun.quick_sync.enabled = false;
@@ -990,7 +1023,6 @@ mod tests {
         chain.railgun.deployment.archive_until_block = Some(0);
         chain.railgun.deployment.archive_rpc_url = Some("https://archive.example".into());
         chain.railgun.deployment.archive_rpc_direct = true;
-        chain.direct_rpc_endpoints = vec!["https://direct.example".into()];
         chain.gas.gas_price_buffer_numerator = Some(12);
         let draft = chain_editor_draft(&settings, 1).unwrap();
         let wire = serde_json::to_vec(&ChainEditorCommand::Save {
@@ -1015,10 +1047,10 @@ mod tests {
             (ChainField::NativeName, "Custom coin"),
             (ChainField::NativeSymbol, "CSTM"),
             (ChainField::NativeDecimals, "6"),
-            (ChainField::RpcEndpoints, "https://rpc.example"),
         ] {
             draft.fields.insert(field, value.into());
         }
+        draft.rpc_endpoints = vec![RpcEndpointDraft::new("https://rpc.example".into())];
         let wire = serde_json::to_vec(&ChainEditorCommand::Save {
             draft,
             existing: false,

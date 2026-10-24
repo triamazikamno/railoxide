@@ -70,7 +70,10 @@ async fn read_fee_bps<C: SolCall<Return = U120> + 'static>(
     call: C,
     fee: &str,
 ) -> Result<U256> {
-    let route = RpcRoute::from(resolve_effective_chain_rpc_route(chain.chain_id, chain)?);
+    let route = RpcRoute::from(
+        resolve_effective_chain_rpc_route(chain.chain_id, chain)?
+            .for_class(crate::RpcTrafficClass::General)?,
+    );
     let value = http
         .rpc_broker()
         .submit_calls_decoded_at::<C>(

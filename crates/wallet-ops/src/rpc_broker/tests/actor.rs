@@ -219,9 +219,8 @@ async fn duplicate_reads_share_one_request_under_the_strictest_attempt_cap() {
                 .await
         })
     };
-    let lenient =
-        submit(RpcRoute::from(chain.clone()).with_attempt_timeout(Duration::from_secs(5)));
-    let strict = submit(RpcRoute::from(chain).with_attempt_timeout(Duration::from_millis(100)));
+    let lenient = submit(RpcRoute::new(chain.clone()).with_attempt_timeout(Duration::from_secs(5)));
+    let strict = submit(RpcRoute::new(chain).with_attempt_timeout(Duration::from_millis(100)));
     gate.request_started.notified().await;
     time::advance(Duration::from_millis(200)).await;
     for _ in 0..64 {
@@ -459,7 +458,7 @@ fn waiter_policies_expire_independently_and_select_shortest_live_cap() {
 #[tokio::test]
 async fn actor_resolves_each_read_and_does_not_leave_waiters_on_empty_route() {
     let broker = test_broker(Duration::from_millis(1), 1);
-    let route = RpcRoute::from(RpcChainRoute::new(1, Vec::<Url>::new()));
+    let route = RpcRoute::new(RpcChainRoute::new(1, Vec::<Url>::new()));
     let submission = RpcSubmission::new(
         route,
         vec![RpcRead::eth_call(Address::ZERO, Bytes::new())],
@@ -877,7 +876,7 @@ async fn duplicate_submissions_attach_to_an_in_flight_execution() {
     let broker = test_broker_with_executor(Duration::from_millis(1), 1, executor);
     broker.notify_block(1, 1);
     time::sleep(Duration::from_millis(5)).await;
-    let route = RpcRoute::from(RpcChainRoute::new(
+    let route = RpcRoute::new(RpcChainRoute::new(
         1,
         vec![
             Url::parse("https://first-selected.invalid").unwrap(),
@@ -912,7 +911,7 @@ async fn duplicate_submissions_attach_to_an_in_flight_execution() {
         async move { broker.submit(submission).await }
     });
     started.notified().await;
-    let equivalent_route = RpcRoute::from(RpcChainRoute::new(
+    let equivalent_route = RpcRoute::new(RpcChainRoute::new(
         route.chain_id(),
         route.chain_route().endpoint_urls(),
     ));
@@ -1102,7 +1101,7 @@ async fn aggregate_member_expiry_with_late_waiter(shutdown: bool) {
         |_| {},
     );
     let actor_task = tokio::spawn(actor.run(block_rx));
-    let route = RpcRoute::from(
+    let route = RpcRoute::new(
         RpcChainRoute::new(1, vec![endpoint]).with_multicall(Address::from([15_u8; 20])),
     )
     .with_test_thresholds(2, DEFAULT_MAX_ESTIMATED_GAS);
@@ -1452,7 +1451,7 @@ async fn latest_cache_hits_within_a_block_and_invalidates_on_advance() {
     let broker = test_broker_with_executor(Duration::from_millis(1), 1, executor);
     broker.notify_block(1, 10);
     time::sleep(Duration::from_millis(5)).await;
-    let route = RpcRoute::from(RpcChainRoute::new(
+    let route = RpcRoute::new(RpcChainRoute::new(
         1,
         vec![Url::parse("https://cache.invalid").unwrap()],
     ));
@@ -1510,7 +1509,7 @@ async fn latest_cache_lease_and_invalidation_preserve_numbered_entries() {
         tokio::task::yield_now().await;
     }
     let route = |chain_id| {
-        RpcRoute::from(RpcChainRoute::new(
+        RpcRoute::new(RpcChainRoute::new(
             chain_id,
             vec![Url::parse("https://lease-cache.invalid").unwrap()],
         ))

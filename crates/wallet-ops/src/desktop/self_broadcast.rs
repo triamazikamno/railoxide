@@ -167,7 +167,13 @@ pub(super) async fn submit_self_broadcast_plan(
 ) -> Result<DesktopSelfBroadcastResult> {
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     let gas_payer = self_broadcast_gas_payer(vault_store, view_session, &public_account_uuid)?;
-    let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
+    // The pools resolve here, before the outer transaction is signed.
+    let sensitive_route = chain.rpc_route.for_class(RpcTrafficClass::Sensitive)?;
+    let query_rpc_pool = query_rpc_pool_for_route(&sensitive_route, http);
+    let submit_pool = query_rpc_pool_for_route(
+        &chain.rpc_route.for_class(RpcTrafficClass::Submission)?,
+        http,
+    );
     let signer =
         if let Some(authorization @ DesktopPrivateSpendAuthorization::HardwareExecutor(hardware)) =
             spend_authorization.as_ref()
@@ -230,7 +236,7 @@ pub(super) async fn submit_self_broadcast_plan(
         let preflight = match self_broadcast_preflight_from_rpc_pool(
             &query_rpc_pool,
             http,
-            &chain.rpc_route,
+            &sensitive_route,
             chain_id,
             gas_payer,
             transaction.clone(),
@@ -288,7 +294,7 @@ pub(super) async fn submit_self_broadcast_plan(
         );
         match submit_self_broadcast_attempt(
             preflight,
-            &query_rpc_pool,
+            &submit_pool,
             http.network_mode(),
             &signer,
             &session,
@@ -399,7 +405,7 @@ pub(super) async fn submit_self_broadcast_plan(
                     let replacement = match self_broadcast_replacement_preflight_from_rpc_pool(
                         &query_rpc_pool,
                         http,
-                        &chain.rpc_route,
+                        &sensitive_route,
                         chain_id,
                         gas_payer,
                         transaction.clone(),
@@ -431,7 +437,7 @@ pub(super) async fn submit_self_broadcast_plan(
                     let previous_attempt_count = submitted_attempts.len();
                     match submit_self_broadcast_attempt(
                         replacement,
-                        &query_rpc_pool,
+                        &submit_pool,
                         http.network_mode(),
                         &signer,
                         &session,
@@ -623,7 +629,7 @@ pub(super) async fn submit_self_broadcast_attempt(
 pub(super) async fn self_broadcast_replacement_preflight_from_rpc_pool(
     query_rpc_pool: &QueryRpcPool,
     http: &HttpContext,
-    route: &RpcChainRoute,
+    route: &ClassRoute,
     chain_id: u64,
     from: Address,
     transaction: TransactionRequest,
@@ -1151,7 +1157,7 @@ pub(super) fn upper_quartile(values: &mut [u128]) -> Option<u128> {
 /// checks count against the sampler's hard window, which starts here.
 pub(super) async fn self_broadcast_gas_fee_quote_from_route(
     http: &HttpContext,
-    route: &RpcChainRoute,
+    route: &ClassRoute,
 ) -> Result<SelfBroadcastGasFeeQuote> {
     let network_mode = http.network_mode();
     let started_at = tokio::time::Instant::now();
@@ -1268,7 +1274,7 @@ pub(crate) fn validate_self_broadcast_gas_fee(
 pub(super) async fn self_broadcast_preflight_from_rpc_pool(
     query_rpc_pool: &QueryRpcPool,
     http: &HttpContext,
-    route: &RpcChainRoute,
+    route: &ClassRoute,
     chain_id: u64,
     from: Address,
     transaction: TransactionRequest,
@@ -1824,7 +1830,8 @@ pub async fn run_sponsored_self_broadcast_session(
     }
 
     let route =
-        settings::resolve_effective_chain_rpc_route(request.chain_id, &request.effective_chain)?;
+        settings::resolve_effective_chain_rpc_route(request.chain_id, &request.effective_chain)?
+            .for_class(RpcTrafficClass::Sensitive)?;
     let query_rpc_pool = query_rpc_pool_for_route(&route, http);
     let tx_hash = keccak256(&request.signed_raw_transaction);
     let signed_raw_transaction = Zeroizing::new(hex::encode_prefixed(
@@ -1915,7 +1922,10 @@ pub(super) async fn submit_prepared_sponsored_self_broadcast(
         ));
     }
 
-    let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
+    let query_rpc_pool = query_rpc_pool_for_route(
+        &chain.rpc_route.for_class(RpcTrafficClass::Sensitive)?,
+        http,
+    );
     let provider_handle =
         sponsored_code_preflight_from_rpc_pool(&query_rpc_pool, payer, signer_address).await?;
     let nonce = provider_handle
@@ -2545,7 +2555,9 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::rpc_broker::tests::{MAX_IDENTITY_PROBES, RpcMockGate, spawn_rpc_mock_with_gate};
+    use crate::rpc_broker::tests::{
+        MAX_IDENTITY_PROBES, RpcMockGate, general, spawn_rpc_mock_with_gate,
+    };
     use serde_json::{Value, json};
 
     #[tokio::test(start_paused = true)]
@@ -2652,10 +2664,13 @@ mod tests {
             })
             .collect();
         let started = tokio::time::Instant::now();
-        let candidates =
-            RpcCandidates::acquire_for_gateway(&http, &RpcChainRoute::new(42161, urls), None)
-                .await
-                .expect("gateway candidates");
+        let candidates = RpcCandidates::acquire_for_gateway(
+            &http,
+            &general(&RpcChainRoute::new(42161, urls)),
+            None,
+        )
+        .await
+        .expect("gateway candidates");
         let stalled_endpoints: Vec<_> = candidates
             .pool()
             .available_providers()
@@ -2767,10 +2782,13 @@ mod tests {
         let http = HttpContext::direct_for_tests_with_candidate_order(|_| {});
         let route = RpcChainRoute::new(FEE_CHAIN_ID, endpoints).with_identity_verification();
         let started_at = tokio::time::Instant::now();
-        let candidates =
-            RpcCandidates::acquire(&http, &route, Some(started_at + policy.hard_deadline))
-                .await
-                .expect("candidates");
+        let candidates = RpcCandidates::acquire(
+            &http,
+            &general(&route),
+            Some(started_at + policy.hard_deadline),
+        )
+        .await
+        .expect("candidates");
         let sampling = tokio::spawn({
             let candidates = candidates.clone();
             async move { self_broadcast_parallel_fee_samples(&candidates, started_at, policy).await }
@@ -2836,10 +2854,13 @@ mod tests {
         let http = HttpContext::direct_for_tests_with_candidate_order(|_| {});
         let route = RpcChainRoute::new(FEE_CHAIN_ID, endpoints).with_identity_verification();
         let started_at = tokio::time::Instant::now();
-        let candidates =
-            RpcCandidates::acquire(&http, &route, Some(started_at + policy.hard_deadline))
-                .await
-                .expect("candidates");
+        let candidates = RpcCandidates::acquire(
+            &http,
+            &general(&route),
+            Some(started_at + policy.hard_deadline),
+        )
+        .await
+        .expect("candidates");
 
         let samples = self_broadcast_parallel_fee_samples(&candidates, started_at, policy).await;
         assert!(samples.is_none());
@@ -2965,7 +2986,7 @@ mod tests {
     async fn sponsored_payer_mismatch_fails_through_active_query_rpc_pool() {
         let (url, task) = spawn_query_rpc_response(Ok(json!("0x")));
         let http = HttpContext::direct_for_tests();
-        let pool = query_rpc_pool_for_route(&RpcChainRoute::new(1, vec![url]), &http);
+        let pool = query_rpc_pool_for_route(&general(&RpcChainRoute::new(1, vec![url])), &http);
         let result = sponsored_code_preflight_from_rpc_pool(
             &pool,
             Address::from([0x13; 20]),
@@ -2988,7 +3009,7 @@ mod tests {
             "data": reflected,
         })));
         let http = HttpContext::direct_for_tests();
-        let pool = query_rpc_pool_for_route(&RpcChainRoute::new(1, vec![url]), &http);
+        let pool = query_rpc_pool_for_route(&general(&RpcChainRoute::new(1, vec![url])), &http);
         let provider_handle = pool
             .available_providers()
             .into_iter()

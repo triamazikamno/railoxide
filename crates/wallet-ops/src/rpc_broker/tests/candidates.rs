@@ -77,7 +77,7 @@ async fn cached_and_gateway_candidates_are_ready_without_new_probes() {
         .expect("a clone verifies the cached endpoint");
 
     // The cached endpoint is ready at once while the other endpoint's probe is held.
-    let candidates = RpcCandidates::acquire(&http, &route, None)
+    let candidates = RpcCandidates::acquire(&http, &super::general(&route), None)
         .await
         .expect("candidates");
     assert_eq!(ready(&candidates), vec![0]);
@@ -89,7 +89,7 @@ async fn cached_and_gateway_candidates_are_ready_without_new_probes() {
 
     // Gateway reads verify per read, so even an unverified configuration is ready unprobed.
     let unverified = RpcChainRoute::new(CHAIN_ID, vec![cached, held]).with_identity_verification();
-    let gateway = RpcCandidates::acquire_for_gateway(&http, &unverified, None)
+    let gateway = RpcCandidates::acquire_for_gateway(&http, &super::general(&unverified), None)
         .await
         .expect("gateway candidates");
     assert_eq!(ready(&gateway), vec![0, 1]);
@@ -108,7 +108,7 @@ async fn discovery_probes_each_endpoint_once_and_ends_after_failures() {
     let http = HttpContext::direct_for_tests();
     let route =
         RpcChainRoute::new(CHAIN_ID, vec![wrong, failing, held]).with_identity_verification();
-    let candidates = RpcCandidates::acquire(&http, &route, None)
+    let candidates = RpcCandidates::acquire(&http, &super::general(&route), None)
         .await
         .expect("candidates");
 
@@ -187,7 +187,7 @@ async fn dropping_the_last_candidates_handle_stops_discovery() {
     endpoints.push(queued);
     let http = HttpContext::direct_for_tests();
     let route = RpcChainRoute::new(CHAIN_ID, endpoints).with_identity_verification();
-    let candidates = RpcCandidates::acquire(&http, &route, None)
+    let candidates = RpcCandidates::acquire(&http, &super::general(&route), None)
         .await
         .expect("candidates");
     let clone = candidates.clone();

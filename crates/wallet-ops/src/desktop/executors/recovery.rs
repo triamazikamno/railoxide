@@ -559,6 +559,7 @@ pub(super) async fn recovery_allowance(
     };
     let pool = chain
         .rpc_route
+        .for_class(crate::RpcTrafficClass::Sensitive)?
         .query_rpc_pool(&http.rpc_clients(), Duration::from_secs(30));
     for endpoint in pool.available_providers() {
         let provider = &endpoint.provider;

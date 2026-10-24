@@ -179,7 +179,7 @@ async fn malformed_aggregate_response_strikes_without_reduction_and_can_fail_ove
             } else {
                 vec![first.clone()]
             };
-            let route = RpcRoute::from(
+            let route = RpcRoute::new(
                 RpcChainRoute::new(1, endpoints).with_multicall(Address::from([10_u8; 20])),
             );
             let items = (1..=2)
@@ -358,7 +358,7 @@ async fn production_path_reassembles_mixed_and_individual_reads() {
         None,
     );
     let mixed = RpcSubmission::new(
-        RpcRoute::from(RpcChainRoute::new(1, vec![endpoint.clone()]).with_multicall(multicall)),
+        RpcRoute::new(RpcChainRoute::new(1, vec![endpoint.clone()]).with_multicall(multicall)),
         vec![
             rpc_read_from_request(
                 TransactionRequest {
@@ -386,7 +386,7 @@ async fn production_path_reassembles_mixed_and_individual_reads() {
     );
 
     let individual = RpcSubmission::new(
-        RpcRoute::from(RpcChainRoute::new(1, vec![endpoint])),
+        RpcRoute::new(RpcChainRoute::new(1, vec![endpoint])),
         vec![RpcRead::eth_call(
             Address::from([3_u8; 20]),
             Bytes::from_static(b"\x12\x34\x56\x78"),
@@ -428,7 +428,7 @@ async fn production_path_isolates_inner_revert_payloads() {
         .collect();
     let result = broker
         .submit(RpcSubmission::new(
-            RpcRoute::from(RpcChainRoute::new(1, vec![endpoint]).with_multicall(multicall)),
+            RpcRoute::new(RpcChainRoute::new(1, vec![endpoint]).with_multicall(multicall)),
             reads,
             test_origin(),
         ))
@@ -486,7 +486,7 @@ async fn production_path_reduces_recoverable_aggregates_concurrently() {
     let result = time::timeout(
         Duration::from_secs(1),
         broker.submit(RpcSubmission::new(
-            RpcRoute::from(RpcChainRoute::new(1, vec![endpoint]).with_multicall(multicall)),
+            RpcRoute::new(RpcChainRoute::new(1, vec![endpoint]).with_multicall(multicall)),
             reads,
             test_origin(),
         )),
@@ -529,7 +529,7 @@ async fn aggregate_attempt_timeout_fails_over_before_total_deadline() {
     )
     .await;
     let (second, second_server) = spawn_rpc_mock(second_responder, active, maximum).await;
-    let route = RpcRoute::from(
+    let route = RpcRoute::new(
         RpcChainRoute::new(1, vec![first.clone(), second.clone()]).with_multicall(multicall),
     )
     .with_request_timeout(Duration::from_secs(2))
@@ -614,7 +614,7 @@ async fn aggregate_uses_the_strictest_cap_selected_at_dispatch() {
     let maximum = Arc::new(AtomicUsize::new(0));
     let (endpoint, server) = spawn_gated_rpc_mock(responder, active, maximum, gate.clone()).await;
     let route =
-        RpcRoute::from(RpcChainRoute::new(1, vec![endpoint.clone()]).with_multicall(multicall));
+        RpcRoute::new(RpcChainRoute::new(1, vec![endpoint.clone()]).with_multicall(multicall));
     let read = RpcRead::eth_call(
         Address::from([1_u8; 20]),
         Bytes::from_static(b"\x70\xa0\x82\x31"),
@@ -894,9 +894,8 @@ async fn aggregate_predispatch_timeout_does_not_replace_prior_endpoint_error() {
     )
     .await;
     let (second, second_server) = spawn_rpc_mock(second_responder, active, maximum).await;
-    let route = RpcRoute::from(
-        RpcChainRoute::new(1, vec![first.clone(), second]).with_multicall(multicall),
-    );
+    let route =
+        RpcRoute::new(RpcChainRoute::new(1, vec![first.clone(), second]).with_multicall(multicall));
     let read = RpcRead::eth_call(Address::ZERO, Bytes::from_static(b"\x70\xa0\x82\x31"));
     let item = WorkItem {
         key: WorkKey {
@@ -971,7 +970,7 @@ async fn reduction_parent_error_replaces_undispatched_children() {
     let (endpoint, server) =
         spawn_gated_rpc_mock(first_responder, active, maximum, first_gate.clone()).await;
     let route =
-        RpcRoute::from(RpcChainRoute::new(1, vec![endpoint.clone()]).with_multicall(multicall));
+        RpcRoute::new(RpcChainRoute::new(1, vec![endpoint.clone()]).with_multicall(multicall));
     let reads = [
         RpcRead::eth_call(Address::from([1_u8; 20]), Bytes::from_static(b"first")),
         RpcRead::eth_call(Address::from([2_u8; 20]), Bytes::from_static(b"second")),
@@ -1059,7 +1058,7 @@ async fn singleton_reduction_retry_resnapshots_late_waiter() {
     let (endpoint, server) =
         spawn_gated_rpc_mock(responder, active, maximum, first_gate.clone()).await;
     let route =
-        RpcRoute::from(RpcChainRoute::new(1, vec![endpoint.clone()]).with_multicall(multicall));
+        RpcRoute::new(RpcChainRoute::new(1, vec![endpoint.clone()]).with_multicall(multicall));
     let read = RpcRead::eth_call(Address::from([1_u8; 20]), Bytes::from_static(b"singleton"));
     let initial_deadline = Instant::now() + Duration::from_secs(30);
     let waiters = WaiterState::new(WaiterPolicy {
@@ -1184,7 +1183,7 @@ async fn reduction_preserves_requested_cardinality() {
         .collect();
     let result = test_broker(Duration::from_millis(1), 2)
         .submit(RpcSubmission::new(
-            RpcRoute::from(RpcChainRoute::new(1, vec![endpoint]).with_multicall(multicall)),
+            RpcRoute::new(RpcChainRoute::new(1, vec![endpoint]).with_multicall(multicall)),
             reads,
             test_origin(),
         ))
@@ -1229,7 +1228,7 @@ async fn reduction_limit_fails_over_without_phantom_attempts() {
     let (first, first_server) = spawn_rpc_mock(first_responder, first_active, first_maximum).await;
     let (second, second_server) =
         spawn_rpc_mock(second_responder, second_active, second_maximum).await;
-    let route = RpcRoute::from(
+    let route = RpcRoute::new(
         RpcChainRoute::new(1, vec![first.clone(), second.clone()]).with_multicall(multicall),
     );
     let items = (0_u8..64)
@@ -1303,9 +1302,8 @@ async fn singleton_leaf_fails_over_after_individual_retry() {
     let (first, first_server) = spawn_rpc_mock(first_responder, first_active, first_maximum).await;
     let (second, second_server) =
         spawn_rpc_mock(second_responder, second_active, second_maximum).await;
-    let route = RpcRoute::from(
-        RpcChainRoute::new(1, vec![first.clone(), second]).with_multicall(multicall),
-    );
+    let route =
+        RpcRoute::new(RpcChainRoute::new(1, vec![first.clone(), second]).with_multicall(multicall));
     let read = RpcRead::eth_call(
         Address::from([1_u8; 20]),
         Bytes::from_static(b"\x70\xa0\x82\x31"),
@@ -1366,7 +1364,7 @@ async fn individual_read_fails_over_on_recoverable_error() {
     let (first, first_server) = spawn_rpc_mock(first_responder, first_active, first_maximum).await;
     let (second, second_server) =
         spawn_rpc_mock(second_responder, second_active, second_maximum).await;
-    let route = RpcRoute::from(RpcChainRoute::new(1, vec![first.clone(), second]));
+    let route = RpcRoute::new(RpcChainRoute::new(1, vec![first.clone(), second]));
     let read = RpcRead::eth_call(
         Address::from([1_u8; 20]),
         Bytes::from_static(b"\x70\xa0\x82\x31"),
@@ -1424,7 +1422,7 @@ async fn production_path_fans_out_unrecoverable_outer_failure() {
     let result = time::timeout(
         Duration::from_secs(1),
         broker.submit(RpcSubmission::new(
-            RpcRoute::from(RpcChainRoute::new(1, vec![endpoint]).with_multicall(multicall)),
+            RpcRoute::new(RpcChainRoute::new(1, vec![endpoint]).with_multicall(multicall)),
             reads,
             test_origin(),
         )),
@@ -1616,7 +1614,7 @@ async fn started_request_timeout_is_recorded_as_an_attributed_request() {
         release_response: Arc::new(tokio::sync::Notify::new()),
     };
     let (endpoint, server) = spawn_gated_rpc_mock(responder, active, maximum, gate.clone()).await;
-    let route = RpcRoute::from(RpcChainRoute::new(1, vec![endpoint.clone()]));
+    let route = RpcRoute::new(RpcChainRoute::new(1, vec![endpoint.clone()]));
     let item = WorkItem {
         key: WorkKey {
             identity: read.identity_for_route(&route),
@@ -1675,7 +1673,7 @@ async fn aggregate_semaphore_wait_filters_expired_members_and_preserves_order() 
     let active = Arc::new(AtomicUsize::new(0));
     let maximum = Arc::new(AtomicUsize::new(0));
     let (endpoint, server) = spawn_rpc_mock(responder, active, maximum).await;
-    let route = RpcRoute::from(RpcChainRoute::new(1, vec![endpoint]).with_multicall(multicall));
+    let route = RpcRoute::new(RpcChainRoute::new(1, vec![endpoint]).with_multicall(multicall));
     let read = |index| {
         RpcRead::eth_call(
             Address::from([index; 20]),
@@ -1797,9 +1795,8 @@ async fn aggregate_failover_filters_expired_member_but_keeps_first_outcome() {
     .await;
     let (second, second_server) =
         spawn_gated_rpc_mock(second_responder, active, maximum, second_gate.clone()).await;
-    let route = RpcRoute::from(
-        RpcChainRoute::new(1, vec![first.clone(), second]).with_multicall(multicall),
-    );
+    let route =
+        RpcRoute::new(RpcChainRoute::new(1, vec![first.clone(), second]).with_multicall(multicall));
     let read = |index| {
         RpcRead::eth_call(
             Address::from([index; 20]),
@@ -1953,7 +1950,7 @@ async fn reduction_drops_expired_child_but_preserves_parent_error() {
     };
     let (endpoint, server) =
         spawn_gated_rpc_mock(responder, active, maximum, first_gate.clone()).await;
-    let route = RpcRoute::from(RpcChainRoute::new(1, vec![endpoint]).with_multicall(multicall));
+    let route = RpcRoute::new(RpcChainRoute::new(1, vec![endpoint]).with_multicall(multicall));
     let read = |index| {
         RpcRead::eth_call(
             Address::from([index; 20]),
@@ -2081,7 +2078,7 @@ async fn ordinary_submission_emits_only_requested_rpc_method() {
     let broker = test_broker(Duration::from_millis(1), 1);
     let result = broker
         .submit(RpcSubmission::new(
-            RpcRoute::from(RpcChainRoute::new(1, vec![endpoint])),
+            RpcRoute::new(RpcChainRoute::new(1, vec![endpoint])),
             vec![RpcRead::get_balance(Address::ZERO)],
             test_origin(),
         ))
@@ -2158,7 +2155,7 @@ async fn endpoint_failover_retries_unrecoverable_failure_for_aggregate_reads() {
     let broker = test_broker(Duration::from_millis(1), 2);
     let result = broker
         .submit(RpcSubmission::new(
-            RpcRoute::from(RpcChainRoute::new(1, vec![first, second]).with_multicall(multicall)),
+            RpcRoute::new(RpcChainRoute::new(1, vec![first, second]).with_multicall(multicall)),
             vec![RpcRead::eth_call(
                 Address::from([1_u8; 20]),
                 Bytes::from_static(b"\x70\xa0\x82\x31"),
@@ -2200,7 +2197,7 @@ async fn reverted_member_is_not_retried_on_the_next_endpoint() {
     let broker = test_broker(Duration::from_millis(1), 2);
     let result = broker
         .submit(RpcSubmission::new(
-            RpcRoute::from(RpcChainRoute::new(1, vec![first, second]).with_multicall(multicall)),
+            RpcRoute::new(RpcChainRoute::new(1, vec![first, second]).with_multicall(multicall)),
             vec![RpcRead::eth_call(
                 Address::from([1_u8; 20]),
                 Bytes::from_static(b"\x70\xa0\x82\x31"),
@@ -2257,7 +2254,7 @@ async fn verified_routes_reuse_identity_and_never_read_from_wrong_chain_endpoint
         Arc::default(),
     )
     .await;
-    let route = RpcRoute::from(RpcChainRoute::new(1, vec![bad, good]).with_identity_verification());
+    let route = RpcRoute::new(RpcChainRoute::new(1, vec![bad, good]).with_identity_verification());
     let broker = test_broker(Duration::from_millis(1), 1);
     for _ in 0..4 {
         let results = broker

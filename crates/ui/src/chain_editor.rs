@@ -10,7 +10,8 @@ use gpui::{
     relative, rgb,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    WindowExt as _,
     alert::Alert,
     button::{Button, ButtonVariant, ButtonVariants as _},
     checkbox::Checkbox,
@@ -22,7 +23,7 @@ use gpui_component::{
 };
 use railgun_ui::chain_editor::{
     ChainDraft, ChainEditorCommand, ChainEditorSnapshot, ChainField, ChainSummary, NativeUsdChoice,
-    NativeUsdProbe, NativeUsdState, NativeUsdStatus,
+    NativeUsdProbe, NativeUsdState, NativeUsdStatus, RpcEndpointDraft,
 };
 use std::collections::BTreeMap;
 
@@ -52,6 +53,8 @@ pub struct ChainEditor {
     probe_source: Option<String>,
     chain_id: Option<Entity<InputState>>,
     fields: BTreeMap<ChainField, FieldInput>,
+    /// One URL input per RPC endpoint with its flags. The input owns the URL until collection.
+    rpc_endpoints: Vec<(Entity<InputState>, RpcEndpointDraft)>,
     existing: bool,
     pending: bool,
     /// The host committed a different revision while this draft was open.
@@ -114,6 +117,7 @@ impl ChainEditor {
             probe_source: None,
             chain_id: None,
             fields: BTreeMap::new(),
+            rpc_endpoints: Vec::new(),
             existing: false,
             pending: false,
             stale: false,
@@ -219,6 +223,7 @@ impl ChainEditor {
         self.pricing_preset = None;
         self.chain_id = None;
         self.fields.clear();
+        self.rpc_endpoints.clear();
         self.existing = false;
     }
 
@@ -278,6 +283,11 @@ impl ChainEditor {
                 (field, input)
             })
             .collect();
+        self.rpc_endpoints = draft
+            .rpc_endpoints
+            .iter()
+            .map(|endpoint| (new_input(&endpoint.url, window, cx), endpoint.clone()))
+            .collect();
         let chain_id = new_input(&draft.chain_id, window, cx);
         if existing {
             // The row that opened this editor is gone, so keep focus on the editor root.
@@ -320,7 +330,8 @@ impl ChainEditor {
             existing: self.existing,
         };
         let count = self.newly_direct(&draft);
-        if count == 0 {
+        let submitting = self.newly_submit_direct(&draft);
+        if count == 0 && submitting == 0 {
             self.send(command, cx);
             return;
         }
@@ -328,19 +339,28 @@ impl ChainEditor {
         // A host commit while the dialog is open makes this draft stale; don't stamp it.
         let revision = self.snapshot.revision.clone();
         let ok_text = self.save_label(&draft, cx);
-        let (title, body) = if count == 1 {
-            (
+        let (title, body) = match count {
+            0 => ("Submit through a direct endpoint?".to_owned(), None),
+            1 => (
                 "Bypass Tor for this endpoint?".to_owned(),
-                "This endpoint will see your IP address and every request sent to it, \
-                 including public balance reads that are otherwise isolated per account.",
-            )
-        } else {
-            (
+                Some(
+                    "This endpoint will see your IP address and every request sent to it, \
+                     including public balance reads that are otherwise isolated per account.",
+                ),
+            ),
+            _ => (
                 format!("Bypass Tor for {count} endpoints?"),
-                "These endpoints will see your IP address and every request sent to them, \
-                 including public balance reads that are otherwise isolated per account.",
-            )
+                Some(
+                    "These endpoints will see your IP address and every request sent to them, \
+                     including public balance reads that are otherwise isolated per account.",
+                ),
+            ),
         };
+        let submit_body = (submitting > 0).then_some(
+            "Transactions sent through a direct endpoint with Submit on are announced to the \
+             network from that node's IP address. Submit there only if that address can't be \
+             linked to you.",
+        );
         window.open_alert_dialog(cx, move |dialog, _, _| {
             let editor = editor.clone();
             let command = command.clone();
@@ -348,11 +368,16 @@ impl ChainEditor {
             dialog
                 .width(CONFIRM_DIALOG_WIDTH)
                 .title(app_strong_text(title.clone()))
-                .child(
+                .children(body.map(|body| {
                     app_muted_text(body)
                         .debug_selector(|| "chain-direct-confirm".into())
-                        .whitespace_normal(),
-                )
+                        .whitespace_normal()
+                }))
+                .children(submit_body.map(|body| {
+                    app_muted_text(body)
+                        .debug_selector(|| "chain-submit-direct-confirm".into())
+                        .whitespace_normal()
+                }))
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text(ok_text)
@@ -378,19 +403,19 @@ impl ChainEditor {
         let Some(opened) = &self.opened_draft else {
             return 0;
         };
-        let field = ChainField::DirectRpcEndpoints;
-        let before: Vec<&str> = opened.value(field).lines().map(str::trim).collect();
-        let added = draft
-            .value(field)
-            .lines()
-            .map(str::trim)
-            .filter(|url| !url.is_empty() && !before.contains(url))
-            .count();
+        let added = newly_flagged(draft, opened, |endpoint| endpoint.direct);
         let archive = draft.value(ChainField::ArchiveRpcUrl).trim();
         let archive_was_direct =
             opened.archive_rpc_direct && opened.value(ChainField::ArchiveRpcUrl).trim() == archive;
         let archive_added = draft.archive_rpc_direct && !archive.is_empty() && !archive_was_direct;
         added + usize::from(archive_added)
+    }
+
+    /// Direct endpoints with Submit on that the opened draft did not submit to directly.
+    fn newly_submit_direct(&self, draft: &ChainDraft) -> usize {
+        self.opened_draft.as_ref().map_or(0, |opened| {
+            newly_flagged(draft, opened, |endpoint| endpoint.direct && endpoint.submit)
+        })
     }
 
     /// The open draft with every input's current value, as the host receives it.
@@ -402,7 +427,29 @@ impl ChainEditor {
         for (&field, input) in &self.fields {
             draft.fields.insert(field, input.value(cx));
         }
+        draft.rpc_endpoints = self.collected_endpoints(cx);
         Some(draft)
+    }
+
+    /// Endpoint rows that have a URL, as the host receives them.
+    fn collected_endpoints(&self, cx: &App) -> Vec<RpcEndpointDraft> {
+        self.rpc_endpoints
+            .iter()
+            .filter_map(|(input, endpoint)| {
+                let url = input.read(cx).value().trim().to_owned();
+                (!url.is_empty()).then(|| {
+                    let mut endpoint = endpoint.clone();
+                    endpoint.url = url;
+                    endpoint
+                })
+            })
+            .collect()
+    }
+
+    /// Whether a filled endpoint row has `flag` on, or none when no row has a URL yet.
+    fn endpoint_coverage(&self, flag: EndpointFlag, cx: &App) -> Option<bool> {
+        let endpoints = self.collected_endpoints(cx);
+        (!endpoints.is_empty()).then(|| endpoints.iter().any(|endpoint| flag.get(endpoint)))
     }
 
     /// Reads the draft's own source once. Save stays available whatever the result is.
@@ -451,14 +498,48 @@ impl ChainEditor {
 
     fn move_url(&mut self, field: ChainField, index: usize, up: bool, cx: &mut Context<'_, Self>) {
         if let Some(FieldInput::List(rows)) = self.fields.get_mut(&field) {
-            let len = rows.len();
-            let target = if up {
-                index.checked_sub(1)
-            } else {
-                index.checked_add(1)
+            move_row(rows, index, up);
+        }
+        cx.notify();
+    }
+
+    fn move_endpoint(&mut self, index: usize, up: bool, cx: &mut Context<'_, Self>) {
+        move_row(&mut self.rpc_endpoints, index, up);
+        cx.notify();
+    }
+
+    fn remove_endpoint(&mut self, index: usize, cx: &mut Context<'_, Self>) {
+        if index < self.rpc_endpoints.len() {
+            self.rpc_endpoints.remove(index);
+        }
+        cx.notify();
+    }
+
+    fn add_endpoint(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let input = new_input("", window, cx);
+        self.rpc_endpoints
+            .push((input.clone(), RpcEndpointDraft::new(String::new())));
+        input.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    fn toggle_endpoint_flag(
+        &mut self,
+        index: usize,
+        flag: EndpointFlag,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some((_, endpoint)) = self.rpc_endpoints.get_mut(index) {
+            let on = match flag {
+                EndpointFlag::Direct => &mut endpoint.direct,
+                EndpointFlag::General => &mut endpoint.general,
+                EndpointFlag::Sensitive => &mut endpoint.sensitive,
+                EndpointFlag::Submit => &mut endpoint.submit,
             };
-            if let Some(target) = target.filter(|target| *target < len) {
-                rows.swap(index, target);
+            *on = !*on;
+            // A node announces transactions from its own address, so Direct starts without Submit.
+            if flag == EndpointFlag::Direct && endpoint.direct {
+                endpoint.submit = false;
             }
         }
         cx.notify();
@@ -977,24 +1058,130 @@ impl ChainEditor {
                     .child(section_title("RPC ENDPOINTS"))
                     .child(subtle_text("Preference order")),
             )
-            .child(self.render_url_list(
-                ChainField::RpcEndpoints,
-                false,
-                Some("Endpoints are checked against the chain ID before use."),
-                cx,
-            ))
-            .child(meta_text(ChainField::DirectRpcEndpoints.label()))
-            .child(self.render_url_list(
-                ChainField::DirectRpcEndpoints,
-                false,
-                Some(if self.snapshot.direct_network {
-                    "Network mode is Direct, so all endpoints are already reached directly."
+            .child(self.render_endpoint_rows(cx))
+            .child(
+                subtle_text(if self.snapshot.direct_network {
+                    "Endpoints are checked against the chain ID before use. Network mode is \
+                     Direct, so all endpoints are already reached directly."
                 } else {
-                    "Used alongside the endpoints above, without Tor or the proxy. \
-                     Add only endpoints you trust."
+                    "Endpoints are checked against the chain ID before use."
+                })
+                .whitespace_normal(),
+            )
+            .children(
+                (self.endpoint_coverage(EndpointFlag::General, cx) == Some(false)).then(|| {
+                    Alert::error(
+                        "chain-no-general",
+                        "Turn General on for at least one endpoint to save this chain.",
+                    )
+                    .small()
                 }),
-                cx,
-            ))
+            )
+            .children(
+                (self.endpoint_coverage(EndpointFlag::Sensitive, cx) == Some(false)).then(|| {
+                    Alert::error(
+                        "chain-no-sensitive",
+                        "Turn Sensitive on for at least one endpoint to save this chain. \
+                         Balance reads, transaction preparation and other account-specific reads \
+                         need one.",
+                    )
+                    .small()
+                }),
+            )
+            .children(
+                (self.endpoint_coverage(EndpointFlag::Submit, cx) == Some(false)).then(|| {
+                    Alert::error(
+                        "chain-no-submit",
+                        "Turn Submit on for at least one endpoint to save this chain. \
+                         Transactions need one to be sent.",
+                    )
+                    .small()
+                }),
+            )
+    }
+
+    fn render_endpoint_rows(&self, cx: &Context<'_, Self>) -> gpui::Div {
+        let last = self.rpc_endpoints.len().saturating_sub(1);
+        let mut list = div().flex().flex_col().gap_2().min_w_0();
+        for (index, (input, endpoint)) in self.rpc_endpoints.iter().enumerate() {
+            let flags = EndpointFlag::ALL.iter().fold(
+                div().flex().flex_none().items_center().gap_1(),
+                |group, &flag| {
+                    let on = flag.get(endpoint);
+                    let selector = format!("chain-endpoint-{index}-{}", flag.key());
+                    group.child(
+                        row_icon_button(
+                            SharedString::from(selector.clone()),
+                            flag.icon(),
+                            flag.label().into(),
+                            self.pending,
+                            cx.listener(move |this, _, _, cx| {
+                                this.toggle_endpoint_flag(index, flag, cx);
+                            }),
+                        )
+                        .selected(on)
+                        .toggled(on)
+                        // The ghost hover alone can't tell on from off.
+                        .when(!self.pending, |button| {
+                            button
+                                .when(on, |button| button.bg(rgb(theme::SURFACE_HOVER)))
+                                .text_color(rgb(if on {
+                                    theme::PRIMARY
+                                } else {
+                                    theme::TEXT_SUBTLE
+                                }))
+                        })
+                        .tooltip(flag.tooltip())
+                        .debug_selector(move || selector),
+                    )
+                },
+            );
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .min_w_0()
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            app_input(input)
+                                .aria_label("RPC endpoint")
+                                .disabled(self.pending),
+                        ),
+                    )
+                    .child(flags)
+                    .child(row_icon_button(
+                        SharedString::from(format!("chain-endpoint-{index}-up")),
+                        IconName::ArrowUp,
+                        "Move up".into(),
+                        self.pending || index == 0,
+                        cx.listener(move |this, _, _, cx| this.move_endpoint(index, true, cx)),
+                    ))
+                    .child(row_icon_button(
+                        SharedString::from(format!("chain-endpoint-{index}-down")),
+                        IconName::ArrowDown,
+                        "Move down".into(),
+                        self.pending || index == last,
+                        cx.listener(move |this, _, _, cx| this.move_endpoint(index, false, cx)),
+                    ))
+                    .child(row_icon_button(
+                        SharedString::from(format!("chain-endpoint-{index}-remove")),
+                        IconName::Close,
+                        "Remove endpoint".into(),
+                        self.pending,
+                        cx.listener(move |this, _, _, cx| this.remove_endpoint(index, cx)),
+                    )),
+            );
+        }
+        list.child(
+            div().flex().child(
+                app_button("chain-add-endpoint", "Add endpoint")
+                    .icon(IconName::Plus)
+                    .small()
+                    .disabled(self.pending)
+                    .on_click(cx.listener(|this, _, window, cx| this.add_endpoint(window, cx))),
+            ),
+        )
     }
 
     fn render_advanced_section(&self, cx: &Context<'_, Self>) -> Collapsible {
@@ -1203,18 +1390,8 @@ impl ChainEditor {
         let key = field as usize;
         let noun = url_noun(field);
         let last = rows.len().saturating_sub(1);
-        let direct = match field {
-            ChainField::RpcEndpoints | ChainField::DirectRpcEndpoints => self
-                .fields
-                .get(&ChainField::DirectRpcEndpoints)
-                .map(|input| input.value(cx))
-                .unwrap_or_default(),
-            _ => String::new(),
-        };
         let mut list = div().flex().flex_col().gap_2().min_w_0();
         for (index, input) in rows.iter().enumerate() {
-            let value = input.read(cx).value().trim().to_owned();
-            let is_direct = !value.is_empty() && direct.lines().any(|url| url == value);
             list = list.child(
                 div()
                     .flex()
@@ -1229,15 +1406,6 @@ impl ChainEditor {
                                 .disabled(self.pending),
                         ),
                     )
-                    .when(is_direct, |row| {
-                        row.child(
-                            Tag::warning()
-                                .small()
-                                .rounded_full()
-                                .flex_none()
-                                .child("Direct"),
-                        )
-                    })
                     .child(row_icon_button(
                         SharedString::from(format!("chain-url-{key}-{index}-up")),
                         IconName::ArrowUp,
@@ -1264,9 +1432,6 @@ impl ChainEditor {
         list.child(
             div().flex().child(
                 app_button(("chain-add-url", key), format!("Add {noun}"))
-                    .when(field == ChainField::DirectRpcEndpoints, |button| {
-                        button.debug_selector(|| "chain-add-direct-endpoint".into())
-                    })
                     .icon(IconName::Plus)
                     .small()
                     .disabled(readonly || self.pending)
@@ -1286,6 +1451,7 @@ impl ChainEditor {
             && draft.quick_sync_enabled == opened.quick_sync_enabled
             && draft.use_default_relays == opened.use_default_relays
             && draft.archive_rpc_direct == opened.archive_rpc_direct
+            && self.collected_endpoints(cx) == opened.rpc_endpoints
             && self.fields.iter().all(|(&field, input)| {
                 field == ChainField::NativeUsdOracle || input.value(cx) == opened.value(field)
             })
@@ -1497,7 +1663,17 @@ impl ChainEditor {
                 app_button("chain-save", self.save_label(draft, cx))
                     .primary()
                     .debug_selector(|| "chain-save".into())
-                    .disabled(unavailable || self.stale)
+                    .disabled(
+                        unavailable
+                            || self.stale
+                            || [
+                                EndpointFlag::General,
+                                EndpointFlag::Sensitive,
+                                EndpointFlag::Submit,
+                            ]
+                            .into_iter()
+                            .any(|flag| self.endpoint_coverage(flag, cx) == Some(false)),
+                    )
                     .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
             )
     }
@@ -1627,7 +1803,7 @@ fn new_input(
 
 fn row_icon_button(
     id: SharedString,
-    icon: IconName,
+    icon: impl Into<Icon>,
     label: SharedString,
     disabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -1641,6 +1817,103 @@ fn row_icon_button(
         .tooltip(label)
         .disabled(disabled)
         .on_click(on_click)
+}
+
+fn move_row<T>(rows: &mut [T], index: usize, up: bool) {
+    let target = if up {
+        index.checked_sub(1)
+    } else {
+        index.checked_add(1)
+    };
+    if let Some(target) = target.filter(|target| *target < rows.len()) {
+        rows.swap(index, target);
+    }
+}
+
+/// Endpoints `flagged` in the draft whose URL was not `flagged` in the opened draft.
+fn newly_flagged(
+    draft: &ChainDraft,
+    opened: &ChainDraft,
+    flagged: fn(&RpcEndpointDraft) -> bool,
+) -> usize {
+    draft
+        .rpc_endpoints
+        .iter()
+        .filter(|endpoint| {
+            flagged(endpoint)
+                && !opened
+                    .rpc_endpoints
+                    .iter()
+                    .any(|before| flagged(before) && before.url.trim() == endpoint.url.trim())
+        })
+        .count()
+}
+
+/// One endpoint row toggle. Direct is the transport; the others are the accepted traffic.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EndpointFlag {
+    Direct,
+    General,
+    Sensitive,
+    Submit,
+}
+
+impl EndpointFlag {
+    const ALL: [Self; 4] = [Self::Direct, Self::General, Self::Sensitive, Self::Submit];
+
+    const fn get(self, endpoint: &RpcEndpointDraft) -> bool {
+        match self {
+            Self::Direct => endpoint.direct,
+            Self::General => endpoint.general,
+            Self::Sensitive => endpoint.sensitive,
+            Self::Submit => endpoint.submit,
+        }
+    }
+
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::General => "general",
+            Self::Sensitive => "sensitive",
+            Self::Submit => "submit",
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "Direct",
+            Self::General => "General",
+            Self::Sensitive => "Sensitive",
+            Self::Submit => "Submit",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Self::Direct => IconName::Globe.into(),
+            Self::General => IconName::Network.into(),
+            Self::Sensitive => IconName::CircleUser.into(),
+            Self::Submit => Icon::empty().path(crate::icons::send_icon_path()),
+        }
+    }
+
+    const fn tooltip(self) -> &'static str {
+        match self {
+            Self::Direct => {
+                "Direct: reach this endpoint without Tor or the proxy, so it sees your IP \
+                 address."
+            }
+            Self::General => "General: chain sync, prices and other reads that don't identify you.",
+            Self::Sensitive => {
+                "Sensitive: balance reads, transaction preparation and other reads that identify your \
+                 accounts."
+            }
+            Self::Submit => {
+                "Submit: send transactions here.\nTransactions are announced to the network from \
+                 this endpoint's IP address, which can be linked to you if you run it."
+            }
+        }
+    }
 }
 
 fn chain_avatar(
@@ -1731,7 +2004,6 @@ const fn url_noun(field: ChainField) -> &'static str {
     match field {
         ChainField::ExplorerUrls => "explorer",
         ChainField::SponsoredBundleRelays => "relay",
-        ChainField::DirectRpcEndpoints => "direct endpoint",
         _ => "endpoint",
     }
 }

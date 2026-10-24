@@ -350,7 +350,7 @@ mod tests {
             .unwrap();
         let mut settings = WalletSettings::default();
         settings.chains.per_chain.get_mut(&1).unwrap().rpc_endpoints =
-            vec!["https://synthetic:credential@rpc.example".into()];
+            vec!["https://synthetic:credential@rpc.example".to_owned().into()];
         let snapshot = chain_editor_snapshot(&settings, Some(1)).unwrap();
         let revision = snapshot.revision.clone();
         provider

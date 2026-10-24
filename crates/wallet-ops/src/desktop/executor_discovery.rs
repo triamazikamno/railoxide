@@ -131,6 +131,7 @@ async fn inspect_executor_state(
 ) -> Result<ExecutorInspection> {
     let pool = chain
         .rpc_route
+        .for_class(crate::RpcTrafficClass::Sensitive)?
         .query_rpc_pool(&http.rpc_clients(), Duration::from_secs(30));
     for provider in pool.available_providers() {
         // Avoid leaking the selected address to an endpoint serving a different chain.
@@ -388,6 +389,7 @@ async fn inspect_signing_state(
 )> {
     let pool = chain
         .rpc_route
+        .for_class(crate::RpcTrafficClass::Sensitive)?
         .query_rpc_pool(&http.rpc_clients(), Duration::from_secs(30));
     for endpoint in pool.available_providers() {
         let provider = &endpoint.provider;

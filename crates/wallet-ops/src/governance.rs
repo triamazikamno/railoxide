@@ -21,7 +21,10 @@ use tokio::time::timeout;
 use crate::rpc_broker::total_failure;
 use crate::settings::{EffectiveChainConfig, resolve_effective_chain_rpc_route};
 use crate::staking::{MulticallChunkSize, fetch_account_snapshots_multi, snapshot_hint};
-use crate::{HttpContext, RpcBrokerError, RpcRoute, WalletRpcOrigin, query_rpc_pool_for_route};
+use crate::{
+    HttpContext, RpcBrokerError, RpcRoute, RpcTrafficClass, WalletRpcOrigin,
+    query_rpc_pool_for_route,
+};
 
 const GOVERNANCE_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -730,9 +733,14 @@ pub async fn fetch_governance_participation(
                 ]
             })
             .collect();
-        let batch_values =
-            fetch_governance_multicall_raw(&chain_route, http, calls, "governance participation")
-                .await?;
+        let batch_values = fetch_governance_multicall_raw(
+            &chain_route,
+            RpcTrafficClass::Sensitive,
+            http,
+            calls,
+            "governance participation",
+        )
+        .await?;
         values.extend(batch_values);
     }
     for (position, &(_row_index, account, sponsor_hint, voting_hint)) in prepared.iter().enumerate()
@@ -865,8 +873,10 @@ fn decode_governance_participation(
 /// A member revert is reported to the caller as `Err(RpcBrokerError::InnerRevert(_))` so it can be
 /// distinguished from a transport or JSON-RPC failure; only a whole-batch failure is an outer
 /// error.
+/// Participant reads pass `Sensitive`; proposal lists and overviews pass `General`.
 async fn fetch_governance_multicall_raw(
     chain_route: &crate::RpcChainRoute,
+    class: RpcTrafficClass,
     http: &HttpContext,
     calls: Vec<(Address, Bytes)>,
     caller: &'static str,
@@ -874,7 +884,7 @@ async fn fetch_governance_multicall_raw(
     let results = http
         .rpc_broker()
         .submit_eth_calls(
-            RpcRoute::from(chain_route.clone()),
+            RpcRoute::from(chain_route.for_class(class)?),
             calls,
             WalletRpcOrigin::Governance.into(),
         )
@@ -1178,8 +1188,9 @@ fn provider_for_chain(
     chain_id: u64,
     effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
-) -> Result<(Arc<QueryRpcPool>, crate::RpcChainRoute)> {
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+) -> Result<(Arc<QueryRpcPool>, crate::ClassRoute)> {
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
+        .for_class(RpcTrafficClass::General)?;
     Ok((query_rpc_pool_for_route(&chain_route, http), chain_route))
 }
 
@@ -1206,8 +1217,14 @@ async fn fetch_contract_summaries(
             .map(move |call| (voting_address, call.into()))
         })
         .collect();
-    let values =
-        fetch_governance_multicall_raw(chain_route, http, calls, "governance overview").await?;
+    let values = fetch_governance_multicall_raw(
+        chain_route,
+        RpcTrafficClass::General,
+        http,
+        calls,
+        "governance overview",
+    )
+    .await?;
     let mut summaries = Vec::with_capacity(targets.len());
     for (target_index, &(version, address)) in targets.iter().enumerate() {
         let fields = &values[target_index * 9..target_index * 9 + 9];
@@ -1272,8 +1289,14 @@ async fn fetch_proposal_calls(
             ]
         })
         .collect();
-    let values =
-        fetch_governance_multicall_raw(chain_route, http, calls, "governance proposal").await?;
+    let values = fetch_governance_multicall_raw(
+        chain_route,
+        RpcTrafficClass::General,
+        http,
+        calls,
+        "governance proposal",
+    )
+    .await?;
     let mut proposals = Vec::with_capacity(planned.len());
     for (position, (version, address, index)) in planned.iter().enumerate() {
         let proposal_result = &values[position * 2];

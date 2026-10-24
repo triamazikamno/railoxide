@@ -149,12 +149,15 @@ pub async fn refresh_public_balances_at_least(
     {
         return Ok(empty_public_balance_snapshot(chain_id, accounts));
     }
+    let sensitive = chain
+        .rpc_route
+        .for_class(crate::RpcTrafficClass::Sensitive)?;
     // Never fall back to the shared route: that would mix this account with other traffic.
     let client = http
         .operation_http_client()
         .await
         .wrap_err("public balance isolated route unavailable")?;
-    let route = RpcRoute::from(chain.rpc_route.isolated(client));
+    let route = RpcRoute::from(sensitive.isolated(client));
     let head = RpcRead::from_method_params("eth_blockNumber", Value::Array(Vec::new()), chain_id)?;
     let observed_block = submit_public_balance_reads(http, route.clone(), vec![head])
         .await?

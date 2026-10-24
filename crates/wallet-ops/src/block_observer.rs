@@ -961,10 +961,10 @@ mod tests {
         let (broker, executions) = spawn_counting_test_broker();
         broker.notify_block(1, 10);
         tokio::time::sleep(Duration::from_millis(5)).await;
-        let route = RpcRoute::from(RpcChainRoute::new(
+        let route = RpcRoute::from(crate::rpc_broker::tests::general(&RpcChainRoute::new(
             1,
             vec![Url::parse("https://cache.invalid").unwrap()],
-        ));
+        )));
         let read = RpcRead::eth_call(Address::from([4_u8; 20]), Bytes::from_static(b"read"));
         let make_submission = || {
             RpcSubmission::new(

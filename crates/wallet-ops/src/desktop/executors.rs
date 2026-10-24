@@ -191,7 +191,11 @@ impl ExecutorOwner {
             view,
             vault: DesktopVaultStore::from_db(db),
             store,
-            endpoints: super::executor_observation::ObservationEndpoints::new(&chain, &http),
+            endpoints: super::executor_observation::ObservationEndpoints::new(
+                &chain,
+                &http,
+                crate::RpcTrafficClass::Sensitive,
+            )?,
             chain,
             http,
             closed: watch::channel(false).0,

@@ -86,7 +86,7 @@ mod tests {
 
     use super::*;
     use crate::rpc_broker::RpcChainRoute;
-    use crate::rpc_broker::tests::{RpcMockGate, spawn_gated_rpc_mock, spawn_rpc_mock};
+    use crate::rpc_broker::tests::{RpcMockGate, general, spawn_gated_rpc_mock, spawn_rpc_mock};
 
     #[tokio::test]
     async fn rollup_data_cost_reads_only_the_public_oracle_and_fails_closed() {
@@ -95,9 +95,10 @@ mod tests {
             .parse()
             .unwrap();
         let http = crate::HttpContext::direct_for_tests();
-        let candidates = RpcCandidates::acquire(&http, &RpcChainRoute::new(42161, vec![url]), None)
-            .await
-            .unwrap();
+        let candidates =
+            RpcCandidates::acquire(&http, &general(&RpcChainRoute::new(42161, vec![url])), None)
+                .await
+                .unwrap();
         let gas = EffectiveChainGasSettings {
             gas_limit_buffer: 0,
             gas_price_buffer_numerator: 3,
@@ -213,7 +214,7 @@ mod tests {
             .verify_identity(&http.rpc_clients())
             .await
             .expect("a clone verifies the undecodable endpoint");
-        let candidates = RpcCandidates::acquire(&http, &route, None)
+        let candidates = RpcCandidates::acquire(&http, &general(&route), None)
             .await
             .expect("candidates");
         let cost = tokio::spawn(async move {

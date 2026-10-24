@@ -20,10 +20,10 @@ use crate::rpc_broker::RpcCandidates;
 use crate::settings::EffectiveChainConfig;
 use crate::walletconnect::WalletConnectDecodedCallKind;
 use crate::{
-    Eip1559GasCostProjection, GAS_LIMIT_BUFFER, HttpContext, RAILGUN_PROTOCOL_FEE_BPS,
-    RpcChainRoute, SelfBroadcastGasFeeQuote, SelfBroadcastResolvedGasFee, SelfBroadcastTipFallback,
-    TRANSACTION_INTRINSIC_GAS, expected_eip1559_fee_per_gas, railgun_protocol_fee_amount,
-    resolve_self_broadcast_gas_fee,
+    ClassRoute, Eip1559GasCostProjection, GAS_LIMIT_BUFFER, HttpContext, RAILGUN_PROTOCOL_FEE_BPS,
+    RpcTrafficClass, SelfBroadcastGasFeeQuote, SelfBroadcastResolvedGasFee,
+    SelfBroadcastTipFallback, TRANSACTION_INTRINSIC_GAS, expected_eip1559_fee_per_gas,
+    railgun_protocol_fee_amount, resolve_self_broadcast_gas_fee,
 };
 use railgun_ui::native_usd_micro_value;
 
@@ -472,7 +472,14 @@ pub async fn quote_public_action_gas_fee_with_reads(
     rpc_reads: Option<&super::DappRpcReadClient>,
 ) -> Result<PublicActionGasFeeQuote> {
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
-    let candidates = public_fee_candidates(http, &chain.rpc_route, rpc_reads).await?;
+    // A quote for a dapp's request belongs to that request's Sensitive flow.
+    let class = if rpc_reads.is_some() {
+        RpcTrafficClass::Sensitive
+    } else {
+        RpcTrafficClass::General
+    };
+    let candidates =
+        public_fee_candidates(http, &chain.rpc_route.for_class(class)?, rpc_reads).await?;
     public_action_gas_fee_quote_from_candidates_with_reads(
         &candidates,
         http.network_mode(),
@@ -510,7 +517,12 @@ pub async fn quote_public_action_gas_fee_bundle_with_profile(
     http: &HttpContext,
 ) -> Result<PublicActionGasFeeQuoteBundle> {
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
-    let candidates = public_fee_candidates(http, &chain.rpc_route, None).await?;
+    let candidates = public_fee_candidates(
+        http,
+        &chain.rpc_route.for_class(RpcTrafficClass::General)?,
+        None,
+    )
+    .await?;
     public_action_gas_fee_quote_bundle_from_candidates_with_profile(
         &candidates,
         http.network_mode(),
@@ -533,7 +545,12 @@ pub async fn estimate_public_advanced_transaction(
     }
     let chain = public_chain_runtime_config(request.chain_id, &request.effective_chain)?;
     // The quote and the estimate share one source, so neither stage probes an endpoint again.
-    let candidates = public_fee_candidates(http, &chain.rpc_route, None).await?;
+    let candidates = public_fee_candidates(
+        http,
+        &chain.rpc_route.for_class(RpcTrafficClass::Sensitive)?,
+        None,
+    )
+    .await?;
     let quote = public_action_gas_fee_quote_from_candidates(
         &candidates,
         http.network_mode(),
@@ -639,7 +656,11 @@ async fn estimate_public_advanced_transaction_with_own_candidates(
         |_: eyre::Report| unavailable_simulation_error("RPC providers are unavailable.");
     let chain = public_chain_runtime_config(request.chain_id, &request.effective_chain)
         .map_err(unavailable)?;
-    let candidates = public_fee_candidates(http, &chain.rpc_route, rpc_reads)
+    let route = chain
+        .rpc_route
+        .for_class(RpcTrafficClass::Sensitive)
+        .map_err(|error| unavailable(error.into()))?;
+    let candidates = public_fee_candidates(http, &route, rpc_reads)
         .await
         .map_err(unavailable)?;
     estimate_public_advanced_transaction_with_fee_core(
@@ -1030,7 +1051,12 @@ pub async fn estimate_public_native_action_gas_reserve_with_profile_and_ceiling(
         ));
     }
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
-    let candidates = public_fee_candidates(http, &chain.rpc_route, None).await?;
+    let candidates = public_fee_candidates(
+        http,
+        &chain.rpc_route.for_class(RpcTrafficClass::General)?,
+        None,
+    )
+    .await?;
     let quote_bundle = public_action_gas_fee_quote_bundle_from_candidates_with_profile(
         &candidates,
         http.network_mode(),
@@ -1084,7 +1110,7 @@ pub async fn estimate_public_native_action_gas_reserve_with_profile(
 /// failed lookup never falls back to the route's raw endpoints.
 pub(super) async fn public_fee_candidates(
     http: &HttpContext,
-    route: &RpcChainRoute,
+    route: &ClassRoute,
     rpc_reads: Option<&super::DappRpcReadClient>,
 ) -> Result<RpcCandidates> {
     match rpc_reads {

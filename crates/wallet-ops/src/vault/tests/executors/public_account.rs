@@ -12,7 +12,9 @@ fn chain() -> crate::settings::EffectiveChainConfig {
             .get(1)
             .cloned()
             .unwrap();
-    chain.rpc_route = crate::RpcChainRoute::new(1, Vec::<url::Url>::new());
+    // Executor owners need a Sensitive endpoint; these tests never contact it.
+    chain.rpc_route =
+        crate::RpcChainRoute::new(1, vec![url::Url::parse("http://127.0.0.1:9").unwrap()]);
     chain
 }
 

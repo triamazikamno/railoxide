@@ -298,7 +298,7 @@ enum Shape {
 impl Shape {
     fn route(self, endpoints: Vec<Url>) -> RpcRoute {
         let chain = RpcChainRoute::new(1, endpoints).with_identity_verification();
-        RpcRoute::from(match self {
+        RpcRoute::new(match self {
             Self::Individual => chain,
             Self::Aggregate => chain.with_multicall(Address::from([0x4d_u8; 20])),
         })
@@ -483,7 +483,7 @@ async fn eight_identity_checks_leave_four_read_slots_available_across_chains() {
             &traffic,
         )
         .await;
-        let route = RpcRoute::from(
+        let route = RpcRoute::new(
             RpcChainRoute::new(chain_id, vec![endpoint.url.clone()]).with_identity_verification(),
         );
         warm_identity(&route, &endpoint.url).await;
@@ -511,7 +511,7 @@ async fn eight_identity_checks_leave_four_read_slots_available_across_chains() {
             urls.push(extra.url.clone());
             extra_endpoints.push(extra);
         }
-        let route = long_lived(RpcRoute::from(
+        let route = long_lived(RpcRoute::new(
             RpcChainRoute::new(chain_id, urls).with_identity_verification(),
         ));
         let task = spawn_submit(&broker, route, Shape::Individual.reads(0));
@@ -705,7 +705,7 @@ async fn an_abandoned_runner_request_releases_its_isolated_route_while_runners_a
     let healthy = spawn_endpoint(healthy_responder(), None, &traffic).await;
     let shared = Shape::Individual.route(vec![failing.url.clone(), healthy.url.clone()]);
     warm_identity(&shared, &failing.url).await;
-    let isolated = long_lived(RpcRoute::from(shared.chain_route().isolated(
+    let isolated = long_lived(RpcRoute::new(shared.chain_route().isolated(
         OperationHttpClient::for_tests(
             reqwest::Client::new(),
             OperationNetworkIsolation::Dedicated,
@@ -1007,16 +1007,19 @@ async fn trusted_endpoint_serves_reads_and_candidates_while_its_warmup_probe_is_
 
     let results = submit_within(
         &http.rpc_broker(),
-        &RpcRoute::from(route.clone()),
+        &RpcRoute::new(route.clone()),
         vec![method_read("eth_blockNumber")],
         "read on a trusted route during its warmup probe",
     )
     .await;
     assert_eq!(results, vec![Ok(RpcResult::new(json!("0x42")))]);
-    let candidates = time::timeout(BOUND, RpcCandidates::acquire(&http, &route, None))
-        .await
-        .expect("candidates are captured during the probe")
-        .expect("candidates");
+    let candidates = time::timeout(
+        BOUND,
+        RpcCandidates::acquire(&http, &super::general(&route), None),
+    )
+    .await
+    .expect("candidates are captured during the probe")
+    .expect("candidates");
     assert_eq!(ready(&candidates), vec![0]);
     // Neither foreground path started an identity check of its own.
     let methods = trusted.methods.lock().expect("method log lock").clone();
@@ -1059,7 +1062,7 @@ async fn one_failed_warmup_probe_withdraws_a_trusted_endpoint_from_reads_and_sna
 
     let results = submit_within(
         &http.rpc_broker(),
-        &RpcRoute::from(route.clone()),
+        &RpcRoute::new(route.clone()),
         vec![method_read("eth_blockNumber")],
         "read after the failed warmup probe",
     )

@@ -1715,7 +1715,8 @@ async fn prepare_desktop_sponsored_calldata(
         .relay_adapt_contract
         .ok_or(SponsorshipError::MissingRelayAdapt)?;
     let signer_address = self_broadcast_gas_payer(vault_store, view_session, public_account_uuid)?;
-    let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
+    let sensitive_route = chain.rpc_route.for_class(RpcTrafficClass::Sensitive)?;
+    let query_rpc_pool = query_rpc_pool_for_route(&sensitive_route, http);
 
     let provider_handle =
         sponsored_code_preflight_from_rpc_pool(&query_rpc_pool, payer, signer_address).await?;
@@ -1765,7 +1766,7 @@ async fn prepare_desktop_sponsored_calldata(
         required_wrapped_native: authorization_limit.max_total_wrapped_native_spend,
     })?;
 
-    let quote = self_broadcast_gas_fee_quote_from_route(http, &chain.rpc_route)
+    let quote = self_broadcast_gas_fee_quote_from_route(http, &sensitive_route)
         .await
         .wrap_err("fetch sponsored self-broadcast gas price")?;
     let resolved_fee = resolve_self_broadcast_gas_fee(gas_fee, quote)?;
@@ -2298,7 +2299,12 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
     if let Some(executor) = &request.executor {
         executor.require_broadcaster(&broadcaster)?;
     }
-    let fee_candidates = acquire_fee_candidates(http, &chain.rpc_route, None).await?;
+    let fee_candidates = acquire_fee_candidates(
+        http,
+        &chain.rpc_route.for_class(RpcTrafficClass::General)?,
+        None,
+    )
+    .await?;
     let min_gas_price = buffered_gas_price_from_candidates(&fee_candidates, &chain.gas).await?;
     let utxos = if let Some(prepared) = request.executor.as_deref() {
         request.session.unspent_utxos_for_executor(prepared)?
@@ -2606,7 +2612,12 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
         policy,
         &request.trust_filter,
     )?;
-    let fee_candidates = acquire_fee_candidates(http, &chain.rpc_route, None).await?;
+    let fee_candidates = acquire_fee_candidates(
+        http,
+        &chain.rpc_route.for_class(RpcTrafficClass::General)?,
+        None,
+    )
+    .await?;
     let min_gas_price = buffered_gas_price_from_candidates(&fee_candidates, &chain.gas).await?;
     let utxos = request.session.unspent_utxos();
     let same_token_fee = request.fee_token == request.token;

@@ -20,7 +20,7 @@ use crate::settings::{EffectiveChainConfig, resolve_effective_chain_rpc_route};
 use crate::staking::{
     AccountSnapshot, MulticallChunkSize, chunk_indices, reward_staking_interval, snapshot_hint,
 };
-use crate::{HttpContext, RpcRoute, WalletRpcOrigin, query_rpc_pool_for_route};
+use crate::{HttpContext, RpcRoute, RpcTrafficClass, WalletRpcOrigin, query_rpc_pool_for_route};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -609,7 +609,8 @@ pub async fn fetch_interval_metadata(
     let Some(contracts) = governance_contracts(chain_id) else {
         return Ok(None);
     };
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
+        .for_class(RpcTrafficClass::General)?;
     let route = RpcRoute::from(chain_route);
     let mut calls = vec![
         GovernorRewards::STAKING_DISTRIBUTION_INTERVAL_MULTIPLIERCall {}
@@ -728,7 +729,8 @@ pub async fn fetch_reward_evidence_multi(
             .collect());
     };
     let lower_bound = reward_starting_interval(snapshots, metadata.multiplier)?;
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
+        .for_class(RpcTrafficClass::Sensitive)?;
     let route = RpcRoute::from(chain_route);
     let mut claimed: Vec<Option<Vec<Option<bool>>>> = Vec::with_capacity(tokens.len());
     let mut errors: Vec<Option<String>> = vec![None; tokens.len()];
@@ -955,7 +957,8 @@ pub async fn fetch_reward_batch_evidence(
         .ok()
         .and_then(|value| value.checked_add(1))
         .ok_or_else(|| eyre!("reward interval range exceeds platform limits"))?;
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
+        .for_class(RpcTrafficClass::Sensitive)?;
     let route = RpcRoute::from(chain_route);
     let mut claimed = vec![vec![None; count]; tokens.len()];
     let calls = tokens
@@ -1111,7 +1114,8 @@ pub async fn fetch_reward_batch_claimed_intervals(
             .ok_or_else(|| eyre!("reward interval range is invalid"))?,
     )
     .map_err(|_| eyre!("reward interval range exceeds platform limits"))?;
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
+        .for_class(RpcTrafficClass::Sensitive)?;
     let route = RpcRoute::from(chain_route);
     let mut claimed = vec![vec![None; count]; evidence.reward_tokens.len()];
     let calls = evidence
@@ -1203,7 +1207,8 @@ pub async fn fetch_reward_batch_authorization_state(
     let Some(contracts) = governance_contracts(chain_id) else {
         return Err(eyre!("reward contracts are unavailable"));
     };
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
+        .for_class(RpcTrafficClass::Sensitive)?;
     let route = RpcRoute::from(chain_route);
     let values = http
         .rpc_broker()
@@ -1298,7 +1303,8 @@ pub async fn fetch_reward_interval_amounts(
     let Some(contracts) = governance_contracts(chain_id) else {
         return Err(eyre!("reward contracts are unavailable"));
     };
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
+        .for_class(RpcTrafficClass::Sensitive)?;
     let route = RpcRoute::from(chain_route);
     let count = usize::try_from(evidence.ending_interval - evidence.starting_interval)
         .ok()
@@ -1393,7 +1399,8 @@ pub async fn fetch_reward_batch_interval_amounts(
     if evidence.hints.len() != count {
         return Err(eyre!("reward evidence hints do not match interval range"));
     }
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
+        .for_class(RpcTrafficClass::Sensitive)?;
     let route = RpcRoute::from(chain_route);
     let mut amounts = Vec::with_capacity(count);
     for chunk in chunk_indices(count, chunk_size) {
@@ -1442,8 +1449,9 @@ fn provider_for_chain(
     chain_id: u64,
     effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
-) -> Result<(Arc<QueryRpcPool>, crate::RpcChainRoute)> {
-    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+) -> Result<(Arc<QueryRpcPool>, crate::ClassRoute)> {
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
+        .for_class(RpcTrafficClass::General)?;
     Ok((query_rpc_pool_for_route(&chain_route, http), chain_route))
 }
 

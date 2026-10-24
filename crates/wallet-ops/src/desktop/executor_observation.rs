@@ -65,7 +65,7 @@ pub(super) fn trace_step<T, E>(
 /// a weak reference to it, so releasing the pool lets them stop. A released owner
 /// never rebuilds the pool and has no endpoints.
 pub(super) struct ObservationEndpoints {
-    route: crate::RpcChainRoute,
+    route: crate::ClassRoute,
     clients: crate::rpc_broker::RpcClients,
     /// Completes once the first admission returned, whether or not the pool was kept.
     admitted: tokio::sync::OnceCell<()>,
@@ -83,14 +83,25 @@ struct PoolSlot {
 }
 
 impl ObservationEndpoints {
-    pub(super) fn new(chain: &EffectiveChainConfig, http: &HttpContext) -> Self {
-        Self {
-            route: chain.rpc_route.clone(),
+    /// Observes through `chain`'s endpoints that accept `class`.
+    pub(super) fn new(
+        chain: &EffectiveChainConfig,
+        http: &HttpContext,
+        class: crate::RpcTrafficClass,
+    ) -> Result<Self, crate::RpcClassUnavailable> {
+        Ok(Self {
+            route: chain.rpc_route.for_class(class)?,
             clients: http.rpc_clients(),
             admitted: tokio::sync::OnceCell::new(),
             pool: Mutex::new(PoolSlot::default()),
             preferred: AtomicUsize::new(usize::MAX),
-        }
+        })
+    }
+
+    /// The endpoints of this class, admitted or not. Decisions that count endpoint answers
+    /// count against this.
+    pub(super) fn configured_count(&self) -> usize {
+        self.route.endpoints().len()
     }
 
     fn slot(&self) -> std::sync::MutexGuard<'_, PoolSlot> {
@@ -618,7 +629,12 @@ mod tests {
         .await;
         chain.rpc_route =
             crate::RpcChainRoute::new(1, vec![failing, serving]).with_identity_verification();
-        let endpoints = ObservationEndpoints::new(&chain, &HttpContext::direct_for_tests());
+        let endpoints = ObservationEndpoints::new(
+            &chain,
+            &HttpContext::direct_for_tests(),
+            crate::RpcTrafficClass::Sensitive,
+        )
+        .unwrap();
         // Admission returns at the first verified endpoint and admits the other after.
         tokio::time::timeout(Duration::from_secs(5), async {
             while endpoints.providers().await.len() < 2 {
@@ -652,7 +668,12 @@ mod tests {
         assert!(endpoints.current_pool().is_none());
 
         // A release while the first admission is pending wins over its completion.
-        let pending_endpoints = ObservationEndpoints::new(&chain, &HttpContext::direct_for_tests());
+        let pending_endpoints = ObservationEndpoints::new(
+            &chain,
+            &HttpContext::direct_for_tests(),
+            crate::RpcTrafficClass::Sensitive,
+        )
+        .unwrap();
         let mut pending = std::pin::pin!(pending_endpoints.providers());
         assert!(futures_util::poll!(&mut pending).is_pending());
         pending_endpoints.release();

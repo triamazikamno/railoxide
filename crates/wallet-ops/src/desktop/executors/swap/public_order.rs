@@ -887,7 +887,13 @@ impl ExecutorOwner {
         let Some(profile) = origin.public_swap_profile() else {
             return Ok(false);
         };
-        let pool = query_rpc_pool_for_route(&origin.rpc_route, &self.http);
+        // Asked within a Public account's swap, so it shares the swap's class.
+        let pool = query_rpc_pool_for_route(
+            &origin
+                .rpc_route
+                .for_class(crate::RpcTrafficClass::Sensitive)?,
+            &self.http,
+        );
         self.while_active(swap_math_deployed(&pool, profile.math()))
             .await
     }
@@ -1034,7 +1040,10 @@ impl ExecutorOwner {
                     profile.cow_shed_implementation(),
                     source,
                 );
-                let pool = query_rpc_pool_for_route(&origin.rpc_route, &self.http);
+                let route = origin
+                    .rpc_route
+                    .for_class(crate::RpcTrafficClass::Sensitive)?;
+                let pool = query_rpc_pool_for_route(&route, &self.http);
                 // The first batch of an account deploys its proxy, which costs the hook more.
                 let deployed = proxy_deployed(&pool, proxy).await?;
                 // A permit travels in the order as a pre-hook, so the plan is read before the
@@ -1080,8 +1089,7 @@ impl ExecutorOwner {
                         .map_err(eyre::Report::from)
                 };
                 // The gas price and data cost reads share this quote's candidates.
-                let fee_candidates =
-                    acquire_fee_candidates(&self.http, &origin.rpc_route, None).await?;
+                let fee_candidates = acquire_fee_candidates(&self.http, &route, None).await?;
                 let (quote, gas_price_wei, hook_data_cost_wei) = tokio::try_join!(
                     quote,
                     gas_price_from_candidates_with_policy(&fee_candidates, 1, 1),
@@ -1534,12 +1542,12 @@ impl ExecutorOwner {
             profile.cow_shed_implementation(),
             source,
         );
+        let route = origin
+            .rpc_route
+            .for_class(crate::RpcTrafficClass::Sensitive)?;
         let balance = self
             .while_active(async {
-                Ok(
-                    query_erc20_balance(&origin.rpc_route, &self.http, intent.bridged_token, proxy)
-                        .await,
-                )
+                Ok(query_erc20_balance(&route, &self.http, intent.bridged_token, proxy).await)
             })
             .await?;
         match balance {

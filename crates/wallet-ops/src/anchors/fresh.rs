@@ -534,8 +534,10 @@ async fn read_head(
     effective_chains: &EffectiveChainRegistry,
     http: &HttpContext,
 ) -> Option<(RpcRoute, AnchorBlock)> {
-    let chain_route =
-        resolve_effective_chain_rpc_route(chain_id, effective_chains.get(chain_id)?).ok()?;
+    let chain_route = resolve_effective_chain_rpc_route(chain_id, effective_chains.get(chain_id)?)
+        .ok()?
+        .for_class(crate::RpcTrafficClass::General)
+        .ok()?;
     let route = RpcRoute::from(chain_route)
         .with_request_timeout(TOKEN_ANCHOR_ORACLE_REQUEST_TIMEOUT)
         .with_attempt_timeout(Duration::from_secs(5));

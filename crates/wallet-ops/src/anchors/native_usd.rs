@@ -233,7 +233,9 @@ async fn fetch_native_quote(
         .native_usd_oracle
         .ok_or_else(|| "This chain has no USD price source".to_owned())?;
     let route = resolve_effective_chain_rpc_route(chain.chain_id, chain)
-        .map_err(|_| "Check the chain's RPC configuration".to_owned())?;
+        .map_err(|_| "Check the chain's RPC configuration".to_owned())?
+        .for_class(crate::RpcTrafficClass::General)
+        .map_err(|error| error.to_string())?;
     let route = RpcRoute::from(route)
         .with_request_timeout(TOKEN_ANCHOR_ORACLE_REQUEST_TIMEOUT)
         .with_attempt_timeout(Duration::from_secs(5));
@@ -797,8 +799,7 @@ mod tests {
                 symbol: "COIN".into(),
                 decimals: 6,
             },
-            rpc_endpoints: vec!["https://rpc.example".into()],
-            direct_rpc_endpoints: Vec::new(),
+            rpc_endpoints: vec!["https://rpc.example".to_owned().into()],
             explorer_urls: vec![],
             enabled: true,
             contracts: crate::settings::ChainContractSettings::default(),

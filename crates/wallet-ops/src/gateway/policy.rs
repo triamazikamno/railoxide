@@ -57,8 +57,11 @@ pub(super) fn proposed_chain(
             symbol: metadata.native_currency.symbol,
             decimals: metadata.native_currency.decimals,
         },
-        rpc_endpoints: metadata.rpc_urls,
-        direct_rpc_endpoints: Vec::new(),
+        rpc_endpoints: metadata
+            .rpc_urls
+            .into_iter()
+            .map(crate::settings::RpcEndpointSetting::from)
+            .collect(),
         explorer_urls: metadata.block_explorer_urls,
         enabled: true,
         contracts: crate::settings::ChainContractSettings::default(),
@@ -88,7 +91,8 @@ pub async fn verify_proposed_chain(
         .rpc_endpoints
         .iter()
         .map(|endpoint| {
-            let url = url::Url::parse(endpoint).map_err(|_| RpcBrokerError::InvalidResponse)?;
+            let url =
+                url::Url::parse(&endpoint.url).map_err(|_| RpcBrokerError::InvalidResponse)?;
             if url.scheme() != "https" {
                 return Err(RpcBrokerError::OriginRejected);
             }

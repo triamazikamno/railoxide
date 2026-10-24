@@ -1091,9 +1091,10 @@ pub(super) async fn public_broadcaster_setup(
         anchor_rate,
         executor_delivery,
     )?;
-    let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, http);
+    let route = chain.rpc_route.for_class(RpcTrafficClass::Sensitive)?;
+    let query_rpc_pool = query_rpc_pool_for_route(&route, http);
     // Refresh after approval, then keep this price stable while building the proof.
-    let fee_candidates = acquire_fee_candidates(http, &chain.rpc_route, None).await?;
+    let fee_candidates = acquire_fee_candidates(http, &route, None).await?;
     let min_gas_price = buffered_gas_price_from_candidates(&fee_candidates, &chain.gas).await?;
     let artifact_source = artifact_source(http, session.db.as_ref())?;
     let prover = ProverService::new_with_db(&artifact_source, &session.db);

@@ -6556,9 +6556,9 @@ async fn across_fills_need_the_pinned_pool_or_the_token_transfer_and_are_otherwi
 }
 
 /// A report is final, so only a read that establishes the fill block holds no fill, or that
-/// every endpoint lacks whole-block receipts, yields one. A read that could still turn out
-/// otherwise leaves the swap to be checked again. An endpoint whose identity check passes
-/// after the first ones were tried is still asked.
+/// every Sensitive endpoint lacks whole-block receipts, yields one. A read that could still turn
+/// out otherwise leaves the swap to be checked again. An endpoint whose identity check passes
+/// after the first ones were tried is still asked. A General-only endpoint is never asked.
 #[tokio::test]
 async fn across_reports_a_delivery_only_when_no_later_read_could_verify_it() {
     // The final fill block holds a fill event without evidence, as for a native delivery. 0: it
@@ -6566,8 +6566,9 @@ async fn across_reports_a_delivery_only_when_no_later_read_could_verify_it() {
     // receipts. 2: one endpoint has none, and another fails to serve them.
     // The identity check of a second endpoint is held until the first, which has no
     // whole-block receipts, was asked for them. 3: the second has none either. 4: the second
-    // serves them, and the fill has its token transfer. 5: the check stays held.
-    for scenario in 0..6 {
+    // serves them, and the fill has its token transfer. 5: the check stays held. 6: like 1,
+    // with a General-only endpoint that serves them. 7: like 5, with that endpoint too.
+    for scenario in 0..8 {
         let fixture = Fixture::start().await;
         let (delivery, terms) = across_handoff(&fixture, UNPINNED_CHAIN).await;
         let (destination, mut config, server) = across_destination(UNPINNED_CHAIN).await;
@@ -6594,14 +6595,21 @@ async fn across_reports_a_delivery_only_when_no_later_read_could_verify_it() {
             }
         }
         let mut servers = vec![server];
-        // Per endpoint, the error it answers whole-block receipts with, and whether its
-        // identity check is held.
-        let endpoints: &[(Option<i64>, bool)] = match scenario {
-            2 => &[(Some(-32601), false), (Some(-32000), false)],
-            3 | 5 => &[(Some(-32601), false), (Some(-32601), true)],
-            4 => &[(Some(-32601), false), (None, true)],
+        // Per endpoint, the error it answers whole-block receipts with, whether its identity
+        // check is held, and whether it is Sensitive.
+        let endpoints: &[(Option<i64>, bool, bool)] = match scenario {
+            2 => &[(Some(-32601), false, true), (Some(-32000), false, true)],
+            3 | 5 => &[(Some(-32601), false, true), (Some(-32601), true, true)],
+            4 => &[(Some(-32601), false, true), (None, true, true)],
+            6 => &[(Some(-32601), false, true), (None, false, false)],
+            7 => &[
+                (Some(-32601), false, true),
+                (Some(-32601), true, true),
+                (None, false, false),
+            ],
             _ => &[],
         };
+        let general_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         if !endpoints.is_empty() {
             let gate = crate::rpc_broker::tests::RpcMockGate {
                 request_started: Arc::default(),
@@ -6609,11 +6617,15 @@ async fn across_reports_a_delivery_only_when_no_later_read_could_verify_it() {
             };
             let asked = Arc::new(tokio::sync::Notify::new());
             let mut urls = Vec::new();
-            for &(code, held) in endpoints {
+            for &(code, held, sensitive) in endpoints {
                 let served = destination.clone();
                 let asked = asked.clone();
+                let general_requests = general_requests.clone();
                 let responder: crate::rpc_broker::tests::RpcResponder = Arc::new(
                     move |request: Value| {
+                        if !sensitive {
+                            general_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
                         let result = served.lock().unwrap().respond(&request);
                         if request["method"] != "eth_getBlockReceipts" {
                             return result;
@@ -6640,10 +6652,15 @@ async fn across_reports_a_delivery_only_when_no_later_read_could_verify_it() {
                     )
                     .await
                 };
-                urls.push(endpoint);
+                let roles = crate::RpcEndpointRoles {
+                    general: !sensitive,
+                    sensitive,
+                    submit: true,
+                };
+                urls.push((endpoint.into(), crate::RpcTransport::Wallet, roles));
                 servers.push(server);
             }
-            config.rpc_route = crate::RpcChainRoute::new(UNPINNED_CHAIN, urls);
+            config.rpc_route = crate::RpcChainRoute::new_with_transports(UNPINNED_CHAIN, urls);
             if scenario >= 3 {
                 config.rpc_route = config.rpc_route.with_identity_verification();
             }
@@ -6668,7 +6685,7 @@ async fn across_reports_a_delivery_only_when_no_later_read_could_verify_it() {
             .observe_swap_bridge(fixture.operation, uid(1, 20), &clients, &config)
             .await;
         let expected = match scenario {
-            1 | 3 => Some(across_reported()),
+            1 | 3 | 6 => Some(across_reported()),
             4 => Some(across_verified(&destination.lock().unwrap(), &terms, 0)),
             _ => None,
         };
@@ -6676,7 +6693,12 @@ async fn across_reports_a_delivery_only_when_no_later_read_could_verify_it() {
         // polled again.
         assert_eq!(
             result.is_err(),
-            matches!(scenario, 2 | 5),
+            matches!(scenario, 2 | 5 | 7),
+            "scenario {scenario}"
+        );
+        assert_eq!(
+            general_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
             "scenario {scenario}"
         );
         assert_eq!(result.ok().flatten(), expected, "scenario {scenario}");

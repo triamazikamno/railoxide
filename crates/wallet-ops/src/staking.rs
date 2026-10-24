@@ -21,7 +21,7 @@ use thiserror::Error;
 use tokio::time::timeout;
 
 use crate::settings::{EffectiveChainConfig, resolve_effective_chain_rpc_route};
-use crate::{HttpContext, RpcRoute, WalletRpcOrigin, query_rpc_pool_for_route};
+use crate::{HttpContext, RpcRoute, RpcTrafficClass, WalletRpcOrigin, query_rpc_pool_for_route};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 pub const DEFAULT_MULTICALL_CHUNK_SIZE: NonZeroUsize = NonZeroUsize::new(64).unwrap();
@@ -208,6 +208,8 @@ pub async fn validate_deployment(
     let contracts = governance_contracts(chain_id)
         .ok_or(DeploymentValidationError::UnsupportedChain { chain_id })?;
     let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)
+        .map_err(|error| DeploymentValidationError::Read(error.to_string()))?
+        .for_class(RpcTrafficClass::General)
         .map_err(|error| DeploymentValidationError::Read(error.to_string()))?;
     let broker = http.rpc_broker();
     let values = broker
@@ -347,7 +349,8 @@ pub async fn fetch_governance_token_balance_allowance(
     let Some(contracts) = governance_contracts(chain_id) else {
         return Ok(None);
     };
-    let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
+        .for_class(RpcTrafficClass::Sensitive)?;
     let broker = http.rpc_broker();
     let values = broker
         .submit_calls_decoded_as::<GovernanceToken::balanceOfCall>(
@@ -405,7 +408,8 @@ pub async fn fetch_account_stakes(
     let Some(contracts) = governance_contracts(chain_id) else {
         return Ok(Vec::new());
     };
-    let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
+        .for_class(RpcTrafficClass::Sensitive)?;
     let broker = http.rpc_broker();
     let route = RpcRoute::from(route);
     let metadata_plan: Vec<(Address, Bytes)> = accounts
@@ -631,7 +635,8 @@ pub async fn fetch_account_snapshots_multi(
     let Some(contracts) = governance_contracts(chain_id) else {
         return Ok(Vec::new());
     };
-    let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+    let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
+        .for_class(RpcTrafficClass::Sensitive)?;
     let broker = http.rpc_broker();
     let route = RpcRoute::from(route);
     let mut count_values: Vec<std::result::Result<U256, String>> = accounts
@@ -785,8 +790,9 @@ fn provider_for_chain(
     chain_id: u64,
     effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
-) -> Result<(Arc<QueryRpcPool>, crate::RpcChainRoute)> {
-    let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?;
+) -> Result<(Arc<QueryRpcPool>, crate::ClassRoute)> {
+    let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
+        .for_class(RpcTrafficClass::General)?;
     Ok((query_rpc_pool_for_route(&route, http), route))
 }
 

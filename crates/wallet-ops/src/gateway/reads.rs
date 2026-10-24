@@ -184,7 +184,8 @@ pub(super) async fn submit_reads(
     if remaining.is_zero() {
         return Err(RpcBrokerError::TimeoutBeforeDispatch);
     }
-    let route = RpcRoute::from(chain)
+    // Dapp reads carry the dapp's request parameters.
+    let route = RpcRoute::from(chain.for_class(crate::RpcTrafficClass::Sensitive)?)
         .with_request_timeout(remaining)
         .with_attempt_timeout(Duration::from_secs(10));
     http.rpc_broker()

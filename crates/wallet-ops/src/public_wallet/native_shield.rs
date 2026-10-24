@@ -354,7 +354,14 @@ pub async fn prepare_native_shield(
     effective_chain.require_railgun()?;
     let contracts = stealth_native_shield_contracts(chain_id, effective_chain, payer)?;
     let chain = public_chain_runtime_config(chain_id, effective_chain)?;
-    let candidates = public_fee_candidates(http, &chain.rpc_route, None).await?;
+    let candidates = public_fee_candidates(
+        http,
+        &chain
+            .rpc_route
+            .for_class(crate::RpcTrafficClass::Sensitive)?,
+        None,
+    )
+    .await?;
     // The stealth account and shield key need the authorization collected after review; a
     // random stand-in of each gives the same request shape for the estimate. Neither is kept.
     let stand_in = PrivateKeySigner::random();

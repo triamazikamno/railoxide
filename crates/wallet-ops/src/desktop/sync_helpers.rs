@@ -316,7 +316,8 @@ async fn fetch_effective_chain_head(
     let route =
         settings::resolve_effective_chain_rpc_route(effective_chain.chain_id, effective_chain)?
             .verify_identity(&http.rpc_clients())
-            .await?;
+            .await?
+            .for_class(RpcTrafficClass::General)?;
     let rpcs = query_rpc_pool_for_route(&route, http);
     let providers = rpcs.available_providers();
     if providers.is_empty() {
@@ -588,19 +589,18 @@ async fn verified_chain_config(
         .clone()
         .map(|url| (url, private.archive_rpc_transport));
     let clients = http.rpc_clients();
-    // Endpoints join the pool as their identity checks pass; the session starts with the first.
-    let mut pool = effective_chain
+    let route = effective_chain
         .rpc_route
+        .for_class(RpcTrafficClass::General)?;
+    // Endpoints join the pool as their identity checks pass; the session starts with the first.
+    let mut pool = route
         .query_rpc_pool(&clients, DEFAULT_QUERY_RPC_COOLDOWN)
         .with_pending_admission();
     if archive.is_some() {
         pool = pool.with_pending_archive();
     }
     let pool = Arc::new(pool);
-    effective_chain
-        .rpc_route
-        .admit_sync_pool(&clients, &pool, archive)
-        .await?;
+    route.admit_sync_pool(&clients, &pool, archive).await?;
     config.rpcs = pool;
     Ok(config)
 }
@@ -612,7 +612,8 @@ pub(crate) fn chain_config(
 ) -> Result<ChainConfig> {
     let private = effective_chain.require_railgun()?;
     let route =
-        settings::resolve_effective_chain_rpc_route(effective_chain.chain_id, effective_chain)?;
+        settings::resolve_effective_chain_rpc_route(effective_chain.chain_id, effective_chain)?
+            .for_class(RpcTrafficClass::General)?;
     let mut sync = private.sync.clone();
     if let Some(source) = &mut sync.indexed_artifact_source {
         source.gateway_pool = Some(http.gateway_pool());
@@ -1285,5 +1286,40 @@ mod tests {
             let config = chain_config(&effective_chain, &http, None).expect("chain config");
             assert_eq!(config.poi_submission_routes.is_some(), isolated, "{mode:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn sync_pool_leaves_out_endpoints_without_the_general_flag() {
+        let mut wallet_settings = settings::WalletSettings::default();
+        wallet_settings
+            .chains
+            .per_chain
+            .get_mut(&1)
+            .expect("Ethereum settings")
+            .rpc_endpoints = vec![
+            settings::RpcEndpointSetting {
+                url: "https://node.example".to_owned(),
+                general: false,
+                ..settings::RpcEndpointSetting::default()
+            },
+            "https://general.example".to_owned().into(),
+        ];
+        let effective_chain = settings::build_effective_chain_configs(&wallet_settings)
+            .expect("chain configs")
+            .get(1)
+            .cloned()
+            .expect("Ethereum chain config");
+        let config = chain_config(&effective_chain, &HttpContext::direct_for_tests(), None)
+            .expect("chain config");
+        let urls = config
+            .rpcs
+            .available_providers()
+            .into_iter()
+            .map(|provider| provider.url)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![url::Url::parse("https://general.example").unwrap()]
+        );
     }
 }

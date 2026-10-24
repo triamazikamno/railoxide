@@ -736,7 +736,8 @@ async fn fetch_oracle_answers_for_chain_with_timeout(
         effective_chains
             .get(chain_id)
             .ok_or_else(|| eyre::eyre!("chain {chain_id} is not configured"))?,
-    )?;
+    )?
+    .for_class(crate::RpcTrafficClass::General)?;
     let route = RpcRoute::from(chain_route)
         .with_request_timeout(request_timeout)
         .with_attempt_timeout(Duration::from_secs(5));
@@ -1052,7 +1053,8 @@ async fn fetch_twap_inputs_for_chain_with_timeout(
         effective_chains
             .get(chain_id)
             .ok_or_else(|| eyre::eyre!("chain {chain_id} is not configured"))?,
-    )?;
+    )?
+    .for_class(crate::RpcTrafficClass::General)?;
     let route = RpcRoute::from(chain_route)
         .with_request_timeout(request_timeout)
         .with_attempt_timeout(Duration::from_secs(5));

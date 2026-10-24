@@ -82,7 +82,11 @@ fn released_chains(chains: &super::ChainSettings) -> super::legacy::ChainSetting
                     id,
                     super::legacy::ChainSettingsOverride {
                         enabled: chain.enabled,
-                        rpc_endpoints: chain.rpc_endpoints.clone(),
+                        rpc_endpoints: chain
+                            .rpc_endpoints
+                            .iter()
+                            .map(|endpoint| endpoint.url.clone())
+                            .collect(),
                         sponsored_bundle_relays: private.sponsored_bundle_relays.clone(),
                         quick_sync: private.quick_sync.clone(),
                         contracts: super::legacy::ChainContractSettings {
@@ -225,7 +229,7 @@ fn released_v2_settings_payload() -> Vec<u8> {
         .per_chain
         .get_mut(&1)
         .expect("ethereum settings");
-    ethereum.rpc_endpoints = vec!["https://existing-rpc.example".to_string()];
+    ethereum.rpc_endpoints = vec!["https://existing-rpc.example".to_string().into()];
     ethereum.contracts.wrapped_native_token =
         Some("0x0000000000000000000000000000000000000001".to_string());
     let chains = released_chains(&settings.chains)
@@ -977,7 +981,12 @@ fn version_2_settings_migrate_with_sponsored_fields_unset() {
         .get(&1)
         .expect("migrated ethereum settings");
     assert_eq!(migrated.version, WALLET_SETTINGS_VERSION);
-    assert_eq!(ethereum.rpc_endpoints, vec!["https://existing-rpc.example"]);
+    assert_eq!(
+        ethereum.rpc_endpoints,
+        vec![super::RpcEndpointSetting::from(
+            "https://existing-rpc.example".to_owned()
+        )]
+    );
     assert_eq!(ethereum.railgun.sponsored_bundle_relays, None);
     let effective = build_effective_chain_configs(&migrated).expect("effective migrated settings");
     let ethereum = effective.get(1).expect("effective ethereum");
@@ -1604,7 +1613,7 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
             .map(|url| Url::parse(url).unwrap())
             .collect::<Vec<_>>(),
     );
-    assert!(ethereum.rpc_route.endpoints().len() > 1);
+    assert!(ethereum.rpc_route.configured_endpoints().len() > 1);
     assert_eq!(ethereum.finality_depth, defaults.finality_depth);
     assert!(ethereum.has_sponsorship_prerequisites());
     for chain_id in [56, 137, 42161] {
@@ -1913,19 +1922,28 @@ fn direct_endpoint_validation_names_the_field_without_the_url() {
         .per_chain
         .get_mut(&1)
         .expect("ethereum settings");
-    ethereum.direct_rpc_endpoints = vec![invalid.to_string()];
-    // Both lists count toward the shared cap.
+    let direct = super::RpcEndpointSetting {
+        url: invalid.to_string(),
+        direct: true,
+        ..super::RpcEndpointSetting::default()
+    };
+    // A Direct endpoint applies the endpoint cap to a built-in override.
     ethereum.rpc_endpoints = (0..super::MAX_CHAIN_ENDPOINTS)
-        .map(|index| format!("https://rpc{index}.example"))
+        .map(|index| format!("https://rpc{index}.example").into())
         .collect();
+    ethereum.rpc_endpoints.push(direct.clone());
     let mut custom = custom_evm_chain();
-    custom.direct_rpc_endpoints = vec![invalid.to_string()];
+    custom.rpc_endpoints.push(direct);
     settings.chains.custom.insert(999_999, custom);
 
     let error = settings.validate().expect_err("invalid direct endpoints");
+    let built_in = format!(
+        "chains.per_chain.1.rpc_endpoints[{}] ",
+        super::MAX_CHAIN_ENDPOINTS
+    );
     for field in [
-        "chains.per_chain.1.direct_rpc_endpoints[0] ",
-        "chains.custom.999999.direct_rpc_endpoints[0] ",
+        built_in.as_str(),
+        "chains.custom.999999.rpc_endpoints[1] ",
         "chains.per_chain.1 has too many RPC endpoints",
     ] {
         assert!(
@@ -2188,8 +2206,8 @@ fn effective_chain_configs_apply_supported_overrides_in_order() {
         .get_mut(&1)
         .expect("ethereum settings");
     ethereum.rpc_endpoints = vec![
-        "https://rpc-a.example".to_string(),
-        "https://rpc-b.example".to_string(),
+        "https://rpc-a.example".to_string().into(),
+        "https://rpc-b.example".to_string().into(),
     ];
     ethereum.railgun.quick_sync.endpoint = Some("https://quick.example/graphql".to_string());
     ethereum.finality_depth = Some(64);
@@ -2241,29 +2259,39 @@ fn effective_chain_configs_apply_supported_overrides_in_order() {
 }
 
 #[test]
-fn effective_chain_configs_join_direct_endpoints_after_the_base_list() {
+fn effective_chain_configs_carry_endpoint_transports_and_roles() {
     let mut settings = WalletSettings::default();
     let ethereum = settings
         .chains
         .per_chain
         .get_mut(&1)
         .expect("ethereum settings");
-    ethereum.direct_rpc_endpoints = vec!["http://127.0.0.1:8545".to_string()];
+    let presets = super::presets::EvmPreset::for_chain(1)
+        .unwrap()
+        .rpc_endpoints;
+    ethereum.rpc_endpoints = presets
+        .iter()
+        .cloned()
+        .map(super::RpcEndpointSetting::from)
+        .collect();
+    ethereum.rpc_endpoints.push(super::RpcEndpointSetting {
+        url: "http://127.0.0.1:8545".to_string(),
+        direct: true,
+        general: false,
+        submit: false,
+        ..super::RpcEndpointSetting::default()
+    });
     ethereum.railgun.deployment.archive_rpc_url = Some("http://127.0.0.1:8546".to_string());
     ethereum.railgun.deployment.archive_rpc_direct = true;
 
     let configs = build_effective_chain_configs(&settings).expect("build effective configs");
     let ethereum = configs.get(1).expect("ethereum config");
-    let mut expected = super::presets::EvmPreset::for_chain(1)
-        .unwrap()
-        .rpc_endpoints
+    let node = Url::parse("http://127.0.0.1:8545").unwrap();
+    let mut expected = presets
         .iter()
         .map(|url| (Url::parse(url).unwrap(), RpcTransport::Wallet))
         .collect::<Vec<_>>();
-    expected.push((
-        Url::parse("http://127.0.0.1:8545").unwrap(),
-        RpcTransport::Direct,
-    ));
+    expected.push((node.clone(), RpcTransport::Direct));
     assert_eq!(
         ethereum
             .rpc_route
@@ -2272,30 +2300,83 @@ fn effective_chain_configs_join_direct_endpoints_after_the_base_list() {
             .collect::<Vec<_>>(),
         expected
     );
+    let class_urls = |class| {
+        ethereum
+            .rpc_route
+            .for_class(class)
+            .expect("class has endpoints")
+            .endpoint_urls()
+    };
+    assert!(class_urls(crate::RpcTrafficClass::Sensitive).contains(&node));
+    for class in [
+        crate::RpcTrafficClass::General,
+        crate::RpcTrafficClass::Submission,
+    ] {
+        assert!(!class_urls(class).contains(&node));
+    }
     assert!(ethereum.rpc_route.requires_identity_verification());
     assert_eq!(
         ethereum.require_railgun().unwrap().archive_rpc_transport,
         RpcTransport::Direct
     );
     assert_eq!(configs.direct_rpc_endpoint_count(), 2);
+}
 
-    // A URL in both lists is one direct endpoint at its base position.
-    let ethereum = settings.chains.per_chain.get_mut(&1).unwrap();
-    ethereum.rpc_endpoints = vec!["http://127.0.0.1:8545/".to_string()];
-    let configs = build_effective_chain_configs(&settings).expect("build effective configs");
-    assert_eq!(
-        configs
-            .get(1)
-            .unwrap()
-            .rpc_route
-            .transport_endpoints()
-            .map(|(endpoint, transport)| (endpoint.expose_url().clone(), transport))
-            .collect::<Vec<_>>(),
-        vec![(
-            Url::parse("http://127.0.0.1:8545").unwrap(),
-            RpcTransport::Direct
-        )]
-    );
+#[test]
+fn endpoint_lists_must_cover_every_traffic_class() {
+    let endpoint = |url: &str, general, sensitive, submit| super::RpcEndpointSetting {
+        url: url.to_string(),
+        direct: false,
+        general,
+        sensitive,
+        submit,
+    };
+    let with_endpoints = |endpoints: Vec<super::RpcEndpointSetting>| {
+        let mut settings = WalletSettings::default();
+        settings
+            .chains
+            .per_chain
+            .get_mut(&1)
+            .expect("ethereum settings")
+            .rpc_endpoints = endpoints.clone();
+        let mut custom = custom_evm_chain();
+        custom.rpc_endpoints = endpoints;
+        settings.chains.custom.insert(999_999, custom);
+        settings
+    };
+
+    for (class, [general, sensitive, submit]) in [
+        ("General", [false, true, true]),
+        ("Sensitive", [true, false, true]),
+        ("Submit", [true, true, false]),
+    ] {
+        let error = with_endpoints(vec![
+            endpoint("https://a.example", general, sensitive, submit),
+            endpoint("https://b.example", general, sensitive, submit),
+        ])
+        .validate()
+        .expect_err(class);
+        for chain in ["chains.per_chain.1", "chains.custom.999999"] {
+            let expected = format!("{chain}.rpc_endpoints must include a {class} endpoint");
+            assert_eq!(
+                error
+                    .messages
+                    .iter()
+                    .filter(|message| message.starts_with(&format!("{chain}.")))
+                    .collect::<Vec<_>>(),
+                [&expected]
+            );
+        }
+    }
+
+    // Classes may come from different endpoints.
+    with_endpoints(vec![
+        endpoint("https://a.example", true, false, false),
+        endpoint("https://b.example", false, true, false),
+        endpoint("https://c.example", false, false, true),
+    ])
+    .validate()
+    .expect("classes spread across endpoints");
 }
 
 #[test]
@@ -2966,6 +3047,55 @@ fn encoded_settings_decode_without_db() {
 }
 
 #[test]
+fn released_v11_endpoint_urls_load_with_default_flags_and_entries_keep_theirs() {
+    let url = "https://rpc-a.example";
+    let mut settings = WalletSettings::default();
+    settings
+        .chains
+        .per_chain
+        .get_mut(&1)
+        .expect("ethereum settings")
+        .rpc_endpoints = vec![url.to_owned().into()];
+    settings.chains.custom.insert(999_999, custom_evm_chain());
+    // Released v11 wrote each endpoint as its bare URL.
+    let mut released = encode_wallet_settings(&settings).expect("encode settings");
+    for endpoint in [url, "http://127.0.0.1:8545"] {
+        let entry = rmp_serde::to_vec_named(&super::RpcEndpointSetting::from(endpoint.to_owned()))
+            .expect("encode entry");
+        let bare = rmp_serde::to_vec_named(endpoint).expect("encode URL");
+        let at = released
+            .windows(entry.len())
+            .position(|window| window == entry.as_slice())
+            .expect("entry in the record");
+        released = [
+            &released[..at],
+            bare.as_slice(),
+            &released[at + entry.len()..],
+        ]
+        .concat();
+    }
+    let loaded = decode_wallet_settings(&released).expect("decode released v11 settings");
+    for endpoint in [
+        &loaded.chains.per_chain[&1].rpc_endpoints[0],
+        &loaded.chains.custom[&999_999].rpc_endpoints[0],
+    ] {
+        assert!(endpoint.general && endpoint.sensitive && endpoint.submit && !endpoint.direct);
+    }
+    assert_eq!(loaded, settings);
+
+    let ethereum = settings.chains.per_chain.get_mut(&1).unwrap();
+    ethereum.rpc_endpoints[0] = super::RpcEndpointSetting {
+        url: url.to_owned(),
+        direct: true,
+        general: false,
+        sensitive: true,
+        submit: false,
+    };
+    let encoded = encode_wallet_settings(&settings).expect("encode flagged settings");
+    assert_eq!(decode_wallet_settings(&encoded).unwrap(), settings);
+}
+
+#[test]
 fn settings_without_direct_endpoints_keep_the_released_shape() {
     let mut settings = WalletSettings::default();
     let ethereum = settings
@@ -2973,18 +3103,14 @@ fn settings_without_direct_endpoints_keep_the_released_shape() {
         .per_chain
         .get_mut(&1)
         .expect("ethereum settings");
-    ethereum.rpc_endpoints = vec!["https://rpc-a.example".to_string()];
+    ethereum.rpc_endpoints = vec!["https://rpc-a.example".to_string().into()];
     ethereum.railgun.deployment.archive_rpc_url = Some("https://archive.example".to_string());
     settings.chains.custom.insert(999_999, custom_evm_chain());
 
     let payload = rmp_serde::to_vec_named(&settings).expect("encode settings");
-    // Released v11 builds reject unknown fields, so absent values must not be written.
-    for key in [
-        b"direct_rpc_endpoints".as_slice(),
-        b"archive_rpc_direct".as_slice(),
-    ] {
-        assert!(!payload.windows(key.len()).any(|window| window == key));
-    }
+    // Released v11 builds reject unknown fields, so an absent value must not be written.
+    let key = b"archive_rpc_direct".as_slice();
+    assert!(!payload.windows(key.len()).any(|window| window == key));
     let decoded = decode_wallet_settings(&payload).expect("decode settings");
     assert_eq!(decoded, settings);
     let configs = build_effective_chain_configs(&decoded).expect("build effective configs");
@@ -3101,8 +3227,7 @@ pub(super) fn custom_evm_chain() -> super::CustomChainSettings {
             symbol: "TST".into(),
             decimals: 6,
         },
-        rpc_endpoints: vec!["http://127.0.0.1:8545".into()],
-        direct_rpc_endpoints: Vec::new(),
+        rpc_endpoints: vec!["http://127.0.0.1:8545".to_owned().into()],
         explorer_urls: vec![],
         enabled: true,
         contracts: super::ChainContractSettings::default(),
@@ -3116,7 +3241,7 @@ fn custom_chains_fold_into_built_in_presets_on_load() {
     let root_dir = temp_db_root();
     let mut saved = WalletSettings::default();
     let mut adopted = custom_evm_chain();
-    adopted.rpc_endpoints = vec!["https://base.example".into()];
+    adopted.rpc_endpoints = vec!["https://base.example".to_owned().into()];
     adopted.enabled = false;
     adopted.finality_depth = Some(32);
     saved.chains.custom.insert(8453, adopted);
@@ -3143,7 +3268,9 @@ fn custom_chains_fold_into_built_in_presets_on_load() {
     let adopted = migrated.chains.per_chain.get(&8453).expect("base override");
     assert_eq!(
         adopted.rpc_endpoints,
-        vec!["https://base.example".to_owned()]
+        vec![super::RpcEndpointSetting::from(
+            "https://base.example".to_owned()
+        )]
     );
     assert!(!adopted.enabled);
     assert_eq!(adopted.finality_depth, Some(32));
@@ -3282,7 +3409,7 @@ fn custom_registry_retains_token_and_oracle_references_across_disable() {
     settings.chains.custom.remove(&1);
     let mut oversized = custom_evm_chain();
     oversized.rpc_endpoints = (0..=super::MAX_CHAIN_ENDPOINTS)
-        .map(|index| format!("https://rpc{index}.example"))
+        .map(|index| format!("https://rpc{index}.example").into())
         .collect();
     assert!(
         super::ChainMutation::Add {
@@ -3457,13 +3584,36 @@ fn released_v6_overrides_migrate_without_losing_repairable_or_unrelated_settings
     fs::remove_dir_all(root_dir).unwrap();
 }
 
+/// `settings` in the released v7–v10 shape, whose built-in overrides list endpoint URLs.
+fn released_v7_to_v10_settings(settings: &WalletSettings) -> super::legacy::ReleasedWalletSettings {
+    let mut without_endpoints = settings.clone();
+    for chain in without_endpoints.chains.per_chain.values_mut() {
+        chain.rpc_endpoints.clear();
+    }
+    let mut released: super::legacy::ReleasedWalletSettings =
+        rmp_serde::from_slice(&rmp_serde::to_vec_named(&without_endpoints).unwrap()).unwrap();
+    for (chain_id, chain) in &settings.chains.per_chain {
+        released
+            .chains
+            .per_chain
+            .get_mut(chain_id)
+            .unwrap()
+            .rpc_endpoints = chain
+            .rpc_endpoints
+            .iter()
+            .map(|endpoint| endpoint.url.clone())
+            .collect();
+    }
+    released
+}
+
 #[test]
 fn released_v7_pricing_defaults_preserve_populated_settings_on_reopen() {
     let root_dir = temp_db_root();
     let mut expected = WalletSettings::default();
     expected.chains.custom.insert(31337, custom_evm_chain());
     expected.chains.per_chain.get_mut(&1).unwrap().rpc_endpoints =
-        vec!["https://rpc.example".into()];
+        vec!["https://rpc.example".to_owned().into()];
     expected.chains.per_chain.get_mut(&56).unwrap().enabled = false;
     expected.runtime.auto_lock_timeout_secs = Some(600);
     expected
@@ -3485,7 +3635,7 @@ fn released_v7_pricing_defaults_preserve_populated_settings_on_reopen() {
     let mut released = expected.clone();
     released.version = 7;
     released.waku.backup_peers = None;
-    let payload = rmp_serde::to_vec_named(&released).unwrap();
+    let payload = rmp_serde::to_vec_named(&released_v7_to_v10_settings(&released)).unwrap();
     let store = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
     })
@@ -3548,7 +3698,7 @@ fn released_v7_pricing_defaults_preserve_populated_settings_on_reopen() {
 fn released_v10_protocol_overrides_are_dropped_and_other_settings_kept() {
     let mut expected = WalletSettings::default();
     let ethereum = expected.chains.per_chain.get_mut(&1).unwrap();
-    ethereum.rpc_endpoints = vec!["https://rpc.example".into()];
+    ethereum.rpc_endpoints = vec!["https://rpc.example".to_owned().into()];
     ethereum.railgun.sponsored_bundle_relays = Some(vec!["https://relay.example".into()]);
     ethereum.railgun.quick_sync.enabled = false;
     ethereum.railgun.quick_sync.endpoint = Some("https://quick.example".into());
@@ -3556,8 +3706,7 @@ fn released_v10_protocol_overrides_are_dropped_and_other_settings_kept() {
     ethereum.railgun.deployment.archive_rpc_url = Some("https://archive.example".into());
     let mut released = expected.clone();
     released.version = 10;
-    let mut released: super::legacy::ReleasedWalletSettings =
-        rmp_serde::from_slice(&rmp_serde::to_vec_named(&released).unwrap()).unwrap();
+    let mut released = released_v7_to_v10_settings(&released);
     // Released builds wrote the removed keys as nil.
     let without_overrides = rmp_serde::to_vec_named(&released).unwrap();
     let railgun = &mut released.chains.per_chain.get_mut(&1).unwrap().railgun;

@@ -129,7 +129,7 @@ fn estimation_reuses_call_validation_and_admission_checks_the_actual_route() {
         RpcRead::from_method_params("eth_estimateGas", json!([transaction, "latest", {}]), 1)
             .is_err()
     );
-    let wrong_route = RpcChainRoute::new(2, Vec::<Url>::new()).into();
+    let wrong_route = RpcRoute::new(RpcChainRoute::new(2, Vec::<Url>::new()));
     assert_eq!(
         RpcSubmission::new(wrong_route, vec![read], dapp()).validate_admission(),
         Err(RpcBrokerError::InvalidRead(
@@ -252,7 +252,7 @@ async fn submission_preserves_mixed_results_and_rejects_wallet_hash_reads_before
         })
     };
     let (url, server) = spawn_rpc_mock(responder, Arc::default(), Arc::default()).await;
-    let route: RpcRoute = RpcChainRoute::new(1, vec![url]).into();
+    let route = RpcRoute::new(RpcChainRoute::new(1, vec![url]));
     let broker = test_broker(Duration::from_millis(1), 4);
     let reads = vec![
         named("eth_getBlockByNumber", json!(["latest", false])),
@@ -341,9 +341,7 @@ async fn repeated_nullable_logs_estimates_and_special_calls_execute_without_reus
         })
     };
     let (url, server) = spawn_rpc_mock(responder, Arc::default(), Arc::default()).await;
-    let route: RpcRoute = RpcChainRoute::new(1, vec![url])
-        .with_multicall(Address::ZERO)
-        .into();
+    let route = RpcRoute::new(RpcChainRoute::new(1, vec![url]).with_multicall(Address::ZERO));
     let broker = test_broker(Duration::from_millis(1), 4);
     broker.notify_block(1, 100);
     let reads = vec![
@@ -474,7 +472,7 @@ async fn chunked_endpoint(body: Vec<u8>, delay: Duration) -> (Url, tokio::task::
 }
 
 async fn individual_job(read: RpcRead, endpoints: Vec<Url>, timeout: Duration) -> JobOutput {
-    let route = RpcRoute::from(RpcChainRoute::new(1, endpoints));
+    let route = RpcRoute::new(RpcChainRoute::new(1, endpoints));
     let key = WorkKey {
         identity: read.identity_for_route(&route),
         route: route.chain_route().clone(),
@@ -578,7 +576,7 @@ async fn aggregate_body_cap_is_terminal_without_partial_results_or_reduction() {
         } else {
             vec![exact.clone()]
         };
-        let route = RpcRoute::from(RpcChainRoute::new(1, urls).with_multicall(Address::ZERO));
+        let route = RpcRoute::new(RpcChainRoute::new(1, urls).with_multicall(Address::ZERO));
         let reads = [
             RpcRead::get_balance(Address::ZERO),
             RpcRead::eth_call(Address::from([1; 20]), Bytes::new()),

@@ -19,6 +19,7 @@ const TOR_STATUS_ICON_PATH: &str = "ui/icons/tor-status.svg";
 const ARROW_RIGHT_LEFT_ICON_PATH: &str = "ui/icons/arrow-right-left.svg";
 const ARROW_DOWN_TO_LINE_ICON_PATH: &str = "ui/icons/arrow-down-to-line.svg";
 const CIRCLE_FADING_ARROW_UP_ICON_PATH: &str = "ui/icons/circle-fading-arrow-up.svg";
+const SEND_ICON_PATH: &str = "ui/icons/send.svg";
 
 #[must_use]
 pub const fn logs_icon_path() -> &'static str {
@@ -123,4 +124,9 @@ pub const fn arrow_down_to_line_icon_path() -> &'static str {
 #[must_use]
 pub const fn circle_fading_arrow_up_icon_path() -> &'static str {
     CIRCLE_FADING_ARROW_UP_ICON_PATH
+}
+
+#[must_use]
+pub const fn send_icon_path() -> &'static str {
+    SEND_ICON_PATH
 }

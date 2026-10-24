@@ -44,8 +44,8 @@ fn read_at(target: u8, block: u64) -> RpcRead {
 async fn isolated_routes_aggregate_apart_over_their_own_clients() {
     let (endpoint, recorded, server) = spawn_recording_rpc_mock(echo_responder()).await;
     let chain = RpcChainRoute::new(1, vec![endpoint]).with_multicall(MULTICALL);
-    let first = RpcRoute::from(chain.isolated(tagged_client("first")));
-    let second = RpcRoute::from(chain.isolated(tagged_client("second")));
+    let first = RpcRoute::new(chain.isolated(tagged_client("first")));
+    let second = RpcRoute::new(chain.isolated(tagged_client("second")));
     let broker = test_broker(Duration::from_millis(20), 4);
     let submit = |route: &RpcRoute| {
         broker.submit(RpcSubmission::new(
@@ -87,8 +87,8 @@ async fn isolated_routes_aggregate_apart_over_their_own_clients() {
 #[tokio::test]
 async fn isolated_and_shared_reads_share_neither_requests_nor_cached_results() {
     let (endpoint, recorded, server) = spawn_recording_rpc_mock(echo_responder()).await;
-    let shared = RpcRoute::from(RpcChainRoute::new(1, vec![endpoint]));
-    let isolated = RpcRoute::from(shared.chain_route().isolated(tagged_client("isolated")));
+    let shared = RpcRoute::new(RpcChainRoute::new(1, vec![endpoint]));
+    let isolated = RpcRoute::new(shared.chain_route().isolated(tagged_client("isolated")));
     let broker = test_broker(Duration::from_millis(20), 4);
     let submit = |route: &RpcRoute, block| {
         broker.submit(RpcSubmission::new(
@@ -148,7 +148,7 @@ async fn failover_sends_each_endpoint_over_its_own_transport() {
             1,
             endpoints
                 .into_iter()
-                .map(|(url, transport)| (url.into(), transport))
+                .map(|(url, transport)| (url.into(), transport, RpcEndpointRoles::default()))
                 .collect(),
         )
     };
@@ -166,7 +166,7 @@ async fn failover_sends_each_endpoint_over_its_own_transport() {
     for chain in [mixed, both_direct] {
         let results = broker
             .submit(RpcSubmission::new(
-                RpcRoute::from(chain),
+                RpcRoute::new(chain),
                 vec![read_at(1, 1)],
                 test_origin(),
             ))
@@ -201,7 +201,7 @@ async fn failover_sends_each_endpoint_over_its_own_transport() {
 #[tokio::test]
 async fn completed_isolated_reads_leave_no_route_clone_in_the_broker() {
     let (endpoint, _recorded, server) = spawn_recording_rpc_mock(echo_responder()).await;
-    let route = RpcRoute::from(
+    let route = RpcRoute::new(
         RpcChainRoute::new(1, vec![endpoint])
             .with_multicall(MULTICALL)
             .isolated(tagged_client("isolated")),

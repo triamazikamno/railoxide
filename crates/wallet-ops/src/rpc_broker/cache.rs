@@ -183,7 +183,7 @@ mod tests {
     use url::Url;
 
     fn identity(block: BlockId) -> ReadIdentity {
-        let route = RpcRoute::from(RpcChainRoute::new(
+        let route = RpcRoute::new(RpcChainRoute::new(
             1,
             vec![Url::parse("https://cache.test").unwrap()],
         ));

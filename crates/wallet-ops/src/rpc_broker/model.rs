@@ -811,17 +811,84 @@ impl RpcClients {
     }
 }
 
+/// The traffic class of a wallet RPC request. Each request is sent only to endpoints whose
+/// roles allow its class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RpcTrafficClass {
+    /// Chain-generic reads that identify no user.
+    General,
+    /// Reads that identify the user or follow a user transaction.
+    Sensitive,
+    /// `eth_sendRawTransaction`.
+    Submission,
+}
+
+/// The traffic classes one endpoint accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RpcEndpointRoles {
+    pub general: bool,
+    pub sensitive: bool,
+    pub submit: bool,
+}
+
+impl Default for RpcEndpointRoles {
+    fn default() -> Self {
+        Self {
+            general: true,
+            sensitive: true,
+            submit: true,
+        }
+    }
+}
+
+impl RpcEndpointRoles {
+    #[must_use]
+    pub const fn allows(self, class: RpcTrafficClass) -> bool {
+        match class {
+            RpcTrafficClass::General => self.general,
+            RpcTrafficClass::Sensitive => self.sensitive,
+            RpcTrafficClass::Submission => self.submit,
+        }
+    }
+}
+
+/// No endpoint of a chain accepts a traffic class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RpcClassUnavailable {
+    pub chain_id: u64,
+    pub class: RpcTrafficClass,
+}
+
+impl fmt::Display for RpcClassUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let class = match self.class {
+            RpcTrafficClass::General => "general reads",
+            RpcTrafficClass::Sensitive => "account-specific reads",
+            RpcTrafficClass::Submission => "transaction submission",
+        };
+        write!(
+            formatter,
+            "no RPC endpoint on chain {} accepts {class}",
+            self.chain_id
+        )
+    }
+}
+
+impl std::error::Error for RpcClassUnavailable {}
+
 /// A clone-shared snapshot of chain endpoints and Multicall3 configuration.
 ///
-/// Equality and hashing compare contents, including each endpoint's transport, so independently
-/// built equivalent snapshots share deduplication keys. An isolated route equals only itself and
-/// its clones.
+/// Equality and hashing compare contents, including each endpoint's transport and roles, so
+/// independently built equivalent snapshots share deduplication keys. An isolated route equals
+/// only itself and its clones.
 #[derive(Debug, Clone)]
 pub struct RpcChainRoute {
     chain_id: u64,
     endpoints: Arc<[SensitiveUrl]>,
     /// Indexed like `endpoints`.
     transports: Arc<[RpcTransport]>,
+    /// Indexed like `endpoints`.
+    roles: Arc<[RpcEndpointRoles]>,
     multicall: Option<Address>,
     verify_identity: bool,
     pub(super) verified_identities: Arc<VerifiedIdentities>,
@@ -850,6 +917,7 @@ impl PartialEq for RpcChainRoute {
         self.chain_id == other.chain_id
             && self.endpoints == other.endpoints
             && self.transports == other.transports
+            && self.roles == other.roles
             && self.multicall == other.multicall
             && self.verify_identity == other.verify_identity
             && self.isolation_id() == other.isolation_id()
@@ -868,29 +936,45 @@ impl Hash for RpcChainRoute {
             endpoint.expose_url().hash(state);
             transport.hash(state);
         }
+        self.roles.hash(state);
     }
 }
 
 impl RpcChainRoute {
-    /// Creates a chain route from a chain ID and RPC endpoints that use the wallet transport.
+    /// Creates a chain route from a chain ID and RPC endpoints that use the wallet transport and
+    /// accept every traffic class.
     #[must_use]
     pub fn new<E: Into<SensitiveUrl>>(chain_id: u64, endpoints: Vec<E>) -> Self {
         Self::new_with_transports(
             chain_id,
             endpoints
                 .into_iter()
-                .map(|endpoint| (endpoint.into(), RpcTransport::Wallet))
+                .map(|endpoint| {
+                    (
+                        endpoint.into(),
+                        RpcTransport::Wallet,
+                        RpcEndpointRoles::default(),
+                    )
+                })
                 .collect(),
         )
     }
-    /// Creates a chain route from a chain ID and RPC endpoints, each with its transport.
+    /// Creates a chain route from a chain ID and RPC endpoints, each with its transport and
+    /// roles.
     #[must_use]
     pub fn new_with_transports(
         chain_id: u64,
-        endpoints: Vec<(SensitiveUrl, RpcTransport)>,
+        endpoints: Vec<(SensitiveUrl, RpcTransport, RpcEndpointRoles)>,
     ) -> Self {
-        let (endpoints, transports): (Vec<_>, Vec<_>) = endpoints.into_iter().unzip();
-        let endpoints: Arc<[SensitiveUrl]> = endpoints.into();
+        let mut urls = Vec::with_capacity(endpoints.len());
+        let mut transports = Vec::with_capacity(endpoints.len());
+        let mut roles = Vec::with_capacity(endpoints.len());
+        for (endpoint, transport, endpoint_roles) in endpoints {
+            urls.push(endpoint);
+            transports.push(transport);
+            roles.push(endpoint_roles);
+        }
+        let endpoints: Arc<[SensitiveUrl]> = urls.into();
         let verified_identities = Arc::new(VerifiedIdentities {
             endpoints: endpoints
                 .iter()
@@ -902,6 +986,7 @@ impl RpcChainRoute {
             chain_id,
             endpoints,
             transports: transports.into(),
+            roles: roles.into(),
             multicall: None,
             verify_identity: false,
             verified_identities,
@@ -911,7 +996,7 @@ impl RpcChainRoute {
     /// Returns a clone whose reads go over `client` and are kept apart from every other route,
     /// including the result cache. Endpoint verification stays shared with this route.
     #[must_use]
-    pub fn isolated(&self, client: OperationHttpClient) -> Self {
+    pub(super) fn isolated(&self, client: OperationHttpClient) -> Self {
         let mut route = self.clone();
         route.isolation = Some(Arc::new(RouteIsolation {
             id: NEXT_ROUTE_ISOLATION.fetch_add(1, Ordering::Relaxed),
@@ -953,9 +1038,32 @@ impl RpcChainRoute {
     /// Restrict an admitted read while retaining this configuration's verified identities.
     pub(crate) fn for_endpoint(&self, endpoint: SensitiveUrl) -> Self {
         debug_assert!(self.endpoints.contains(&endpoint));
+        self.retain(move |configured, _| *configured == endpoint)
+    }
+    /// The endpoints that accept `class`, in configured order. The restricted route shares this
+    /// route's verified identities, which are looked up by URL.
+    pub fn for_class(&self, class: RpcTrafficClass) -> Result<ClassRoute, RpcClassUnavailable> {
+        let route = self.retain(|_, roles| roles.allows(class));
+        if route.endpoints.is_empty() {
+            return Err(RpcClassUnavailable {
+                chain_id: self.chain_id,
+                class,
+            });
+        }
+        Ok(ClassRoute { class, route })
+    }
+    /// A clone keeping the endpoints for which `keep` holds, with their transports and roles.
+    fn retain(&self, keep: impl Fn(&SensitiveUrl, RpcEndpointRoles) -> bool) -> Self {
+        let kept = (0..self.endpoints.len())
+            .filter(|&index| keep(&self.endpoints[index], self.roles[index]))
+            .collect::<Vec<_>>();
         let mut route = self.clone();
-        route.transports = vec![self.endpoint_transport(endpoint.expose_url())].into();
-        route.endpoints = vec![endpoint].into();
+        route.endpoints = kept
+            .iter()
+            .map(|&index| self.endpoints[index].clone())
+            .collect();
+        route.transports = kept.iter().map(|&index| self.transports[index]).collect();
+        route.roles = kept.iter().map(|&index| self.roles[index]).collect();
         route
     }
     #[must_use]
@@ -967,9 +1075,23 @@ impl RpcChainRoute {
     pub const fn chain_id(&self) -> u64 {
         self.chain_id
     }
+    /// Every configured endpoint, whatever its roles. For display only, such as editor counts,
+    /// the status line and log labels; requests and decisions use a [`ClassRoute`].
     #[must_use]
-    pub fn endpoints(&self) -> &[SensitiveUrl] {
+    pub fn configured_endpoints(&self) -> &[SensitiveUrl] {
         &self.endpoints
+    }
+    /// This route's endpoints, for broker internals that run on a class-restricted route.
+    pub(super) fn endpoints(&self) -> &[SensitiveUrl] {
+        &self.endpoints
+    }
+    /// The endpoints in configured order, each with its transport and roles.
+    pub(super) fn configured_settings(
+        &self,
+    ) -> impl Iterator<Item = (&SensitiveUrl, RpcTransport, RpcEndpointRoles)> {
+        self.transport_endpoints()
+            .zip(self.roles.iter().copied())
+            .map(|((endpoint, transport), roles)| (endpoint, transport, roles))
     }
     #[must_use]
     pub fn endpoint_urls(&self) -> Vec<Url> {
@@ -998,6 +1120,55 @@ impl RpcChainRoute {
     }
 }
 
+/// A chain route restricted to the endpoints that accept one traffic class. Requests, pools,
+/// candidates and endpoint counts go through a class route only.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClassRoute {
+    class: RpcTrafficClass,
+    route: RpcChainRoute,
+}
+
+impl ClassRoute {
+    #[must_use]
+    pub const fn class(&self) -> RpcTrafficClass {
+        self.class
+    }
+    #[must_use]
+    pub const fn chain_id(&self) -> u64 {
+        self.route.chain_id
+    }
+    /// The endpoints that accept this class, in configured order.
+    #[must_use]
+    pub fn endpoints(&self) -> &[SensitiveUrl] {
+        &self.route.endpoints
+    }
+    #[must_use]
+    pub fn endpoint_urls(&self) -> Vec<Url> {
+        self.route.endpoint_urls()
+    }
+    /// The transport of `endpoint`; a URL outside this route uses the wallet transport.
+    #[must_use]
+    pub fn endpoint_transport(&self, endpoint: &Url) -> RpcTransport {
+        self.route.endpoint_transport(endpoint)
+    }
+    #[must_use]
+    pub const fn multicall(&self) -> Option<Address> {
+        self.route.multicall
+    }
+    /// Returns a clone whose reads go over `client` and are kept apart from every other route,
+    /// including the result cache. Endpoint verification stays shared with this route.
+    #[must_use]
+    pub fn isolated(&self, client: OperationHttpClient) -> Self {
+        Self {
+            class: self.class,
+            route: self.route.isolated(client),
+        }
+    }
+    pub(super) const fn route(&self) -> &RpcChainRoute {
+        &self.route
+    }
+}
+
 /// Per-submission execution policy paired with an immutable chain route.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RpcRoute {
@@ -1008,9 +1179,17 @@ pub struct RpcRoute {
     pub(super) attempt_timeout: Duration,
 }
 
-impl From<RpcChainRoute> for RpcRoute {
-    /// Creates an RPC route by pairing a chain route with the default execution policy.
-    fn from(chain: RpcChainRoute) -> Self {
+impl From<ClassRoute> for RpcRoute {
+    /// Creates an RPC route by pairing a class route with the default execution policy.
+    fn from(route: ClassRoute) -> Self {
+        Self::new(route.route)
+    }
+}
+
+impl RpcRoute {
+    /// Pairs `chain` with the default execution policy. Outside the broker, routes come only
+    /// from a [`ClassRoute`].
+    pub(super) const fn new(chain: RpcChainRoute) -> Self {
         Self {
             chain,
             max_calls: DEFAULT_MAX_CALLS,
@@ -1019,9 +1198,7 @@ impl From<RpcChainRoute> for RpcRoute {
             attempt_timeout: DEFAULT_ATTEMPT_TIMEOUT,
         }
     }
-}
-
-impl RpcRoute {
+    /// The class-restricted endpoints this route sends to.
     #[must_use]
     pub fn endpoints(&self) -> &[SensitiveUrl] {
         self.chain.endpoints()
@@ -1166,6 +1343,8 @@ pub enum RpcBrokerError {
     Shutdown,
     #[error("no configured RPC endpoint is available for chain {chain_id}")]
     NoEndpoint { chain_id: u64 },
+    #[error(transparent)]
+    ClassUnavailable(#[from] RpcClassUnavailable),
     #[error("RPC request failed ({0})")]
     Remote(RpcRemoteError),
     #[error("RPC endpoint returned HTTP status {0}")]

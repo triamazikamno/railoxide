@@ -3,7 +3,7 @@ use alloy::rpc::types::TransactionRequest;
 use eyre::{Result, WrapErr as _, eyre};
 
 use super::submission::{
-    PublicActionHandoff, PublicActionStepEnd, PublicActionStepResult,
+    PublicActionHandoff, PublicActionStepEnd, PublicActionStepResult, public_action_pools,
     submit_public_action_step_session,
 };
 use super::{
@@ -12,7 +12,7 @@ use super::{
 };
 use crate::hardware_typed_data::HardwareEip712Model;
 use crate::settings::EffectiveChainConfig;
-use crate::{HttpContext, TxReceiptOutput, query_rpc_pool_for_route};
+use crate::{HttpContext, TxReceiptOutput};
 
 /// What one transaction of a swap's Public account came to. A reverted transaction is an
 /// outcome too: its `receipt.status` is false.
@@ -48,6 +48,7 @@ pub(crate) async fn submit_public_swap_step(
         .gas
         .ok_or_else(|| eyre!("the swap's transaction has no reviewed gas limit"))?;
     let nonce = transaction.nonce;
+    let pools = public_action_pools(&chain.rpc_route, http)?;
     let outcome = submit_public_action_step_session(
         step,
         transaction,
@@ -56,8 +57,7 @@ pub(crate) async fn submit_public_swap_step(
         PublicShieldTransactionProfile::Railoxide.gas_limit_strategy(),
         signer,
         "public-swap",
-        query_rpc_pool_for_route(&chain.rpc_route, http),
-        &chain.rpc_route,
+        &pools,
         chain.finality_depth,
         http,
         None,

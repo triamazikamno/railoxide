@@ -94,6 +94,7 @@ impl ProviderRpcError {
             RpcBrokerError::Transport
             | RpcBrokerError::HttpStatus(_)
             | RpcBrokerError::NoEndpoint { .. }
+            | RpcBrokerError::ClassUnavailable(_)
             | RpcBrokerError::Shutdown => match availability {
                 ProviderAvailability::Available => LocalProviderFailure::Unavailable,
                 ProviderAvailability::Disconnected => LocalProviderFailure::Disconnected,

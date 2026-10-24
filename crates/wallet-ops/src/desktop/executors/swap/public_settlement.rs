@@ -266,7 +266,8 @@ impl ExecutorOwner {
         origin: &EffectiveChainConfig,
         read: &OrderRead<'_>,
     ) -> Result<PublicSwapObservations> {
-        let endpoints = ObservationEndpoints::new(origin, &self.http);
+        let endpoints =
+            ObservationEndpoints::new(origin, &self.http, crate::RpcTrafficClass::Sensitive)?;
         for endpoint in endpoints.providers().await {
             let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = endpoint.index);
             let result = trace_step(

@@ -27,7 +27,10 @@ use super::simulation::{Execution, execute};
 use crate::public_wallet::{PublicErc20, VaultedPublicSigner, sign_public_swap_typed_data};
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{ExecutorOperationId, PublicSwapPermit, PublicSwapRecord, SwapUseId};
-use crate::{ExecutorOwner, RpcBrokerError, RpcRoute, WalletRpcOrigin, query_rpc_pool_for_route};
+use crate::{
+    ExecutorOwner, RpcBrokerError, RpcRoute, RpcTrafficClass, WalletRpcOrigin,
+    query_rpc_pool_for_route,
+};
 
 const ALLOWANCE_READ: &str = "read the Public account's allowance for the swap";
 const PERMIT_UNUSABLE: &str = "the token's permit couldn't be used; review the swap again";
@@ -449,7 +452,7 @@ impl ExecutorOwner {
                     .http
                     .rpc_broker()
                     .submit_eth_calls(
-                        RpcRoute::from(origin.rpc_route.clone()),
+                        RpcRoute::from(origin.rpc_route.for_class(RpcTrafficClass::Sensitive)?),
                         calls,
                         WalletRpcOrigin::PublicWallet.into(),
                     )
@@ -540,7 +543,10 @@ impl ExecutorOwner {
                 hash_fallback_confirmed,
             ))
             .await?;
-        let pool = query_rpc_pool_for_route(&origin.rpc_route, &self.http);
+        let pool = query_rpc_pool_for_route(
+            &origin.rpc_route.for_class(RpcTrafficClass::Sensitive)?,
+            &self.http,
+        );
         let call = TransactionRequest::default()
             .to(token)
             .input(permit_calldata(&permit, &signature).into());
@@ -585,7 +591,7 @@ impl ExecutorOwner {
                     .http
                     .rpc_broker()
                     .submit_eth_calls(
-                        RpcRoute::from(origin.rpc_route.clone()),
+                        RpcRoute::from(origin.rpc_route.for_class(RpcTrafficClass::Sensitive)?),
                         detection_calls(token, owner).to_vec(),
                         WalletRpcOrigin::PublicWallet.into(),
                     )
@@ -637,7 +643,7 @@ impl ExecutorOwner {
                     .http
                     .rpc_broker()
                     .submit_eth_calls(
-                        RpcRoute::from(origin.rpc_route.clone()),
+                        RpcRoute::from(origin.rpc_route.for_class(RpcTrafficClass::Sensitive)?),
                         calls,
                         WalletRpcOrigin::PublicWallet.into(),
                     )

@@ -155,6 +155,7 @@ impl ExecutorOwner {
         let pool = self
             .chain
             .rpc_route
+            .for_class(crate::RpcTrafficClass::Sensitive)?
             .query_rpc_pool(&self.http.rpc_clients(), Duration::from_secs(30));
         for provider in pool.available_providers() {
             // Validate the chain before disclosing the derived range.

@@ -762,10 +762,17 @@ impl DappProvider {
             let _ = reply.send(Err(RpcBrokerError::OriginRejected));
             return;
         }
-        if !owner.wallet.routes[&request.chain_id]
-            .endpoints()
-            .contains(&endpoint)
+        // The endpoint must be one that dapp reads, which are Sensitive, may use.
+        let sensitive = match owner.wallet.routes[&request.chain_id]
+            .for_class(crate::RpcTrafficClass::Sensitive)
         {
+            Ok(route) => route,
+            Err(error) => {
+                let _ = reply.send(Err(error.into()));
+                return;
+            }
+        };
+        if !sensitive.endpoints().contains(&endpoint) {
             let _ = reply.send(Err(RpcBrokerError::OriginRejected));
             return;
         }

@@ -38,7 +38,8 @@ pub async fn resolve_public_ens_recipient(
         .abi_encode()
         .into(),
     };
-    let route = resolve_effective_chain_rpc_route(1, ethereum)?;
+    let route = resolve_effective_chain_rpc_route(1, ethereum)?
+        .for_class(crate::RpcTrafficClass::Sensitive)?;
     let mut results = http
         .rpc_broker()
         .submit(RpcSubmission::new(

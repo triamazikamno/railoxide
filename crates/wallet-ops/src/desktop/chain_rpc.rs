@@ -31,7 +31,7 @@ pub(super) fn effective_desktop_chain_config(
 
 /// A pool over `route`'s endpoints, each sending through its transport's client.
 pub(crate) fn query_rpc_pool_for_route(
-    route: &RpcChainRoute,
+    route: &crate::ClassRoute,
     http: &HttpContext,
 ) -> Arc<QueryRpcPool> {
     Arc::new(route.query_rpc_pool(&http.rpc_clients(), DEFAULT_QUERY_RPC_COOLDOWN))
@@ -61,7 +61,7 @@ pub fn start_rpc_identity_warmup(
 /// `deadline` gives one. A failed lookup never falls back to the route's raw endpoints.
 pub(crate) async fn acquire_fee_candidates(
     http: &HttpContext,
-    route: &RpcChainRoute,
+    route: &crate::ClassRoute,
     deadline: Option<tokio::time::Instant>,
 ) -> Result<RpcCandidates> {
     RpcCandidates::acquire(http, route, deadline)

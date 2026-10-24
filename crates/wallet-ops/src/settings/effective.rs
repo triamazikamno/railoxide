@@ -1,3 +1,4 @@
+use super::RpcEndpointSetting;
 use super::{
     Address, BTreeMap, ChainContractSettings, ChainGasSettings, DEFAULT_WAKU_BACKUP_PEER_ADDR,
     DEFAULT_WAKU_BACKUP_PEER_ID, EffectiveChainConfig, EffectiveChainGasSettings,
@@ -5,7 +6,7 @@ use super::{
     SensitiveUrl, TokenAnchorSource, TokenKey, TokenPriceAnchorOverride, Url,
     WakuDirectPeerSetting, WalletSettings, WalletSettingsValidationError,
 };
-use crate::{RpcChainRoute, RpcTransport};
+use crate::{RpcChainRoute, RpcEndpointRoles, RpcTransport};
 use eyre::{Result as EyreResult, eyre};
 
 pub const ETHEREUM_SPONSORED_BUNDLE_RELAYS: &[&str] =
@@ -242,7 +243,6 @@ pub fn build_effective_chain_configs(
                 rpc_route: route(
                     chain_id,
                     &saved.rpc_endpoints,
-                    &saved.direct_rpc_endpoints,
                     parse_address(saved.contracts.multicall_contract.as_deref()),
                 )
                 .with_identity_verification(),
@@ -266,21 +266,20 @@ fn built_in_chain_config(
     saved: &super::ChainSettingsOverride,
     settings: &WalletSettings,
 ) -> EffectiveChainConfig {
-    let rpc_values = if saved.rpc_endpoints.is_empty() {
-        &preset.rpc_endpoints
+    let multicall =
+        parse_address(saved.contracts.multicall_contract.as_deref()).or(preset.multicall);
+    // Only an override can hold a Direct endpoint, and an override is always verified.
+    let rpc_route = if saved.rpc_endpoints.is_empty() {
+        let presets = preset
+            .rpc_endpoints
+            .iter()
+            .cloned()
+            .map(RpcEndpointSetting::from)
+            .collect::<Vec<_>>();
+        route(chain_id, &presets, multicall)
     } else {
-        &saved.rpc_endpoints
+        route(chain_id, &saved.rpc_endpoints, multicall).with_identity_verification()
     };
-    let mut rpc_route = route(
-        chain_id,
-        rpc_values,
-        &saved.direct_rpc_endpoints,
-        parse_address(saved.contracts.multicall_contract.as_deref()).or(preset.multicall),
-    );
-    // Verification is per route, so a direct endpoint also turns it on for the presets.
-    if !saved.rpc_endpoints.is_empty() || !saved.direct_rpc_endpoints.is_empty() {
-        rpc_route = rpc_route.with_identity_verification();
-    }
     EffectiveChainConfig {
         chain_id,
         native_usd_oracle: saved.native_usd_pricing.resolve(preset.native_usd_oracle),
@@ -307,31 +306,30 @@ fn parse_address(value: Option<&str>) -> Option<Address> {
     value.map(|value| value.parse().expect("validated contract address"))
 }
 
-/// The base endpoints, then the direct ones; a URL in both lists is one direct endpoint.
+/// Each endpoint with its transport and the traffic classes it accepts.
 pub(super) fn route(
     chain_id: u64,
-    endpoints: &[String],
-    direct: &[String],
+    endpoints: &[RpcEndpointSetting],
     multicall: Option<Address>,
 ) -> RpcChainRoute {
-    let parse = |url: &String| Url::parse(url).expect("validated RPC URL");
-    let mut joined: Vec<(SensitiveUrl, RpcTransport)> = endpoints
+    let endpoints = endpoints
         .iter()
-        .map(|url| (SensitiveUrl::from(parse(url)), RpcTransport::Wallet))
+        .map(|endpoint| {
+            let url = Url::parse(&endpoint.url).expect("validated RPC URL");
+            let transport = if endpoint.direct {
+                RpcTransport::Direct
+            } else {
+                RpcTransport::Wallet
+            };
+            let roles = RpcEndpointRoles {
+                general: endpoint.general,
+                sensitive: endpoint.sensitive,
+                submit: endpoint.submit,
+            };
+            (SensitiveUrl::from(url), transport, roles)
+        })
         .collect();
-    for url in direct.iter().map(parse) {
-        let mut listed = false;
-        for (endpoint, transport) in &mut joined {
-            if *endpoint.expose_url() == url {
-                *transport = RpcTransport::Direct;
-                listed = true;
-            }
-        }
-        if !listed {
-            joined.push((SensitiveUrl::from(url), RpcTransport::Direct));
-        }
-    }
-    let route = RpcChainRoute::new_with_transports(chain_id, joined);
+    let route = RpcChainRoute::new_with_transports(chain_id, endpoints);
     if let Some(contract) = multicall {
         route.with_multicall(contract)
     } else {
@@ -379,7 +377,7 @@ pub fn resolve_effective_chain_rpc_route(
             "effective configuration does not match chain {requested_chain_id}"
         ));
     }
-    if chain.rpc_route.endpoints().is_empty() {
+    if chain.rpc_route.configured_endpoints().is_empty() {
         return Err(eyre!("chain {requested_chain_id} has no RPC endpoints"));
     }
     Ok(chain.rpc_route.clone())

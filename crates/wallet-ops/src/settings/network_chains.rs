@@ -155,16 +155,78 @@ impl NativeUsdPricing {
     }
 }
 
+/// One chain RPC endpoint: its transport and the traffic classes it accepts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+#[serde(remote = "Self")]
+pub struct RpcEndpointSetting {
+    pub url: String,
+    /// Reached without Tor or the proxy.
+    pub direct: bool,
+    pub general: bool,
+    pub sensitive: bool,
+    pub submit: bool,
+}
+
+impl Default for RpcEndpointSetting {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            direct: false,
+            general: true,
+            sensitive: true,
+            submit: true,
+        }
+    }
+}
+
+impl From<String> for RpcEndpointSetting {
+    /// An endpoint with the default flags.
+    fn from(url: String) -> Self {
+        Self {
+            url,
+            ..Self::default()
+        }
+    }
+}
+
+impl Serialize for RpcEndpointSetting {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RpcEndpointSetting {
+    /// Released settings store a bare URL, which gets the default flags.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Entry;
+        impl<'de> serde::de::Visitor<'de> for Entry {
+            type Value = RpcEndpointSetting;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an RPC endpoint URL or entry")
+            }
+            fn visit_str<E: serde::de::Error>(self, url: &str) -> Result<Self::Value, E> {
+                Ok(url.to_owned().into())
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                RpcEndpointSetting::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            }
+        }
+        deserializer.deserialize_any(Entry)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChainSettingsOverride {
     #[serde(skip_serializing_if = "NativeUsdPricing::is_default")]
     pub native_usd_pricing: NativeUsdPricing,
     pub enabled: bool,
-    pub rpc_endpoints: Vec<String>,
-    /// Endpoints reached without Tor or the proxy, joined after `rpc_endpoints` or the presets.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub direct_rpc_endpoints: Vec<String>,
+    /// Replaces the preset endpoints when not empty.
+    pub rpc_endpoints: Vec<RpcEndpointSetting>,
     pub contracts: ChainContractSettings,
     pub finality_depth: Option<u64>,
     pub gas: ChainGasSettings,
@@ -177,7 +239,6 @@ impl Default for ChainSettingsOverride {
             native_usd_pricing: NativeUsdPricing::Default,
             enabled: true,
             rpc_endpoints: Vec::new(),
-            direct_rpc_endpoints: Vec::new(),
             contracts: ChainContractSettings::default(),
             finality_depth: None,
             gas: ChainGasSettings::default(),
@@ -202,25 +263,18 @@ impl ChainSettingsOverride {
         let field = format!("chains.per_chain.{chain_id}");
         // Preserve released built-in overrides; custom-chain limits must not block startup.
         for (index, endpoint) in self.rpc_endpoints.iter().enumerate() {
-            validate_url_scheme(
-                &format!("{field}.rpc_endpoints[{index}]"),
-                endpoint,
-                &["http", "https"],
-                errors,
-            );
+            let endpoint_field = format!("{field}.rpc_endpoints[{index}]");
+            if endpoint.direct {
+                validate_endpoint_length(&endpoint_field, &endpoint.url, errors);
+            }
+            validate_url_scheme(&endpoint_field, &endpoint.url, &["http", "https"], errors);
         }
-        if !self.direct_rpc_endpoints.is_empty() {
-            validate_endpoint_cap(
-                &field,
-                self.rpc_endpoints.len() + self.direct_rpc_endpoints.len(),
-                errors,
-            );
-            validate_endpoints(
-                &format!("{field}.direct_rpc_endpoints"),
-                &self.direct_rpc_endpoints,
-                errors,
-            );
+        // Released overrides hold no Direct endpoint, so the cap never blocks their startup.
+        if self.rpc_endpoints.iter().any(|endpoint| endpoint.direct) {
+            validate_endpoint_cap(&field, self.rpc_endpoints.len(), errors);
         }
+        // An empty override inherits the presets, which accept every class.
+        validate_endpoint_classes(&field, &self.rpc_endpoints, errors);
         self.contracts.validate(&field, errors);
         validate_optional_range(
             &format!("{field}.finality_depth"),
@@ -372,10 +426,7 @@ pub struct CustomChainSettings {
     pub native_usd_pricing: NativeUsdPricing,
     pub name: String,
     pub native_currency: NativeCurrency,
-    pub rpc_endpoints: Vec<String>,
-    /// Endpoints reached without Tor or the proxy, joined after `rpc_endpoints`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub direct_rpc_endpoints: Vec<String>,
+    pub rpc_endpoints: Vec<RpcEndpointSetting>,
     #[serde(default)]
     pub explorer_urls: Vec<String>,
     pub enabled: bool,
@@ -387,24 +438,48 @@ pub struct CustomChainSettings {
     pub gas: ChainGasSettings,
 }
 
-/// The RPC and direct lists of one chain share the endpoint cap.
 fn validate_endpoint_cap(field: &str, endpoints: usize, errors: &mut Vec<String>) {
     if endpoints > super::MAX_CHAIN_ENDPOINTS {
         errors.push(format!("{field} has too many RPC endpoints"));
     }
 }
 
-fn validate_endpoints(field: &str, endpoints: &[String], errors: &mut Vec<String>) {
+fn validate_endpoint_length(field: &str, url: &str, errors: &mut Vec<String>) {
+    if url.len() > 4096 {
+        errors.push(format!("{field} is too long"));
+    }
+}
+
+fn validate_endpoints(field: &str, endpoints: &[RpcEndpointSetting], errors: &mut Vec<String>) {
     for (index, endpoint) in endpoints.iter().enumerate() {
-        if endpoint.len() > 4096 {
-            errors.push(format!("{field}[{index}] is too long"));
+        let endpoint_field = format!("{field}[{index}]");
+        validate_endpoint_length(&endpoint_field, &endpoint.url, errors);
+        validate_url_scheme(&endpoint_field, &endpoint.url, &["http", "https"], errors);
+    }
+}
+
+/// A non-empty endpoint list must cover every traffic class; one endpoint may cover several.
+fn validate_endpoint_classes(
+    field: &str,
+    endpoints: &[RpcEndpointSetting],
+    errors: &mut Vec<String>,
+) {
+    if endpoints.is_empty() {
+        return;
+    }
+    for (class, covered) in [
+        ("General", endpoints.iter().any(|endpoint| endpoint.general)),
+        (
+            "Sensitive",
+            endpoints.iter().any(|endpoint| endpoint.sensitive),
+        ),
+        ("Submit", endpoints.iter().any(|endpoint| endpoint.submit)),
+    ] {
+        if !covered {
+            errors.push(format!(
+                "{field}.rpc_endpoints must include a {class} endpoint"
+            ));
         }
-        validate_url_scheme(
-            &format!("{field}[{index}]"),
-            endpoint,
-            &["http", "https"],
-            errors,
-        );
     }
 }
 
@@ -426,21 +501,13 @@ impl CustomChainSettings {
         if self.rpc_endpoints.is_empty() {
             errors.push(format!("{field}.rpc_endpoints must not be empty"));
         }
-        validate_endpoint_cap(
-            &field,
-            self.rpc_endpoints.len() + self.direct_rpc_endpoints.len(),
-            errors,
-        );
+        validate_endpoint_cap(&field, self.rpc_endpoints.len(), errors);
         validate_endpoints(
             &format!("{field}.rpc_endpoints"),
             &self.rpc_endpoints,
             errors,
         );
-        validate_endpoints(
-            &format!("{field}.direct_rpc_endpoints"),
-            &self.direct_rpc_endpoints,
-            errors,
-        );
+        validate_endpoint_classes(&field, &self.rpc_endpoints, errors);
         for (index, url) in self.explorer_urls.iter().enumerate() {
             validate_url_scheme(
                 &format!("{field}.explorer_urls[{index}]"),

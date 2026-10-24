@@ -278,9 +278,12 @@ impl ExecutorOwner {
     ) -> Result<ExecutorRecoveryFeeEstimate> {
         ExecutorDelivery::PublicBroadcaster(Box::new(candidate.clone())).admit(profile)?;
         let chain = effective_desktop_chain_config(self.chain.chain_id, &self.chain)?;
+        let route = chain
+            .rpc_route
+            .for_class(crate::RpcTrafficClass::Sensitive)?;
         let min_gas_price = self
             .while_active(async {
-                let candidates = acquire_fee_candidates(&self.http, &chain.rpc_route, None).await?;
+                let candidates = acquire_fee_candidates(&self.http, &route, None).await?;
                 buffered_gas_price_from_candidates(&candidates, &chain.gas).await
             })
             .await?;
@@ -452,9 +455,12 @@ impl ExecutorOwner {
     ) -> Result<ExecutorPaidRecoveryOutcome> {
         preparation.require_broadcaster(candidate)?;
         let chain = effective_desktop_chain_config(self.chain.chain_id, &self.chain)?;
-        let query_rpc_pool = query_rpc_pool_for_route(&chain.rpc_route, &self.http);
+        let route = chain
+            .rpc_route
+            .for_class(crate::RpcTrafficClass::Sensitive)?;
+        let query_rpc_pool = query_rpc_pool_for_route(&route, &self.http);
         let min_gas_price = trace_step("paid_gas_price", async {
-            let candidates = acquire_fee_candidates(&self.http, &chain.rpc_route, None).await?;
+            let candidates = acquire_fee_candidates(&self.http, &route, None).await?;
             buffered_gas_price_from_candidates(&candidates, &chain.gas).await
         })
         .await?;

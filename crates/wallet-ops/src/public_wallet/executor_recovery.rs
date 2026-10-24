@@ -2,14 +2,15 @@ use alloy::rpc::types::TransactionRequest;
 use eyre::{Result, eyre};
 
 use super::submission::{
-    PublicActionHandoff, PublicActionStepEnd, submit_public_action_step_session,
+    PublicActionHandoff, PublicActionStepEnd, public_action_pools,
+    submit_public_action_step_session,
 };
 use super::{
     PublicActionGasFeeSelection, PublicActionProgressStep, PublicActionProgressUpdate,
     PublicAssetId, PublicShieldTransactionProfile, VaultedPublicSigner,
 };
 use crate::settings::EffectiveChainConfig;
-use crate::{HttpContext, TxReceiptOutput, query_rpc_pool_for_route};
+use crate::{HttpContext, TxReceiptOutput};
 
 /// Reuse ordinary transaction preflight, signing and block-scoped receipt observation.
 /// The native owner supplies a durable handoff and deliberately no public-account tracker.
@@ -36,6 +37,7 @@ pub(crate) async fn submit_executor_recovery_step(
         }
         progress(update);
     };
+    let pools = public_action_pools(&chain.rpc_route, http)?;
     let outcome = submit_public_action_step_session(
         step,
         transaction,
@@ -44,8 +46,7 @@ pub(crate) async fn submit_executor_recovery_step(
         PublicShieldTransactionProfile::Railoxide.gas_limit_strategy(),
         signer,
         "executor-recovery",
-        query_rpc_pool_for_route(&chain.rpc_route, http),
-        &chain.rpc_route,
+        &pools,
         chain.finality_depth,
         http,
         None,
