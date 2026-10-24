@@ -22,8 +22,8 @@ use super::types::{
 use crate::block_observer::BlockObserver;
 use crate::settings::EffectiveChainGasSettings;
 use crate::{
-    ClassRoute, HttpContext, SelfBroadcastResolvedGasFee, TxReceiptOutput, report_chain_string,
-    self_broadcast_replacement_bumped_fee,
+    ClassRoute, HttpContext, OperationHttpClient, SelfBroadcastResolvedGasFee, TxReceiptOutput,
+    report_chain_string, self_broadcast_replacement_bumped_fee,
     self_broadcast_send_raw_transaction_to_rpc_pool_with_logging,
 };
 
@@ -148,8 +148,9 @@ impl PublicActionStepResult {
     }
 }
 
-/// The routes of a Public action. Callers resolve them before the transaction is signed, so a
-/// route without a Sensitive or Submit endpoint fails before that signature.
+/// The routes of a Public action, isolated over its operation client. Callers resolve them
+/// before the transaction is signed, so a route without a Sensitive or Submit endpoint fails
+/// before that signature.
 pub(super) struct PublicActionPools {
     /// The Sensitive route preflights and estimates read through.
     pub(super) route: ClassRoute,
@@ -162,9 +163,14 @@ pub(super) struct PublicActionPools {
 pub(super) fn public_action_pools(
     route: &crate::RpcChainRoute,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<PublicActionPools> {
-    let sensitive = route.for_class(crate::RpcTrafficClass::Sensitive)?;
-    let submit = route.for_class(crate::RpcTrafficClass::Submission)?;
+    let sensitive = route
+        .for_class(crate::RpcTrafficClass::Sensitive)?
+        .isolated(client.clone());
+    let submit = route
+        .for_class(crate::RpcTrafficClass::Submission)?
+        .isolated(client.clone());
     Ok(PublicActionPools {
         observe: crate::query_rpc_pool_for_route(&sensitive, http),
         submit: crate::query_rpc_pool_for_route(&submit, http),
@@ -1755,8 +1761,42 @@ mod tests {
         server.abort();
     }
 
-    /// A chain-1 endpoint quoting fixed fees and estimating `estimate` gas. It logs each method
-    /// and passes each raw broadcast's hash to `on_send` before accepting it.
+    /// A chain-1 result quoting fixed fees and estimating `estimate` gas. It passes each raw
+    /// broadcast's hash to `on_send` before accepting it.
+    fn session_result(
+        estimate: u64,
+        request: &serde_json::Value,
+        on_send: &dyn Fn(FixedBytes<32>),
+    ) -> serde_json::Value {
+        match request["method"].as_str().unwrap_or_default() {
+            "eth_sendRawTransaction" => {
+                let raw = request["params"][0].as_str().unwrap();
+                let hash = keccak256(alloy::hex::decode(raw).unwrap());
+                on_send(hash);
+                json!(hash)
+            }
+            "eth_getBlockByNumber" => {
+                let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+                block.header.inner.base_fee_per_gas = Some(5);
+                serde_json::to_value(block).unwrap()
+            }
+            "eth_gasPrice" => json!("0x64"),
+            "eth_maxPriorityFeePerGas" => json!("0x2"),
+            "eth_feeHistory" => json!({
+                "oldestBlock": "0x1",
+                "baseFeePerGas": ["0x5", "0x5"],
+                "gasUsedRatio": [0.5],
+                "reward": [["0x1", "0x2", "0x3", "0x4"]]
+            }),
+            "eth_estimateGas" => json!(format!("0x{estimate:x}")),
+            "eth_getTransactionCount" => json!("0x7"),
+            "eth_getBalance" => json!("0x3635c9adc5dea00000"),
+            "eth_getTransactionReceipt" => serde_json::Value::Null,
+            _ => json!("0x1"),
+        }
+    }
+
+    /// An endpoint answering with [`session_result`] that logs each method.
     async fn session_endpoint(
         estimate: u64,
         on_send: impl Fn(FixedBytes<32>) + Send + Sync + 'static,
@@ -1769,34 +1809,8 @@ mod tests {
         let logged = methods.clone();
         let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
             Arc::new(move |request: serde_json::Value| {
+                let result = session_result(estimate, &request, &on_send);
                 let method = request["method"].as_str().unwrap_or_default().to_owned();
-                let result = match method.as_str() {
-                    "eth_sendRawTransaction" => {
-                        let raw = request["params"][0].as_str().unwrap();
-                        let hash = keccak256(alloy::hex::decode(raw).unwrap());
-                        on_send(hash);
-                        json!(hash)
-                    }
-                    "eth_getBlockByNumber" => {
-                        let mut block: alloy::rpc::types::Block =
-                            alloy::rpc::types::Block::default();
-                        block.header.inner.base_fee_per_gas = Some(5);
-                        serde_json::to_value(block).unwrap()
-                    }
-                    "eth_gasPrice" => json!("0x64"),
-                    "eth_maxPriorityFeePerGas" => json!("0x2"),
-                    "eth_feeHistory" => json!({
-                        "oldestBlock": "0x1",
-                        "baseFeePerGas": ["0x5", "0x5"],
-                        "gasUsedRatio": [0.5],
-                        "reward": [["0x1", "0x2", "0x3", "0x4"]]
-                    }),
-                    "eth_estimateGas" => json!(format!("0x{estimate:x}")),
-                    "eth_getTransactionCount" => json!("0x7"),
-                    "eth_getBalance" => json!("0x3635c9adc5dea00000"),
-                    "eth_getTransactionReceipt" => serde_json::Value::Null,
-                    _ => json!("0x1"),
-                };
                 logged.lock().unwrap().push(method);
                 json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
             }),
@@ -1818,6 +1832,34 @@ mod tests {
         handoff: &mut PublicActionHandoff<'_>,
     ) -> Result<PublicActionStepResult> {
         let http = HttpContext::direct_for_tests();
+        let client = http.operation_http_client().await.unwrap();
+        shield_session_over(
+            &http,
+            &client,
+            None,
+            route,
+            gas_limit_strategy,
+            gas_fee,
+            command_rx,
+            event_tx,
+            handoff,
+        )
+        .await
+    }
+
+    /// [`shield_session`] over `http` and the operation's `client`, tracked by
+    /// `transaction_tracking`.
+    async fn shield_session_over(
+        http: &HttpContext,
+        client: &OperationHttpClient,
+        transaction_tracking: Option<&crate::PublicTransactionTrackingContext>,
+        route: RpcChainRoute,
+        gas_limit_strategy: PublicActionGasLimitStrategy,
+        gas_fee: PublicActionGasFeeSelection,
+        command_rx: &mut Option<PublicActionCommandReceiver>,
+        event_tx: Option<&PublicActionSessionEventSender>,
+        handoff: &mut PublicActionHandoff<'_>,
+    ) -> Result<PublicActionStepResult> {
         let chain = crate::settings::build_effective_chain_configs(
             &crate::settings::WalletSettings::default(),
         )
@@ -1825,7 +1867,7 @@ mod tests {
         .get(1)
         .cloned()
         .unwrap();
-        let pools = public_action_pools(&route, &http).expect("route has every class");
+        let pools = public_action_pools(&route, http, client).expect("route has every class");
         let signer = VaultedPublicSigner::Software(
             crate::signer::SoftwareEvmSigner::from_private_key([7; 32]).unwrap(),
         );
@@ -1841,8 +1883,8 @@ mod tests {
             "public action session test",
             &pools,
             1,
-            &http,
-            None,
+            http,
+            transaction_tracking,
             1,
             signer.address(),
             &chain.gas,
@@ -2123,5 +2165,485 @@ mod tests {
         general_server.abort();
         reader_server.abort();
         submitter_server.abort();
+    }
+
+    #[tokio::test]
+    async fn public_action_and_its_handed_off_observation_use_only_the_operation_client() {
+        use crate::rpc_broker::tests::{
+            RpcResponder, spawn_recording_rpc_mock, tagged_reqwest_client,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let block_hash = FixedBytes::<32>::repeat_byte(0x22);
+        let sent = Arc::new(Mutex::new(None));
+        let included = Arc::new(AtomicBool::new(false));
+        // Head 1 until `included`, then head 2 holding the broadcast transaction.
+        let responder: RpcResponder = {
+            let sent = sent.clone();
+            let included = included.clone();
+            Arc::new(move |request: serde_json::Value| {
+                let hash = *sent.lock().unwrap();
+                let result = match (request["method"].as_str(), hash) {
+                    (Some("eth_blockNumber"), _) if included.load(Ordering::SeqCst) => json!("0x2"),
+                    (Some("eth_getBlockByNumber"), Some(hash)) if request["params"][0] == "0x2" => {
+                        let mut block: alloy::rpc::types::Block =
+                            alloy::rpc::types::Block::default();
+                        block.header.hash = block_hash;
+                        block.header.inner.number = 2;
+                        block.transactions =
+                            alloy::rpc::types::BlockTransactions::Hashes(vec![hash]);
+                        serde_json::to_value(block).unwrap()
+                    }
+                    (Some("eth_getBlockReceipts"), Some(hash)) => json!([{
+                        "transactionHash": hash,
+                        "blockHash": block_hash,
+                        "blockNumber": "0x2",
+                        "transactionIndex": "0x0",
+                        "from": Address::ZERO,
+                        "to": Address::ZERO,
+                        "cumulativeGasUsed": "0x5208",
+                        "status": "0x1",
+                        "gasUsed": "0x5208",
+                        "effectiveGasPrice": "0x1",
+                        "logs": [],
+                        "logsBloom": format!("0x{}", "00".repeat(256)),
+                        "type": "0x0",
+                        "contractAddress": null,
+                    }]),
+                    _ => session_result(21_000, &request, &|hash| {
+                        *sent.lock().unwrap() = Some(hash);
+                    }),
+                };
+                json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+            })
+        };
+        let (reader, reader_requests, reader_server) =
+            spawn_recording_rpc_mock(responder.clone()).await;
+        let (submitter, submitter_requests, submitter_server) =
+            spawn_recording_rpc_mock(responder).await;
+        let roles = |sensitive, submit| crate::RpcEndpointRoles {
+            general: false,
+            sensitive,
+            submit,
+        };
+        let route = RpcChainRoute::new_with_transports(
+            1,
+            vec![
+                (
+                    reader.into(),
+                    crate::RpcTransport::Wallet,
+                    roles(true, false),
+                ),
+                (
+                    submitter.into(),
+                    crate::RpcTransport::Wallet,
+                    roles(false, true),
+                ),
+            ],
+        );
+        let http = HttpContext::with_rpc_client_for_tests(
+            tagged_reqwest_client("shared"),
+            crate::WalletNetworkMode::Direct,
+        );
+        let client = OperationHttpClient::for_tests(
+            tagged_reqwest_client("operation"),
+            crate::OperationNetworkIsolation::Dedicated,
+        );
+        let (tracker, tracking) = crate::public_wallet::test_tracking_context();
+        let mut command_rx = None;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handoff =
+            |_: FixedBytes<32>, _: &TransactionRequest, _: &[u8]| -> Result<()> { Ok(()) };
+        let session = Box::pin(shield_session_over(
+            &http,
+            &client,
+            Some(&tracking),
+            route,
+            PublicActionGasLimitStrategy::ChainBuffer,
+            PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas: 100,
+                max_priority_fee_per_gas: 2,
+            },
+            &mut command_rx,
+            Some(&event_tx),
+            &mut handoff,
+        ));
+        // The progress UI closes after the broadcast, which ends the session before its
+        // receipt and hands its observer to the tracker.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                result = session => panic!("session ended early: {:?}", result.err()),
+                () = async {
+                    while !matches!(
+                        event_rx.recv().await.unwrap(),
+                        PublicActionSessionEvent::AttemptSubmitted { .. }
+                    ) {}
+                } => {}
+            }
+        })
+        .await
+        .expect("the attempt is submitted");
+        let hash = (*sent.lock().unwrap()).expect("the attempt was broadcast");
+
+        // The tracker keeps polling before the inclusion and resolves the receipt after it.
+        let handed_off_at = reader_requests.lock().unwrap().len();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while reader_requests.lock().unwrap().len() == handed_off_at {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the tracker polls the handed-off observer");
+        included.store(true, Ordering::SeqCst);
+        let mut changes = tracker.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(
+                tracker.lookup(1, hash),
+                PublicTransactionLookup::Included { .. }
+            ) {
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the handed-off observation resolves the receipt");
+        // Polling stops at the receipt; the tracker would otherwise poll again within 3 s.
+        let resolved_at = reader_requests.lock().unwrap().len();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(reader_requests.lock().unwrap().len(), resolved_at);
+
+        let reader_requests = reader_requests.lock().unwrap().clone();
+        let submitter_requests = submitter_requests.lock().unwrap().clone();
+        assert!(
+            reader_requests
+                .iter()
+                .chain(&submitter_requests)
+                .all(|(tag, _)| tag.as_deref() == Some("operation")),
+            "every request goes over the operation's client"
+        );
+        let methods = |requests: &[(Option<String>, serde_json::Value)]| {
+            requests
+                .iter()
+                .map(|(_, body)| body["method"].as_str().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let reads = methods(&reader_requests);
+        for method in [
+            "eth_getTransactionCount",
+            "eth_estimateGas",
+            "eth_blockNumber",
+            "eth_getBlockReceipts",
+        ] {
+            assert!(reads.iter().any(|read| read == method), "{method}");
+        }
+        assert!(!reads.iter().any(|read| read == "eth_sendRawTransaction"));
+        assert_eq!(methods(&submitter_requests), ["eth_sendRawTransaction"]);
+        tracker.shutdown().await;
+        reader_server.abort();
+        submitter_server.abort();
+    }
+
+    /// A chain-1 Governance `intent` in `context`, estimated over `client` and authorized for
+    /// submission by the vault's account as `step`.
+    async fn authorized_governance_request(
+        context: crate::GovernanceActionContext,
+        intent: &crate::GovernanceActionIntent,
+        step: PublicActionProgressStep,
+        chain: &crate::settings::EffectiveChainConfig,
+        http: &HttpContext,
+        client: &OperationHttpClient,
+        vault: (
+            &Arc<crate::vault::DesktopVaultStore>,
+            &Arc<crate::vault::DesktopViewSession>,
+        ),
+    ) -> crate::GovernanceSubmissionRequest {
+        let quote = PublicActionGasFeeQuote {
+            observed_fee_model: Some(crate::EvmFeeModel::Eip1559),
+            rpc_gas_price: 100,
+            current_base_fee_per_gas: Some(5),
+            suggested_max_fee_per_gas: 100,
+            suggested_max_priority_fee_per_gas: 2,
+        };
+        let fee = resolve_public_action_gas_fee(
+            1,
+            PublicShieldTransactionProfile::Railoxide,
+            PublicAssetId::Native,
+            PublicActionGasFeeSelection::Custom {
+                max_fee_per_gas: 100,
+                max_priority_fee_per_gas: 2,
+            },
+            Some(quote),
+        )
+        .unwrap();
+        let rebuilt = intent.resolve(&context).unwrap();
+        let review = crate::GovernanceActionReview::from_resolved(&rebuilt, context, None).unwrap();
+        let estimate = crate::estimate_governance_action(
+            &review,
+            rebuilt.clone(),
+            chain.clone(),
+            quote,
+            fee,
+            http,
+            client,
+        )
+        .await
+        .expect("the action is estimated")
+        .estimate;
+        crate::GovernanceSubmissionRequest {
+            public_send: crate::PublicSendRequest {
+                executor_owner: None,
+                transaction_tracking: None,
+                chain_id: 1,
+                effective_chain: chain.clone(),
+                view_session: Arc::clone(vault.1),
+                vault_store: Arc::clone(vault.0),
+                authorization: Some(crate::DesktopPrivateSpendAuthorization::VaultPassword(
+                    zeroize::Zeroizing::new(crate::public_wallet::tests::TEST_PASSWORD.into()),
+                )),
+                trezor_app_passphrase: None,
+                trezor_pin_matrix_provider: None,
+                public_account_uuid: review.context.public_account_uuid.clone(),
+                intent: rebuilt.raw.clone(),
+                advanced_authorization: Some(crate::PublicAdvancedTransactionAuthorization {
+                    payload_fingerprint: estimate.payload_fingerprint,
+                    gas_limit: estimate.gas_limit,
+                }),
+                gas_fee: PublicActionGasFeeSelection::Custom {
+                    max_fee_per_gas: fee.max_fee_per_gas,
+                    max_priority_fee_per_gas: fee.max_priority_fee_per_gas,
+                },
+                command_rx: None,
+                event_tx: None,
+            },
+            review,
+            rebuilt,
+            estimate,
+            progress_step: step,
+        }
+    }
+
+    #[tokio::test]
+    async fn governance_action_and_workflow_use_only_the_action_client() {
+        use crate::public_wallet::tests::{
+            TEST_IMPORTED_PRIVATE_KEY, TEST_PASSWORD, public_action_request_parts,
+        };
+        use crate::rpc_broker::tests::{
+            RpcResponder, spawn_recording_rpc_mock, tagged_reqwest_client,
+        };
+        use crate::{GovernanceActionContext, GovernanceActionIntent, GovernanceContractKind};
+
+        // Each broadcast is mined alone in the next block, so block `n + 2` holds the n-th.
+        let responder: RpcResponder = {
+            let mined = Arc::new(Mutex::new(Vec::<FixedBytes<32>>::new()));
+            Arc::new(move |request: serde_json::Value| {
+                let hashes = mined.lock().unwrap().clone();
+                let mined_in = |number: u64| {
+                    hashes
+                        .get(usize::try_from(number.checked_sub(2)?).ok()?)
+                        .copied()
+                };
+                let block_number = request["params"][0]
+                    .as_str()
+                    .and_then(|param| u64::from_str_radix(param.strip_prefix("0x")?, 16).ok());
+                let result = match (request["method"].as_str(), block_number) {
+                    (Some("eth_blockNumber"), _) => json!(format!("0x{:x}", hashes.len() + 1)),
+                    // Covers every Governance token balance and allowance the workflow reads.
+                    (Some("eth_call"), _) => json!(format!("0x{:064x}", 1_u128 << 80)),
+                    (Some("eth_getBlockByNumber"), Some(number)) => {
+                        let mut block: alloy::rpc::types::Block =
+                            alloy::rpc::types::Block::default();
+                        block.header.hash = FixedBytes::repeat_byte(number as u8);
+                        block.header.inner.number = number;
+                        block.header.inner.base_fee_per_gas = Some(5);
+                        block.transactions = alloy::rpc::types::BlockTransactions::Hashes(
+                            mined_in(number).into_iter().collect(),
+                        );
+                        serde_json::to_value(block).unwrap()
+                    }
+                    (Some("eth_getBlockReceipts"), _) => {
+                        let block_hash: FixedBytes<32> =
+                            serde_json::from_value(request["params"][0].clone()).unwrap();
+                        let number = u64::from(block_hash[0]);
+                        json!([{
+                            "transactionHash": mined_in(number).unwrap(),
+                            "blockHash": block_hash,
+                            "blockNumber": format!("0x{number:x}"),
+                            "transactionIndex": "0x0",
+                            "from": Address::ZERO,
+                            "to": Address::ZERO,
+                            "cumulativeGasUsed": "0x5208",
+                            "status": "0x1",
+                            "gasUsed": "0x5208",
+                            "effectiveGasPrice": "0x1",
+                            "logs": [],
+                            "logsBloom": format!("0x{}", "00".repeat(256)),
+                            "type": "0x0",
+                            "contractAddress": null,
+                        }])
+                    }
+                    _ => session_result(21_000, &request, &|hash| {
+                        mined.lock().unwrap().push(hash);
+                    }),
+                };
+                json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+            })
+        };
+        let (general_only, general_requests, general_server) =
+            spawn_recording_rpc_mock(responder.clone()).await;
+        let (action_endpoint, action_requests, action_server) =
+            spawn_recording_rpc_mock(responder).await;
+        let roles = |general, sensitive, submit| crate::RpcEndpointRoles {
+            general,
+            sensitive,
+            submit,
+        };
+        let mut chain = crate::settings::build_effective_chain_configs(
+            &crate::settings::WalletSettings::default(),
+        )
+        .unwrap()
+        .get(1)
+        .cloned()
+        .unwrap();
+        chain.rpc_route = RpcChainRoute::new_with_transports(
+            1,
+            vec![
+                (
+                    general_only.into(),
+                    crate::RpcTransport::Wallet,
+                    roles(true, false, false),
+                ),
+                (
+                    action_endpoint.into(),
+                    crate::RpcTransport::Wallet,
+                    roles(false, true, true),
+                ),
+            ],
+        );
+        let http = HttpContext::with_rpc_client_for_tests(
+            tagged_reqwest_client("shared"),
+            crate::WalletNetworkMode::Direct,
+        );
+        let client = OperationHttpClient::for_tests(
+            tagged_reqwest_client("action"),
+            crate::OperationNetworkIsolation::Dedicated,
+        );
+        let (root_dir, db, store, view_session) = public_action_request_parts();
+        let account = store
+            .import_public_account(
+                TEST_PASSWORD,
+                &view_session,
+                TEST_IMPORTED_PRIVATE_KEY,
+                Some("Governance actor"),
+                false,
+            )
+            .expect("import public account");
+        let contracts = railgun_ui::governance_contracts(1).unwrap();
+        let context = |contract, contract_kind, observed_state| GovernanceActionContext {
+            private_wallet_uuid: "public-action-wallet".into(),
+            chain_id: 1,
+            public_account_uuid: account.public_account_uuid.clone(),
+            actor: account.address,
+            contract,
+            contract_kind,
+            observed_state,
+        };
+
+        let sponsor = authorized_governance_request(
+            context(
+                contracts.voting,
+                GovernanceContractKind::Voting,
+                FixedBytes::ZERO,
+            ),
+            &GovernanceActionIntent::Sponsor {
+                proposal_version: crate::GovernanceContractVersion::V2,
+                proposal_index: U256::from(7),
+                amount: U256::from(3),
+                snapshot_interval: U256::from(9),
+                snapshot_hint: U256::from(2),
+            },
+            PublicActionProgressStep::Sponsor,
+            &chain,
+            &http,
+            &client,
+            (&store, &view_session),
+        )
+        .await;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            Box::pin(crate::submit_governance_action_with_progress(
+                sponsor,
+                &http,
+                &client,
+                |_| {},
+            )),
+        )
+        .await
+        .expect("the sponsor action ends")
+        .expect("the sponsor action is confirmed");
+
+        // An approval-required stake: the approval, then the stake rebuilt from fresh reads.
+        let plan = crate::plan_stake(
+            account.address,
+            contracts.staking,
+            U256::from(10),
+            U256::ZERO,
+            U256::from(5),
+        )
+        .unwrap();
+        let approval = authorized_governance_request(
+            context(
+                contracts.governance_token,
+                GovernanceContractKind::GovernanceToken,
+                plan.observed_state,
+            ),
+            plan.approval.as_ref().unwrap(),
+            PublicActionProgressStep::GovernanceApprove,
+            &chain,
+            &http,
+            &client,
+            (&store, &view_session),
+        )
+        .await;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            Box::pin(crate::submit_governance_workflow_with_progress(
+                crate::GovernanceWorkflowRequest {
+                    initial: approval,
+                    workflow: crate::GovernanceWorkflow::StakeApproval(plan),
+                },
+                &http,
+                &client,
+                |_| {},
+            )),
+        )
+        .await
+        .expect("the workflow ends")
+        .expect("the approval and its continued stake are confirmed");
+
+        assert!(
+            general_requests.lock().unwrap().is_empty(),
+            "nothing reaches the General-only endpoint"
+        );
+        let action_requests = action_requests.lock().unwrap().clone();
+        assert!(
+            action_requests
+                .iter()
+                .all(|(tag, _)| tag.as_deref() == Some("action")),
+            "every request goes over the action's client"
+        );
+        let count = |method: &str| {
+            action_requests
+                .iter()
+                .filter(|(_, body)| body["method"] == method)
+                .count()
+        };
+        // Estimates, the continuation's fresh reads, and each transaction's broadcast and receipt.
+        assert!(count("eth_estimateGas") > 0 && count("eth_call") > 0);
+        assert_eq!(count("eth_sendRawTransaction"), 3);
+        assert_eq!(count("eth_getBlockReceipts"), 3);
+        general_server.abort();
+        action_server.abort();
+        drop(store);
+        drop(db);
+        std::fs::remove_dir_all(root_dir).expect("remove temp db dir");
     }
 }

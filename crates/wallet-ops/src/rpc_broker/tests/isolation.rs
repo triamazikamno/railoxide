@@ -1,5 +1,10 @@
 use super::*;
+use crate::block_observer::BlockObserver;
 use crate::http::{OperationHttpClient, OperationNetworkIsolation};
+use crate::rpc_broker::RpcCandidates;
+use crate::{HttpContext, WalletNetworkMode};
+use alloy::providers::Provider as _;
+use std::collections::HashSet;
 
 const MULTICALL: Address = Address::repeat_byte(0x33);
 
@@ -224,4 +229,124 @@ async fn completed_isolated_reads_leave_no_route_clone_in_the_broker() {
     assert!(probe.upgrade().is_none());
     drop(broker);
     server.abort();
+}
+
+#[tokio::test]
+async fn isolated_pools_and_candidates_use_the_route_client_and_probes_stay_shared() {
+    let answer: RpcResponder = Arc::new(|request| rpc_result(&request, &json!("0x1")));
+    let (wallet, wallet_requests, wallet_server) = spawn_recording_rpc_mock(answer.clone()).await;
+    let (direct, direct_requests, direct_server) = spawn_recording_rpc_mock(answer).await;
+    let http = HttpContext::with_rpc_clients_for_tests(
+        tagged_reqwest_client("wallet"),
+        tagged_reqwest_client("direct"),
+        WalletNetworkMode::Direct,
+    );
+    let route = RpcChainRoute::new_with_transports(
+        1,
+        vec![
+            (
+                wallet.into(),
+                RpcTransport::Wallet,
+                RpcEndpointRoles::default(),
+            ),
+            (
+                direct.into(),
+                RpcTransport::Direct,
+                RpcEndpointRoles::default(),
+            ),
+        ],
+    )
+    .with_identity_verification();
+    let isolated = general(&route).isolated(tagged_client("isolated"));
+
+    // Candidates probe each endpoint's identity before it is ready.
+    let pool = isolated.query_rpc_pool(&http.rpc_clients(), Duration::ZERO);
+    let candidates = RpcCandidates::acquire(&http, &isolated, None)
+        .await
+        .unwrap();
+    let mut providers = pool.available_providers();
+    let mut tried = HashSet::new();
+    while let Some(provider) = candidates.next_untried(&mut tried).await {
+        providers.push(provider);
+    }
+    assert_eq!(tried.len(), 2);
+    for provider in providers {
+        provider.provider.get_block_number().await.unwrap();
+    }
+
+    let sent = |requests: &RecordedRequests| {
+        let mut sent = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(tag, body)| {
+                (
+                    tag.clone().unwrap(),
+                    body["method"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        sent.sort();
+        sent.dedup();
+        sent
+    };
+    let request = |tag: &str, method: &str| (tag.to_owned(), method.to_owned());
+    assert_eq!(
+        sent(&wallet_requests),
+        vec![
+            request("isolated", "eth_blockNumber"),
+            request("wallet", "eth_chainId")
+        ]
+    );
+    assert_eq!(
+        sent(&direct_requests),
+        vec![
+            request("direct", "eth_blockNumber"),
+            request("direct", "eth_chainId")
+        ]
+    );
+    drop(candidates);
+    wallet_server.abort();
+    direct_server.abort();
+}
+
+#[tokio::test]
+async fn isolated_block_observation_times_out_and_fails_over() {
+    let answer: RpcResponder = Arc::new(|request| rpc_result(&request, &json!("0x4")));
+    // The gate is never released, so the first endpoint accepts the read and never answers.
+    let (hanging, hanging_server) = spawn_gated_rpc_mock(
+        answer.clone(),
+        Arc::default(),
+        Arc::default(),
+        RpcMockGate::default(),
+    )
+    .await;
+    let (healthy, healthy_server) = spawn_rpc_mock(answer, Arc::default(), Arc::default()).await;
+    let isolated_client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap();
+    let route = general(&RpcChainRoute::new(1, vec![hanging, healthy])).isolated(
+        OperationHttpClient::for_tests(isolated_client, OperationNetworkIsolation::Dedicated),
+    );
+    // The shared clients have no timeout, so only the isolated client's ends the hung read.
+    let http = HttpContext::direct_for_tests();
+    let pool = Arc::new(route.query_rpc_pool(&http.rpc_clients(), Duration::from_secs(60)));
+
+    let observer = tokio::time::timeout(
+        Duration::from_secs(5),
+        BlockObserver::establish(Arc::clone(&pool), 1, http.rpc_broker(), 1),
+    )
+    .await
+    .expect("the isolated client times out the hung read")
+    .expect("block observation fails over to the healthy endpoint");
+    drop(observer);
+    let available = pool
+        .available_providers()
+        .iter()
+        .map(|provider| provider.index)
+        .collect::<Vec<_>>();
+    assert_eq!(available, vec![1]);
+    hanging_server.abort();
+    healthy_server.abort();
 }

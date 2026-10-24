@@ -1665,6 +1665,7 @@ async fn settlement_with_both_hooks_scenario(chain_id: u64, rpc_env: &str, usdc:
         .find(|preimage| preimage.token.tokenAddress == usdc)
         .map(|preimage| U256::from(preimage.value))
         .expect("the post-hook shields the bought USDC");
+    let http = HttpContext::direct_for_tests();
     let origin = crate::resolve_source_tx_origin(
         chain_id,
         &wallet.chain,
@@ -1672,7 +1673,8 @@ async fn settlement_with_both_hooks_scenario(chain_id: u64, rpc_env: &str, usdc:
         receipt.transaction_hash,
         usdc,
         shielded,
-        &HttpContext::direct_for_tests(),
+        &http,
+        &http.operation_http_client().await.unwrap(),
     )
     .await
     .unwrap();

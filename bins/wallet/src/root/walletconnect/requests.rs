@@ -49,6 +49,7 @@ pub(super) async fn approve_walletconnect_request_task(
     executor_owner: Option<Arc<wallet_ops::ExecutorOwner>>,
     response_sender: DappResponseSender,
     http: HttpContext,
+    operation: wallet_ops::OperationHttpClientSlot,
     hash_fallback_confirmed: bool,
     reviewed_fee: Option<super::fee::WalletConnectReviewedFeeProjection>,
     event_tx: Option<PublicActionSessionEventSender>,
@@ -130,6 +131,10 @@ pub(super) async fn approve_walletconnect_request_task(
                         submitted_tx_hash,
                     );
                 };
+                let client = match operation.client().await {
+                    Ok(client) => client,
+                    Err(error) => return (Err(error), submitted_tx_hash),
+                };
                 match transaction_request_from_walletconnect(chain_id, transaction) {
                     Ok(tx_req) => submit_walletconnect_send_transaction(
                         WalletConnectSendTransactionRequest {
@@ -154,6 +159,7 @@ pub(super) async fn approve_walletconnect_request_task(
                             event_tx,
                         },
                         &http,
+                        &client,
                     )
                     .await
                     .map(|result| {

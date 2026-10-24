@@ -68,11 +68,13 @@ struct NativeShieldTarget {
     payer_address: Address,
     view_session: Arc<DesktopViewSession>,
     http: wallet_ops::HttpContext,
+    operation: OperationHttpClientSlot,
 }
 
 impl NativeShieldTarget {
     async fn prepare(self, amount: U256) -> eyre::Result<NativeShieldPreparation> {
         let recipient = public_shield_recipient(&self.view_session)?;
+        let client = self.operation.client().await?;
         prepare_native_shield(
             self.chain_id,
             &self.effective_chain,
@@ -82,6 +84,7 @@ impl NativeShieldTarget {
             recipient,
             amount,
             &self.http,
+            &client,
         )
         .await
     }
@@ -92,6 +95,7 @@ impl NativeShieldTarget {
         max_fee_per_gas: u128,
     ) -> eyre::Result<NativeShieldPreparation> {
         let recipient = public_shield_recipient(&self.view_session)?;
+        let client = self.operation.client().await?;
         prepare_native_shield_max(
             self.chain_id,
             &self.effective_chain,
@@ -102,6 +106,7 @@ impl NativeShieldTarget {
             balance,
             max_fee_per_gas,
             &self.http,
+            &client,
         )
         .await
     }
@@ -275,8 +280,9 @@ impl WalletRoot {
             .map(|preparation| (preparation.raw_gas_limit(), preparation.gas_limit()))
     }
 
-    fn native_shield_target(&self) -> Option<NativeShieldTarget> {
+    fn native_shield_target(&mut self) -> Option<NativeShieldTarget> {
         let (payer_address, payer) = self.selected_native_shield_payer()?;
+        let account = self.public_form.selected_account_uuid.clone()?;
         Some(NativeShieldTarget {
             chain_id: self.selected_chain,
             effective_chain: self
@@ -289,6 +295,7 @@ impl WalletRoot {
             payer_address,
             view_session: self.view_session.clone()?,
             http: self.http.clone(),
+            operation: self.public_form_operation(&account),
         })
     }
 

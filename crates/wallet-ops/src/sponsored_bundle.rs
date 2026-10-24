@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::SensitiveUrl;
-use crate::http::{HttpContext, redact_url_for_display};
+use crate::http::{OperationHttpClient, redact_url_for_display};
 
 const SPONSORED_BUNDLE_REQUEST_ID: u64 = 1;
 const SPONSORED_BUNDLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -73,18 +73,19 @@ enum RelayAttemptError {
 
 /// Submits one signed transaction as a pending-block bundle to every relay.
 ///
-/// All requests use the client owned by `http`; relay errors deliberately omit
+/// All requests use the operation's client; relay errors deliberately omit
 /// response messages because providers can reflect signed bytes or endpoint data.
 pub async fn submit_sponsored_bundle(
-    http: &HttpContext,
+    client: &OperationHttpClient,
     relays: &[SensitiveUrl],
     signed_raw_transaction: &str,
 ) -> Result<SponsoredBundleFanout, SponsoredBundleAllRelaysFailed> {
-    submit_sponsored_bundle_with_acceptance(http, relays, signed_raw_transaction, || async {}).await
+    submit_sponsored_bundle_with_acceptance(client, relays, signed_raw_transaction, || async {})
+        .await
 }
 
 pub(crate) async fn submit_sponsored_bundle_with_acceptance<F, Fut>(
-    http: &HttpContext,
+    client: &OperationHttpClient,
     relays: &[SensitiveUrl],
     signed_raw_transaction: &str,
     on_first_acceptance: F,
@@ -98,7 +99,7 @@ where
         .map(|relay| async move {
             let redacted_relay = redact_url_for_display(relay.expose_url());
             let result =
-                submit_sponsored_bundle_to_relay(http, relay, signed_raw_transaction).await;
+                submit_sponsored_bundle_to_relay(client, relay, signed_raw_transaction).await;
             (redacted_relay, result)
         })
         .collect::<FuturesUnordered<_>>();
@@ -143,7 +144,7 @@ where
 }
 
 async fn submit_sponsored_bundle_to_relay(
-    http: &HttpContext,
+    client: &OperationHttpClient,
     relay: &SensitiveUrl,
     signed_raw_transaction: &str,
 ) -> Result<(), RelayAttemptError> {
@@ -158,8 +159,8 @@ async fn submit_sponsored_bundle_to_relay(
             txs: [signed_raw_transaction],
         }],
     };
-    let response = http
-        .client
+    let response = client
+        .client()
         .post(request_url)
         .timeout(SPONSORED_BUNDLE_REQUEST_TIMEOUT)
         .json(&request)
@@ -198,6 +199,14 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::http::{OperationNetworkIsolation, WalletNetworkMode};
+
+    fn operation_client(client: reqwest::Client) -> OperationHttpClient {
+        OperationHttpClient::for_tests(
+            client,
+            OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct),
+        )
+    }
 
     struct CapturedRequest {
         headers: String,
@@ -300,10 +309,11 @@ mod tests {
         let relays = [SensitiveUrl::from(url)];
         let raw_transaction = "0x010203";
 
-        let result =
-            submit_sponsored_bundle(&HttpContext::direct_for_tests(), &relays, raw_transaction)
-                .await
-                .expect("bundle accepted");
+        let client = operation_client(crate::rpc_broker::tests::tagged_reqwest_client("operation"));
+
+        let result = submit_sponsored_bundle(&client, &relays, raw_transaction)
+            .await
+            .expect("bundle accepted");
         let request = request_rx.recv().expect("captured relay request");
         task.join().expect("relay task");
 
@@ -317,12 +327,9 @@ mod tests {
                 "params": [{ "txs": [raw_transaction] }],
             })
         );
-        assert!(
-            !request
-                .headers
-                .to_ascii_lowercase()
-                .contains("authorization:")
-        );
+        let headers = request.headers.to_ascii_lowercase();
+        assert!(!headers.contains("authorization:"));
+        assert!(headers.contains("x-route: operation"));
     }
 
     #[tokio::test]
@@ -368,7 +375,7 @@ mod tests {
         let raw_transaction = "0xidentical-signed-transaction";
 
         let result = submit_sponsored_bundle_with_acceptance(
-            &HttpContext::direct_for_tests(),
+            &operation_client(reqwest::Client::new()),
             &relays,
             raw_transaction,
             move || async move {
@@ -405,7 +412,8 @@ mod tests {
             SensitiveUrl::from(failure_url),
         ];
 
-        let result = submit_sponsored_bundle(&HttpContext::direct_for_tests(), &relays, "0xsigned")
+        let client = operation_client(reqwest::Client::new());
+        let result = submit_sponsored_bundle(&client, &relays, "0xsigned")
             .await
             .expect("one relay acceptance is success");
         success_task.join().expect("success relay task");
@@ -429,7 +437,8 @@ mod tests {
             SensitiveUrl::from(rpc_error_url),
         ];
 
-        let error = submit_sponsored_bundle(&HttpContext::direct_for_tests(), &relays, "0xsigned")
+        let client = operation_client(reqwest::Client::new());
+        let error = submit_sponsored_bundle(&client, &relays, "0xsigned")
             .await
             .expect_err("all relays fail");
         http_error_task.join().expect("HTTP error relay task");
@@ -461,13 +470,10 @@ mod tests {
         let relay_host = url.host_str().expect("relay host").to_owned();
         let relays = [SensitiveUrl::from(url)];
 
-        let error = submit_sponsored_bundle(
-            &HttpContext::direct_for_tests(),
-            &relays,
-            signed_transaction,
-        )
-        .await
-        .expect_err("relay rejects bundle");
+        let client = operation_client(reqwest::Client::new());
+        let error = submit_sponsored_bundle(&client, &relays, signed_transaction)
+            .await
+            .expect_err("relay rejects bundle");
         task.join().expect("relay task");
         let formatted = format!("{error} {error:?}");
 

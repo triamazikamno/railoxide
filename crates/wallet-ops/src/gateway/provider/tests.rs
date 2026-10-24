@@ -2633,6 +2633,7 @@ async fn native_review_reads_preserve_dapp_budget_and_drain_after_retirement() {
         url::Url::parse("http://127.0.0.1:2").unwrap().into(),
         rpc(),
         Instant::now(),
+        operation_client(),
         reply,
     );
     assert_eq!(rejected.await.unwrap(), Err(RpcBrokerError::OriginRejected));
@@ -2642,6 +2643,7 @@ async fn native_review_reads_preserve_dapp_budget_and_drain_after_retirement() {
         endpoint.clone().into(),
         rpc(),
         Instant::now(),
+        operation_client(),
         reply,
     );
     tokio::time::timeout(Duration::from_secs(5), started.notified())
@@ -2683,6 +2685,17 @@ async fn native_review_reads_preserve_dapp_budget_and_drain_after_retirement() {
     drop(provider);
     drop(view);
     std::fs::remove_dir_all(path).unwrap();
+}
+
+fn operation_client() -> crate::OperationHttpClient {
+    crate::OperationHttpClient::for_tests(
+        reqwest::Client::new(),
+        crate::OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Direct),
+    )
+}
+
+fn operation_slot() -> crate::OperationHttpClientSlot {
+    crate::OperationHttpClientSlot::for_tests(HttpContext::direct_for_tests(), operation_client())
 }
 
 fn approval_handle(
@@ -2773,10 +2786,11 @@ async fn native_review_fee_fanout_succeeds_with_full_dapp_queue() {
         -32005
     );
     let (handle, mut commands) = approval_handle(&provider);
+    let operation = operation_slot();
     let mut callers = tokio::task::JoinSet::new();
     for endpoint in endpoints {
         for (&method, expected) in &responses {
-            let reads = handle.approval_reads(ready.id.clone());
+            let reads = handle.approval_reads(ready.id.clone(), operation.clone());
             let endpoint = endpoint.clone();
             let expected = expected.clone();
             let params = if method == "eth_feeHistory" {
@@ -2799,10 +2813,10 @@ async fn native_review_fee_fanout_succeeds_with_full_dapp_queue() {
         while !callers.is_empty() {
             tokio::select! {
                 command = commands.recv() => {
-                    let Command::ApprovalRead(id, endpoint, rpc, entered, reply) = command.unwrap() else {
+                    let Command::ApprovalRead(id, endpoint, rpc, entered, client, reply) = command.unwrap() else {
                         panic!("expected approval read");
                     };
-                    provider.approval_read(&id, endpoint, rpc, entered, reply);
+                    provider.approval_read(&id, endpoint, rpc, entered, client, reply);
                 }
                 completion = provider.jobs.join_next(), if !provider.jobs.is_empty() => {
                     provider.complete_read(completion.unwrap().unwrap());
@@ -2835,6 +2849,258 @@ async fn native_review_fee_fanout_succeeds_with_full_dapp_queue() {
     std::fs::remove_dir_all(path).unwrap();
 }
 
+/// A browser dapp's transaction request: its simulation and preflight read through the real
+/// approval callback, then it is broadcast and observed, all over the request's own client.
+#[tokio::test]
+async fn native_transaction_request_reaches_the_chain_only_over_its_client() {
+    use crate::gateway::Command;
+    use crate::rpc_broker::tests::{RpcResponder, spawn_recording_rpc_mock, tagged_reqwest_client};
+    use alloy::network::TransactionBuilder as _;
+    use alloy::primitives::{Address, Bytes, U256};
+
+    let responder: RpcResponder = Arc::new(|request: Value| {
+        let result = match request["method"].as_str().unwrap_or_default() {
+            "eth_sendRawTransaction" => {
+                let raw = alloy::hex::decode(request["params"][0].as_str().unwrap()).unwrap();
+                json!(alloy::primitives::keccak256(raw))
+            }
+            "eth_getBlockByNumber" => {
+                let mut block: alloy::rpc::types::Block = alloy::rpc::types::Block::default();
+                block.header.inner.base_fee_per_gas = Some(5);
+                serde_json::to_value(block).unwrap()
+            }
+            "eth_feeHistory" => json!({
+                "oldestBlock": "0x1",
+                "baseFeePerGas": ["0x5", "0x5"],
+                "gasUsedRatio": [0.5],
+                "reward": [["0x1", "0x2", "0x3", "0x4"]]
+            }),
+            "eth_estimateGas" => json!("0x5208"),
+            "eth_getBalance" => json!("0x3635c9adc5dea00000"),
+            _ => json!("0x1"),
+        };
+        json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+    });
+    let (reader, reader_requests, reader_server) =
+        spawn_recording_rpc_mock(responder.clone()).await;
+    let (submitter, submitter_requests, submitter_server) =
+        spawn_recording_rpc_mock(responder).await;
+    let roles = |sensitive, submit| crate::RpcEndpointRoles {
+        general: false,
+        sensitive,
+        submit,
+    };
+    let route = RpcChainRoute::new_with_transports(
+        1,
+        vec![
+            (
+                reader.into(),
+                crate::RpcTransport::Wallet,
+                roles(true, false),
+            ),
+            (
+                submitter.into(),
+                crate::RpcTransport::Wallet,
+                roles(false, true),
+            ),
+        ],
+    );
+    let http = HttpContext::with_rpc_client_for_tests(
+        tagged_reqwest_client("shared"),
+        crate::WalletNetworkMode::Direct,
+    );
+    let operation = crate::OperationHttpClientSlot::for_tests(
+        http.clone(),
+        crate::OperationHttpClient::for_tests(
+            tagged_reqwest_client("request"),
+            crate::OperationNetworkIsolation::Dedicated,
+        ),
+    );
+    let mut chain =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .get(1)
+            .cloned()
+            .unwrap();
+    chain.rpc_route = route.clone();
+
+    let (path, mut provider, view) = fixture();
+    authorize(
+        &mut provider,
+        &view,
+        url::Url::parse("http://127.0.0.1:1").unwrap(),
+    );
+    let mut wallet = provider.wallet.clone();
+    wallet.http = Some(http.clone());
+    wallet.routes.insert(1, route);
+    provider.update_wallet(wallet, 3);
+    let account = provider
+        .resolve(&provider.documents[&(1, "doc".to_owned())].origin)
+        .unwrap()
+        .1;
+    let to = Address::repeat_byte(2);
+    provider
+        .request(
+            1,
+            "doc".to_owned(),
+            "send".to_owned(),
+            "eth_sendTransaction",
+            json!([{"from": account.address, "to": to, "value": "0x7"}]),
+            Instant::now(),
+        )
+        .unwrap();
+    let ready = provider.approval_updates.borrow()[0].clone();
+    let (handle, mut commands) = approval_handle(&provider);
+    let reads = handle.approval_reads(ready.id.clone(), operation.clone());
+    let client = operation.client().await.unwrap();
+    let (tracker, tracking) = crate::public_wallet::test_tracking_context();
+    let gas_fee = crate::PublicActionGasFeeSelection::Custom {
+        max_fee_per_gas: 100,
+        max_priority_fee_per_gas: 2,
+    };
+    let quote = crate::PublicActionGasFeeQuote {
+        observed_fee_model: Some(crate::EvmFeeModel::Eip1559),
+        rpc_gas_price: 100,
+        current_base_fee_per_gas: Some(5),
+        suggested_max_fee_per_gas: 100,
+        suggested_max_priority_fee_per_gas: 2,
+    };
+    let resolved = crate::resolve_public_action_gas_fee(
+        1,
+        crate::PublicShieldTransactionProfile::Railoxide,
+        crate::PublicAssetId::Native,
+        gas_fee,
+        Some(quote),
+    )
+    .unwrap();
+    let vault_store = Arc::new(DesktopVaultStore::from_db(provider.store.db()));
+    let mut review_and_submit = Box::pin(async {
+        crate::simulate_public_advanced_transaction_with_fee_and_reads(
+            crate::PublicAdvancedTransactionEstimateRequest {
+                chain_id: 1,
+                effective_chain: chain.clone(),
+                from: account.address,
+                intent: crate::PublicTransactionIntent::Raw {
+                    to: Some(to),
+                    value: U256::from(7),
+                    data: Bytes::new(),
+                },
+                gas_fee,
+                access_list: None,
+            },
+            quote,
+            resolved,
+            &http,
+            &client,
+            Some(&reads),
+        )
+        .await
+        .expect("the request is simulated");
+        crate::submit_walletconnect_send_transaction(
+            crate::WalletConnectSendTransactionRequest {
+                executor_owner: None,
+                request_control: Some(ready.control.clone()),
+                rpc_reads: Some(reads),
+                transaction_tracking: Some(tracking),
+                chain_id: 1,
+                effective_chain: chain,
+                view_session: Arc::clone(&view),
+                vault_store,
+                authorization: Some(crate::DesktopPrivateSpendAuthorization::VaultPassword(
+                    zeroize::Zeroizing::new(PASSWORD.to_owned()),
+                )),
+                trezor_app_passphrase: None,
+                trezor_pin_matrix_provider: None,
+                public_account_uuid: account.public_account_uuid.clone(),
+                tx_req: alloy::rpc::types::TransactionRequest::default()
+                    .with_to(to)
+                    .with_value(U256::from(7)),
+                decoded_transaction: None,
+                reviewed_transaction: None,
+                reviewed_fee: None,
+                gas_fee,
+                expiry_timestamp: None,
+                event_tx: None,
+            },
+            &http,
+            &client,
+        )
+        .await
+    });
+    // The gateway actor's side: each approval read the request sends runs on the provider.
+    let mut approval_reads = 0;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            tokio::select! {
+                result = &mut review_and_submit => break result,
+                command = commands.recv() => {
+                    let Command::ApprovalRead(id, endpoint, rpc, entered, client, reply) = command.unwrap() else {
+                        panic!("expected approval read");
+                    };
+                    approval_reads += 1;
+                    provider.approval_read(&id, endpoint, rpc, entered, client, reply);
+                }
+                completion = provider.jobs.join_next(), if !provider.jobs.is_empty() => {
+                    provider.complete_read(completion.unwrap().unwrap());
+                }
+            }
+        }
+    })
+    .await
+    .expect("the request ends")
+    .expect("the request is submitted");
+    drop(review_and_submit);
+    assert!(approval_reads > 0);
+
+    // The tracker keeps observing the handed-off transaction.
+    let handed_off_at = reader_requests.lock().unwrap().len();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while reader_requests.lock().unwrap().len() == handed_off_at {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the tracker polls the handed-off observer");
+
+    let reader_requests = reader_requests.lock().unwrap().clone();
+    let submitter_requests = submitter_requests.lock().unwrap().clone();
+    assert!(
+        reader_requests
+            .iter()
+            .chain(&submitter_requests)
+            .all(|(tag, _)| tag.as_deref() == Some("request")),
+        "every request goes over the request's client"
+    );
+    let methods = |requests: &[(Option<String>, Value)]| {
+        requests
+            .iter()
+            .map(|(_, body)| body["method"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let read_methods = methods(&reader_requests);
+    for method in [
+        "eth_estimateGas",
+        "eth_getTransactionCount",
+        "eth_getBalance",
+        "eth_blockNumber",
+    ] {
+        assert!(read_methods.iter().any(|read| read == method), "{method}");
+    }
+    assert!(
+        !read_methods
+            .iter()
+            .any(|read| read == "eth_sendRawTransaction")
+    );
+    assert_eq!(methods(&submitter_requests), ["eth_sendRawTransaction"]);
+    tracker.shutdown().await;
+    reader_server.abort();
+    submitter_server.abort();
+    drop(handle);
+    drop(provider);
+    drop(view);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
 #[tokio::test]
 async fn native_review_read_waits_for_command_capacity_and_delivers_once() {
     use crate::gateway::Command;
@@ -2851,7 +3117,7 @@ async fn native_review_read_waits_for_command_capacity_and_delivers_once() {
             .ok()
             .unwrap();
     }
-    let reads = handle.approval_reads(ready.id.clone());
+    let reads = handle.approval_reads(ready.id.clone(), operation_slot());
     let mut read = Box::pin(reads.read(
         endpoint.into(),
         RpcRead::from_method_params("eth_blockNumber", json!([]), 1).unwrap(),
@@ -2862,7 +3128,7 @@ async fn native_review_read_waits_for_command_capacity_and_delivers_once() {
     for _ in 0..31 {
         assert!(matches!(commands.try_recv().unwrap(), Command::Pair(..)));
     }
-    let Command::ApprovalRead(_, _, _, _, reply) = commands.try_recv().unwrap() else {
+    let Command::ApprovalRead(_, _, _, _, _, reply) = commands.try_recv().unwrap() else {
         panic!("expected the waiting approval read");
     };
     reply.send(Ok(json!("0xfeed"))).unwrap();
@@ -2898,7 +3164,7 @@ async fn native_review_read_cancellation_expiry_and_drop_prevent_late_enqueue() 
                 .ok()
                 .unwrap();
         }
-        let reads = handle.approval_reads(ready.id.clone());
+        let reads = handle.approval_reads(ready.id.clone(), operation_slot());
         let mut read = Box::pin(reads.read(
             endpoint.into(),
             RpcRead::from_method_params("eth_blockNumber", json!([]), 1).unwrap(),
@@ -2954,7 +3220,7 @@ async fn native_review_read_queue_and_response_wait_share_original_deadline() {
                 .ok()
                 .unwrap();
         }
-        let reads = handle.approval_reads(ready.id.clone());
+        let reads = handle.approval_reads(ready.id.clone(), operation_slot());
         let mut read = Box::pin(reads.read(
             endpoint.into(),
             RpcRead::from_method_params("eth_blockNumber", json!([]), 1).unwrap(),
@@ -2967,7 +3233,7 @@ async fn native_review_read_queue_and_response_wait_share_original_deadline() {
                 assert!(matches!(commands.try_recv().unwrap(), Command::Pair(..)));
             }
             assert!(futures_util::poll!(&mut read).is_pending());
-            let Command::ApprovalRead(_, _, _, command_entered, reply) =
+            let Command::ApprovalRead(_, _, _, command_entered, _, reply) =
                 commands.try_recv().unwrap()
             else {
                 panic!("expected the waiting approval read");
@@ -3783,6 +4049,7 @@ async fn chain_addition_without_account_access_requires_current_confirmation() {
             url::Url::parse("https://mainnet.base.org").unwrap().into(),
             RpcRead::from_method_params("eth_blockNumber", json!([]), 31337).unwrap(),
             Instant::now(),
+            operation_client(),
             reply,
         );
         assert!(matches!(

@@ -113,6 +113,7 @@ pub(super) fn test_walletconnect_request(
     WalletConnectRequestUi {
         request_control: None,
         rpc_reads: None,
+        operation: None,
         key: key.to_owned(),
         review_token: 1,
         binding: DappRequestBinding::from_walletconnect_session(&test_walletconnect_session(

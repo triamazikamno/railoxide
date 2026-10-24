@@ -13,6 +13,7 @@ pub(super) struct PreparedBlockedShieldRescuePlan {
 pub async fn resolve_blocked_shield_rescue_eligibility(
     request: BlockedShieldRescueEligibilityRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<BlockedShieldRescueEligibility> {
     let Some(snapshot) = request.session.handle.current_snapshot() else {
         return Ok(blocked_shield_rescue_disabled(
@@ -39,6 +40,7 @@ pub async fn resolve_blocked_shield_rescue_eligibility(
         utxo.token_address(),
         utxo.note.value,
         http,
+        client,
     )
     .await
     {
@@ -92,6 +94,7 @@ pub async fn resolve_source_tx_origin(
     token: Address,
     value: U256,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<Address> {
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     // The delegate RelayAdapt7702 never holds tokens, so it is not a shared RelayAdapt here.
@@ -100,7 +103,10 @@ pub async fn resolve_source_tx_origin(
         .deployment
         .relay_adapt_history;
     let query_rpc_pool = query_rpc_pool_for_route(
-        &chain.rpc_route.for_class(RpcTrafficClass::Sensitive)?,
+        &chain
+            .rpc_route
+            .for_class(RpcTrafficClass::Sensitive)?
+            .isolated(client.clone()),
         http,
     );
     let source =

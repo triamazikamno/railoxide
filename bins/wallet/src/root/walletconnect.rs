@@ -648,9 +648,13 @@ impl WalletConnectApprovalProgress {
 
 impl WalletConnectCompletedRequestUi {
     fn from_outcome(
-        request: WalletConnectRequestUi,
+        mut request: WalletConnectRequestUi,
         outcome: &WalletConnectRequestApprovalOutcome,
     ) -> Self {
+        // The request's active role ends here; submission and any receipt observation hold
+        // their own clients.
+        request.operation = None;
+        request.rpc_reads = None;
         let status = walletconnect_completed_request_status(outcome);
         Self {
             request,

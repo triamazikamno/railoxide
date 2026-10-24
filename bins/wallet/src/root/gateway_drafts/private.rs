@@ -936,18 +936,23 @@ impl WalletRoot {
         let generation = record.wallet_generation;
         let ethereum = self.effective_chain_configs.get(1).cloned();
         let http = self.http.clone();
+        let operation = record.operation(&http);
         let join = self.runtime.spawn(async move {
             let recipient = recipient?;
             if input.kind == GatewayPrivateDraftKind::Unshield
                 && !recipient.trim().is_empty()
                 && recipient.trim().parse::<Address>().is_err()
             {
+                let client = operation.client().await.map_err(|_| {
+                    "Recipient could not be resolved. Check the address or ENS name.".to_owned()
+                })?;
                 resolve_public_ens_recipient(
                     recipient.trim(),
                     ethereum
                         .as_ref()
                         .ok_or_else(|| "Ethereum is unavailable".to_string())?,
                     &http,
+                    &client,
                 )
                 .await
                 .map(|recipient| recipient.to_checksum(None))

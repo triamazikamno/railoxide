@@ -10,7 +10,7 @@ use super::{
     PublicAssetId, PublicShieldTransactionProfile, VaultedPublicSigner,
 };
 use crate::settings::EffectiveChainConfig;
-use crate::{HttpContext, TxReceiptOutput};
+use crate::{HttpContext, OperationHttpClient, TxReceiptOutput};
 
 /// Reuse ordinary transaction preflight, signing and block-scoped receipt observation.
 /// The native owner supplies a durable handoff and deliberately no public-account tracker.
@@ -21,6 +21,7 @@ pub(crate) async fn submit_executor_recovery_step(
     chain: &EffectiveChainConfig,
     gas_fee: PublicActionGasFeeSelection,
     http: &HttpContext,
+    client: &OperationHttpClient,
     handoff: &mut PublicActionHandoff<'_>,
     progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
 ) -> Result<TxReceiptOutput> {
@@ -37,7 +38,7 @@ pub(crate) async fn submit_executor_recovery_step(
         }
         progress(update);
     };
-    let pools = public_action_pools(&chain.rpc_route, http)?;
+    let pools = public_action_pools(&chain.rpc_route, http, client)?;
     let outcome = submit_public_action_step_session(
         step,
         transaction,

@@ -62,6 +62,7 @@ const fn walletconnect_request_footer_action_state(
 pub(in crate::root::walletconnect) fn gateway_pending_request(
     approval: &wallet_ops::gateway::GatewayApprovalRequest,
     rpc_reads: wallet_ops::DappRpcReadClient,
+    operation: wallet_ops::OperationHttpClientSlot,
 ) -> Option<WalletConnectRequestUi> {
     approval.control.ensure_current().ok()?;
     let key = format!("gateway:{}", approval.id);
@@ -113,10 +114,25 @@ pub(in crate::root::walletconnect) fn gateway_pending_request(
             .map(|authorization| authorization.account.source),
         request_control: Some(approval.control.clone()),
         rpc_reads: approval.authorization.as_ref().map(|_| rpc_reads),
+        operation: Some(operation),
     })
 }
 
 impl WalletRoot {
+    /// A clone of the pending request and its operation client, which a `WalletConnect` request
+    /// gets on first use.
+    pub(in crate::root::walletconnect) fn walletconnect_request_with_operation(
+        &mut self,
+        request_key: &str,
+    ) -> Option<(WalletConnectRequestUi, wallet_ops::OperationHttpClientSlot)> {
+        let request = self.walletconnect.pending_requests.get_mut(request_key)?;
+        let operation = request
+            .operation
+            .get_or_insert_with(|| wallet_ops::OperationHttpClientSlot::new(self.http.clone()))
+            .clone();
+        Some((request.clone(), operation))
+    }
+
     pub(in crate::root) fn walletconnect_hardware_executor_action(
         &self,
         key: &str,
@@ -166,9 +182,13 @@ impl WalletRoot {
                 ) {
                     continue;
                 }
-                let Some(request) =
-                    gateway_pending_request(approval, handle.approval_reads(approval.id.clone()))
-                else {
+                // The approval reads share the request's operation client.
+                let operation = wallet_ops::OperationHttpClientSlot::new(self.http.clone());
+                let Some(request) = gateway_pending_request(
+                    approval,
+                    handle.approval_reads(approval.id.clone(), operation.clone()),
+                    operation,
+                ) else {
                     continue;
                 };
                 if let Some(authorization) = &approval.authorization {
@@ -747,11 +767,7 @@ impl WalletRoot {
         if self.walletconnect.request_actions.contains(request_key) {
             return;
         }
-        let Some(request) = self
-            .walletconnect
-            .pending_requests
-            .get(request_key)
-            .cloned()
+        let Some((request, operation)) = self.walletconnect_request_with_operation(request_key)
         else {
             return;
         };
@@ -939,6 +955,7 @@ impl WalletRoot {
                 executor_owner,
                 response_sender,
                 http,
+                operation,
                 hash_fallback_confirmed,
                 reviewed_fee,
                 approval_event_tx,
@@ -1359,6 +1376,7 @@ impl WalletRoot {
             WalletConnectRequestUi {
                 request_control: None,
                 rpc_reads: None,
+                operation: request.operation.clone(),
                 key: request.key.clone(),
                 review_token: request.review_token,
                 binding,

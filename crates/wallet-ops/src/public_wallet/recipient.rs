@@ -8,17 +8,19 @@ use eyre::{Result, eyre};
 
 use crate::rpc_broker::{RpcRead, RpcRoute, RpcSubmission, WalletRpcOrigin};
 use crate::{
-    HttpContext,
+    HttpContext, OperationHttpClient,
     settings::{EffectiveChainConfig, resolve_effective_chain_rpc_route},
 };
 
-/// ENS records are resolved on Ethereum using the desktop's configured Ethereum route.
+/// ENS records are resolved on Ethereum using the desktop's configured Ethereum route, isolated
+/// over the operation's `client`.
 /// Alloy's provider helper cannot use our broker directly. Reuse its ABI and encoding,
 /// with ENSIP-15 normalization, while submitting the single read with a wallet origin.
 pub async fn resolve_public_ens_recipient(
     name: &str,
     ethereum: &EffectiveChainConfig,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<Address> {
     let normalized = ens_normalize_rs::normalize(name).map_err(|_| eyre!("Invalid ENS name"))?;
     // Alloy 2.3's DNS encoder truncates a label length to u8. Enforce that API's
@@ -39,7 +41,8 @@ pub async fn resolve_public_ens_recipient(
         .into(),
     };
     let route = resolve_effective_chain_rpc_route(1, ethereum)?
-        .for_class(crate::RpcTrafficClass::Sensitive)?;
+        .for_class(crate::RpcTrafficClass::Sensitive)?
+        .isolated(client.clone());
     let mut results = http
         .rpc_broker()
         .submit(RpcSubmission::new(

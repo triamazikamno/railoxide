@@ -1709,6 +1709,7 @@ mod tests {
         WalletConnectRequestUi {
             request_control: None,
             rpc_reads: None,
+            operation: None,
             key: "session-topic:7".to_owned(),
             review_token: 1,
             binding: DappRequestBinding {

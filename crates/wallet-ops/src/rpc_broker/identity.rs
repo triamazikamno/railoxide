@@ -295,16 +295,15 @@ impl RpcChainRoute {
         Ok(route)
     }
 
-    /// A pool over this route's endpoints in configured order, each sending through its
-    /// transport's client.
+    /// A pool over this route's endpoints in configured order, each sending through the client
+    /// [`Self::read_client`] picks for it.
     pub(super) fn query_rpc_pool(&self, clients: &RpcClients, cooldown: Duration) -> QueryRpcPool {
         QueryRpcPool::with_http_clients(
-            self.transport_endpoints()
-                .map(|(endpoint, transport)| {
-                    (
-                        endpoint.expose_url().clone(),
-                        clients.get(transport).clone(),
-                    )
+            self.endpoints()
+                .iter()
+                .map(|endpoint| {
+                    let url = endpoint.expose_url();
+                    (url.clone(), self.read_client(clients, url).clone())
                 })
                 .collect(),
             cooldown,
@@ -471,14 +470,9 @@ impl RpcChainRoute {
 }
 
 impl ClassRoute {
-    /// A pool over this class's endpoints in configured order, each sending through its
-    /// transport's client.
+    /// A pool over this class's endpoints in configured order. See
+    /// [`RpcChainRoute::query_rpc_pool`].
     pub(crate) fn query_rpc_pool(&self, clients: &RpcClients, cooldown: Duration) -> QueryRpcPool {
-        // A pool ignores isolation, and its raw clients could outlive the operation's bridge.
-        assert!(
-            !self.route().is_isolated(),
-            "an isolated route cannot back a query pool"
-        );
         self.route().query_rpc_pool(clients, cooldown)
     }
 

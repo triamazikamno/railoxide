@@ -161,21 +161,19 @@ impl RpcCandidates {
     }
 }
 
-/// Each snapshot endpoint sends through its transport's client on `route`.
+/// Each snapshot endpoint sends through the client `route` picks for it.
 fn snapshot_pool(
     http: &HttpContext,
     route: &RpcChainRoute,
     snapshot: &[SensitiveUrl],
 ) -> QueryRpcPool {
+    let clients = http.rpc_clients();
     QueryRpcPool::with_http_clients(
         snapshot
             .iter()
             .map(|endpoint| {
                 let url = endpoint.expose_url();
-                (
-                    url.clone(),
-                    http.rpc_client_for(route.endpoint_transport(url)).clone(),
-                )
+                (url.clone(), route.read_client(&clients, url).clone())
             })
             .collect(),
         DEFAULT_QUERY_RPC_COOLDOWN,

@@ -7,8 +7,8 @@ use wallet_ops::gateway::{GatewayApprovalFailure, GatewayHandle, LocalProviderFa
 use wallet_ops::vault::PublicAccountScope;
 use wallet_ops::vault::PublicAccountSource;
 use wallet_ops::{
-    DappRpcReadClient, WalletConnectParsedRequest, WalletConnectPendingRequest,
-    WalletConnectRequestErrorKind,
+    DappRpcReadClient, OperationHttpClientSlot, WalletConnectParsedRequest,
+    WalletConnectPendingRequest, WalletConnectRequestErrorKind,
 };
 
 #[derive(Clone)]
@@ -42,6 +42,9 @@ pub(super) struct DappRequestUi {
     pub(super) account_source: Option<PublicAccountSource>,
     pub(super) request_control: Option<DappRequestControl>,
     pub(super) rpc_reads: Option<DappRpcReadClient>,
+    /// The request's operation client. A browser request has one from creation, which its
+    /// approval reads share; a `WalletConnect` request gets one at its first simulation or approval.
+    pub(super) operation: Option<OperationHttpClientSlot>,
 }
 
 impl DappRequestUi {

@@ -164,14 +164,21 @@ pub(super) async fn submit_self_broadcast_plan(
     mut command_rx: Option<SelfBroadcastCommandReceiver>,
     event_tx: Option<SelfBroadcastSessionEventSender>,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<DesktopSelfBroadcastResult> {
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     let gas_payer = self_broadcast_gas_payer(vault_store, view_session, &public_account_uuid)?;
-    // The pools resolve here, before the outer transaction is signed.
-    let sensitive_route = chain.rpc_route.for_class(RpcTrafficClass::Sensitive)?;
+    // The pools resolve here, before the outer transaction is signed, isolated over `client`.
+    let sensitive_route = chain
+        .rpc_route
+        .for_class(RpcTrafficClass::Sensitive)?
+        .isolated(client.clone());
     let query_rpc_pool = query_rpc_pool_for_route(&sensitive_route, http);
     let submit_pool = query_rpc_pool_for_route(
-        &chain.rpc_route.for_class(RpcTrafficClass::Submission)?,
+        &chain
+            .rpc_route
+            .for_class(RpcTrafficClass::Submission)?
+            .isolated(client.clone()),
         http,
     );
     let signer =
@@ -1791,9 +1798,14 @@ pub(crate) fn sponsored_self_broadcast_cancel_grace(block_time: Duration) -> Dur
 ///
 /// The signed payload is owned only by this call. It is reused for every relay
 /// attempt and is neither persisted nor submitted through normal chain RPCs.
+///
+/// It observes through `query_rpc_pool`, the pool over the operation's isolated Sensitive route
+/// that prepared and submitted it.
 pub async fn run_sponsored_self_broadcast_session(
     request: SponsoredSelfBroadcastSessionRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
+    query_rpc_pool: Arc<QueryRpcPool>,
 ) -> Result<SponsoredSelfBroadcastSessionOutcome> {
     if request.session.chain_id != request.chain_id {
         return Err(eyre!(
@@ -1829,10 +1841,6 @@ pub async fn run_sponsored_self_broadcast_session(
         ));
     }
 
-    let route =
-        settings::resolve_effective_chain_rpc_route(request.chain_id, &request.effective_chain)?
-            .for_class(RpcTrafficClass::Sensitive)?;
-    let query_rpc_pool = query_rpc_pool_for_route(&route, http);
     let tx_hash = keccak256(&request.signed_raw_transaction);
     let signed_raw_transaction = Zeroizing::new(hex::encode_prefixed(
         Zeroizing::new(request.signed_raw_transaction).as_slice(),
@@ -1840,6 +1848,7 @@ pub async fn run_sponsored_self_broadcast_session(
     let backend = LiveSponsoredSelfBroadcastBackend {
         transaction_tracking: request.transaction_tracking.as_ref(),
         http,
+        client,
         relays: &request
             .effective_chain
             .require_railgun()?
@@ -1888,6 +1897,8 @@ fn resolve_sponsored_pending_spent_inputs(
 pub(super) async fn submit_prepared_sponsored_self_broadcast(
     mut request: DesktopPreparedSponsoredSelfBroadcastRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
+    query_rpc_pool: Arc<QueryRpcPool>,
 ) -> Result<SponsoredSelfBroadcastSessionOutcome> {
     if request.prepared.chain_id != request.chain_id {
         return Err(eyre!(
@@ -1900,7 +1911,6 @@ pub(super) async fn submit_prepared_sponsored_self_broadcast(
         return Err(SponsorshipError::DeliveryUnsupported.into());
     }
 
-    let chain = effective_desktop_chain_config(request.chain_id, &request.effective_chain)?;
     let signer_address = self_broadcast_gas_payer(
         &request.vault_store,
         &request.view_session,
@@ -1922,10 +1932,6 @@ pub(super) async fn submit_prepared_sponsored_self_broadcast(
         ));
     }
 
-    let query_rpc_pool = query_rpc_pool_for_route(
-        &chain.rpc_route.for_class(RpcTrafficClass::Sensitive)?,
-        http,
-    );
     let provider_handle =
         sponsored_code_preflight_from_rpc_pool(&query_rpc_pool, payer, signer_address).await?;
     let nonce = provider_handle
@@ -2061,6 +2067,8 @@ pub(super) async fn submit_prepared_sponsored_self_broadcast(
                     command_rx: request.command_rx,
                 },
                 http,
+                client,
+                query_rpc_pool,
             )
             .await
         })
@@ -2098,6 +2106,7 @@ struct SponsoredCanonicalState {
 struct LiveSponsoredSelfBroadcastBackend<'a> {
     transaction_tracking: Option<&'a crate::PublicTransactionTrackingContext>,
     http: &'a HttpContext,
+    client: &'a OperationHttpClient,
     relays: &'a [SensitiveUrl],
     query_rpc_pool: Arc<QueryRpcPool>,
     finality_depth: u64,
@@ -2135,7 +2144,7 @@ impl SponsoredSelfBroadcastBackend for LiveSponsoredSelfBroadcastBackend<'_> {
             return false;
         }
         match submit_sponsored_bundle_with_acceptance(
-            self.http,
+            self.client,
             self.relays,
             signed_raw_transaction,
             || async {

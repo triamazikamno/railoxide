@@ -708,8 +708,26 @@ impl WalletRoot {
         self.invalidate_advanced_public_send_estimate();
         self.public_form.shield_error = None;
         self.public_form.native_shield_preparation.invalidate();
+        // The dialog's operation ends; a submitted draft keeps its own clone.
+        self.public_form.operation = None;
         if !self.public_form.sending && !self.public_form.shielding {
             self.clear_public_action_progress_state();
+        }
+    }
+
+    /// The Public action dialog's operation client for `account`. Another acting account
+    /// replaces it.
+    pub(in crate::root) fn public_form_operation(
+        &mut self,
+        account: &Arc<str>,
+    ) -> OperationHttpClientSlot {
+        match &self.public_form.operation {
+            Some((owner, operation)) if owner == account => operation.clone(),
+            _ => {
+                let operation = OperationHttpClientSlot::new(self.http.clone());
+                self.public_form.operation = Some((Arc::clone(account), operation.clone()));
+                operation
+            }
         }
     }
 
@@ -792,19 +810,26 @@ impl WalletRoot {
         let send_kind = self.public_form.public_send_kind;
         let selected_wallet_id = self.selected_wallet_id.clone();
         let http = self.http.clone();
+        let operation = self.public_form_operation(&public_account_uuid);
         cx.spawn(async move |this, cx| {
-            let result = estimate_public_advanced_transaction(
-                PublicAdvancedTransactionEstimateRequest {
-                    chain_id,
-                    effective_chain,
-                    from,
-                    intent,
-                    gas_fee,
-                    access_list: None,
-                },
-                &http,
-            )
-            .await;
+            let result = match operation.client().await {
+                Ok(client) => {
+                    estimate_public_advanced_transaction(
+                        PublicAdvancedTransactionEstimateRequest {
+                            chain_id,
+                            effective_chain,
+                            from,
+                            intent,
+                            gas_fee,
+                            access_list: None,
+                        },
+                        &http,
+                        &client,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
             let _ = this.update(cx, |root, cx| {
                 if root.selected_wallet_id != selected_wallet_id
                     || root.selected_chain != chain_id
@@ -2366,6 +2391,7 @@ impl WalletRoot {
                     fee_display,
                 )
             };
+        let operation = self.public_form_operation(&public_account_uuid);
         Some(PublicSendDraft {
             gateway_execution: None,
             chain_id,
@@ -2384,6 +2410,7 @@ impl WalletRoot {
             advanced_estimate,
             gas_fee,
             fee_display,
+            operation,
         })
     }
 
@@ -2436,6 +2463,7 @@ impl WalletRoot {
             intent,
             advanced_estimate,
             gas_fee,
+            operation,
             ..
         } = draft;
         let transaction_tracking =
@@ -2531,7 +2559,8 @@ impl WalletRoot {
         };
         let submitted_public_account_uuid = Arc::clone(&public_account_uuid);
         let join = self.spawn_public_transaction_submission(chain_id, async move {
-            submit_public_send_with_progress(request, &http, move |update| {
+            let client = operation.client().await?;
+            submit_public_send_with_progress(request, &http, &client, move |update| {
                 let _ = progress_tx.send(update);
             })
             .await
@@ -2782,6 +2811,7 @@ impl WalletRoot {
         } else {
             None
         };
+        let operation = self.public_form_operation(&public_account_uuid);
         Some(PublicShieldDraft {
             gateway_execution: None,
             chain_id,
@@ -2803,6 +2833,7 @@ impl WalletRoot {
             gas_fee_mode,
             authorized_fee_ceiling,
             fee_display,
+            operation,
         })
     }
 
@@ -2860,6 +2891,7 @@ impl WalletRoot {
             gas_fee,
             gas_fee_mode,
             authorized_fee_ceiling,
+            operation,
             ..
         } = draft;
         let transaction_tracking =
@@ -2963,7 +2995,8 @@ impl WalletRoot {
         let submitted_public_account_uuid = Arc::clone(&public_account_uuid);
         let native_stealth = request.native_preparation.is_some();
         let join = self.spawn_public_transaction_submission(chain_id, async move {
-            submit_public_shield_with_progress(request, &http, move |update| {
+            let client = operation.client().await?;
+            submit_public_shield_with_progress(request, &http, &client, move |update| {
                 let _ = progress_tx.send(update);
             })
             .await

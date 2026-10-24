@@ -227,9 +227,18 @@ fn walletconnect_personal_sign_progress_fails_response_after_device_approval() {
     );
 }
 
-#[test]
-fn walletconnect_completed_transaction_result_keeps_copyable_tx_hash() {
-    let request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
+#[tokio::test]
+async fn walletconnect_completed_transaction_result_keeps_copyable_tx_hash() {
+    let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
+    request.operation = Some(wallet_ops::OperationHttpClientSlot::new(
+        wallet_ops::HttpContext::with_rpc_client_for_tests(
+            reqwest::Client::new(),
+            wallet_ops::WalletNetworkMode::Direct,
+        ),
+    ));
+    request.rpc_reads = Some(wallet_ops::DappRpcReadClient::new(|_, _| {
+        Box::pin(async { panic!("a completed request must not read RPC") })
+    }));
     let outcome = WalletConnectRequestApprovalOutcome {
         authorization_failed: false,
         response_published: true,
@@ -252,6 +261,8 @@ fn walletconnect_completed_transaction_result_keeps_copyable_tx_hash() {
         completed.message.as_ref(),
         "Transaction submitted and response sent to the dapp."
     );
+    assert!(completed.request.operation.is_none());
+    assert!(completed.request.rpc_reads.is_none());
 }
 
 #[test]

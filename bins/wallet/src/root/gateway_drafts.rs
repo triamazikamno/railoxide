@@ -10,10 +10,10 @@ use gpui::{Context, Window};
 use gpui_component::WindowExt as _;
 use wallet_ops::{
     EvmFeeModel, HttpContext, NativeShieldPayer, NativeShieldPreparation, NativeShieldRoute,
-    PublicActionGasFeeMode, PublicActionGasFeeQuote, PublicActionGasFeeQuoteBundle,
-    PublicActionGasFeeSelection, PublicActionKind, PublicAssetId, PublicBalanceAmount,
-    PublicShieldApprovalMode, PublicShieldTransactionProfile, PublicTransactionIntent,
-    RAILGUN_PROTOCOL_FEE_BPS, TokenAnchorRateCache,
+    OperationHttpClientSlot, PublicActionGasFeeMode, PublicActionGasFeeQuote,
+    PublicActionGasFeeQuoteBundle, PublicActionGasFeeSelection, PublicActionKind, PublicAssetId,
+    PublicBalanceAmount, PublicShieldApprovalMode, PublicShieldTransactionProfile,
+    PublicTransactionIntent, RAILGUN_PROTOCOL_FEE_BPS, TokenAnchorRateCache,
     estimate_public_action_gas_cost_with_profile_and_ceiling,
     gateway::{
         GatewayDraftApproval, GatewayDraftCommand, GatewayDraftEstimate,
@@ -63,6 +63,16 @@ struct DraftRecord {
     estimation: Option<tokio::task::AbortHandle>,
     execution: Option<GatewayDraftExecution>,
     picker: Option<private::PrivateDraftPicker>,
+    /// The draft's own operation client, opened by its first account-bearing request.
+    operation: Option<OperationHttpClientSlot>,
+}
+
+impl DraftRecord {
+    fn operation(&mut self, http: &HttpContext) -> OperationHttpClientSlot {
+        self.operation
+            .get_or_insert_with(|| OperationHttpClientSlot::new(http.clone()))
+            .clone()
+    }
 }
 
 #[derive(Clone)]
@@ -139,6 +149,7 @@ impl GatewayDraftBook {
                 estimation: None,
                 execution: None,
                 picker: None,
+                operation: None,
             },
         );
         true
@@ -173,6 +184,11 @@ impl GatewayDraftBook {
             record.view.gas_quote = None;
         }
         record.picker = None;
+        if record.view.input.public().map(|input| &input.account)
+            != input.public().map(|input| &input.account)
+        {
+            record.operation = None;
+        }
         record.view.input = input;
         record.view.revision = revision;
         record.view.estimate = None;
@@ -704,7 +720,8 @@ impl WalletRoot {
         let revision = record.view.revision;
         let wallet = record.wallet.clone();
         let wallet_generation = record.wallet_generation;
-        let join = self.runtime.spawn(estimate_draft(context));
+        let operation = record.operation(&self.http);
+        let join = self.runtime.spawn(estimate_draft(context, operation));
         record.estimation = Some(join.abort_handle());
         drop(book);
         let peer_id = peer_id.to_owned();
@@ -1048,7 +1065,10 @@ struct DraftEstimation {
     result: Result<(Option<PreparedDraft>, GatewayDraftEstimate), String>,
 }
 
-async fn estimate_draft(mut context: EstimationContext) -> DraftEstimation {
+async fn estimate_draft(
+    mut context: EstimationContext,
+    operation: OperationHttpClientSlot,
+) -> DraftEstimation {
     // Resolve first so a slow ENS lookup cannot age the subsequently captured quote.
     // A resolution failure still permits the gas hint to be returned for editing.
     let recipient_error = if context.input.kind == GatewayDraftKind::Send
@@ -1056,10 +1076,12 @@ async fn estimate_draft(mut context: EstimationContext) -> DraftEstimation {
         && !context.input.recipient.trim().is_empty()
     {
         if let Some(ethereum) = context.ethereum.as_ref()
+            && let Ok(client) = operation.client().await
             && let Ok(recipient) = resolve_public_ens_recipient(
                 context.input.recipient.trim(),
                 ethereum,
                 &context.http,
+                &client,
             )
             .await
         {
@@ -1109,7 +1131,7 @@ async fn estimate_draft(mut context: EstimationContext) -> DraftEstimation {
             bundle.standard.observed_fee_model,
         ) {
             Ok(NativeShieldRoute::Stealth(_)) => {
-                prepare_native_shield_draft(&context, &bundle, profile)
+                prepare_native_shield_draft(&context, &operation, &bundle, profile)
                     .await
                     .map(|preparation| Some(Arc::new(preparation)))
             }
@@ -1132,7 +1154,7 @@ async fn estimate_draft(mut context: EstimationContext) -> DraftEstimation {
     DraftEstimation {
         gas_quote,
         result: recipient_error.map_or_else(
-            || prepare_draft(context, bundle, profile, native_preparation),
+            || prepare_draft(context, bundle, profile, native_preparation, operation),
             Err,
         ),
     }
@@ -1161,6 +1183,7 @@ fn draft_native_shield_route(
 /// Prepares a stealth-route native shield draft in `profile`.
 async fn prepare_native_shield_draft(
     context: &EstimationContext,
+    operation: &OperationHttpClientSlot,
     bundle: &PublicActionGasFeeQuoteBundle,
     profile: PublicShieldTransactionProfile,
 ) -> Result<NativeShieldPreparation, String> {
@@ -1179,6 +1202,10 @@ async fn prepare_native_shield_draft(
     };
     let recipient = public_shield_recipient(&context.wallet)
         .map_err(|_| "The private wallet's receive address is unavailable".to_owned())?;
+    let client = operation
+        .client()
+        .await
+        .map_err(|error| format!("The native shield could not be prepared: {error}"))?;
     let prepared = if context.input.max {
         prepare_native_shield_max(
             chain_id,
@@ -1190,6 +1217,7 @@ async fn prepare_native_shield_draft(
             context.balance,
             max_fee_per_gas,
             &context.http,
+            &client,
         )
         .await
         .map_err(|error| format!("Max is unavailable: {error}"))?
@@ -1211,6 +1239,7 @@ async fn prepare_native_shield_draft(
             recipient,
             amount,
             &context.http,
+            &client,
         )
         .await
         .map_err(|error| format!("The native shield could not be prepared: {error}"))?
@@ -1223,6 +1252,7 @@ fn prepare_draft(
     bundle: PublicActionGasFeeQuoteBundle,
     profile: PublicShieldTransactionProfile,
     native_preparation: Option<Arc<NativeShieldPreparation>>,
+    operation: OperationHttpClientSlot,
 ) -> Result<(Option<PreparedDraft>, GatewayDraftEstimate), String> {
     let EstimationContext {
         input,
@@ -1381,6 +1411,7 @@ fn prepare_draft(
                 gas_fee,
                 fee_display,
                 gateway_execution: None,
+                operation,
             }))
         }
         GatewayDraftKind::Shield => PreparedDraft::Shield(Box::new(PublicShieldDraft {
@@ -1404,6 +1435,7 @@ fn prepare_draft(
             authorized_fee_ceiling: ceiling,
             fee_display,
             gateway_execution: None,
+            operation,
         })),
     };
     Ok((Some(prepared), estimate))
@@ -1595,6 +1627,70 @@ mod tests {
         ));
         book.reconcile_wallet(Some(&wallet), 2);
         assert!(book.records.is_empty());
+        drop(book);
+        drop(wallet);
+        drop(store);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn each_draft_opens_its_own_client_and_a_new_account_replaces_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (path, store, wallet) = synthetic_wallet();
+        let public_input = |account: &str| -> GatewayDraftPayload {
+            GatewayDraftInput {
+                account: account.to_owned(),
+                chain_id: 1,
+                kind: GatewayDraftKind::Send,
+                asset: "native".to_owned(),
+                amount: "0.1".to_owned(),
+                recipient: String::new(),
+                address_book_entry: None,
+                fee: GatewayDraftFee::Normal,
+                mimic_railway: false,
+                approval: GatewayDraftApproval::default(),
+                max: false,
+            }
+            .into()
+        };
+        let opens = Arc::new(AtomicUsize::new(0));
+        let http = {
+            let opens = Arc::clone(&opens);
+            HttpContext::with_rpc_client_for_tests(
+                reqwest::Client::new(),
+                wallet_ops::WalletNetworkMode::Direct,
+            )
+            .with_operation_clients_for_tests(move || {
+                opens.fetch_add(1, Ordering::SeqCst);
+                Ok(wallet_ops::OperationHttpClient::for_tests(
+                    reqwest::Client::new(),
+                    wallet_ops::OperationNetworkIsolation::Unavailable(
+                        wallet_ops::WalletNetworkMode::Direct,
+                    ),
+                ))
+            })
+        };
+        let mut book = GatewayDraftBook::default();
+        for peer in ["a", "b"] {
+            assert!(book.create(
+                peer,
+                "create".into(),
+                public_input("account-0"),
+                wallet.clone(),
+                1
+            ));
+        }
+        // Two requests of draft a and one of draft b, all for the same account.
+        for peer in ["a", "a", "b"] {
+            let operation = book.records.get_mut(peer).unwrap().operation(&http);
+            operation.client().await.unwrap();
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
+        let id = book.records["a"].view.draft_id.clone();
+        assert!(book.update("a", &id, 1, public_input("account-1"), &wallet, 1));
+        let operation = book.records.get_mut("a").unwrap().operation(&http);
+        operation.client().await.unwrap();
+        assert_eq!(opens.load(Ordering::SeqCst), 3);
         drop(book);
         drop(wallet);
         drop(store);

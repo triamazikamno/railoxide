@@ -485,7 +485,8 @@ impl WalletRoot {
             utxo_id,
         };
         let resolve = self.runtime.spawn(async move {
-            wallet_ops::resolve_blocked_shield_rescue_eligibility(request, &http).await
+            let client = http.operation_http_client().await?;
+            wallet_ops::resolve_blocked_shield_rescue_eligibility(request, &http, &client).await
         });
         cx.spawn(async move |this, cx| {
             let (info, blocker) = match resolve.await {
@@ -822,7 +823,8 @@ impl WalletRoot {
             event_tx: Some(event_tx),
         };
         let submit = self.spawn_public_transaction_submission(request.chain_id, async move {
-            wallet_ops::submit_blocked_shield_rescue_self_broadcast(request, &http).await
+            let client = http.operation_http_client().await?;
+            wallet_ops::submit_blocked_shield_rescue_self_broadcast(request, &http, &client).await
         });
         cx.spawn(async move |this, cx| {
             let result = submit.await;

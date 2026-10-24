@@ -784,9 +784,9 @@ impl Actor {
                 let _ = reply.send(self.provider.complete_approval(&id, result));
                 self.flush_provider();
             }
-            Command::ApprovalRead(id, endpoint, rpc, entered, reply) => {
+            Command::ApprovalRead(id, endpoint, rpc, entered, client, reply) => {
                 self.provider
-                    .approval_read(&id, endpoint, rpc, entered, reply);
+                    .approval_read(&id, endpoint, rpc, entered, client, reply);
                 self.flush_provider();
             }
             Command::Shutdown(_) => unreachable!("shutdown handled in actor loop"),

@@ -449,8 +449,8 @@ fn personal_sign_message_bytes_decode_only_explicit_hex_prefix() {
     );
 }
 
-#[test]
-fn gateway_ready_requests_use_shared_intent_and_frozen_approval_identity() {
+#[tokio::test]
+async fn gateway_ready_requests_use_shared_intent_and_frozen_approval_identity() {
     use super::super::intent::{WalletConnectIntentContext, build_walletconnect_intent};
     use wallet_ops::dapp_request::DappRequestControl;
     use wallet_ops::gateway::GatewayApprovalRequest;
@@ -479,6 +479,11 @@ fn gateway_ready_requests_use_shared_intent_and_frozen_approval_identity() {
         tokens: BTreeMap::new(),
     };
     let rates = TokenAnchorRateCache::new();
+    let http = wallet_ops::HttpContext::with_rpc_client_for_tests(
+        reqwest::Client::new(),
+        wallet_ops::WalletNetworkMode::Direct,
+    );
+    let operation = || wallet_ops::OperationHttpClientSlot::new(http.clone());
     let accounts = [account.clone()];
     let context = WalletConnectIntentContext {
         chain: chains.get(1).unwrap(),
@@ -528,7 +533,8 @@ fn gateway_ready_requests_use_shared_intent_and_frozen_approval_identity() {
                 Box::pin(async { panic!("intent rendering must not read RPC") })
             })
         };
-        let request = super::super::root::gateway_pending_request(&approval, reads()).unwrap();
+        let request =
+            super::super::root::gateway_pending_request(&approval, reads(), operation()).unwrap();
         let mut legacy =
             test_walletconnect_request("session-topic:7", request.item.expiry_timestamp);
         legacy.parsed = parsed.clone();
@@ -601,7 +607,9 @@ fn gateway_ready_requests_use_shared_intent_and_frozen_approval_identity() {
         ));
         control.invalidate(&wallet_ops::RpcBrokerError::OriginRejected);
         assert!(!request.is_current());
-        assert!(super::super::root::gateway_pending_request(&approval, reads()).is_none());
+        assert!(
+            super::super::root::gateway_pending_request(&approval, reads(), operation()).is_none()
+        );
         assert_eq!(
             expired_walletconnect_request_keys(&queued, &BTreeSet::new(), 0),
             vec![request.key]
@@ -623,7 +631,8 @@ fn gateway_ready_requests_use_shared_intent_and_frozen_approval_identity() {
     let reads = wallet_ops::DappRpcReadClient::new(|_, _| {
         Box::pin(async { panic!("chain addition must not get account RPC access") })
     });
-    let request = super::super::root::gateway_pending_request(&approval, reads).unwrap();
+    let request =
+        super::super::root::gateway_pending_request(&approval, reads, operation()).unwrap();
     assert!(request.binding.account.is_none());
     assert!(request.item.account.is_none());
     assert!(request.account_source.is_none());

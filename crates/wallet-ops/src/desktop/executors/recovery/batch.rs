@@ -107,6 +107,8 @@ impl ExecutorOwner {
         let signer = VaultedPublicSigner::Software(SoftwareEvmSigner::from_private_key(
             signer.to_bytes().0,
         )?);
+        // The submitted step's own client, opened before the payload is recorded as issued.
+        let client = self.while_active(self.http.operation_http_client()).await?;
         self.ensure_active()?;
         self.store.record_recovery_issued(
             prepared.operation,
@@ -138,6 +140,7 @@ impl ExecutorOwner {
                 &chain,
                 gas_fee,
                 &self.http,
+                &client,
                 &mut handoff,
                 &mut progress,
             )))

@@ -15930,6 +15930,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tor-rtcompat",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "trezor-client",

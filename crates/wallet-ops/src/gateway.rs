@@ -372,6 +372,7 @@ enum Command {
         crate::SensitiveUrl,
         crate::RpcRead,
         tokio::time::Instant,
+        crate::OperationHttpClient,
         oneshot::Sender<Result<serde_json::Value, crate::RpcBrokerError>>,
     ),
     Shutdown(oneshot::Sender<Result<(), GatewayError>>),
@@ -690,8 +691,13 @@ impl GatewayHandle {
             } => result,
         }
     }
+    /// Reads for the approval `id`, sent over `operation`'s client, which the first read opens.
     #[must_use]
-    pub fn approval_reads(&self, id: String) -> crate::public_wallet::DappRpcReadClient {
+    pub fn approval_reads(
+        &self,
+        id: String,
+        operation: crate::OperationHttpClientSlot,
+    ) -> crate::public_wallet::DappRpcReadClient {
         let commands = self.commands.clone();
         let approvals = self.approvals.clone();
         crate::public_wallet::DappRpcReadClient::new(move |endpoint, rpc| {
@@ -702,8 +708,9 @@ impl GatewayHandle {
                 .find(|request| request.id == id)
                 .map(|request| request.control.clone());
             let commands = commands.clone();
+            let operation = operation.clone();
+            let id = id.clone();
             let (reply, response) = oneshot::channel();
-            let command = Command::ApprovalRead(id.clone(), endpoint, rpc, entered, reply);
             Box::pin(async move {
                 let control = control.ok_or(crate::RpcBrokerError::OriginRejected)?;
                 let deadline = entered + admission::READ_TIMEOUT;
@@ -715,9 +722,18 @@ impl GatewayHandle {
                     () = tokio::time::sleep_until(deadline) => {
                         return Err(crate::RpcBrokerError::TimeoutBeforeDispatch);
                     }
-                    sent = commands.send(command) => {
-                        sent.map_err(|_| crate::RpcBrokerError::Shutdown)?;
-                    }
+                    sent = async {
+                        let client = operation
+                            .client()
+                            .await
+                            .map_err(|_| crate::RpcBrokerError::Transport)?;
+                        let command =
+                            Command::ApprovalRead(id, endpoint, rpc, entered, client, reply);
+                        commands
+                            .send(command)
+                            .await
+                            .map_err(|_| crate::RpcBrokerError::Shutdown)
+                    } => sent?,
                 }
                 tokio::select! {
                     biased;

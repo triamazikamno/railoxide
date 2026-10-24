@@ -43,7 +43,7 @@ use super::types::{EvmFeeModel, PublicShieldTransactionProfile};
 use crate::desktop::executors::{estimate_delegated_gas, native_shield_execute_calldata};
 use crate::rpc_broker::RpcCandidates;
 use crate::settings::EffectiveChainConfig;
-use crate::{DesktopPrivateSpendAuthorization, HttpContext};
+use crate::{DesktopPrivateSpendAuthorization, HttpContext, OperationHttpClient};
 
 /// Preparations a native Max may make while fitting its amount to the balance.
 const MAX_PREPARATION_ATTEMPTS: usize = 3;
@@ -347,6 +347,7 @@ pub async fn prepare_native_shield(
     recipient: AddressData,
     amount: U256,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<NativeShieldPreparation> {
     if amount.is_zero() {
         return Err(eyre!("amount is required"));
@@ -358,7 +359,8 @@ pub async fn prepare_native_shield(
         http,
         &chain
             .rpc_route
-            .for_class(crate::RpcTrafficClass::Sensitive)?,
+            .for_class(crate::RpcTrafficClass::Sensitive)?
+            .isolated(client.clone()),
         None,
     )
     .await?;
@@ -414,6 +416,7 @@ pub async fn prepare_native_shield_max(
     balance: U256,
     max_fee_per_gas: u128,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<NativeShieldPreparation> {
     fit_native_shield_max(balance, max_fee_per_gas, |amount| {
         prepare_native_shield(
@@ -425,6 +428,7 @@ pub async fn prepare_native_shield_max(
             recipient,
             amount,
             http,
+            client,
         )
     })
     .await

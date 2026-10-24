@@ -742,6 +742,7 @@ impl DappProvider {
         endpoint: SensitiveUrl,
         rpc: RpcRead,
         entered: Instant,
+        client: crate::OperationHttpClient,
         reply: oneshot::Sender<Result<Value, RpcBrokerError>>,
     ) {
         self.tick(Instant::now());
@@ -799,7 +800,10 @@ impl DappProvider {
             }
         };
         let read_id = ticket.id;
-        let route = owner.wallet.routes[&request.chain_id].for_endpoint(endpoint);
+        // The read goes over the approval's own operation client.
+        let route = owner.wallet.routes[&request.chain_id]
+            .for_endpoint(endpoint)
+            .isolated(client);
         self.reads.insert(
             read_id,
             PendingRead {

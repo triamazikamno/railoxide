@@ -434,6 +434,7 @@ pub async fn prepare_blocked_shield_rescue_preview(
             utxo_id: request.utxo_id,
         },
         http,
+        &http.operation_http_client().await?,
     )
     .await?;
     let origin_address = eligibility
@@ -467,6 +468,7 @@ pub async fn prepare_blocked_shield_rescue_preview(
 pub(super) async fn prepare_blocked_shield_rescue_plan(
     request: &BlockedShieldRescueSelfBroadcastRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<PreparedBlockedShieldRescuePlan> {
     if request.session.chain_id != request.chain_id {
         return Err(eyre!(
@@ -489,6 +491,7 @@ pub(super) async fn prepare_blocked_shield_rescue_plan(
             utxo_id: request.utxo_id,
         },
         http,
+        client,
     )
     .await?;
     if !eligibility.eligible {
@@ -1672,6 +1675,22 @@ fn sponsored_rebuild_error(error: BuildError) -> Report {
     }
 }
 
+/// The Sensitive route of one sponsored self-broadcast, isolated over `client`, with a pool over
+/// it. Preparation, submission and observation all read through this one route.
+fn sponsored_sensitive_route(
+    chain_id: u64,
+    effective_chain: &settings::EffectiveChainConfig,
+    http: &HttpContext,
+    client: &OperationHttpClient,
+) -> Result<(ClassRoute, Arc<QueryRpcPool>)> {
+    let route = effective_desktop_chain_config(chain_id, effective_chain)?
+        .rpc_route
+        .for_class(RpcTrafficClass::Sensitive)?
+        .isolated(client.clone());
+    let query_rpc_pool = query_rpc_pool_for_route(&route, http);
+    Ok((route, query_rpc_pool))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn prepare_desktop_sponsored_calldata(
     chain_id: u64,
@@ -1689,6 +1708,8 @@ async fn prepare_desktop_sponsored_calldata(
     authorization_limit: &SponsoredAuthorizationLimit,
     progress_tx: Option<&TransactionGenerationProgressSender>,
     http: &HttpContext,
+    sensitive_route: &ClassRoute,
+    query_rpc_pool: &QueryRpcPool,
 ) -> Result<PreparedSponsoredCall> {
     if session.chain_id != chain_id {
         return Err(eyre!(
@@ -1715,11 +1736,9 @@ async fn prepare_desktop_sponsored_calldata(
         .relay_adapt_contract
         .ok_or(SponsorshipError::MissingRelayAdapt)?;
     let signer_address = self_broadcast_gas_payer(vault_store, view_session, public_account_uuid)?;
-    let sensitive_route = chain.rpc_route.for_class(RpcTrafficClass::Sensitive)?;
-    let query_rpc_pool = query_rpc_pool_for_route(&sensitive_route, http);
 
     let provider_handle =
-        sponsored_code_preflight_from_rpc_pool(&query_rpc_pool, payer, signer_address).await?;
+        sponsored_code_preflight_from_rpc_pool(query_rpc_pool, payer, signer_address).await?;
     let utxos = session.unspent_utxos();
     let native_top_up = if native_top_up_requested {
         let SponsoredPrivateIntent::Unshield {
@@ -1766,7 +1785,7 @@ async fn prepare_desktop_sponsored_calldata(
         required_wrapped_native: authorization_limit.max_total_wrapped_native_spend,
     })?;
 
-    let quote = self_broadcast_gas_fee_quote_from_route(http, &sensitive_route)
+    let quote = self_broadcast_gas_fee_quote_from_route(http, sensitive_route)
         .await
         .wrap_err("fetch sponsored self-broadcast gas price")?;
     let resolved_fee = resolve_self_broadcast_gas_fee(gas_fee, quote)?;
@@ -2044,9 +2063,11 @@ async fn prepare_desktop_sponsored_calldata(
     })
 }
 
-pub async fn prepare_desktop_sponsored_send_calldata(
+async fn prepare_desktop_sponsored_send_calldata(
     request: DesktopSponsoredSendCalldataRequest,
     http: &HttpContext,
+    sensitive_route: &ClassRoute,
+    query_rpc_pool: &QueryRpcPool,
 ) -> Result<PreparedSponsoredCall> {
     let recipient = parse_railgun_recipient(request.recipient.trim())?;
     prepare_desktop_sponsored_calldata(
@@ -2069,13 +2090,17 @@ pub async fn prepare_desktop_sponsored_send_calldata(
         &request.authorization_limit,
         request.progress_tx.as_ref(),
         http,
+        sensitive_route,
+        query_rpc_pool,
     )
     .await
 }
 
-pub async fn prepare_desktop_sponsored_unshield_calldata(
+async fn prepare_desktop_sponsored_unshield_calldata(
     request: DesktopSponsoredUnshieldCalldataRequest,
     http: &HttpContext,
+    sensitive_route: &ClassRoute,
+    query_rpc_pool: &QueryRpcPool,
 ) -> Result<PreparedSponsoredCall> {
     let chain = effective_desktop_chain_config(request.chain_id, &request.effective_chain)?;
     if request.unwrap && !is_effective_wrapped_native_token(request.chain_id, request.token, &chain)
@@ -2104,6 +2129,8 @@ pub async fn prepare_desktop_sponsored_unshield_calldata(
         &request.authorization_limit,
         request.progress_tx.as_ref(),
         http,
+        sensitive_route,
+        query_rpc_pool,
     )
     .await
 }
@@ -2111,17 +2138,23 @@ pub async fn prepare_desktop_sponsored_unshield_calldata(
 pub async fn submit_prepared_desktop_sponsored_self_broadcast(
     request: DesktopPreparedSponsoredSelfBroadcastRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<SponsoredSelfBroadcastSessionOutcome> {
-    submit_prepared_sponsored_self_broadcast(request, http).await
+    let (_, query_rpc_pool) =
+        sponsored_sensitive_route(request.chain_id, &request.effective_chain, http, client)?;
+    submit_prepared_sponsored_self_broadcast(request, http, client, query_rpc_pool).await
 }
 
 pub async fn submit_desktop_sponsored_send_self_broadcast(
     request: DesktopSponsoredSendSelfBroadcastRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<DesktopSponsoredSelfBroadcastResult> {
     let (spend_authorization, gas_payer_authorization) = request
         .spend_authorization
         .split_hardware_gas_payment(&request.view_session)?;
+    let (sensitive_route, query_rpc_pool) =
+        sponsored_sensitive_route(request.chain_id, &request.effective_chain, http, client)?;
     let prepared = prepare_desktop_sponsored_send_calldata(
         DesktopSponsoredSendCalldataRequest {
             chain_id: request.chain_id,
@@ -2141,6 +2174,8 @@ pub async fn submit_desktop_sponsored_send_self_broadcast(
             progress_tx: request.progress_tx.clone(),
         },
         http,
+        &sensitive_route,
+        &query_rpc_pool,
     )
     .await?;
     let outcome = submit_prepared_sponsored_self_broadcast(
@@ -2162,6 +2197,8 @@ pub async fn submit_desktop_sponsored_send_self_broadcast(
             event_tx: request.event_tx,
         },
         http,
+        client,
+        query_rpc_pool,
     )
     .await?;
     Ok(DesktopSponsoredSelfBroadcastResult { prepared, outcome })
@@ -2170,10 +2207,13 @@ pub async fn submit_desktop_sponsored_send_self_broadcast(
 pub async fn submit_desktop_sponsored_unshield_self_broadcast(
     request: DesktopSponsoredUnshieldSelfBroadcastRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<DesktopSponsoredSelfBroadcastResult> {
     let (spend_authorization, gas_payer_authorization) = request
         .spend_authorization
         .split_hardware_gas_payment(&request.view_session)?;
+    let (sensitive_route, query_rpc_pool) =
+        sponsored_sensitive_route(request.chain_id, &request.effective_chain, http, client)?;
     let prepared = prepare_desktop_sponsored_unshield_calldata(
         DesktopSponsoredUnshieldCalldataRequest {
             chain_id: request.chain_id,
@@ -2196,6 +2236,8 @@ pub async fn submit_desktop_sponsored_unshield_self_broadcast(
             progress_tx: request.progress_tx.clone(),
         },
         http,
+        &sensitive_route,
+        &query_rpc_pool,
     )
     .await?;
     let outcome = submit_prepared_sponsored_self_broadcast(
@@ -2217,6 +2259,8 @@ pub async fn submit_desktop_sponsored_unshield_self_broadcast(
             event_tx: request.event_tx,
         },
         http,
+        client,
+        query_rpc_pool,
     )
     .await?;
     Ok(DesktopSponsoredSelfBroadcastResult { prepared, outcome })
@@ -2802,6 +2846,7 @@ pub async fn submit_desktop_send_public_broadcaster(
 pub async fn submit_desktop_unshield_self_broadcast(
     request: DesktopUnshieldSelfBroadcastRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<DesktopSelfBroadcastResult> {
     if let Some(prepared) = &request.executor {
         if request.executor_maximum_gas.is_none_or(|gas| gas == 0)
@@ -2901,6 +2946,7 @@ pub async fn submit_desktop_unshield_self_broadcast(
         request.command_rx,
         request.event_tx,
         http,
+        client,
     )
     .await?;
     result.native_top_up = prepared.native_top_up;
@@ -2910,8 +2956,9 @@ pub async fn submit_desktop_unshield_self_broadcast(
 pub async fn submit_blocked_shield_rescue_self_broadcast(
     request: BlockedShieldRescueSelfBroadcastRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<DesktopSelfBroadcastResult> {
-    let prepared = prepare_blocked_shield_rescue_plan(&request, http).await?;
+    let prepared = prepare_blocked_shield_rescue_plan(&request, http, client).await?;
     let pending_output_pois_required =
         unshield_chunks_require_pending_output_pois(&prepared.plan.chunks);
     emit_self_broadcast_event(
@@ -2956,6 +3003,7 @@ pub async fn submit_blocked_shield_rescue_self_broadcast(
         request.command_rx,
         request.event_tx,
         http,
+        client,
     )
     .await
 }
@@ -2963,6 +3011,7 @@ pub async fn submit_blocked_shield_rescue_self_broadcast(
 pub async fn submit_desktop_send_self_broadcast(
     request: DesktopSendSelfBroadcastRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<DesktopSelfBroadcastResult> {
     let recipient = request.recipient.trim().to_string();
     let prepared = prepare_desktop_send_plan_without_broadcaster_fee(
@@ -3028,6 +3077,7 @@ pub async fn submit_desktop_send_self_broadcast(
         request.command_rx,
         request.event_tx,
         http,
+        client,
     )
     .await
 }

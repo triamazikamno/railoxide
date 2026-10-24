@@ -1336,6 +1336,7 @@ impl WalletRoot {
             asset_menu_subscription: None,
             open_section: wallet_ops::vault::PublicAccountStatus::Active,
             refresh_help_open: false,
+            operation: None,
         };
         let repair_cache_block_input = new_text_input(window, cx, "0 = deployment block");
         let tx_search_input = new_text_input(window, cx, "search tx hash");

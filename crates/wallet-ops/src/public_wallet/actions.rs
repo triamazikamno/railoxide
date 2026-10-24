@@ -32,18 +32,23 @@ use super::types::{
 use crate::block_observer::resolve_source_transaction_by_block;
 use crate::settings::EffectiveChainConfig;
 use crate::vault::DesktopViewSession;
-use crate::{HttpContext, RpcRoute, ShieldSendOutput, WalletRpcOrigin, report_chain_string};
+use crate::{
+    HttpContext, OperationHttpClient, RpcRoute, ShieldSendOutput, WalletRpcOrigin,
+    report_chain_string,
+};
 
 pub async fn submit_public_send(
     request: PublicSendRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<PublicSendResult> {
-    submit_public_send_with_progress(request, http, |_| {}).await
+    submit_public_send_with_progress(request, http, client, |_| {}).await
 }
 
 pub async fn submit_public_send_with_progress(
     request: PublicSendRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
     mut progress: impl FnMut(PublicActionProgressUpdate) + Send,
 ) -> Result<PublicSendResult> {
     validate_public_transaction_intent(&request.intent)?;
@@ -75,6 +80,7 @@ pub async fn submit_public_send_with_progress(
                 &mut command_rx,
                 request.event_tx.as_ref(),
                 http,
+                client,
                 request.transaction_tracking.as_ref(),
                 &mut progress,
             )
@@ -101,6 +107,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
     command_rx: &mut Option<PublicActionCommandReceiver>,
     event_tx: Option<&PublicActionSessionEventSender>,
     http: &HttpContext,
+    client: &OperationHttpClient,
     transaction_tracking: Option<&crate::PublicTransactionTrackingContext>,
     progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
 ) -> Result<crate::TxReceiptOutput> {
@@ -115,7 +122,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
         dynamic_gas_preflight,
         gas_fee,
     )?;
-    let pools = public_action_pools(&chain.rpc_route, http)?;
+    let pools = public_action_pools(&chain.rpc_route, http, client)?;
     let tx_req = public_send_transaction_request(chain_id, from_address, intent)?;
     let tx = submit_public_action_step_session(
         step,
@@ -225,13 +232,15 @@ pub(super) fn public_send_authorized_gas_limit(
 pub async fn submit_public_shield(
     request: PublicShieldRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<ShieldSendOutput> {
-    submit_public_shield_with_progress(request, http, |_| {}).await
+    submit_public_shield_with_progress(request, http, client, |_| {}).await
 }
 
 pub async fn submit_public_shield_with_progress(
     mut request: PublicShieldRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
     mut progress: impl FnMut(PublicActionProgressUpdate) + Send,
 ) -> Result<ShieldSendOutput> {
     if request.amount.is_zero() {
@@ -258,7 +267,7 @@ pub async fn submit_public_shield_with_progress(
         None,
     )
     .await?;
-    let pools = public_action_pools(&chain.rpc_route, http)?;
+    let pools = public_action_pools(&chain.rpc_route, http, client)?;
     let token = public_shield_token(request.asset, &chain)?;
     let addr_data = public_shield_recipient(&request.view_session)?;
     let signer = if native_prepared

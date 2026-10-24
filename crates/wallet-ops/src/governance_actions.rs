@@ -10,7 +10,7 @@ use eyre::{Result, eyre};
 use thiserror::Error;
 
 use crate::governance::GovernanceContractVersion;
-use crate::http::HttpContext;
+use crate::http::{HttpContext, OperationHttpClient};
 use crate::public_wallet::{
     PublicActionFeeProjection, PublicActionGasFeeSelection, PublicActionProgressStep,
     PublicAdvancedTransactionAuthorization, PublicAdvancedTransactionEstimate,
@@ -62,6 +62,7 @@ pub async fn estimate_reward_claim_baseline(
     evidence: &crate::RewardBatchEvidence,
     effective_chain: &EffectiveChainConfig,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<PublicAdvancedTransactionEstimate> {
     let contract = governance_contracts(chain_id)
         .ok_or_else(|| eyre!("Reward contracts unavailable"))?
@@ -88,6 +89,7 @@ pub async fn estimate_reward_claim_baseline(
             access_list: None,
         },
         http,
+        client,
     )
     .await
 }
@@ -513,6 +515,7 @@ pub async fn simulate_governance_action(
     quote: crate::PublicActionGasFeeQuote,
     resolved_fee: crate::PublicActionResolvedGasFee,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> std::result::Result<GovernancePreflight, GovernanceActionError> {
     if !review.rebuild_matches(&rebuilt) {
         return Err(GovernanceActionError::StaleDraft);
@@ -529,6 +532,7 @@ pub async fn simulate_governance_action(
         quote,
         resolved_fee,
         http,
+        client,
     )
     .await
     .map_err(|error| match error {
@@ -553,6 +557,7 @@ pub async fn estimate_governance_action(
     quote: crate::PublicActionGasFeeQuote,
     resolved_fee: crate::PublicActionResolvedGasFee,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<GovernancePreflight> {
     if !review.rebuild_matches(&rebuilt) {
         return Err(eyre!(GovernanceActionError::StaleDraft));
@@ -569,6 +574,7 @@ pub async fn estimate_governance_action(
         quote,
         resolved_fee,
         http,
+        client,
     )
     .await?;
     Ok(GovernancePreflight {
@@ -647,6 +653,7 @@ pub fn validate_governance_submission(
 pub async fn submit_governance_action_with_progress(
     request: GovernanceSubmissionRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
     mut progress: impl FnMut(crate::PublicActionProgressUpdate) + Send,
 ) -> Result<PublicSendResult> {
     validate_governance_submission(
@@ -694,6 +701,7 @@ pub async fn submit_governance_action_with_progress(
                 &mut command_rx,
                 request.public_send.event_tx.as_ref(),
                 http,
+                client,
                 request.public_send.transaction_tracking.as_ref(),
                 &mut progress,
             )
@@ -778,6 +786,7 @@ pub fn validate_governance_workflow(
 pub async fn submit_governance_workflow_with_progress(
     request: GovernanceWorkflowRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
     mut progress: impl FnMut(crate::PublicActionProgressUpdate) + Send,
 ) -> Result<GovernanceWorkflowResult> {
     validate_governance_workflow(&request.initial, &request.workflow)
@@ -818,17 +827,17 @@ pub async fn submit_governance_workflow_with_progress(
                 &mut command_rx,
                 event_tx,
                 http,
+                client,
                 initial.public_send.transaction_tracking.as_ref(),
                 &mut progress,
             )
             .await?;
             let mut transactions = vec![PublicSendResult { tx: first }];
 
-            // One isolated route carries every continuation read for this actor.
-            let client = http.operation_http_client().await?;
+            // The continuation reads share the flow's client with both transactions.
             let route = resolve_effective_chain_rpc_route(chain_id, effective_chain)?
                 .for_class(RpcTrafficClass::Sensitive)?
-                .isolated(client);
+                .isolated(client.clone());
             let (next_intent, next_context, next_step) = match &workflow {
                 GovernanceWorkflow::StakeApproval(plan) => {
                     let Some((balance, allowance)) =
@@ -887,7 +896,6 @@ pub async fn submit_governance_workflow_with_progress(
                     (continued.intent, context, PublicActionProgressStep::Unlock)
                 }
             };
-            drop(route);
             let resolved = next_intent
                 .resolve(&next_context)
                 .map_err(|error| eyre!(error))?;
@@ -905,6 +913,7 @@ pub async fn submit_governance_workflow_with_progress(
                 &mut command_rx,
                 event_tx,
                 http,
+                client,
                 initial.public_send.transaction_tracking.as_ref(),
                 &mut progress,
             )

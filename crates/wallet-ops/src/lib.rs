@@ -189,12 +189,12 @@ pub use governor_rewards::{
     validate_reward_batch_authorization_state, validate_reward_batch_claimed_intervals,
 };
 pub use http::{
-    HttpContext, OperationHttpClient, OperationNetworkIsolation, TorBridgeActivitySnapshot,
-    TorRuntimeHealth, WalletNetworkConfig, WalletNetworkHealth, WalletNetworkHealthCause,
-    WalletNetworkHealthState, WalletNetworkMode, WalletNetworkProgress, WalletNetworkProgressStage,
-    WalletTorClient, WalletTorClientProvider, build_http_client, build_wallet_network_context,
-    build_wallet_network_context_with_progress, request_tor_state_reset,
-    resolve_wallet_network_mode,
+    HttpContext, OperationHttpClient, OperationHttpClientSlot, OperationNetworkIsolation,
+    TorBridgeActivitySnapshot, TorRuntimeHealth, WalletNetworkConfig, WalletNetworkHealth,
+    WalletNetworkHealthCause, WalletNetworkHealthState, WalletNetworkMode, WalletNetworkProgress,
+    WalletNetworkProgressStage, WalletTorClient, WalletTorClientProvider, build_http_client,
+    build_wallet_network_context, build_wallet_network_context_with_progress,
+    request_tor_state_reset, resolve_wallet_network_mode,
 };
 pub use native_topup::{
     DesktopNativeTopUpPlan, DesktopNativeTopUpRequest, NATIVE_TOP_UP_ARBITRUM_AMOUNT,

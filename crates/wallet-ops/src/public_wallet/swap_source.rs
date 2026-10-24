@@ -12,7 +12,7 @@ use super::{
 };
 use crate::hardware_typed_data::HardwareEip712Model;
 use crate::settings::EffectiveChainConfig;
-use crate::{HttpContext, TxReceiptOutput};
+use crate::{HttpContext, OperationHttpClient, TxReceiptOutput};
 
 /// What one transaction of a swap's Public account came to. A reverted transaction is an
 /// outcome too: its `receipt.status` is false.
@@ -40,6 +40,7 @@ pub(crate) async fn submit_public_swap_step(
     chain: &EffectiveChainConfig,
     gas_fee: PublicActionGasFeeSelection,
     http: &HttpContext,
+    client: &OperationHttpClient,
     handoff: &mut PublicActionHandoff<'_>,
     end: PublicActionStepEnd,
     progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
@@ -48,7 +49,7 @@ pub(crate) async fn submit_public_swap_step(
         .gas
         .ok_or_else(|| eyre!("the swap's transaction has no reviewed gas limit"))?;
     let nonce = transaction.nonce;
-    let pools = public_action_pools(&chain.rpc_route, http)?;
+    let pools = public_action_pools(&chain.rpc_route, http, client)?;
     let outcome = submit_public_action_step_session(
         step,
         transaction,

@@ -3,13 +3,13 @@ use std::sync::Arc;
 use alloy::primitives::{B256, TxKind, U256};
 use gpui::{Context, Focusable, Window};
 use wallet_ops::{
-    HttpContext, PublicActionFeeProjection, PublicActionFeeSource, PublicActionGasFeeQuote,
-    PublicActionGasFeeSelection, PublicActionResolvedGasFee, PublicAdvancedTransactionEstimate,
-    PublicAdvancedTransactionEstimateRequest, PublicAdvancedTransactionSimulationError,
-    PublicAssetId, PublicShieldTransactionProfile, PublicTransactionIntent,
-    SelfBroadcastGasFeeQuote, WalletConnectDecodedCallKind, WalletConnectParsedRequest,
-    WalletConnectReviewedFee, WalletConnectReviewedTransaction, project_public_action_fee,
-    public_native_action_gas_units_from_walletconnect_intent,
+    HttpContext, OperationHttpClientSlot, PublicActionFeeProjection, PublicActionFeeSource,
+    PublicActionGasFeeQuote, PublicActionGasFeeSelection, PublicActionResolvedGasFee,
+    PublicAdvancedTransactionEstimate, PublicAdvancedTransactionEstimateRequest,
+    PublicAdvancedTransactionSimulationError, PublicAssetId, PublicShieldTransactionProfile,
+    PublicTransactionIntent, SelfBroadcastGasFeeQuote, WalletConnectDecodedCallKind,
+    WalletConnectParsedRequest, WalletConnectReviewedFee, WalletConnectReviewedTransaction,
+    project_public_action_fee, public_native_action_gas_units_from_walletconnect_intent,
     quote_public_action_gas_fee_with_reads, resolve_public_action_gas_fee,
     simulate_public_advanced_transaction_with_fee_and_reads,
 };
@@ -602,10 +602,19 @@ pub(super) async fn simulate_walletconnect_transaction(
     quote: PublicActionGasFeeQuote,
     resolved: PublicActionResolvedGasFee,
     http: &HttpContext,
+    operation: &OperationHttpClientSlot,
     rpc_reads: Option<&wallet_ops::DappRpcReadClient>,
 ) -> WalletConnectSimulationResult {
+    let client = match operation.client().await {
+        Ok(client) => client,
+        Err(error) => {
+            return WalletConnectSimulationResult::Error(
+                WalletConnectSimulationError::Unavailable(Arc::from(error.to_string())),
+            );
+        }
+    };
     match simulate_public_advanced_transaction_with_fee_and_reads(
-        request, quote, resolved, http, rpc_reads,
+        request, quote, resolved, http, &client, rpc_reads,
     )
     .await
     {
@@ -1280,11 +1289,7 @@ impl WalletRoot {
         {
             return;
         }
-        let Some(request) = self
-            .walletconnect
-            .pending_requests
-            .get(request_key)
-            .cloned()
+        let Some((request, operation)) = self.walletconnect_request_with_operation(request_key)
         else {
             return;
         };
@@ -1380,7 +1385,7 @@ impl WalletRoot {
                     if !request.is_current() {
                         return WalletConnectSimulationResult::Error(WalletConnectSimulationError::Unavailable(Arc::from("Dapp approval is no longer current")));
                     }
-                    let simulation = simulate_walletconnect_transaction(estimate_request, quote, resolved, &http, request.rpc_reads.as_ref());
+                    let simulation = simulate_walletconnect_transaction(estimate_request, quote, resolved, &http, &operation, request.rpc_reads.as_ref());
                     if let Some(control) = &request.request_control {
                         tokio::select! {
                             result = simulation => result,

@@ -21,6 +21,8 @@ pub(in crate::root) struct PublicSendDraft {
     pub(in crate::root) advanced_estimate: Option<PublicAdvancedTransactionEstimate>,
     pub(in crate::root) gas_fee: PublicActionGasFeeSelection,
     pub(in crate::root) fee_display: PublicActionFeeDisplay,
+    /// The owner's operation client, which the submission uses.
+    pub(in crate::root) operation: OperationHttpClientSlot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,6 +206,8 @@ pub(in crate::root) struct PublicShieldDraft {
     pub(in crate::root) gas_fee_mode: PublicActionGasFeeMode,
     pub(in crate::root) authorized_fee_ceiling: PublicActionGasFeeSelection,
     pub(in crate::root) fee_display: PublicActionFeeDisplay,
+    /// The owner's operation client, which the submission uses.
+    pub(in crate::root) operation: OperationHttpClientSlot,
 }
 
 /// The asset and profile a Shield gas quote was requested for.

@@ -105,4 +105,6 @@ pub(in crate::root) struct PublicAccountFormState {
     pub(in crate::root) open_section: wallet_ops::vault::PublicAccountStatus,
     /// Whether the "How balances are read" popover is open, which drops its hover tooltip.
     pub(in crate::root) refresh_help_open: bool,
+    /// The Public action dialog's operation client and the account it was opened for.
+    pub(in crate::root) operation: Option<(Arc<str>, wallet_ops::OperationHttpClientSlot)>,
 }

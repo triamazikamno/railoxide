@@ -56,6 +56,7 @@ thiserror = "2"
 tikv-jemallocator = { version = "0.7", features = ["profiling_libunwind", "stats"] }
 tikv-jemalloc-sys = { version = "0.7", features = ["profiling_libunwind", "stats"] }
 tokio = "1"
+tower = { version = "0.5", default-features = false, features = ["util"] }
 trezor-client = { version = "=0.1.5", default-features = false, features = ["ethereum"] }
 tracing = "0.1"
 tracing-appender = "0.2"

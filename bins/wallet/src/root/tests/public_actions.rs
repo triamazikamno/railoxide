@@ -290,3 +290,246 @@ fn native_shield_payer_follows_the_account_source() {
         assert_eq!(native_shield_payer(source, wallet_is_hardware), payer);
     }
 }
+
+/// A wallet root in a test window, with chain 1's only endpoint at `endpoint` in `roles`.
+fn operation_test_root<'a>(
+    cx: &'a mut gpui::TestAppContext,
+    path: &std::path::Path,
+    runtime: &tokio::runtime::Runtime,
+    endpoint: reqwest::Url,
+    roles: wallet_ops::RpcEndpointRoles,
+) -> (gpui::Entity<WalletRoot>, &'a mut gpui::VisualTestContext) {
+    cx.update(gpui_component::init);
+    let mut root = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let wallet = super::public_accounts::fixture_root(path, runtime, window, cx);
+        root = Some(wallet.clone());
+        gpui_component::Root::new(wallet, window, cx)
+    });
+    let root = root.unwrap();
+    root.update(cx, |root, _| {
+        let mut chain = root.effective_chain_configs.get(1).unwrap().clone();
+        chain.rpc_route = wallet_ops::RpcChainRoute::new_with_transports(
+            1,
+            vec![(endpoint.into(), wallet_ops::RpcTransport::Wallet, roles)],
+        );
+        root.effective_chain_configs = std::iter::once(chain).collect();
+    });
+    (root, cx)
+}
+
+/// Direct-mode wallet HTTP that counts every operation client it opens.
+fn counted_operation_http(opens: &Arc<std::sync::atomic::AtomicUsize>) -> wallet_ops::HttpContext {
+    let opens = Arc::clone(opens);
+    wallet_ops::HttpContext::with_rpc_client_for_tests(
+        reqwest::Client::new(),
+        wallet_ops::WalletNetworkMode::Direct,
+    )
+    .with_operation_clients_for_tests(move || {
+        opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(wallet_ops::OperationHttpClient::for_tests(
+            reqwest::Client::new(),
+            wallet_ops::OperationNetworkIsolation::Unavailable(
+                wallet_ops::WalletNetworkMode::Direct,
+            ),
+        ))
+    })
+}
+
+const ALL_ROLES: wallet_ops::RpcEndpointRoles = wallet_ops::RpcEndpointRoles {
+    general: true,
+    sensitive: true,
+    submit: true,
+};
+
+/// Fills the open Public dialog with an advanced contract call from the selected account.
+fn enter_contract_call(
+    root: &mut WalletRoot,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<'_, WalletRoot>,
+) {
+    root.set_public_action_mode(PublicActionMode::Send, window, cx);
+    root.set_public_send_kind(PublicSendKind::ContractCall, window, cx);
+    root.public_form
+        .advanced_send_to_input
+        .update(cx, |input, cx| {
+            input.set_value("0x1111111111111111111111111111111111111111", window, cx);
+        });
+    root.public_form
+        .advanced_send_data_input
+        .update(cx, |input, cx| input.set_value("0x01", window, cx));
+}
+
+/// Authorizes and submits the dialog's advanced send against an admitted estimate, then waits
+/// for the submission to end. The fixture accounts have no signer, so nothing is broadcast.
+fn send_contract_call(
+    root: &gpui::Entity<WalletRoot>,
+    cx: &mut gpui::VisualTestContext,
+    runtime: &tokio::runtime::Runtime,
+) {
+    root.update_in(cx, |root, window, cx| {
+        root.public_form.advanced_send_estimate =
+            Some(wallet_ops::PublicAdvancedTransactionEstimate {
+                payload_fingerprint: alloy::primitives::B256::ZERO,
+                raw_gas_limit: 50_000,
+                gas_limit: 60_000,
+                max_fee_per_gas: 2,
+                max_priority_fee_per_gas: 1,
+                expected_fee_per_gas: 2,
+                expected_gas_cost: U256::from(100_000),
+                max_gas_cost: U256::from(120_000),
+            });
+        let draft = root.public_send_draft(cx).expect("advanced send draft");
+        root.submit_public_send_authorized(
+            draft,
+            wallet_ops::DesktopPrivateSpendAuthorization::VaultPassword(zeroize::Zeroizing::new(
+                "public list test password".to_owned(),
+            )),
+            window,
+            cx,
+        );
+        assert!(root.public_form.sending);
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while root.read_with(cx, |root, _| root.public_form.sending) {
+        assert!(std::time::Instant::now() < deadline, "the send did not end");
+        runtime.block_on(tokio::time::sleep(Duration::from_millis(10)));
+        cx.run_until_parked();
+    }
+}
+
+#[gpui::test]
+fn public_dialog_estimate_and_send_share_a_client_per_acting_account(
+    cx: &mut gpui::TestAppContext,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let path = temp_wallet_db_root("public-action-operation");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    let (root, cx) = operation_test_root(
+        cx,
+        &path,
+        &runtime,
+        reqwest::Url::parse("http://127.0.0.1:1").unwrap(),
+        ALL_ROLES,
+    );
+    let opens = Arc::new(AtomicUsize::new(0));
+    let http = counted_operation_http(&opens);
+
+    // The estimate opens the dialog's client for account 0.
+    root.update_in(cx, |root, window, cx| {
+        root.http = http.clone();
+        root.open_public_action_dialog(Arc::from("account-0"), PublicAssetId::Native, window, cx);
+        enter_contract_call(root, window, cx);
+        root.estimate_advanced_public_send(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+    // Switching the open dialog to account 1 replaces the client before that account's send.
+    root.update_in(cx, |root, window, cx| {
+        root.set_public_selected_balance(Arc::from("account-1"), PublicAssetId::Native, window, cx);
+        enter_contract_call(root, window, cx);
+    });
+    send_contract_call(&root, cx, &runtime);
+    assert_eq!(opens.load(Ordering::SeqCst), 2);
+
+    // A send uses the client its estimate opened.
+    root.update_in(cx, |root, window, cx| {
+        root.open_public_action_dialog(Arc::from("account-1"), PublicAssetId::Native, window, cx);
+        enter_contract_call(root, window, cx);
+        root.estimate_advanced_public_send(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(opens.load(Ordering::SeqCst), 3);
+    send_contract_call(&root, cx, &runtime);
+    assert_eq!(opens.load(Ordering::SeqCst), 3);
+
+    // Locking the vault resets the wallet runtime, which releases the dialog's client.
+    root.update_in(cx, |root, window, cx| {
+        assert!(root.public_form.operation.is_some());
+        root.reset_public_wallet_state(window, cx);
+        assert!(root.public_form.operation.is_none());
+    });
+
+    cx.update(|window, _| window.remove_window());
+    drop(root);
+    cx.run_until_parked();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[gpui::test]
+fn public_action_without_an_operation_client_fails_without_the_shared_route(
+    cx: &mut gpui::TestAppContext,
+) {
+    use std::io::Read as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let path = temp_wallet_db_root("public-action-no-operation-client");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    // Chain 1's only Sensitive and Submit endpoint counts every connection it receives.
+    let connections = Arc::new(AtomicUsize::new(0));
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let endpoint =
+        reqwest::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+    let counted = Arc::clone(&connections);
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let _ = stream.read(&mut [0; 1024]);
+        }
+    });
+    let (root, cx) = operation_test_root(
+        cx,
+        &path,
+        &runtime,
+        endpoint,
+        wallet_ops::RpcEndpointRoles {
+            general: false,
+            ..ALL_ROLES
+        },
+    );
+
+    // Built-in Tor without the internal SOCKS bridge can't open an operation client.
+    let shared = wallet_ops::HttpContext::with_rpc_client_for_tests(
+        reqwest::Client::new(),
+        wallet_ops::WalletNetworkMode::Tor,
+    );
+    root.update_in(cx, |root, window, cx| {
+        root.http = shared.clone();
+        root.open_public_action_dialog(Arc::from("account-0"), PublicAssetId::Native, window, cx);
+        enter_contract_call(root, window, cx);
+        root.estimate_advanced_public_send(cx);
+    });
+    cx.run_until_parked();
+    let estimate_error = root.read_with(cx, |root, _| root.public_form.send_error.clone());
+    assert!(
+        estimate_error
+            .as_deref()
+            .is_some_and(|error| error.contains("internal SOCKS bridge")),
+        "{estimate_error:?}"
+    );
+
+    send_contract_call(&root, cx, &runtime);
+    let send_error = root.read_with(cx, |root, _| root.public_form.send_error.clone());
+    assert!(
+        send_error
+            .as_deref()
+            .is_some_and(|error| error.contains("internal SOCKS bridge")),
+        "{send_error:?}"
+    );
+    assert_eq!(connections.load(Ordering::SeqCst), 0);
+
+    cx.update(|window, _| window.remove_window());
+    drop(root);
+    cx.run_until_parked();
+    std::fs::remove_dir_all(path).unwrap();
+}

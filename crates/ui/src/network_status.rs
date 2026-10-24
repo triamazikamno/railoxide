@@ -552,12 +552,12 @@ pub fn network_status_popover_content(
             )
             .child(
                 div()
-                    .debug_selector(|| "wallet-network-public-balance-disclosure".into())
+                    .debug_selector(|| "wallet-network-rpc-isolation-disclosure".into())
                     .text_size(gpui::rems(12.0 / 16.0))
                     .line_height(gpui::relative(APP_TEXT_LINE_HEIGHT))
                     .text_color(rgb(theme::TEXT_MUTED))
                     .child(format!(
-                        "Public balance and governance reads are not isolated in {}.",
+                        "RPC requests are not isolated per account in {}.",
                         health.kind.label().to_lowercase()
                     )),
             )
@@ -928,7 +928,7 @@ mod tests {
         assert!(cx.read(|cx| first.read(cx).open));
         assert!(cx.read(|cx| first.read(cx).intents.is_empty()));
         assert!(
-            cx.debug_bounds("wallet-network-public-balance-disclosure")
+            cx.debug_bounds("wallet-network-rpc-isolation-disclosure")
                 .is_none()
         );
         assert!(
@@ -981,7 +981,7 @@ mod tests {
             assert!(cx.debug_bounds("wallet-network-new-tor-session").is_none());
             assert!(cx.debug_bounds("wallet-network-query-exit-ip").is_none());
             assert!(
-                cx.debug_bounds("wallet-network-public-balance-disclosure")
+                cx.debug_bounds("wallet-network-rpc-isolation-disclosure")
                     .is_some()
             );
             assert_eq!(

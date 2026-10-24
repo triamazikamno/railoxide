@@ -1078,6 +1078,7 @@ pub(super) async fn public_broadcaster_setup(
     trust_filter: &PublicBroadcasterTrustFilter,
     anchor_cache: Option<&Arc<TokenAnchorRateCache>>,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<PublicBroadcasterSetup> {
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     let anchor_rate = public_broadcaster_anchor_rate_for_policy(anchor_cache, chain_id, token);
@@ -1091,7 +1092,10 @@ pub(super) async fn public_broadcaster_setup(
         anchor_rate,
         executor_delivery,
     )?;
-    let route = chain.rpc_route.for_class(RpcTrafficClass::Sensitive)?;
+    let route = chain
+        .rpc_route
+        .for_class(RpcTrafficClass::Sensitive)?
+        .isolated(client.clone());
     let query_rpc_pool = query_rpc_pool_for_route(&route, http);
     // Refresh after approval, then keep this price stable while building the proof.
     let fee_candidates = acquire_fee_candidates(http, &route, None).await?;

@@ -996,7 +996,7 @@ impl RpcChainRoute {
     /// Returns a clone whose reads go over `client` and are kept apart from every other route,
     /// including the result cache. Endpoint verification stays shared with this route.
     #[must_use]
-    pub(super) fn isolated(&self, client: OperationHttpClient) -> Self {
+    pub(crate) fn isolated(&self, client: OperationHttpClient) -> Self {
         let mut route = self.clone();
         route.isolation = Some(Arc::new(RouteIsolation {
             id: NEXT_ROUTE_ISOLATION.fetch_add(1, Ordering::Relaxed),
@@ -1016,7 +1016,7 @@ impl RpcChainRoute {
         endpoint: &Url,
     ) -> &'a reqwest::Client {
         match (self.endpoint_transport(endpoint), &self.isolation) {
-            (RpcTransport::Wallet, Some(isolation)) => isolation.client.client(),
+            (RpcTransport::Wallet, Some(isolation)) => isolation.client.rpc_client(),
             (transport, _) => clients.get(transport),
         }
     }

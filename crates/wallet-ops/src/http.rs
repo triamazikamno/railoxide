@@ -638,7 +638,13 @@ pub struct HttpContext {
     arti_cache_dir: Option<PathBuf>,
     socks_bridge: Option<Arc<ArtiSocksBridge>>,
     fail_closed: bool,
+    /// Opens operation clients in place of [`Self::operation_http_client`]'s own.
+    #[cfg(any(test, feature = "test-support"))]
+    operation_clients_for_tests: Option<OperationClientsForTests>,
 }
+
+#[cfg(any(test, feature = "test-support"))]
+type OperationClientsForTests = Arc<dyn Fn() -> Result<OperationHttpClient> + Send + Sync>;
 
 impl HttpContext {
     /// Return the broker for submitted `eth_call` and `eth_getBalance` reads.
@@ -829,13 +835,18 @@ impl HttpContext {
     /// `isolated_client()` handle of the shared Arti instance. Arti gives each `TorClient`
     /// handle its own `IsolationToken`, and streams with different tokens never share a
     /// circuit. Sync, RPC, broadcaster, and other operations' traffic use other handles, so
-    /// none of it shares circuits with this operation. The client uses the same proxy-only
-    /// builder as the shared client, so a failed bridge fails the request rather than
-    /// bypassing Tor. The bridge stops when the last clone of the returned value is dropped.
+    /// none of it shares circuits with this operation. The clients use the same proxy-only
+    /// builder as the shared clients, so a failed bridge fails the request rather than
+    /// bypassing Tor. Each client's connector holds the bridge, which stops when the last clone
+    /// of either client is dropped.
     ///
     /// Proxy and direct modes can't isolate one operation's traffic. They return the shared
-    /// client and report isolation as unavailable so that callers can disclose it.
+    /// clients and report isolation as unavailable so that callers can disclose it.
     pub async fn operation_http_client(&self) -> Result<OperationHttpClient> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(open) = &self.operation_clients_for_tests {
+            return open();
+        }
         match self.mode {
             WalletNetworkMode::Tor => {
                 if self.socks_bridge.is_none() {
@@ -853,20 +864,37 @@ impl HttpContext {
                 );
                 let proxy_url = Url::parse(&format!("socks5h://{}", bridge.local_addr()))
                     .wrap_err("build operation Arti SOCKS proxy URL")?;
-                let client =
-                    wallet_reqwest_client_builder(WalletNetworkMode::Tor, Some(&proxy_url))?
-                        .build()
-                        .wrap_err("build operation HTTP client")?;
+                let builder = || -> Result<reqwest::ClientBuilder> {
+                    let bridge = Arc::clone(&bridge);
+                    // A no-op connector layer whose services keep the bridge running.
+                    let hold_bridge = tower::util::MapErrLayer::new(
+                        move |error: Box<dyn std::error::Error + Send + Sync>| {
+                            let _ = &bridge;
+                            error
+                        },
+                    );
+                    Ok(
+                        wallet_reqwest_client_builder(WalletNetworkMode::Tor, Some(&proxy_url))?
+                            .connector_layer(hold_bridge),
+                    )
+                };
                 Ok(OperationHttpClient {
-                    client,
+                    client: builder()?.build().wrap_err("build operation HTTP client")?,
+                    rpc_client: builder()?
+                        .timeout(rpc_request_timeout(WalletNetworkMode::Tor))
+                        .build()
+                        .wrap_err("build operation RPC HTTP client")?,
                     isolation: OperationNetworkIsolation::Dedicated,
-                    bridge: Some(bridge),
+                    #[cfg(test)]
+                    bridge_addr: Some(bridge.local_addr()),
                 })
             }
             WalletNetworkMode::Proxy | WalletNetworkMode::Direct => Ok(OperationHttpClient {
                 client: self.client.clone(),
+                rpc_client: self.rpc_client.clone(),
                 isolation: OperationNetworkIsolation::Unavailable(self.mode),
-                bridge: None,
+                #[cfg(test)]
+                bridge_addr: None,
             }),
         }
     }
@@ -926,6 +954,7 @@ impl HttpContext {
             arti_cache_dir: None,
             socks_bridge: None,
             fail_closed: false,
+            operation_clients_for_tests: None,
         }
     }
 
@@ -935,16 +964,34 @@ impl HttpContext {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn with_rpc_client_for_tests(rpc_client: reqwest::Client, mode: WalletNetworkMode) -> Self {
+        Self::with_rpc_clients_for_tests(rpc_client.clone(), rpc_client, mode)
+    }
+
+    /// Like [`Self::with_rpc_client_for_tests`], with a separate client for direct endpoints.
+    ///
+    /// # Panics
+    ///
+    /// Panics without an active Tokio runtime.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub(crate) fn with_rpc_clients_for_tests(
+        rpc_client: reqwest::Client,
+        direct_rpc_client: reqwest::Client,
+        mode: WalletNetworkMode,
+    ) -> Self {
         #[cfg(test)]
-        let broker =
-            RpcBroker::spawn_with_candidate_order(rpc_client.clone(), rpc_client.clone(), |_| {});
+        let broker = RpcBroker::spawn_with_candidate_order(
+            rpc_client.clone(),
+            direct_rpc_client.clone(),
+            |_| {},
+        );
         // The fixed-order constructor is crate-test-only; downstream tests use the default order.
         #[cfg(not(test))]
-        let broker = RpcBroker::spawn(rpc_client.clone(), rpc_client.clone());
+        let broker = RpcBroker::spawn(rpc_client.clone(), direct_rpc_client.clone());
         let broker = broker.expect("HttpContext test constructor requires an active Tokio runtime");
         Self {
             client: reqwest::Client::new(),
-            direct_rpc_client: rpc_client.clone(),
+            direct_rpc_client,
             rpc_client,
             broker,
             gateway_pool: GatewayPool::new(),
@@ -956,7 +1003,19 @@ impl HttpContext {
             arti_cache_dir: None,
             socks_bridge: None,
             fail_closed: mode != WalletNetworkMode::Direct,
+            operation_clients_for_tests: None,
         }
+    }
+
+    /// Opens every operation client with `open` instead of from the network mode.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_operation_clients_for_tests(
+        mut self,
+        open: impl Fn() -> Result<OperationHttpClient> + Send + Sync + 'static,
+    ) -> Self {
+        self.operation_clients_for_tests = Some(Arc::new(open));
+        self
     }
 }
 
@@ -971,20 +1030,16 @@ pub enum OperationNetworkIsolation {
 
 /// HTTP route for one wallet operation, built by [`HttpContext::operation_http_client`].
 ///
-/// The `reqwest::Client` stays crate-private: a clone that outlived the operation's bridge
-/// could reach whatever later binds the same loopback port.
+/// It holds two clients over the same route: one for the operation's general HTTP, and one with
+/// the wallet's RPC request timeout for its JSON-RPC. In built-in Tor mode the operation's
+/// bridge runs as long as any clone of either client.
 #[derive(Clone)]
 pub struct OperationHttpClient {
     client: reqwest::Client,
+    rpc_client: reqwest::Client,
     isolation: OperationNetworkIsolation,
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "keeps the operation bridge running until the last clone drops"
-        )
-    )]
-    bridge: Option<Arc<ArtiSocksBridge>>,
+    #[cfg(test)]
+    bridge_addr: Option<SocketAddr>,
 }
 
 impl OperationHttpClient {
@@ -997,18 +1052,25 @@ impl OperationHttpClient {
         &self.client
     }
 
-    #[cfg(test)]
-    pub(crate) fn bridge_addr(&self) -> Option<SocketAddr> {
-        self.bridge.as_ref().map(|bridge| bridge.local_addr())
+    pub(crate) const fn rpc_client(&self) -> &reqwest::Client {
+        &self.rpc_client
     }
 
+    #[cfg(test)]
+    pub(crate) const fn bridge_addr(&self) -> Option<SocketAddr> {
+        self.bridge_addr
+    }
+
+    /// Uses `client` for both general HTTP and JSON-RPC.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
-    pub const fn for_tests(client: reqwest::Client, isolation: OperationNetworkIsolation) -> Self {
+    pub fn for_tests(client: reqwest::Client, isolation: OperationNetworkIsolation) -> Self {
         Self {
+            rpc_client: client.clone(),
             client,
             isolation,
-            bridge: None,
+            #[cfg(test)]
+            bridge_addr: None,
         }
     }
 }
@@ -1017,6 +1079,48 @@ impl fmt::Debug for OperationHttpClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OperationHttpClient")
             .field("isolation", &self.isolation)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One operation's HTTP client, opened on first use and shared by every clone.
+#[derive(Clone)]
+pub struct OperationHttpClientSlot {
+    http: HttpContext,
+    client: Arc<tokio::sync::OnceCell<OperationHttpClient>>,
+}
+
+impl OperationHttpClientSlot {
+    #[must_use]
+    pub fn new(http: HttpContext) -> Self {
+        Self {
+            http,
+            client: Arc::default(),
+        }
+    }
+
+    /// Opens the client on the first call; a failed open leaves the slot empty for a later retry.
+    pub async fn client(&self) -> Result<OperationHttpClient> {
+        self.client
+            .get_or_try_init(|| self.http.operation_http_client())
+            .await
+            .cloned()
+    }
+
+    /// A slot already holding `client`.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn for_tests(http: HttpContext, client: OperationHttpClient) -> Self {
+        Self {
+            http,
+            client: Arc::new(tokio::sync::OnceCell::from(client)),
+        }
+    }
+}
+
+impl fmt::Debug for OperationHttpClientSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OperationHttpClientSlot")
             .finish_non_exhaustive()
     }
 }
@@ -1388,6 +1492,8 @@ fn build_reqwest_context(
         arti_cache_dir,
         socks_bridge,
         fail_closed: mode != WalletNetworkMode::Direct,
+        #[cfg(any(test, feature = "test-support"))]
+        operation_clients_for_tests: None,
     })
 }
 
@@ -2530,6 +2636,23 @@ mod tests {
             assert_ne!(first_addr, second_addr);
             // Operation isolation leaves the shared sync, RPC, and broadcaster session alone.
             assert_eq!(context.tor_session_generation(), 1);
+
+            // A raw client clone keeps the bridge running after its operation client drops.
+            let rpc_client = first.rpc_client().clone();
+            drop(first);
+            TcpStream::connect(first_addr)
+                .await
+                .expect("a client clone keeps the operation bridge running");
+            drop(rpc_client);
+            let mut stopped = false;
+            for _ in 0..100 {
+                if TcpStream::connect(first_addr).await.is_err() {
+                    stopped = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(stopped, "the bridge stops with the last client clone");
         });
         let _ = std::fs::remove_dir_all(&data_dir);
     }

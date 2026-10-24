@@ -782,9 +782,12 @@ impl WalletRoot {
                         event_tx: self_broadcast_event_tx,
                     };
                     self.spawn_public_transaction_submission(chain_id, async move {
-                        Box::pin(submit_desktop_sponsored_send_self_broadcast(request, &http))
-                            .await
-                            .map(|result| SendResult::Sponsored(Box::new(result)))
+                        let client = http.operation_http_client().await?;
+                        Box::pin(submit_desktop_sponsored_send_self_broadcast(
+                            request, &http, &client,
+                        ))
+                        .await
+                        .map(|result| SendResult::Sponsored(Box::new(result)))
                     })
                 } else {
                     let request = DesktopSendSelfBroadcastRequest {
@@ -810,7 +813,8 @@ impl WalletRoot {
                         event_tx: self_broadcast_event_tx,
                     };
                     self.spawn_public_transaction_submission(chain_id, async move {
-                        submit_desktop_send_self_broadcast(request, &http)
+                        let client = http.operation_http_client().await?;
+                        submit_desktop_send_self_broadcast(request, &http, &client)
                             .await
                             .map(|result| SendResult::SelfBroadcast(Box::new(result)))
                     })
@@ -1848,8 +1852,9 @@ impl WalletRoot {
                         event_tx: self_broadcast_event_tx,
                     };
                     self.spawn_public_transaction_submission(chain_id, async move {
+                        let client = http.operation_http_client().await?;
                         Box::pin(submit_desktop_sponsored_unshield_self_broadcast(
-                            request, &http,
+                            request, &http, &client,
                         ))
                         .await
                         .map(|result| UnshieldResult::Sponsored(Box::new(result)))
@@ -1887,9 +1892,12 @@ impl WalletRoot {
                         event_tx: self_broadcast_event_tx,
                     };
                     self.spawn_public_transaction_submission(chain_id, async move {
-                        Box::pin(submit_desktop_unshield_self_broadcast(request, &http))
-                            .await
-                            .map(|result| UnshieldResult::SelfBroadcast(Box::new(result)))
+                        let client = http.operation_http_client().await?;
+                        Box::pin(submit_desktop_unshield_self_broadcast(
+                            request, &http, &client,
+                        ))
+                        .await
+                        .map(|result| UnshieldResult::SelfBroadcast(Box::new(result)))
                     })
                 }
             }

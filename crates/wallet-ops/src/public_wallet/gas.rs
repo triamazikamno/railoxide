@@ -20,10 +20,10 @@ use crate::rpc_broker::RpcCandidates;
 use crate::settings::EffectiveChainConfig;
 use crate::walletconnect::WalletConnectDecodedCallKind;
 use crate::{
-    ClassRoute, Eip1559GasCostProjection, GAS_LIMIT_BUFFER, HttpContext, RAILGUN_PROTOCOL_FEE_BPS,
-    RpcTrafficClass, SelfBroadcastGasFeeQuote, SelfBroadcastResolvedGasFee,
-    SelfBroadcastTipFallback, TRANSACTION_INTRINSIC_GAS, expected_eip1559_fee_per_gas,
-    railgun_protocol_fee_amount, resolve_self_broadcast_gas_fee,
+    ClassRoute, Eip1559GasCostProjection, GAS_LIMIT_BUFFER, HttpContext, OperationHttpClient,
+    RAILGUN_PROTOCOL_FEE_BPS, RpcTrafficClass, SelfBroadcastGasFeeQuote,
+    SelfBroadcastResolvedGasFee, SelfBroadcastTipFallback, TRANSACTION_INTRINSIC_GAS,
+    expected_eip1559_fee_per_gas, railgun_protocol_fee_amount, resolve_self_broadcast_gas_fee,
 };
 use railgun_ui::native_usd_micro_value;
 
@@ -536,6 +536,7 @@ pub async fn quote_public_action_gas_fee_bundle_with_profile(
 pub async fn estimate_public_advanced_transaction(
     request: PublicAdvancedTransactionEstimateRequest,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<PublicAdvancedTransactionEstimate> {
     validate_public_transaction_intent(&request.intent)?;
     if !matches!(request.intent, PublicTransactionIntent::Raw { .. }) {
@@ -547,7 +548,10 @@ pub async fn estimate_public_advanced_transaction(
     // The quote and the estimate share one source, so neither stage probes an endpoint again.
     let candidates = public_fee_candidates(
         http,
-        &chain.rpc_route.for_class(RpcTrafficClass::Sensitive)?,
+        &chain
+            .rpc_route
+            .for_class(RpcTrafficClass::Sensitive)?
+            .isolated(client.clone()),
         None,
     )
     .await?;
@@ -582,11 +586,12 @@ pub async fn estimate_public_advanced_transaction_with_fee(
     quote: PublicActionGasFeeQuote,
     resolved: PublicActionResolvedGasFee,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> Result<PublicAdvancedTransactionEstimate> {
     validate_advanced_transaction_estimate_request(&request)?;
     advanced_estimate_report(
         estimate_public_advanced_transaction_with_own_candidates(
-            request, quote, resolved, http, None,
+            request, quote, resolved, http, client, None,
         )
         .await,
     )
@@ -608,10 +613,13 @@ pub async fn simulate_public_advanced_transaction_with_fee(
     quote: PublicActionGasFeeQuote,
     resolved: PublicActionResolvedGasFee,
     http: &HttpContext,
+    client: &OperationHttpClient,
 ) -> std::result::Result<PublicAdvancedTransactionEstimate, PublicAdvancedTransactionSimulationError>
 {
-    simulate_public_advanced_transaction_with_fee_and_reads(request, quote, resolved, http, None)
-        .await
+    simulate_public_advanced_transaction_with_fee_and_reads(
+        request, quote, resolved, http, client, None,
+    )
+    .await
 }
 
 pub async fn simulate_public_advanced_transaction_with_fee_and_reads(
@@ -619,6 +627,7 @@ pub async fn simulate_public_advanced_transaction_with_fee_and_reads(
     quote: PublicActionGasFeeQuote,
     resolved: PublicActionResolvedGasFee,
     http: &HttpContext,
+    client: &OperationHttpClient,
     rpc_reads: Option<&super::DappRpcReadClient>,
 ) -> std::result::Result<PublicAdvancedTransactionEstimate, PublicAdvancedTransactionSimulationError>
 {
@@ -626,7 +635,7 @@ pub async fn simulate_public_advanced_transaction_with_fee_and_reads(
         PublicAdvancedTransactionSimulationError::Unavailable(error.to_string())
     })?;
     estimate_public_advanced_transaction_with_own_candidates(
-        request, quote, resolved, http, rpc_reads,
+        request, quote, resolved, http, client, rpc_reads,
     )
     .await
 }
@@ -643,12 +652,14 @@ fn validate_advanced_transaction_estimate_request(
     Ok(())
 }
 
-/// A standalone estimate owns its candidate source.
+/// A standalone estimate owns its candidate source, on the Sensitive route isolated over
+/// `client`.
 async fn estimate_public_advanced_transaction_with_own_candidates(
     request: PublicAdvancedTransactionEstimateRequest,
     quote: PublicActionGasFeeQuote,
     resolved: PublicActionResolvedGasFee,
     http: &HttpContext,
+    client: &OperationHttpClient,
     rpc_reads: Option<&super::DappRpcReadClient>,
 ) -> std::result::Result<PublicAdvancedTransactionEstimate, PublicAdvancedTransactionSimulationError>
 {
@@ -659,7 +670,8 @@ async fn estimate_public_advanced_transaction_with_own_candidates(
     let route = chain
         .rpc_route
         .for_class(RpcTrafficClass::Sensitive)
-        .map_err(|error| unavailable(error.into()))?;
+        .map_err(|error| unavailable(error.into()))?
+        .isolated(client.clone());
     let candidates = public_fee_candidates(http, &route, rpc_reads)
         .await
         .map_err(unavailable)?;

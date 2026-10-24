@@ -180,6 +180,7 @@ impl Payer {
                 public_shield_recipient(&self.view).unwrap(),
                 amount,
                 &self.http,
+                &self.http.operation_http_client().await.unwrap(),
             )
             .await
             .expect("prepare the native shield"),
@@ -232,6 +233,7 @@ impl Payer {
         submit_public_shield(
             self.request(asset, profile, approval_mode, amount, native_preparation),
             &self.http,
+            &self.http.operation_http_client().await?,
         )
         .await
     }

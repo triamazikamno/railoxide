@@ -57,6 +57,8 @@ pub(super) struct GovernanceSpendDraft {
     pub workflow: Option<GovernanceWorkflow>,
     pub continuation: Option<GovernanceContinuation>,
     pub recipe: GovernanceDraftRecipe,
+    /// The action's operation client, which its re-estimates, submission and continuation use.
+    pub operation: wallet_ops::OperationHttpClientSlot,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -483,20 +485,27 @@ impl WalletRoot {
         let raw = draft.resolved.raw.clone();
         let gas_fee = draft.gas_fee;
         let http = self.http.clone();
+        let operation = draft.operation.clone();
         let expected_draft = draft.clone();
         cx.spawn_in(window, async move |this, cx| {
-            let estimate = wallet_ops::estimate_public_advanced_transaction(
-                PublicAdvancedTransactionEstimateRequest {
-                    chain_id,
-                    effective_chain,
-                    from: actor,
-                    intent: raw,
-                    gas_fee,
-                    access_list: None,
-                },
-                &http,
-            )
-            .await
+            let estimate = match operation.client().await {
+                Ok(client) => {
+                    wallet_ops::estimate_public_advanced_transaction(
+                        PublicAdvancedTransactionEstimateRequest {
+                            chain_id,
+                            effective_chain,
+                            from: actor,
+                            intent: raw,
+                            gas_fee,
+                            access_list: None,
+                        },
+                        &http,
+                        &client,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
             .map_err(|error| format_report_chain(&error));
             let _ = this.update_in(cx, |root, window, cx| {
                 let generation_current =
@@ -648,6 +657,10 @@ impl WalletRoot {
             return;
         };
         let http = self.http.clone();
+        let operation = self
+            .governance
+            .action_flow
+            .operation(selection.actor, &self.http);
         let actor_uuid: Arc<str> = Arc::from(account.public_account_uuid.clone());
         let actor_source = account.source;
         self.governance.action_flow.pending = true;
@@ -668,6 +681,7 @@ impl WalletRoot {
                 vault_store,
                 effective_chain,
                 http,
+                operation,
                 PublicActionGasFeeSelection::Auto,
             )
             .await;
@@ -729,7 +743,9 @@ impl WalletRoot {
             workflow,
             continuation,
             recipe,
+            operation,
         } = draft;
+        let continuation_operation = operation.clone();
         let continuation_view_session = view_session.clone();
         let continuation_vault_store = vault_store.clone();
         #[cfg(feature = "hardware")]
@@ -857,6 +873,7 @@ impl WalletRoot {
         let http = self.http.clone();
         let submitted_target = target;
         let join = self.spawn_public_transaction_submission(chain_id, async move {
+            let client = operation.client().await?;
             if let Some(workflow) = workflow {
                 Box::pin(wallet_ops::submit_governance_workflow_with_progress(
                     GovernanceWorkflowRequest {
@@ -864,6 +881,7 @@ impl WalletRoot {
                         workflow,
                     },
                     &http,
+                    &client,
                     move |update| {
                         let _ = progress_tx.send(update);
                     },
@@ -871,9 +889,14 @@ impl WalletRoot {
                 .await
                 .map(|result| result.transactions)
             } else {
-                wallet_ops::submit_governance_action_with_progress(request, &http, move |update| {
-                    let _ = progress_tx.send(update);
-                })
+                wallet_ops::submit_governance_action_with_progress(
+                    request,
+                    &http,
+                    &client,
+                    move |update| {
+                        let _ = progress_tx.send(update);
+                    },
+                )
                 .await
                 .map(|result| vec![result])
             }
@@ -908,6 +931,7 @@ impl WalletRoot {
                                 continuation_view_session.clone(),
                                 continuation_vault_store.clone(),
                                 recipe.clone(),
+                                continuation_operation.clone(),
                                 hash,
                                 window,
                                 cx,
@@ -1128,7 +1152,7 @@ pub(super) async fn read_proposal_action_state(
     Ok((fresh, rules, chain_time, participation))
 }
 
-async fn build_governance_spend_draft(
+pub(super) async fn build_governance_spend_draft(
     proposal: GovernanceProposal,
     key: ProposalParticipationKey,
     selection: ProposalActionSelection,
@@ -1140,15 +1164,16 @@ async fn build_governance_spend_draft(
     vault_store: Arc<wallet_ops::vault::DesktopVaultStore>,
     effective_chain: wallet_ops::settings::EffectiveChainConfig,
     http: wallet_ops::HttpContext,
+    operation: wallet_ops::OperationHttpClientSlot,
     gas_fee_selection: PublicActionGasFeeSelection,
 ) -> Result<GovernanceSpendDraft, String> {
     let recipe_proposal = proposal.clone();
     let recipe_key = key.clone();
     let recipe_amount = amount;
-    let route = super::governance::open_isolated_governance_route(
+    let (route, client) = super::governance::action_governance_route(
         key.context.chain_id,
         &effective_chain,
-        &http,
+        &operation,
     )
     .await?;
     let (fresh, rules, chain_time, participation) = read_proposal_action_state(
@@ -1159,7 +1184,6 @@ async fn build_governance_spend_draft(
         &http,
     )
     .await?;
-    drop(route);
     let amount = amount.unwrap_or_default();
     validate_proposal_action(
         &fresh,
@@ -1224,6 +1248,7 @@ async fn build_governance_spend_draft(
             access_list: None,
         },
         &http,
+        &client,
     )
     .await
     .map_err(|error| format_report_chain(&error))?;
@@ -1323,6 +1348,7 @@ async fn build_governance_spend_draft(
         vault_store,
         workflow: None,
         continuation: None,
+        operation,
         recipe: GovernanceDraftRecipe::Proposal {
             proposal: Box::new(recipe_proposal),
             key: recipe_key,
@@ -1609,6 +1635,7 @@ pub(super) async fn build_typed_governance_spend_draft(
     vault_store: Arc<wallet_ops::vault::DesktopVaultStore>,
     effective_chain: wallet_ops::settings::EffectiveChainConfig,
     http: wallet_ops::HttpContext,
+    operation: wallet_ops::OperationHttpClientSlot,
     gas_fee_selection: PublicActionGasFeeSelection,
     workflow: Option<GovernanceWorkflow>,
     continuation: Option<GovernanceContinuation>,
@@ -1631,6 +1658,10 @@ pub(super) async fn build_typed_governance_spend_draft(
     let resolved = action
         .resolve(&context)
         .map_err(|error| error.to_string())?;
+    let client = operation
+        .client()
+        .await
+        .map_err(|error| error.to_string())?;
     let estimate = wallet_ops::estimate_public_advanced_transaction(
         PublicAdvancedTransactionEstimateRequest {
             chain_id,
@@ -1641,6 +1672,7 @@ pub(super) async fn build_typed_governance_spend_draft(
             access_list: None,
         },
         &http,
+        &client,
     )
     .await
     .map_err(|error| format_report_chain(&error))?;
@@ -1676,6 +1708,7 @@ pub(super) async fn build_typed_governance_spend_draft(
         workflow,
         continuation,
         recipe,
+        operation,
     })
 }
 

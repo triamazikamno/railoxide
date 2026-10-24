@@ -63,8 +63,8 @@ use crate::vault::{
 };
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, HardwareTrezorPinMatrixProvider, HttpContext,
-    PublicActionGasFeeSelection, PublicActionProgressStep, PublicActionProgressUpdate,
-    PublicAssetId, query_rpc_pool_for_route,
+    OperationHttpClient, PublicActionGasFeeSelection, PublicActionProgressStep,
+    PublicActionProgressUpdate, PublicAssetId, query_rpc_pool_for_route,
     self_broadcast_send_raw_transaction_to_rpc_pool_with_logging,
 };
 
@@ -1206,7 +1206,11 @@ impl ExecutorOwner {
         end: PublicActionStepEnd,
         progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
     ) -> Result<PublicSwapSent> {
-        let submitted_from_block = self.while_active(origin_head(origin, &self.http)).await?;
+        // One client per submitted step covers its head read, submission and inclusion read.
+        let client = self.while_active(self.http.operation_http_client()).await?;
+        let submitted_from_block = self
+            .while_active(origin_head(origin, &self.http, &client))
+            .await?;
         let ends_swap = matches!(
             kind,
             PublicSwapTransactionKind::Withdrawal | PublicSwapTransactionKind::Invalidation
@@ -1245,6 +1249,7 @@ impl ExecutorOwner {
                 origin,
                 gas_fee,
                 &self.http,
+                &client,
                 &mut handoff,
                 end,
                 progress,
@@ -1258,7 +1263,7 @@ impl ExecutorOwner {
         let hash: B256 = outcome.receipt.tx_hash.parse()?;
         // The step reports the block's number. Its hash is read by that number, and the
         // hand-off's read checks the transaction against the final block again.
-        let block = origin_block(origin, &self.http, outcome.receipt.block_number).await?;
+        let block = origin_block(origin, &self.http, &client, outcome.receipt.block_number).await?;
         self.store.record_public_swap_inclusion(
             operation,
             swap_use,
@@ -1300,11 +1305,14 @@ impl ExecutorOwner {
         if unresolved.is_empty() {
             return Ok(());
         }
-        // Stored signed deposits are resent only where submission is allowed.
+        // Stored signed deposits are resent only where submission is allowed, over a client of
+        // this resend's own.
+        let client = self.while_active(self.http.operation_http_client()).await?;
         let pool = query_rpc_pool_for_route(
             &origin
                 .rpc_route
-                .for_class(crate::RpcTrafficClass::Submission)?,
+                .for_class(crate::RpcTrafficClass::Submission)?
+                .isolated(client),
             &self.http,
         );
         for (hash, signed) in unresolved {
@@ -1377,11 +1385,16 @@ fn require_approved_gas_cost(plan: &PublicSwapGasPlan, approved: U256) -> Result
 }
 
 /// The origin chain's head block number, from the first of its endpoints that answers.
-async fn origin_head(origin: &EffectiveChainConfig, http: &HttpContext) -> Result<u64> {
+async fn origin_head(
+    origin: &EffectiveChainConfig,
+    http: &HttpContext,
+    client: &OperationHttpClient,
+) -> Result<u64> {
     let pool = query_rpc_pool_for_route(
         &origin
             .rpc_route
-            .for_class(crate::RpcTrafficClass::Sensitive)?,
+            .for_class(crate::RpcTrafficClass::Sensitive)?
+            .isolated(client.clone()),
         http,
     );
     for endpoint in pool.available_providers() {
@@ -1397,12 +1410,14 @@ async fn origin_head(origin: &EffectiveChainConfig, http: &HttpContext) -> Resul
 async fn origin_block(
     origin: &EffectiveChainConfig,
     http: &HttpContext,
+    client: &OperationHttpClient,
     number: u64,
 ) -> Result<BlockNumHash> {
     let pool = query_rpc_pool_for_route(
         &origin
             .rpc_route
-            .for_class(crate::RpcTrafficClass::Sensitive)?,
+            .for_class(crate::RpcTrafficClass::Sensitive)?
+            .isolated(client.clone()),
         http,
     );
     for endpoint in pool.available_providers() {

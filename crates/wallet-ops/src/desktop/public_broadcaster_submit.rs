@@ -59,6 +59,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         &request.trust_filter,
         request.anchor_cache.as_ref(),
         http,
+        &http.operation_http_client().await?,
     )
     .await?;
     if let Some(prepared) = &request.executor {
@@ -565,6 +566,7 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         &request.trust_filter,
         request.anchor_cache.as_ref(),
         http,
+        &http.operation_http_client().await?,
     )
     .await?;
     let bound_min_gas_price =

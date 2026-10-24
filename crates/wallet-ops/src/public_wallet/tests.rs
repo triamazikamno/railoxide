@@ -42,7 +42,7 @@ use crate::{
 };
 use crate::{WalletConnectDecodedCallKind, WalletConnectSupportedMethod};
 
-const TEST_PASSWORD: &str = "correct horse battery staple";
+pub(super) const TEST_PASSWORD: &str = "correct horse battery staple";
 
 /// `route` restricted to Sensitive traffic, which its default-role endpoints all accept.
 fn sensitive(route: &RpcChainRoute) -> crate::ClassRoute {
@@ -52,7 +52,7 @@ fn sensitive(route: &RpcChainRoute) -> crate::ClassRoute {
 }
 const TEST_MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-const TEST_IMPORTED_PRIVATE_KEY: &str =
+pub(super) const TEST_IMPORTED_PRIVATE_KEY: &str =
     "0x59c6995e998f97a5a0044966f0945387e7d5e4a4dbd4b3f1b530b87d9b4a5c2f";
 static TEMP_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -414,7 +414,7 @@ fn temp_db_root() -> PathBuf {
     dir.join(format!("db-{pid}-{nanos}-{counter}"))
 }
 
-fn public_action_request_parts() -> (
+pub(super) fn public_action_request_parts() -> (
     PathBuf,
     Arc<DbStore>,
     Arc<DesktopVaultStore>,
@@ -2009,6 +2009,7 @@ async fn walletconnect_rpc_privacy_and_submission_boundaries_use_one_http_contex
         simulation_quote,
         simulation_resolved,
         &simulation_http,
+        &simulation_http.operation_http_client().await.unwrap(),
     )
     .await
     .expect("explicit simulation after action");
@@ -2091,11 +2092,13 @@ async fn advanced_simulation_uses_each_provider_once_and_selects_revert_pluralit
         max_priority_fee_per_gas: 2,
     };
 
+    let http = HttpContext::direct_for_tests();
     let result = simulate_public_advanced_transaction_with_fee(
         request,
         quote,
         resolved,
-        &HttpContext::direct_for_tests(),
+        &http,
+        &http.operation_http_client().await.unwrap(),
     )
     .await;
     assert!(matches!(
@@ -2206,9 +2209,13 @@ async fn gas_only_public_reads_never_reach_a_wrong_chain_endpoint() {
 
     // The estimate's quote and estimate stages share one source, so the endpoint is checked
     // once more rather than once per stage.
-    let estimate = estimate_public_advanced_transaction(raw_estimate_request(chain), &http)
-        .await
-        .expect("estimate from the valid endpoint");
+    let estimate = estimate_public_advanced_transaction(
+        raw_estimate_request(chain),
+        &http,
+        &http.operation_http_client().await.unwrap(),
+    )
+    .await
+    .expect("estimate from the valid endpoint");
     assert_eq!(estimate.raw_gas_limit, 42_000);
     assert_eq!(
         *wrong_methods.lock().unwrap(),
@@ -2246,10 +2253,11 @@ async fn advanced_estimate_uses_an_endpoint_admitted_after_its_quote() {
         gate.request_started.notified().await;
         gate.release_response.notify_one();
     };
+    let client = http.operation_http_client().await.unwrap();
     let (estimate, released) = tokio::join!(
         tokio::time::timeout(
             WAIT,
-            estimate_public_advanced_transaction(raw_estimate_request(chain), &http),
+            estimate_public_advanced_transaction(raw_estimate_request(chain), &http, &client),
         ),
         tokio::time::timeout(WAIT, release_late_endpoint),
     );
@@ -3124,6 +3132,7 @@ async fn shield_submission_checks_remaining_funding_before_estimation_and_signin
                 event_tx: Some(event_tx),
             },
             &http,
+            &http.operation_http_client().await.unwrap(),
         )
         .await
         .unwrap_err();
@@ -3210,6 +3219,7 @@ async fn shield_allowance_read_failure_waits_for_retry_and_adopts_its_fee() {
     let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
     let http = HttpContext::direct_for_tests();
+    let client = http.operation_http_client().await.unwrap();
     let submit = submit_public_shield(
         PublicShieldRequest {
             executor_owner: None,
@@ -3241,6 +3251,7 @@ async fn shield_allowance_read_failure_waits_for_retry_and_adopts_its_fee() {
             event_tx: Some(event_tx),
         },
         &http,
+        &client,
     );
     let retry = async {
         loop {
@@ -3461,6 +3472,7 @@ fn public_actions_reject_zero_amount_and_public_only_shield_before_signing() {
         .expect("build runtime");
     let (root_dir, db, store, view_session) = public_action_request_parts();
     let http = runtime.block_on(async { HttpContext::direct_for_tests() });
+    let client = runtime.block_on(http.operation_http_client()).unwrap();
     let recipient = address!("0x2222222222222222222222222222222222222222");
 
     let send_result = runtime.block_on(submit_public_send(
@@ -3491,6 +3503,7 @@ fn public_actions_reject_zero_amount_and_public_only_shield_before_signing() {
             event_tx: None,
         },
         &http,
+        &client,
     ));
     match send_result {
         Ok(_) => panic!("zero-value public send unexpectedly succeeded"),
@@ -3539,6 +3552,7 @@ fn public_actions_reject_zero_amount_and_public_only_shield_before_signing() {
                 event_tx: None,
             },
             &http,
+            &client,
         ));
         match shield_result {
             Ok(_) => panic!("zero-value public shield unexpectedly succeeded"),
@@ -4101,15 +4115,22 @@ async fn admitted_dapp_reads_preserve_fee_and_simulation_policy_and_cover_prefli
         gas_fee,
         access_list: Some(AccessList::default()),
     };
-    let native = simulate_public_advanced_transaction_with_fee(request(), quote, resolved, &http)
-        .await
-        .unwrap();
+    let native = simulate_public_advanced_transaction_with_fee(
+        request(),
+        quote,
+        resolved,
+        &http,
+        &http.operation_http_client().await.unwrap(),
+    )
+    .await
+    .unwrap();
     let before = server.calls().len();
     let admitted = simulate_public_advanced_transaction_with_fee_and_reads(
         request(),
         quote,
         resolved,
         &http,
+        &http.operation_http_client().await.unwrap(),
         Some(&reads),
     )
     .await
@@ -4296,6 +4317,7 @@ async fn admitted_dapp_read_rejections_stop_retries_without_provider_fallback() 
             quote,
             resolved,
             &http,
+            &http.operation_http_client().await.unwrap(),
             Some(&reads),
         )
         .await
@@ -4541,6 +4563,7 @@ async fn dapp_send_invalidation_stops_before_baseline_or_raw_broadcast() {
                 event_tx: Some(event_tx),
             },
             &http,
+            &http.operation_http_client().await.unwrap(),
         )
         .await
         .unwrap_err();
@@ -4812,19 +4835,20 @@ async fn ens_recipient_uses_normalized_alloy_calls_on_the_configured_desktop_rou
     let mut chain = effective_chain_for_rpc(endpoint.as_str(), 0);
     chain.rpc_route = RpcChainRoute::new(1, vec![endpoint]);
     let http = HttpContext::direct_for_tests();
+    let client = http.operation_http_client().await.unwrap();
     assert_eq!(
-        resolve_public_ens_recipient("RaFFY.eth", &chain, &http)
+        resolve_public_ens_recipient("RaFFY.eth", &chain, &http, &client)
             .await
             .unwrap(),
         target
     );
     assert!(
-        resolve_public_ens_recipient("Unassigned.eth", &chain, &http)
+        resolve_public_ens_recipient("Unassigned.eth", &chain, &http, &client)
             .await
             .is_err()
     );
     assert!(
-        resolve_public_ens_recipient("a\u{200d}b.eth", &chain, &http)
+        resolve_public_ens_recipient("a\u{200d}b.eth", &chain, &http, &client)
             .await
             .is_err()
     );
@@ -5112,6 +5136,7 @@ async fn native_preparation_estimates_the_full_request() {
         test_shield_recipient(),
         amount,
         &http,
+        &http.operation_http_client().await.unwrap(),
     )
     .await
     .unwrap();

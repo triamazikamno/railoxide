@@ -23,7 +23,7 @@ use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     Eip1559GasCostProjection, NativeShieldPayer, NativeShieldPreparation, NativeShieldRoute,
-    NativeShieldUnavailable, PublicActionCommand, PublicActionCommandKind,
+    NativeShieldUnavailable, OperationHttpClientSlot, PublicActionCommand, PublicActionCommandKind,
     PublicActionCommandSender, PublicActionFeeSource, PublicActionGasFeeMode,
     PublicActionGasFeeQuote, PublicActionGasFeeSelection, PublicActionKind,
     PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,

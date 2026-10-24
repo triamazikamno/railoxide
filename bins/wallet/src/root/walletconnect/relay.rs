@@ -1182,6 +1182,7 @@ pub(super) fn process_walletconnect_session_request_message(
             WalletConnectRequestUi {
                 request_control: None,
                 rpc_reads: None,
+                operation: None,
                 key: walletconnect_request_key(&message.topic, request_id),
                 review_token: walletconnect_request_id_seed(),
                 binding: DappRequestBinding::from_walletconnect_session(session),

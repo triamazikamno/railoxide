@@ -366,6 +366,7 @@ impl WalletRoot {
         self.public_form.mimic_railway_shield = self.mimic_railway_shields_by_default;
         self.public_form.shield_approval_mode = wallet_ops::PublicShieldApprovalMode::Exact;
         self.public_form.native_shield_preparation.invalidate();
+        self.public_form.operation = None;
         self.public_form.public_send_kind = PublicSendKind::Transfer;
         self.public_form.advanced_send_estimate = None;
         self.public_form.advanced_send_estimate_invalidated = false;
