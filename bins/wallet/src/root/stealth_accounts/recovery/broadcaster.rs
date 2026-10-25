@@ -84,6 +84,7 @@ impl StealthAccountsView {
 
     pub(in crate::root::stealth_accounts) fn close_recovery(&mut self) {
         self.recovery.open = false;
+        self.recovery.client = None;
         self.recovery.refresh_task = None;
         self.recovery.estimate_task = None;
         self.recovery.estimate_revision = self.recovery.estimate_revision.wrapping_add(1);

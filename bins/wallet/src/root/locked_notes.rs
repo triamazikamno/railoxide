@@ -217,14 +217,21 @@ impl LockedNotesView {
         let Some(confirmed) = self.confirmed_block(cx) else {
             return;
         };
+        let Some(http) = self.root.upgrade().map(|root| root.read(cx).http.clone()) else {
+            return;
+        };
         if !self.checking.insert(operation) {
             return;
         }
         self.errors.remove(&operation);
         let session = Arc::clone(&self.session);
-        let check = self
-            .runtime
-            .spawn(async move { session.check_input_lock(operation, confirmed).await });
+        // The check reads the account over a route of its own.
+        let check = self.runtime.spawn(async move {
+            let client = http.operation_http_client().await?;
+            session
+                .check_input_lock(operation, confirmed, &client)
+                .await
+        });
         cx.spawn(async move |this, cx| {
             let result = check.await;
             let _ = this.update(cx, |this, cx| {

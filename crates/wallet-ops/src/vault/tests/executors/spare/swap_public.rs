@@ -211,13 +211,25 @@ async fn a_failed_destination_setup_leaves_the_public_account_untouched() {
     owner.claim_public_swap(request()).unwrap();
     assert!(
         owner
-            .prepare_public_swap_destination(operation, id, None, &authorization)
+            .prepare_public_swap_destination(
+                operation,
+                id,
+                None,
+                &authorization,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .is_err(),
         "a new account needs its setup's broadcaster"
     );
     let SwapPairSide::Setup(prepared) = owner
-        .prepare_public_swap_destination(operation, id, Some(candidate.clone()), &authorization)
+        .prepare_public_swap_destination(
+            operation,
+            id,
+            Some(candidate.clone()),
+            &authorization,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap()
     else {
@@ -307,7 +319,13 @@ async fn a_failed_destination_setup_leaves_the_public_account_untouched() {
 
     // The retry prepares the same account for the same use.
     let SwapPairSide::Setup(retried) = owner
-        .prepare_public_swap_destination(operation, id, Some(candidate), &authorization)
+        .prepare_public_swap_destination(
+            operation,
+            id,
+            Some(candidate),
+            &authorization,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap()
     else {
@@ -363,6 +381,7 @@ async fn delivery_review(
             token_registry: &registry,
             max_fee_per_gas: 1,
             max_priority_fee_per_gas: 1,
+            client: crate::OperationHttpClient::direct_for_tests(),
         })
         .await
         .unwrap()
@@ -446,7 +465,13 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
         .unwrap();
     owner.claim_public_swap(request).unwrap();
     let executor = owner
-        .prepare_public_swap_destination(operation, id, Some(candidate), &authorization)
+        .prepare_public_swap_destination(
+            operation,
+            id,
+            Some(candidate),
+            &authorization,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap()
         .executor();
@@ -472,6 +497,7 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
             valid_to,
             authorization: &authorization,
             notes: None,
+            client: crate::OperationHttpClient::direct_for_tests(),
         })
     };
     // What the latest quote request carried under `name`.
@@ -582,7 +608,13 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
         .unwrap()
         .insert(USDC, Some(input_amount));
     let corrected = owner
-        .requote_public_swap_delivery(&review, &quote, &origin_chain, Address::repeat_byte(0x50))
+        .requote_public_swap_delivery(
+            &review,
+            &quote,
+            &origin_chain,
+            Address::repeat_byte(0x50),
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     assert!(corrected.gas_plan().approval_gas_limits.is_empty());
@@ -755,7 +787,13 @@ async fn a_public_orders_short_signing_time_quote_within_the_cushion_raises_its_
     request.approval.bounds.gas_allowance = Some(U256::from(100));
     owner.claim_public_swap(request).unwrap();
     let executor = owner
-        .prepare_public_swap_destination(operation, id, Some(candidate), &authorization)
+        .prepare_public_swap_destination(
+            operation,
+            id,
+            Some(candidate),
+            &authorization,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap()
         .executor();
@@ -787,6 +825,7 @@ async fn a_public_orders_short_signing_time_quote_within_the_cushion_raises_its_
             valid_to,
             authorization: &authorization,
             notes: None,
+            client: crate::OperationHttpClient::direct_for_tests(),
         })
     };
     // The amount and the message of every quote request so far.
@@ -910,6 +949,7 @@ async fn a_public_orders_short_signing_time_quote_within_the_cushion_raises_its_
             token_registry: &registry,
             max_fee_per_gas: 1,
             max_priority_fee_per_gas: 1,
+            client: crate::OperationHttpClient::direct_for_tests(),
         })
         .await
         .unwrap();
@@ -922,7 +962,13 @@ async fn a_public_orders_short_signing_time_quote_within_the_cushion_raises_its_
         .unwrap()
         .insert(ORDER_SELL_TOKEN, Some(U256::MAX));
     let corrected = owner
-        .requote_public_swap_delivery(&review, &quote, &origin_chain, Address::repeat_byte(0x50))
+        .requote_public_swap_delivery(
+            &review,
+            &quote,
+            &origin_chain,
+            Address::repeat_byte(0x50),
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     assert!(corrected.gas_plan().approval_gas_limits.is_empty());
@@ -958,7 +1004,8 @@ async fn a_public_orders_short_signing_time_quote_within_the_cushion_raises_its_
                 &raised_review,
                 &quote,
                 &origin_chain,
-                Address::repeat_byte(0x50)
+                Address::repeat_byte(0x50),
+                crate::OperationHttpClient::direct_for_tests()
             )
             .await
             .is_err()
@@ -1079,7 +1126,10 @@ async fn a_restart_between_setup_and_approval_resumes_the_public_swap_unsigned()
             ),
         )
         .unwrap();
-    let reconciled = owner.reconcile_account(operation).await.unwrap();
+    let reconciled = owner
+        .reconcile_account(operation, crate::OperationHttpClient::direct_for_tests())
+        .await
+        .unwrap();
     assert_eq!(
         reconciled.record().payload_state(setup),
         Some(ExecutorPayloadState::Resolved)
@@ -1096,7 +1146,13 @@ async fn a_restart_between_setup_and_approval_resumes_the_public_swap_unsigned()
         before.record
     );
     let delegated = restarted
-        .delegated_public_swap_destination(operation, 13, id, None)
+        .delegated_public_swap_destination(
+            operation,
+            13,
+            id,
+            None,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1769,6 +1825,7 @@ impl PublicPayment {
                 &self.origin,
                 &self.signer,
                 REVIEWED_FEE,
+                crate::OperationHttpClient::direct_for_tests(),
                 &mut |_: PublicActionProgressUpdate| {},
             )
             .await
@@ -1784,6 +1841,7 @@ impl PublicPayment {
                 REVIEWED_FEE,
                 &self.delivery,
                 &self.terms,
+                crate::OperationHttpClient::direct_for_tests(),
                 &mut |_: PublicActionProgressUpdate| {},
             )
             .await
@@ -2029,7 +2087,13 @@ impl PublicPayment {
         orderbook: &CowOrderbookClient,
     ) -> PublicSwapRecord {
         owner
-            .observe_public_swap_order(self.operation, self.id, &self.origin, orderbook)
+            .observe_public_swap_order(
+                self.operation,
+                self.id,
+                &self.origin,
+                orderbook,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         self.saved().swap
@@ -2055,7 +2119,12 @@ impl PublicPayment {
         self.deposit(owner).await.unwrap();
         self.mine();
         owner
-            .observe_public_swap_handoff(self.operation, self.id, &self.origin)
+            .observe_public_swap_handoff(
+                self.operation,
+                self.id,
+                &self.origin,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap()
             .unwrap()
@@ -2136,6 +2205,7 @@ impl PublicPayment {
                     across,
                     orderbook,
                     explicit: false,
+                    client: crate::OperationHttpClient::direct_for_tests(),
                 },
             )
             .await
@@ -2309,8 +2379,14 @@ async fn a_public_swap_approves_then_deposits_with_its_path_recorded_first() {
 
     // The hand-off waits for the deposit's block to be final, and is then read from that
     // block's receipts without a log query.
-    let observe =
-        || owner.observe_public_swap_handoff(payment.operation, payment.id, &payment.origin);
+    let observe = || {
+        owner.observe_public_swap_handoff(
+            payment.operation,
+            payment.id,
+            &payment.origin,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
+    };
     assert_eq!(observe().await.unwrap(), None);
     payment.mine();
     let handoff = observe().await.unwrap().unwrap();
@@ -2427,7 +2503,12 @@ async fn a_reverted_public_swap_deposit_hands_nothing_off() {
         // Final observation may verify failure, or discover success after provisional failure.
         payment.mine();
         let handoff = owner
-            .observe_public_swap_handoff(payment.operation, payment.id, &payment.origin)
+            .observe_public_swap_handoff(
+                payment.operation,
+                payment.id,
+                &payment.origin,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         assert_eq!(handoff.is_some(), succeeds_after_reorg);
@@ -2500,8 +2581,14 @@ async fn a_restart_after_the_deposit_broadcast_finds_its_handoff_in_finalized_bl
         HttpContext::direct_for_tests(),
     )
     .unwrap();
-    let observe =
-        || restarted.observe_public_swap_handoff(payment.operation, payment.id, &payment.origin);
+    let observe = || {
+        restarted.observe_public_swap_handoff(
+            payment.operation,
+            payment.id,
+            &payment.origin,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
+    };
     // The deposit's block isn't final yet.
     assert_eq!(observe().await.unwrap(), None);
     payment.mine();
@@ -2576,7 +2663,12 @@ async fn an_interrupted_failed_deposit_resumes_bounded_final_block_scans() {
     assert_eq!(payment.chain.lock().unwrap().broadcasts.len(), 1);
     assert_eq!(
         restarted
-            .observe_public_swap_handoff(payment.operation, payment.id, &payment.origin)
+            .observe_public_swap_handoff(
+                payment.operation,
+                payment.id,
+                &payment.origin,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .unwrap(),
         None
@@ -2600,7 +2692,12 @@ async fn an_interrupted_failed_deposit_resumes_bounded_final_block_scans() {
     payment.chain.lock().unwrap().chain.receipt_error = Some(-32601);
     assert!(
         restarted
-            .observe_public_swap_handoff(payment.operation, payment.id, &payment.origin)
+            .observe_public_swap_handoff(
+                payment.operation,
+                payment.id,
+                &payment.origin,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .is_err()
     );
@@ -2611,7 +2708,12 @@ async fn an_interrupted_failed_deposit_resumes_bounded_final_block_scans() {
     payment.chain.lock().unwrap().chain.receipt_error = None;
     assert_eq!(
         restarted
-            .observe_public_swap_handoff(payment.operation, payment.id, &payment.origin)
+            .observe_public_swap_handoff(
+                payment.operation,
+                payment.id,
+                &payment.origin,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .unwrap(),
         None
@@ -2750,7 +2852,12 @@ async fn a_deposit_reorganized_below_its_sending_head_is_found_not_ruled_out() {
         origin.chain.head = ORIGIN_HEAD + 4;
     }
     let handoff = owner
-        .observe_public_swap_handoff(payment.operation, payment.id, &payment.origin)
+        .observe_public_swap_handoff(
+            payment.operation,
+            payment.id,
+            &payment.origin,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap()
         .unwrap();
@@ -2815,7 +2922,12 @@ async fn a_deposit_whose_nonce_another_transaction_used_is_ruled_out() {
         // Eight blocks stop short of the other transaction, where the nonce is still unused.
         assert_eq!(
             owner
-                .observe_public_swap_handoff(payment.operation, payment.id, &payment.origin)
+                .observe_public_swap_handoff(
+                    payment.operation,
+                    payment.id,
+                    &payment.origin,
+                    crate::OperationHttpClient::direct_for_tests()
+                )
                 .await
                 .unwrap(),
             None
@@ -2830,7 +2942,12 @@ async fn a_deposit_whose_nonce_another_transaction_used_is_ruled_out() {
         payment.chain.lock().unwrap().reorg_on_nonce_read = Some(finalized);
         assert_eq!(
             owner
-                .observe_public_swap_handoff(payment.operation, payment.id, &payment.origin)
+                .observe_public_swap_handoff(
+                    payment.operation,
+                    payment.id,
+                    &payment.origin,
+                    crate::OperationHttpClient::direct_for_tests()
+                )
                 .await
                 .unwrap(),
             None
@@ -2840,7 +2957,12 @@ async fn a_deposit_whose_nonce_another_transaction_used_is_ruled_out() {
         payment.mine();
         assert_eq!(
             owner
-                .observe_public_swap_handoff(payment.operation, payment.id, &payment.origin)
+                .observe_public_swap_handoff(
+                    payment.operation,
+                    payment.id,
+                    &payment.origin,
+                    crate::OperationHttpClient::direct_for_tests()
+                )
                 .await
                 .unwrap(),
             None
@@ -2967,7 +3089,12 @@ async fn a_deposit_whose_provisional_block_was_orphaned_for_its_nonce_is_ruled_o
     // reads three blocks up to it, all in one poll.
     assert_eq!(
         owner
-            .observe_public_swap_handoff(payment.operation, payment.id, &payment.origin)
+            .observe_public_swap_handoff(
+                payment.operation,
+                payment.id,
+                &payment.origin,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .unwrap(),
         None
@@ -3384,7 +3511,10 @@ async fn an_order_is_refused_until_the_math_contract_is_deployed_on_its_chain() 
         payment.chain.lock().unwrap().math_code = code;
         assert!(
             !owner
-                .public_swap_orders_available(&payment.origin)
+                .public_swap_orders_available(
+                    &payment.origin,
+                    crate::OperationHttpClient::direct_for_tests()
+                )
                 .await
                 .unwrap()
         );
@@ -3404,6 +3534,7 @@ async fn an_order_is_refused_until_the_math_contract_is_deployed_on_its_chain() 
                 token_registry: &registry,
                 max_fee_per_gas: 100,
                 max_priority_fee_per_gas: 1,
+                client: crate::OperationHttpClient::direct_for_tests(),
             })
             .await
             .unwrap_err();
@@ -3423,7 +3554,10 @@ async fn an_order_is_refused_until_the_math_contract_is_deployed_on_its_chain() 
     payment.chain.lock().unwrap().math_code = swap_math_runtime_code();
     assert!(
         owner
-            .public_swap_orders_available(&payment.origin)
+            .public_swap_orders_available(
+                &payment.origin,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .unwrap()
     );
@@ -3438,7 +3572,10 @@ async fn an_order_is_refused_until_the_math_contract_is_deployed_on_its_chain() 
     unprofiled.enabled = false;
     assert!(
         !owner
-            .public_swap_orders_available(&unprofiled)
+            .public_swap_orders_available(
+                &unprofiled,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .unwrap()
     );
@@ -3735,7 +3872,14 @@ async fn held_public_order_proceeds_are_withdrawn_to_the_public_account_through_
     // Nothing is withdrawn from a proxy that holds no proceeds of the swap.
     assert!(
         owner
-            .review_public_swap_withdrawal(payment.operation, payment.id, &payment.origin, 100, 1)
+            .review_public_swap_withdrawal(
+                payment.operation,
+                payment.id,
+                &payment.origin,
+                100,
+                1,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .is_err()
     );
@@ -3778,7 +3922,14 @@ async fn held_public_order_proceeds_are_withdrawn_to_the_public_account_through_
         )];
     }
     let review = owner
-        .review_public_swap_withdrawal(payment.operation, payment.id, &payment.origin, 100, 1)
+        .review_public_swap_withdrawal(
+            payment.operation,
+            payment.id,
+            &payment.origin,
+            100,
+            1,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     let gas_limit =
@@ -3804,6 +3955,7 @@ async fn held_public_order_proceeds_are_withdrawn_to_the_public_account_through_
             REVIEWED_FEE,
             &review,
             false,
+            crate::OperationHttpClient::direct_for_tests(),
             &mut |_: PublicActionProgressUpdate| {},
         )
         .await
@@ -3963,7 +4115,14 @@ async fn held_public_order_proceeds_are_withdrawn_to_the_public_account_through_
     // Withdrawn proceeds are not withdrawn again.
     assert!(
         owner
-            .review_public_swap_withdrawal(payment.operation, payment.id, &payment.origin, 100, 1)
+            .review_public_swap_withdrawal(
+                payment.operation,
+                payment.id,
+                &payment.origin,
+                100,
+                1,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .is_err()
     );
@@ -4007,6 +4166,7 @@ async fn invalidate(
             REVIEWED_FEE,
             orderbook,
             INVALIDATION_GAS_LIMIT,
+            crate::OperationHttpClient::direct_for_tests(),
             &mut |_: PublicActionProgressUpdate| {},
         )
         .await
@@ -4444,7 +4604,14 @@ async fn a_withdrawal_whose_receipt_was_never_seen_is_found_by_its_transfer() {
         )];
     }
     let review = owner
-        .review_public_swap_withdrawal(payment.operation, payment.id, &payment.origin, 100, 1)
+        .review_public_swap_withdrawal(
+            payment.operation,
+            payment.id,
+            &payment.origin,
+            100,
+            1,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     let mut progress = |_: PublicActionProgressUpdate| {};
@@ -4456,7 +4623,7 @@ async fn a_withdrawal_whose_receipt_was_never_seen_is_found_by_its_transfer() {
             &payment.signer,
             REVIEWED_FEE,
             &review,
-            false,
+            false, crate::OperationHttpClient::direct_for_tests(),
             &mut progress,
         ) => {
             panic!("the wallet stops before the receipt, but the withdrawal returned {outcome:?}");
@@ -4669,7 +4836,14 @@ async fn a_public_swap_is_delivered_by_the_fill_of_its_deposited_amounts_and_its
     let (orderbook, _requests, orderbook_task) = payment.orderbook(false).await;
     let (across, reply, lookups, across_task) = across_stub().await;
     let uid = payment.submitted(&owner, &orderbook).await;
-    let observe = || owner.observe_public_swap_bridge(payment.operation, payment.id, &across);
+    let observe = || {
+        owner.observe_public_swap_bridge(
+            payment.operation,
+            payment.id,
+            &across,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
+    };
 
     // Without a hand-off there is nothing to ask Across about.
     assert_eq!(observe().await.unwrap(), None);
@@ -4741,7 +4915,12 @@ async fn a_public_swaps_fill_without_its_shield_is_held_on_the_destination() {
     };
     assert_eq!(
         owner
-            .observe_public_swap_bridge(payment.operation, payment.id, &across)
+            .observe_public_swap_bridge(
+                payment.operation,
+                payment.id,
+                &across,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .unwrap(),
         Some(held)
@@ -4792,6 +4971,7 @@ async fn a_public_swaps_fill_without_its_shield_is_held_on_the_destination() {
         across: &across,
         orderbook: None,
         explicit: true,
+        client: crate::OperationHttpClient::direct_for_tests(),
     };
     let progress = owner
         .track_public_swap(payment.operation, payment.id, explicit())
@@ -4858,13 +5038,23 @@ async fn a_public_swaps_fill_that_cant_be_read_is_not_recorded_on_the_word_of_ac
     payment.delivery_chain.lock().unwrap().receipt_error = Some(-32601);
     assert!(
         owner
-            .observe_public_swap_bridge(payment.operation, payment.id, &across)
+            .observe_public_swap_bridge(
+                payment.operation,
+                payment.id,
+                &across,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .is_err()
     );
     assert!(
         owner
-            .check_public_swap_bridge(payment.operation, payment.id, &across)
+            .check_public_swap_bridge(
+                payment.operation,
+                payment.id,
+                &across,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .is_err()
     );
@@ -4876,7 +5066,12 @@ async fn a_public_swaps_fill_that_cant_be_read_is_not_recorded_on_the_word_of_ac
     payment.delivery_chain.lock().unwrap().receipt_error = None;
     assert_eq!(
         owner
-            .observe_public_swap_bridge(payment.operation, payment.id, &across)
+            .observe_public_swap_bridge(
+                payment.operation,
+                payment.id,
+                &across,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .unwrap(),
         Some(SwapBridgeOutcome::DeliveredVerified {
@@ -4902,7 +5097,13 @@ async fn a_refunding_public_swaps_refund_to_its_public_account_is_verified_on_th
     let (across, reply, _lookups, across_task) = across_stub().await;
     payment.handed_off(&owner).await;
     let refund = || {
-        owner.observe_public_swap_refund(payment.operation, payment.id, &payment.origin, &across)
+        owner.observe_public_swap_refund(
+            payment.operation,
+            payment.id,
+            &payment.origin,
+            &across,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
     };
 
     // A swap that isn't refunding has no refund to look for.
@@ -4910,7 +5111,12 @@ async fn a_refunding_public_swaps_refund_to_its_public_account_is_verified_on_th
     *reply.lock().unwrap() = across_deposit("expired", None, None);
     assert_eq!(
         owner
-            .observe_public_swap_bridge(payment.operation, payment.id, &across)
+            .observe_public_swap_bridge(
+                payment.operation,
+                payment.id,
+                &across,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .unwrap(),
         Some(SwapBridgeOutcome::Refunding)
@@ -4993,7 +5199,14 @@ async fn an_explicit_check_replaces_a_public_swaps_refund_with_its_verified_fill
     let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::MAX).await;
     let (across, reply, _lookups, across_task) = across_stub().await;
     payment.handed_off(&owner).await;
-    let observe = || owner.observe_public_swap_bridge(payment.operation, payment.id, &across);
+    let observe = || {
+        owner.observe_public_swap_bridge(
+            payment.operation,
+            payment.id,
+            &across,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
+    };
 
     *reply.lock().unwrap() = across_deposit("expired", None, None);
     assert_eq!(observe().await.unwrap(), Some(SwapBridgeOutcome::Refunding));
@@ -5014,7 +5227,12 @@ async fn an_explicit_check_replaces_a_public_swaps_refund_with_its_verified_fill
     };
     assert_eq!(
         owner
-            .check_public_swap_bridge(payment.operation, payment.id, &across)
+            .check_public_swap_bridge(
+                payment.operation,
+                payment.id,
+                &across,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .unwrap(),
         Some(delivered)
@@ -5239,6 +5457,7 @@ async fn permit_reads_travel_with_the_allowance_read_and_are_kept_for_the_sessio
                 relayer,
                 payment.sell_amount,
                 true,
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .unwrap()
@@ -5533,6 +5752,7 @@ async fn a_permit_review_corrected_to_a_covered_allowance_binds_no_permit_hook()
             token_registry: &registry,
             max_fee_per_gas: 100,
             max_priority_fee_per_gas: 1,
+            client: crate::OperationHttpClient::direct_for_tests(),
         })
         .await
         .unwrap();
@@ -5554,7 +5774,12 @@ async fn a_permit_review_corrected_to_a_covered_allowance_binds_no_permit_hook()
 
     payment.chain.lock().unwrap().allowance = U256::MAX;
     let corrected = owner
-        .requote_public_swap_approvals(&review, &payment.origin, payment.source)
+        .requote_public_swap_approvals(
+            &review,
+            &payment.origin,
+            payment.source,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     assert!(!corrected.approval_plan().signs_permit());

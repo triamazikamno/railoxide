@@ -163,7 +163,8 @@ async fn executor_public_registration_is_atomic_idempotent_and_preserves_custody
             None,
             None,
             None,
-            1
+            1,
+            crate::OperationHttpClient::direct_for_tests()
         )
         .await
         .is_err()
@@ -178,7 +179,8 @@ async fn executor_public_registration_is_atomic_idempotent_and_preserves_custody
             None,
             None,
             Some(&owner),
-            137
+            137,
+            crate::OperationHttpClient::direct_for_tests()
         )
         .await
         .is_err()
@@ -210,7 +212,8 @@ async fn executor_public_registration_is_atomic_idempotent_and_preserves_custody
             None,
             None,
             Some(&replacement),
-            1
+            1,
+            crate::OperationHttpClient::direct_for_tests()
         )
         .await
         .is_err()
@@ -225,6 +228,7 @@ async fn executor_public_registration_is_atomic_idempotent_and_preserves_custody
         None,
         Some(&replacement),
         1,
+        crate::OperationHttpClient::direct_for_tests(),
     )
     .await
     .unwrap();
@@ -273,7 +277,8 @@ async fn executor_public_registration_is_atomic_idempotent_and_preserves_custody
             None,
             None,
             Some(&current),
-            1
+            1,
+            crate::OperationHttpClient::direct_for_tests()
         )
         .await
         .is_err()
@@ -387,24 +392,27 @@ async fn executor_public_message_signing_requires_the_original_passphrase_sessio
     let message = b"Public recovery custody regression";
     let vault = Arc::new(vault);
     for with_seed in [false, true] {
-        let result = walletconnect_sign_personal_message(WalletConnectPersonalSignRequest {
-            chain_id: 1,
-            executor_owner: Some(owner.clone()),
-            request_control: None,
-            view_session: view.clone(),
-            vault_store: vault.clone(),
-            authorization: Some(
-                crate::DesktopPrivateSpendAuthorization::from_software_credentials(
-                    Zeroizing::new(TEST_PASSWORD.into()),
-                    with_seed.then(|| protected.clone()),
+        let result = walletconnect_sign_personal_message(
+            WalletConnectPersonalSignRequest {
+                chain_id: 1,
+                executor_owner: Some(owner.clone()),
+                request_control: None,
+                view_session: view.clone(),
+                vault_store: vault.clone(),
+                authorization: Some(
+                    crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                        Zeroizing::new(TEST_PASSWORD.into()),
+                        with_seed.then(|| protected.clone()),
+                    ),
                 ),
-            ),
-            trezor_app_passphrase: None,
-            trezor_pin_matrix_provider: None,
-            public_account_uuid: account.public_account_uuid.clone(),
-            message: message.to_vec(),
-            event_tx: None,
-        })
+                trezor_app_passphrase: None,
+                trezor_pin_matrix_provider: None,
+                public_account_uuid: account.public_account_uuid.clone(),
+                message: message.to_vec(),
+                event_tx: None,
+            },
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await;
         if with_seed {
             let signature: alloy::primitives::Signature = result.unwrap().parse().unwrap();

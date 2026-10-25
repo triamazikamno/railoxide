@@ -1073,6 +1073,16 @@ impl OperationHttpClient {
             bridge_addr: None,
         }
     }
+
+    /// A direct client of its own, leaked so that test closures and spawned futures can borrow
+    /// it.
+    #[cfg(test)]
+    pub(crate) fn direct_for_tests() -> &'static Self {
+        Box::leak(Box::new(Self::for_tests(
+            reqwest::Client::new(),
+            OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct),
+        )))
+    }
 }
 
 impl fmt::Debug for OperationHttpClient {

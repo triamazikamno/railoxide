@@ -1,4 +1,4 @@
-use super::actor::{Actor, BlockEvent, Command, JobExecutor};
+use super::actor::{Actor, BlockEvent, Command, EndpointHealthOutcome, JobExecutor, RequestEvent};
 use super::execution::run_job;
 use super::identity::{CandidateOrder, random_candidate_order};
 use super::model::{
@@ -302,6 +302,24 @@ impl RpcBroker {
         time::timeout_at(deadline, lookup)
             .await
             .map_err(|_| RpcBrokerError::Timeout)?
+    }
+    /// Reports the outcome of a request the caller sent to `endpoint` itself, without waiting.
+    /// A strike withdraws the endpoint from every route's candidates at once; a healthy outcome
+    /// ends its withdrawal. Reports go on the unbounded advisory channel, so they never wait on
+    /// submission credit or a full command mailbox; a report sent after shutdown is dropped.
+    pub(crate) fn report_endpoint_outcome(
+        &self,
+        chain_id: u64,
+        endpoint: &url::Url,
+        outcome: EndpointHealthOutcome,
+    ) {
+        let _ = self
+            .block_tx
+            .send(BlockEvent::EndpointReported(RequestEvent::new(
+                chain_id,
+                endpoint.clone(),
+                outcome,
+            )));
     }
     /// Advises the broker of a head; newer heads advance state, equal heads refresh freshness,
     /// and stale heads are ignored.

@@ -3,14 +3,12 @@ use std::sync::Arc;
 
 use alloy::primitives::Address;
 use eyre::{Result, eyre};
-use futures_util::FutureExt;
-use futures_util::future::{BoxFuture, Shared};
 use tokio::sync::watch;
 
 use super::ExecutorOwner;
 use crate::desktop::executor_discovery::inspect_for_signing;
 use crate::vault::ExecutorNonceObservation;
-use crate::{ExecutorAsset, ExecutorInspection};
+use crate::{ExecutorAsset, ExecutorInspection, OperationHttpClient};
 
 pub(super) struct CheckedExecutor {
     pub(super) inspection: ExecutorInspection,
@@ -31,15 +29,14 @@ impl CheckedExecutor {
     }
 }
 
-type InspectionRead = Shared<BoxFuture<'static, Result<Arc<CheckedExecutor>, Arc<str>>>>;
-
 struct UnusedRead {
     address: Address,
     assets: BTreeSet<ExecutorAsset>,
-    read: InspectionRead,
+    checked: Arc<CheckedExecutor>,
 }
 
-/// Only accounts without issued payloads can consume these observations. No TTL or poll.
+/// Completed observations that only accounts without issued payloads can consume. A pending
+/// read belongs to its caller and its route. No TTL or poll.
 pub(super) struct UnusedInspections {
     reads: BTreeMap<u32, UnusedRead>,
     head: Option<u64>,
@@ -81,66 +78,62 @@ impl UnusedInspections {
 }
 
 impl ExecutorOwner {
-    fn start_unused_inspection(
-        &self,
-        index: u32,
-        address: Address,
-        assets: &[ExecutorAsset],
-    ) -> Result<InspectionRead> {
-        let mut unused = self
-            .unused
-            .lock()
-            .map_err(|_| eyre!("executor preparation is unavailable"))?;
-        self.ensure_active()?;
-        let mut assets = assets.iter().copied().collect::<BTreeSet<_>>();
-        assets.insert(ExecutorAsset::Native);
-        if let Some(existing) = unused.reads.get(&index)
-            && existing.address == address
-        {
-            if assets.is_subset(&existing.assets)
-                && !existing.read.peek().is_some_and(Result::is_err)
-            {
-                return Ok(existing.read.clone());
-            }
-            assets.extend(&existing.assets);
-        }
-        let chain = self.chain.clone();
-        let http = self.http.clone();
-        let requested = assets.iter().copied().collect::<Vec<_>>();
-        let mut closed = self.closed.subscribe();
-        let mut revision = unused.revision.subscribe();
-        let initial_revision = *revision.borrow();
-        let validity = revision.clone();
-        let read = async move {
-            tokio::select! {
-                biased;
-                _ = closed.wait_for(|closed| *closed) => Err(Arc::from("executor wallet session has ended")),
-                _ = revision.wait_for(|revision| *revision != initial_revision) => Err(Arc::from("executor observation invalidated; retry preparation")),
-                result = inspect_for_signing(&chain, &http, address, &requested) => {
-                    result.map(|(inspection, observed)| Arc::new(CheckedExecutor { inspection, observed, revision: Some((validity, initial_revision)) }))
-                        .map_err(|error| Arc::from(error.to_string()))
-                }
-            }
-        }.boxed().shared();
-        unused.reads.insert(
-            index,
-            UnusedRead {
-                address,
-                assets,
-                read: read.clone(),
-            },
-        );
-        Ok(read)
-    }
-
     pub(super) async fn unused_inspection(
         &self,
         index: u32,
         address: Address,
         assets: &[ExecutorAsset],
+        client: &OperationHttpClient,
     ) -> Result<Arc<CheckedExecutor>> {
-        let read = self.start_unused_inspection(index, address, assets)?;
-        self.while_active(async { read.await.map_err(|error| eyre!(error.to_string())) })
-            .await
+        let (assets, mut revision) = {
+            let unused = self
+                .unused
+                .lock()
+                .map_err(|_| eyre!("executor preparation is unavailable"))?;
+            self.ensure_active()?;
+            let mut assets = assets.iter().copied().collect::<BTreeSet<_>>();
+            assets.insert(ExecutorAsset::Native);
+            if let Some(existing) = unused.reads.get(&index)
+                && existing.address == address
+            {
+                if assets.is_subset(&existing.assets) {
+                    return Ok(existing.checked.clone());
+                }
+                assets.extend(&existing.assets);
+            }
+            (assets, unused.revision.subscribe())
+        };
+        let requested = assets.iter().copied().collect::<Vec<_>>();
+        let mut closed = self.closed.subscribe();
+        let initial_revision = *revision.borrow();
+        let validity = revision.clone();
+        let (inspection, observed) = tokio::select! {
+            biased;
+            _ = closed.wait_for(|closed| *closed) => return Err(eyre!("executor wallet session has ended")),
+            _ = revision.wait_for(|revision| *revision != initial_revision) => return Err(eyre!("executor observation invalidated; retry preparation")),
+            result = inspect_for_signing(&self.chain, &self.http, client, address, &requested) => result?,
+        };
+        self.ensure_active()?;
+        let checked = Arc::new(CheckedExecutor {
+            inspection,
+            observed,
+            revision: Some((validity, initial_revision)),
+        });
+        let mut unused = self
+            .unused
+            .lock()
+            .map_err(|_| eyre!("executor preparation is unavailable"))?;
+        // A read that finished after an invalidation must not restore the evidence it cleared.
+        if *unused.revision.borrow() == initial_revision {
+            unused.reads.insert(
+                index,
+                UnusedRead {
+                    address,
+                    assets,
+                    checked: checked.clone(),
+                },
+            );
+        }
+        Ok(checked)
     }
 }

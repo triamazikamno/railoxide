@@ -15,7 +15,7 @@ use railgun_wallet::TransactionCall;
 use super::execution::PayloadToSign;
 use super::{ExecutorDelivery, ExecutorOwner, IssuedExecutorTransaction};
 use crate::vault::{DesktopViewSession, ExecutorOperationId};
-use crate::{DesktopPrivateSpendAuthorization, ExecutorAsset};
+use crate::{DesktopPrivateSpendAuthorization, ExecutorAsset, OperationHttpClient};
 
 /// The signed `execute` of a native shield's `action`, with no private transactions.
 pub(crate) fn native_shield_execute_calldata(
@@ -46,6 +46,7 @@ impl ExecutorOwner {
         amount: U256,
         request: ShieldRequest,
         purpose_summary: &str,
+        client: &OperationHttpClient,
     ) -> Result<IssuedExecutorTransaction> {
         // The shield's recipient and its stealth account belong to one wallet.
         if !view.is_same_wallet_session(&self.view) {
@@ -61,6 +62,7 @@ impl ExecutorOwner {
                 authorization,
                 &[ExecutorAsset::Native, ExecutorAsset::Erc20(wrapped_native)],
                 Some(purpose_summary),
+                client,
             )
             .await?;
         let context = prepared.context();
@@ -73,7 +75,7 @@ impl ExecutorOwner {
             context.chain_id,
             context.executor,
         );
-        self.issue_payload(&prepared, authorization, None, |_| {
+        self.issue_payload(&prepared, authorization, None, client, |_| {
             Ok(PayloadToSign {
                 hash,
                 value: amount,

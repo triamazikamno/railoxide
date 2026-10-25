@@ -522,3 +522,37 @@ async fn candidate_lookup_is_bounded_and_reports_shutdown() {
         Err(RpcBrokerError::Shutdown)
     );
 }
+
+#[tokio::test]
+async fn a_reported_strike_withdraws_at_once_and_a_healthy_report_restores() {
+    use crate::rpc_broker::{EndpointHealthOutcome, RpcChainRoute};
+    /// Reports and lookups reach the actor on different channels, so this waits for a report
+    /// to apply, well inside the shortest withdrawal so that one can't simply expire.
+    async fn candidates_become(
+        broker: &RpcBroker,
+        route: &RpcChainRoute,
+        expected: &[poi::SensitiveUrl],
+    ) {
+        time::timeout(Duration::from_secs(1), async {
+            while broker.endpoint_candidates(route, None).await.unwrap() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the report applied");
+    }
+    let broker = RpcBroker::spawn_with_candidate_order(
+        reqwest::Client::new(),
+        reqwest::Client::new(),
+        |_| {},
+    )
+    .expect("test broker requires an active Tokio runtime");
+    let urls = ["https://a.invalid", "https://b.invalid"].map(|url| url::Url::parse(url).unwrap());
+    let route = RpcChainRoute::new(1, urls.to_vec());
+
+    // One strike withdraws, without the ordinary three-strike threshold.
+    broker.report_endpoint_outcome(1, &urls[0], EndpointHealthOutcome::Strike);
+    candidates_become(&broker, &route, &route.endpoints()[1..]).await;
+    broker.report_endpoint_outcome(1, &urls[0], EndpointHealthOutcome::Healthy);
+    candidates_become(&broker, &route, route.endpoints()).await;
+}

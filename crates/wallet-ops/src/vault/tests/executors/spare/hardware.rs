@@ -97,7 +97,14 @@ async fn hardware_executor_allocation_issuance_and_public_signing_require_scoped
             DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(TEST_PASSWORD.into()));
         assert!(
             owner
-                .prepare_operation(operation, delivery(), &password, &[], None)
+                .prepare_operation(
+                    operation,
+                    delivery(),
+                    &password,
+                    &[],
+                    None,
+                    crate::OperationHttpClient::direct_for_tests()
+                )
                 .await
                 .is_err()
         );
@@ -108,7 +115,14 @@ async fn hardware_executor_allocation_issuance_and_public_signing_require_scoped
         );
         assert!(
             owner
-                .prepare_operation(operation, delivery(), &private, &[], None)
+                .prepare_operation(
+                    operation,
+                    delivery(),
+                    &private,
+                    &[],
+                    None,
+                    crate::OperationHttpClient::direct_for_tests()
+                )
                 .await
                 .is_err()
         );
@@ -141,7 +155,8 @@ async fn hardware_executor_allocation_issuance_and_public_signing_require_scoped
                     },
                     &native_auth,
                     &[],
-                    None
+                    None,
+                    crate::OperationHttpClient::direct_for_tests()
                 )
                 .await
                 .is_err()
@@ -154,7 +169,14 @@ async fn hardware_executor_allocation_issuance_and_public_signing_require_scoped
         );
         assert!(
             owner
-                .prepare_operation(operation, delivery(), &no_payer, &[], None)
+                .prepare_operation(
+                    operation,
+                    delivery(),
+                    &no_payer,
+                    &[],
+                    None,
+                    crate::OperationHttpClient::direct_for_tests()
+                )
                 .await
                 .is_err()
         );
@@ -200,13 +222,21 @@ async fn hardware_executor_allocation_issuance_and_public_signing_require_scoped
                     &authorization,
                     &[],
                     None,
+                    crate::OperationHttpClient::direct_for_tests(),
                 )
                 .await
                 .is_err()
         );
         assert!(store.records().unwrap().is_empty());
         let prepared = owner
-            .prepare_operation(operation, delivery(), &authorization, &[], None)
+            .prepare_operation(
+                operation,
+                delivery(),
+                &authorization,
+                &[],
+                None,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         let spare = store.spare().unwrap().unwrap();
@@ -218,7 +248,8 @@ async fn hardware_executor_allocation_issuance_and_public_signing_require_scoped
                     delivery(),
                     &authorization,
                     &[],
-                    None
+                    None,
+                    crate::OperationHttpClient::direct_for_tests()
                 )
                 .await
                 .is_err()
@@ -274,6 +305,7 @@ async fn hardware_executor_allocation_issuance_and_public_signing_require_scoped
                 &call,
                 std::slice::from_ref(&input),
                 &authorization,
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .unwrap();
@@ -308,7 +340,13 @@ async fn hardware_executor_allocation_issuance_and_public_signing_require_scoped
             data: repriced.abi_encode().into(),
         };
         let revised = owner
-            .issue_operation(&prepared, &repriced, &[input], &authorization)
+            .issue_operation(
+                &prepared,
+                &repriced,
+                &[input],
+                &authorization,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         assert_ne!(revised.payload_hash(), issued.payload_hash());
@@ -346,7 +384,14 @@ async fn hardware_executor_allocation_issuance_and_public_signing_require_scoped
                 .unwrap(),
         ));
         let next = owner
-            .prepare_operation(next_operation, delivery(), &next, &[], None)
+            .prepare_operation(
+                next_operation,
+                delivery(),
+                &next,
+                &[],
+                None,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         assert_eq!(next.context().executor, spare.address().unwrap());
@@ -417,14 +462,20 @@ async fn hardware_executor_allocation_issuance_and_public_signing_require_scoped
             event_tx: None,
         };
         assert!(
-            walletconnect_sign_personal_message(request(password, refreshed.clone()))
-                .await
-                .is_err()
+            walletconnect_sign_personal_message(
+                request(password, refreshed.clone()),
+                crate::OperationHttpClient::direct_for_tests()
+            )
+            .await
+            .is_err()
         );
         assert!(
-            walletconnect_sign_personal_message(request(registration, refreshed.clone()))
-                .await
-                .is_err()
+            walletconnect_sign_personal_message(
+                request(registration, refreshed.clone()),
+                crate::OperationHttpClient::direct_for_tests()
+            )
+            .await
+            .is_err()
         );
         let public = || {
             authorize(
@@ -437,9 +488,12 @@ async fn hardware_executor_allocation_issuance_and_public_signing_require_scoped
                 },
             )
         };
-        walletconnect_sign_personal_message(request(public(), refreshed.clone()))
-            .await
-            .unwrap();
+        walletconnect_sign_personal_message(
+            request(public(), refreshed.clone()),
+            crate::OperationHttpClient::direct_for_tests(),
+        )
+        .await
+        .unwrap();
         let gas = authorize(
             &owner,
             &refreshed,
@@ -452,14 +506,24 @@ async fn hardware_executor_allocation_issuance_and_public_signing_require_scoped
         // A private-only grant cannot serve as this account's payer, and admitting
         // its gas signer consumes the same action's executor authority.
         let (signer, guard) = owner
-            .admit_authorized_gas_signer(&refreshed, &account, &gas)
+            .admit_authorized_gas_signer(
+                &refreshed,
+                &account,
+                &gas,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         assert_eq!(signer.address(), account.address);
         drop(guard);
         assert!(
             owner
-                .admit_authorized_gas_signer(&refreshed, &account, &gas)
+                .admit_authorized_gas_signer(
+                    &refreshed,
+                    &account,
+                    &gas,
+                    crate::OperationHttpClient::direct_for_tests()
+                )
                 .await
                 .is_err()
         );
@@ -469,9 +533,12 @@ async fn hardware_executor_allocation_issuance_and_public_signing_require_scoped
             &descriptor,
         ));
         assert!(
-            walletconnect_sign_personal_message(request(public(), reopened.clone()))
-                .await
-                .is_err()
+            walletconnect_sign_personal_message(
+                request(public(), reopened.clone()),
+                crate::OperationHttpClient::direct_for_tests()
+            )
+            .await
+            .is_err()
         );
         assert!(
             owner
@@ -509,7 +576,10 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
             db.clone(),
             view.clone(),
             chain(&rpc),
-            HttpContext::direct_for_tests(),
+            HttpContext::with_rpc_client_for_tests(
+                crate::rpc_broker::tests::tagged_reqwest_client("shared"),
+                crate::WalletNetworkMode::Direct,
+            ),
         )
         .unwrap(),
     );
@@ -521,6 +591,12 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
     );
     owner.discover_range(&restore, 42..43).await.unwrap();
     let record = owner.records().unwrap().remove(0);
+    // The recovery form's one client carries inspection, the step and its reconcile.
+    let recovery = crate::OperationHttpClient::for_tests(
+        crate::rpc_broker::tests::tagged_reqwest_client("recovery"),
+        crate::OperationNetworkIsolation::Dedicated,
+    );
+    let restored = rpc.state.routes.lock().unwrap().len();
     let authorization = authorize(
         &owner,
         &view,
@@ -540,6 +616,7 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
             U256::from(100),
             funding.clone(),
             &authorization,
+            &recovery,
         )
         .await
         .unwrap();
@@ -552,14 +629,15 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
                 ExecutorAsset::Native,
                 U256::from(101),
                 funding.clone(),
-                &authorization
+                &authorization,
+                &recovery
             )
             .await
             .is_err()
     );
     assert!(
         owner
-            .submit_native_recovery_batch(&prepared, &authorization, |_| {})
+            .submit_native_recovery_batch(&prepared, &authorization, &recovery, |_| {})
             .await
             .is_err()
     );
@@ -585,11 +663,18 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
     );
     assert!(
         owner
-            .submit_native_recovery_batch(&prepared, &authorization, |_| {})
+            .submit_native_recovery_batch(&prepared, &authorization, &recovery, |_| {})
             .await
             .is_err()
     );
     assert_eq!(owner.records().unwrap()[0].issued().len(), 1);
+    let routes = rpc.state.routes.lock().unwrap()[restored..].to_vec();
+    assert!(!routes.is_empty());
+    assert!(
+        routes
+            .iter()
+            .all(|route| route.as_deref() == Some("recovery"))
+    );
     let fresh = authorize(
         &owner,
         &view,
@@ -634,6 +719,7 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
                 maximum_private_fee: U256::from(1000),
             },
             &fresh,
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -728,7 +814,14 @@ async fn one_hardware_derivation_authorizes_both_setups_of_a_private_bridge_swap
         let delivery = ExecutorDelivery::PublicBroadcaster(Box::new(candidate));
         assert!(
             owner
-                .prepare_operation(operation, delivery, authorization, &[], None)
+                .prepare_operation(
+                    operation,
+                    delivery,
+                    authorization,
+                    &[],
+                    None,
+                    crate::OperationHttpClient::direct_for_tests()
+                )
                 .await
                 .is_err()
         );
@@ -747,6 +840,7 @@ async fn one_hardware_derivation_authorizes_both_setups_of_a_private_bridge_swap
             approval: private_bridge_approval(),
             authorization: &authorization,
             destination_authorization: Some(&destination_authorization),
+            client: crate::OperationHttpClient::direct_for_tests(),
         },
     )
     .await
@@ -836,7 +930,12 @@ async fn one_hardware_derivation_authorizes_both_setups_of_a_private_bridge_swap
         },
     );
     let Err(error) = destination
-        .admit_authorized_gas_signer(&view, &account, &gas)
+        .admit_authorized_gas_signer(
+            &view,
+            &account,
+            &gas,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
     else {
         panic!("an executable destination shield refuses the hardware gas signer");
@@ -862,6 +961,7 @@ async fn one_hardware_derivation_authorizes_both_setups_of_a_private_bridge_swap
             ),
             &[],
             Some("Private swap"),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap()
@@ -954,6 +1054,7 @@ async fn one_hardware_derivation_authorizes_both_setups_of_a_private_bridge_swap
         destination_candidate: None,
         authorization: &source_authorization,
         destination_authorization: Some(destination_authorization),
+        client: crate::OperationHttpClient::direct_for_tests(),
     };
     let before = (origin.records().unwrap(), destination.records().unwrap());
     for authorization in &refused {
@@ -1001,6 +1102,7 @@ async fn one_hardware_derivation_authorizes_both_setups_of_a_private_bridge_swap
             U256::from(1_000),
             authorization,
             None,
+            crate::OperationHttpClient::direct_for_tests(),
         )
     };
     for authorization in &refused {
@@ -1089,6 +1191,7 @@ async fn hardware_native_shield_is_sent_by_the_payer_its_approval_admits() {
             &other.public_account_uuid,
             Some(&owner),
             chain.chain_id,
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .is_err()
@@ -1100,6 +1203,7 @@ async fn hardware_native_shield_is_sent_by_the_payer_its_approval_admits() {
         &payer.public_account_uuid,
         Some(&owner),
         chain.chain_id,
+        crate::OperationHttpClient::direct_for_tests(),
     )
     .await
     .unwrap();
@@ -1125,6 +1229,7 @@ async fn hardware_native_shield_is_sent_by_the_payer_its_approval_admits() {
             U256::from(5_000_u64),
             request,
             "Shield",
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();

@@ -29,7 +29,7 @@ pub(super) struct Pending {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum EndpointHealthOutcome {
+pub(crate) enum EndpointHealthOutcome {
     Healthy,
     Neutral,
     Strike,
@@ -107,10 +107,17 @@ impl JobOutput {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Advisory events that callers send without waiting.
 pub(super) enum BlockEvent {
-    HeadObserved { chain_id: u64, block_number: u64 },
-    Invalidate { chain_id: u64 },
+    HeadObserved {
+        chain_id: u64,
+        block_number: u64,
+    },
+    Invalidate {
+        chain_id: u64,
+    },
+    /// The outcome of a request a caller sent to an endpoint itself.
+    EndpointReported(RequestEvent),
 }
 
 pub(super) type JobExecutor = Arc<
@@ -326,6 +333,7 @@ impl Actor {
                         self.cache.invalidate_head(chain_id);
                         self.flush();
                     }
+                    Some(BlockEvent::EndpointReported(event)) => self.apply_reported_event(&event),
                     None => block_events_closed = true,
                 },
                 Some(output) = self.jobs.next() => {
@@ -702,7 +710,8 @@ impl Actor {
         Ok(endpoints)
     }
     /// Eligible endpoints in hook order for a caller that sends its own requests. Session counts
-    /// exclude that traffic, so ranking by them would keep favoring the same endpoints.
+    /// include at most the outcomes such callers report, not every request they send, so ranking
+    /// by them would keep favoring the same endpoints.
     pub(super) fn select_candidates(
         &mut self,
         route: &RpcChainRoute,
@@ -848,6 +857,28 @@ impl Actor {
             }
         } else {
             self.apply_request_event(event, Instant::now(), true);
+        }
+    }
+    /// A caller's own request runs up to its full timeout, so three strikes in the health window
+    /// can't accumulate: a strike withdraws at once, as in warmup. Success clears an active
+    /// withdrawal but keeps its level, so repeated failures back off longer.
+    fn apply_reported_event(&mut self, event: &RequestEvent) {
+        let now = Instant::now();
+        if event.health_outcome != EndpointHealthOutcome::Healthy {
+            self.apply_request_event(event, now, true);
+            return;
+        }
+        let profile = self
+            .profiles
+            .entry((event.chain_id, event.endpoint.clone()))
+            .or_default();
+        profile.request_count = profile.request_count.saturating_add(1);
+        if profile.withdrawn_until.take().is_some() {
+            tracing::debug!(
+                chain_id = event.chain_id,
+                endpoint = %crate::http::redact_url_for_display(&event.endpoint),
+                "RPC endpoint recovered"
+            );
         }
     }
     fn apply_request_event(&mut self, event: &RequestEvent, now: Instant, warmup: bool) {

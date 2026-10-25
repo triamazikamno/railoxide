@@ -49,13 +49,13 @@ use ui::recipient_picker::RecipientPickerEvent;
 use ui::theme;
 use wallet_ops::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, ExecutorRecoveryFeeEstimate,
-    OperationNetworkIsolation, PublicBroadcasterCandidate, PublicBroadcasterResultKind,
-    PublicBroadcasterSelection, QuoteDeviationError, SwapAccountCandidate, SwapAccountReplacement,
-    SwapAccountReplacements, SwapAmountPlan, SwapAmountRequest, SwapBridgeClients, SwapBridgeQuote,
-    SwapBridgeRoute, SwapDestinationContext, SwapExecutor, SwapOrderOutcome, SwapOrderRequest,
-    SwapPairPreparation, SwapPairSide, SwapPrice, SwapReview, SwapReviewChange, SwapReviewRequest,
-    SwapSetupRequest, TokenAnchorRateCache, TransactionGenerationStage, WakuDeliveryClient,
-    WalletSession,
+    OperationHttpClient, OperationNetworkIsolation, PublicBroadcasterCandidate,
+    PublicBroadcasterResultKind, PublicBroadcasterSelection, QuoteDeviationError,
+    SwapAccountCandidate, SwapAccountReplacement, SwapAccountReplacements, SwapAmountPlan,
+    SwapAmountRequest, SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapDestinationContext,
+    SwapExecutor, SwapOrderOutcome, SwapOrderRequest, SwapPairPreparation, SwapPairSide, SwapPrice,
+    SwapReview, SwapReviewChange, SwapReviewRequest, SwapSetupRequest, TokenAnchorRateCache,
+    TransactionGenerationStage, WakuDeliveryClient, WalletSession,
     bridge::{
         BridgeApiError, BridgeDestination, PublicBridgePath, across_destination_tokens,
         near_destination_tokens,
@@ -1696,6 +1696,8 @@ enum QuoteExecutor {
 }
 
 struct QuoteRequest {
+    /// Opens the swap's orderbook route when the request carries none.
+    http: wallet_ops::HttpContext,
     executor: QuoteExecutor,
     /// This session's last read at the latest block that showed the swap's own setup included,
     /// for an order or a speed-up on that setup while its record leaves it unresolved.
@@ -1797,9 +1799,10 @@ async fn resume_pair_side(
     operation: ExecutorOperationId,
     candidate: Option<&PublicBroadcasterCandidate>,
     authorization: &DesktopPrivateSpendAuthorization,
+    client: &OperationHttpClient,
 ) -> eyre::Result<SwapPairSide> {
     match candidate {
-        Some(candidate) => Box::pin(accounts.resume_setup(side, candidate, authorization))
+        Some(candidate) => Box::pin(accounts.resume_setup(side, candidate, authorization, client))
             .await
             .map(SwapPairSide::Setup),
         None => existing_pair_side(owner, operation),
@@ -1912,7 +1915,7 @@ async fn quote_swap_terms(
     let client = if let Some(client) = orderbook.clone() {
         client
     } else {
-        let client = Box::pin(owner.swap_orderbook_client()).await?;
+        let client = owner.swap_orderbook_client(&request.http.operation_http_client().await?)?;
         *orderbook = Some(client.clone());
         client
     };
@@ -2142,6 +2145,7 @@ struct BridgeRoutesResult {
 /// the form has none yet.
 async fn request_bridge_routes(
     owner: Arc<ExecutorOwner>,
+    http: wallet_ops::HttpContext,
     orderbook: Option<CowOrderbookClient>,
     bridge_clients: Option<SwapBridgeClients>,
     origin: BridgeProfile,
@@ -2156,7 +2160,7 @@ async fn request_bridge_routes(
         let client = if let Some(client) = orderbook.clone() {
             client
         } else {
-            let client = Box::pin(owner.swap_orderbook_client()).await?;
+            let client = owner.swap_orderbook_client(&http.operation_http_client().await?)?;
             orderbook = Some(client.clone());
             client
         };
@@ -3164,15 +3168,20 @@ impl PrivateSwapsView {
                 .get(self.origin_chain_id)
                 .and_then(EffectiveChainConfig::swap_profile)
         });
-        let (Some(owner), Some(profile)) = (self.private_owner().cloned(), profile) else {
+        let (Some(owner), Some(profile), Some(http)) =
+            (self.private_owner().cloned(), profile, self.http(cx))
+        else {
             tracing::warn!("the debug UI fixture's review needs the network's private session");
             return;
         };
         let runtime = self.runtime.clone();
         cx.spawn_in(window, async move |view, cx| {
-            let orderbook = runtime
-                .spawn(async move { Box::pin(owner.swap_orderbook_client()).await })
-                .await;
+            let orderbook =
+                runtime
+                    .spawn(async move {
+                        owner.swap_orderbook_client(&http.operation_http_client().await?)
+                    })
+                    .await;
             let _ = view.update_in(cx, |view, window, cx| {
                 if let Ok(Ok(orderbook)) = orderbook {
                     view.stage_ui_fixture_retry_review(&profile, orderbook, window, cx);
@@ -4155,7 +4164,7 @@ impl PrivateSwapsView {
             .as_ref()
             .and_then(|_| form.bridge_clients.clone());
         let operation = form.operation;
-        let Some(owner) = self.private_owner().cloned() else {
+        let (Some(owner), Some(http)) = (self.private_owner().cloned(), self.http(cx)) else {
             return;
         };
         let runtime = self.runtime.clone();
@@ -4163,6 +4172,7 @@ impl PrivateSwapsView {
             let result = runtime
                 .spawn(request_bridge_routes(
                     owner,
+                    http,
                     orderbook,
                     bridge_clients,
                     origin,
@@ -4203,7 +4213,10 @@ impl PrivateSwapsView {
                 {
                     form.set_orderbook(Some(orderbook.clone()), result.bridge_clients);
                     if let Some(operation) = operation {
-                        self.tracking.entry(operation).or_default().orderbook = Some(orderbook);
+                        self.tracking
+                            .entry(operation)
+                            .or_default()
+                            .set_route(Some(orderbook));
                     }
                 }
                 result.routes
@@ -4259,7 +4272,7 @@ impl PrivateSwapsView {
             .operation
             .and_then(|operation| self.tracking.get_mut(&operation))
         {
-            tracking.orderbook = None;
+            tracking.set_route(None);
         }
         self.load_bridge_routes(window, cx);
         cx.notify();
@@ -6235,9 +6248,10 @@ impl PrivateSwapsView {
         cx: &mut Context<'_, Self>,
     ) {
         let operation = approval.operation;
-        let (Some(owner), Some(session)) = (
+        let (Some(owner), Some(session), Some(http)) = (
             self.private_owner().cloned(),
             self.private_session().cloned(),
+            self.http(cx),
         ) else {
             return;
         };
@@ -6332,7 +6346,7 @@ impl PrivateSwapsView {
             .valid_for_secs
             .map(|secs| Duration::from_secs(secs.into()));
         if approval.orderbook.is_some() {
-            tracking.orderbook.clone_from(&approval.orderbook);
+            tracking.set_route(approval.orderbook.clone());
         }
         // An existing account keeps what this session observed of its own setup.
         if approval.origin.is_some() {
@@ -6350,6 +6364,8 @@ impl PrivateSwapsView {
         // needs is confirmed, whichever of its accounts is the new one.
         tracking.auto_place = true;
         let byte_budget = tracking.byte_budget;
+        // The setups' account reads go over the swap's route, which its order keeps.
+        let route = self.swap_route(&http, operation);
         // A swap whose own account was replaced before keeps the use it started with, which
         // isn't its new account's first.
         let reserved_use = self
@@ -6390,6 +6406,8 @@ impl PrivateSwapsView {
                     },
                 );
                 let outcome = Box::pin(async {
+                    let orderbook = route.orderbook(&owner).await?;
+                    let client = orderbook.http();
                     // A destination account that can't be reserved again doesn't hold back the
                     // swap's own setup.
                     let (mut prepared, prepared_destination) = match &destination {
@@ -6403,6 +6421,7 @@ impl PrivateSwapsView {
                                 operation,
                                 origin.as_ref().map(|origin| &origin.candidate),
                                 &authorization,
+                                client,
                             )
                             .await?;
                             let prepared_destination = resume_pair_side(
@@ -6412,6 +6431,7 @@ impl PrivateSwapsView {
                                 destination.plan.identity().1,
                                 destination.plan.setup().map(|setup| &setup.candidate),
                                 &destination.authorization,
+                                client,
                             )
                             .await;
                             (prepared, Some(prepared_destination))
@@ -6443,6 +6463,7 @@ impl PrivateSwapsView {
                                     .map(|setup| setup.candidate.clone()),
                                 authorization: &authorization,
                                 destination_authorization: Some(&destination.authorization),
+                                client,
                             }))
                             .await?;
                             saved = prepared.approval;
@@ -6456,6 +6477,7 @@ impl PrivateSwapsView {
                                 operation,
                                 origin.as_ref().map(|origin| &origin.candidate),
                                 &authorization,
+                                client,
                             )
                             .await?,
                             None,
@@ -6471,6 +6493,7 @@ impl PrivateSwapsView {
                                 saved.clone(),
                                 None,
                                 &authorization,
+                                client,
                             ))
                             .await;
                             (
@@ -6480,6 +6503,7 @@ impl PrivateSwapsView {
                                         prepared,
                                         &origin.candidate,
                                         &authorization,
+                                        client,
                                     ))
                                     .await?,
                                 ),
@@ -6532,6 +6556,7 @@ impl PrivateSwapsView {
                         progress_tx: progress,
                         response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
                         republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
+                        client: client.clone(),
                     });
                     let (origin, destination) = match (&destination, prepared_destination) {
                         (Some(destination), Some(Ok(mut prepared_destination))) => {
@@ -6545,6 +6570,7 @@ impl PrivateSwapsView {
                                     progress_tx: destination_progress,
                                     response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
                                     republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
+                                    client: client.clone(),
                                 });
                             Box::pin(accounts.submit_setups(
                                 (&mut prepared, origin_request),
@@ -6883,7 +6909,7 @@ impl PrivateSwapsView {
             .operation
             .and_then(|operation| self.tracking.get_mut(&operation))
         {
-            tracking.orderbook = None;
+            tracking.set_route(None);
         }
         self.schedule_quote(window, cx);
     }
@@ -6993,9 +7019,10 @@ impl PrivateSwapsView {
             tracking.valid_for = Some(valid_for);
             tracking.orderbook.clone()
         });
-        let (Some(owner), Some(session)) = (
+        let (Some(owner), Some(session), Some(http)) = (
             self.private_owner().cloned(),
             self.private_session().cloned(),
+            self.http(cx),
         ) else {
             return;
         };
@@ -7003,6 +7030,7 @@ impl PrivateSwapsView {
             return;
         };
         let request = QuoteRequest {
+            http,
             executor: terms.executor,
             inclusion,
             sell: terms.sell,
@@ -7248,7 +7276,10 @@ impl PrivateSwapsView {
         if let Some(orderbook) = result.orderbook {
             form.set_orderbook(Some(orderbook.clone()), result.bridge_clients);
             if let Some(operation) = operation {
-                self.tracking.entry(operation).or_default().orderbook = Some(orderbook);
+                self.tracking
+                    .entry(operation)
+                    .or_default()
+                    .set_route(Some(orderbook));
             }
         }
         form.quoted_bridge = result.bridge;
@@ -8428,8 +8459,10 @@ impl PrivateSwapsView {
         let inclusion = self
             .record(operation)
             .and_then(|record| self.setup_inclusion(record));
+        let http = root.read(cx).http.clone();
         let tracking = self.tracking.entry(operation).or_default();
         let request = QuoteRequest {
+            http,
             executor: QuoteExecutor::Order { operation, reuse },
             inclusion,
             sell,
@@ -8477,7 +8510,7 @@ impl PrivateSwapsView {
     ) {
         let tracking = self.tracking.entry(operation).or_default();
         if let Some(orderbook) = &result.orderbook {
-            tracking.orderbook = Some(orderbook.clone());
+            tracking.set_route(Some(orderbook.clone()));
         }
         // Whatever the answer, the next attempt waits for the user.
         tracking.auto_place = false;
@@ -8485,7 +8518,7 @@ impl PrivateSwapsView {
             Ok(outcome) => outcome,
             Err(error) => {
                 // The next attempt gets a new isolated route instead of the failed circuit.
-                self.tracking.entry(operation).or_default().orderbook = None;
+                self.tracking.entry(operation).or_default().set_route(None);
                 // The quote's values stay in the form's Details, out of the swap's failure text.
                 let message = self.quote_error_message(&error, cx);
                 self.fail(operation, message);
@@ -8826,6 +8859,7 @@ impl PrivateSwapsView {
                             destination_candidate: None,
                             authorization: &authorization,
                             destination_authorization: Some(&destination.authorization),
+                            client: approval.orderbook.http(),
                         },
                     ))
                     .await?;

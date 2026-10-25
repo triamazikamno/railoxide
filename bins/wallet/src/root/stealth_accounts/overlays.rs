@@ -254,6 +254,10 @@ impl StealthAccountsView {
         self.refresh_visible(cx);
         self.select_recovery_account(operation, cx);
         self.recovery.open = true;
+        self.recovery.client = self
+            .root
+            .upgrade()
+            .map(|root| wallet_ops::OperationHttpClientSlot::new(root.read(cx).http.clone()));
         self.recovery.gas_quote = None;
         self.recovery.native_funding = self.recovery_has_native_balance();
         self.sync_recovery_assets(window, cx);
@@ -434,7 +438,7 @@ fn restore_dialog(
     let error = range.as_ref().err().copied();
     let description = match &range {
         Ok(range) => format!(
-            "Derives accounts #{}–#{} from this wallet's seed and asks the endpoint, in one request, which of them have been used. Balances are not checked.",
+            "Derives accounts #{}–#{} from this wallet's seed and asks the endpoint whether each has been used, one address per request, a few seconds apart. Balances are not checked.",
             range.start,
             range.end - 1
         ),

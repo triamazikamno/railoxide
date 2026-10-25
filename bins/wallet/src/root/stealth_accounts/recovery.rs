@@ -71,6 +71,10 @@ pub(super) struct RecoveryForm {
     pub(super) prepared: Option<Arc<PreparedExecutorRecovery>>,
     progress: Option<Task<()>>,
     dialog: Option<RecoveryProgress>,
+    /// The open form's route: every read of the recovery, from its inspection through its last
+    /// step and the reconcile after it, goes over it. Opened on first use, and dropped when the
+    /// form closes.
+    pub(super) client: Option<wallet_ops::OperationHttpClientSlot>,
 }
 
 impl RecoveryForm {
@@ -131,6 +135,7 @@ impl RecoveryForm {
             prepared: None,
             progress: None,
             dialog: None,
+            client: None,
         }
     }
 }
@@ -398,12 +403,17 @@ impl StealthAccountsView {
         cx: &mut Context<'_, Self>,
     ) {
         let owner = Arc::clone(&self.owner);
+        // A form that closed takes no further step.
+        let Some(route) = self.recovery.client.clone() else {
+            return;
+        };
         match action {
             RecoveryAuthorization::Prepare { approval } => {
                 self.start_recovery_job(
                     RecoveryProgressSource::Preparation,
                     show_progress,
                     async move {
+                        let client = route.client().await?;
                         let operation = approval.operation();
                         let asset = approval.asset();
                         let amount = approval.amount();
@@ -417,11 +427,19 @@ impl StealthAccountsView {
                                     amount,
                                     funding,
                                     &authorization,
+                                    &client,
                                 )
                                 .await
                         } else {
                             owner
-                                .prepare_recovery(operation, asset, amount, funding, &authorization)
+                                .prepare_recovery(
+                                    operation,
+                                    asset,
+                                    amount,
+                                    funding,
+                                    &authorization,
+                                    &client,
+                                )
                                 .await
                         }
                         .map(Arc::new)?;
@@ -466,10 +484,12 @@ impl StealthAccountsView {
                             let report = move |update| {
                                 let _ = progress.send(Some(update));
                             };
+                            let client = route.client().await?;
                             Ok(batch_recovery_result(
                                 &Box::pin(owner.submit_native_recovery_batch(
                                     &prepared,
                                     &authorization,
+                                    &client,
                                     report,
                                 ))
                                 .await?,
@@ -504,6 +524,7 @@ impl StealthAccountsView {
                         async move {
                             let outcome = owner
                                 .submit_paid_recovery(ExecutorPaidRecoveryRequest {
+                                    client: route.client().await?,
                                     recovery: prepared,
                                     session,
                                     authorization,

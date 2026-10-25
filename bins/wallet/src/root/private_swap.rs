@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use alloy::primitives::{Address, U256};
 use gpui::{AppContext as _, Context, Entity, Task, WeakEntity, Window};
 use gpui_component::WindowExt as _;
+use rand::RngExt as _;
 use tokio::sync::watch;
 use wallet_ops::cow::OrderUid;
 use wallet_ops::{
@@ -129,8 +130,13 @@ pub(super) use model::{
 };
 use setup_progress::SetupProgress;
 
-/// Delay between caught-up observation passes, and before retrying failed reads.
+/// The longest wait between passes of a polling loop, which notice newly tracked swaps and
+/// continue waiting work, and the first back-off of a bridge provider poll. Each swap's own
+/// polls follow its [`SwapSchedule`].
 const SWAP_OBSERVATION_INTERVAL: Duration = Duration::from_secs(12);
+/// The shortest wait before a swap's next poll, and the polling loops' first wait, so swaps
+/// loaded with the view are first polled 9-15 s after it opens.
+const MIN_SWAP_POLL_INTERVAL: Duration = Duration::from_secs(9);
 /// Longest wait between routine polls of a bridge provider about one order.
 const MAX_BRIDGE_POLL_INTERVAL: Duration = Duration::from_mins(5);
 /// The order validity a prepared swap's draft restores from an approval saved without one. The
@@ -347,8 +353,8 @@ struct SwapTracking {
     /// The gas share and order validity entered before the first order records them.
     gas_share_bps: Option<u16>,
     valid_for: Option<Duration>,
-    /// The swap's own orderbook route, kept for its quotes, its order submission, and its
-    /// order reports.
+    /// The swap's own orderbook route, kept for its quotes, its order submission, its order
+    /// reports, and the RPC reads of its accounts.
     orderbook: Option<CowOrderbookClient>,
     /// The orderbook's last report on each order asked about, by its UID, so a report on one
     /// competing order never replaces another's. Display and location only; never an outcome.
@@ -363,6 +369,9 @@ struct SwapTracking {
     bridge_polls: HashMap<OrderUid, BridgePoll>,
     /// Bridge provider clients on the `orderbook` route, kept with it for status checks.
     bridge_clients: Option<wallet_ops::SwapBridgeClients>,
+    /// The route a polling loop opens for the swap while it keeps no `orderbook`, shared by
+    /// both loops until the opened client is kept there.
+    opening: Arc<tokio::sync::OnceCell<CowOrderbookClient>>,
     /// Traded orders whose executed fee this session already asked the orderbook for, whatever
     /// the answer, so a failed read isn't repeated until the next session.
     fee_asked: HashSet<OrderUid>,
@@ -417,6 +426,33 @@ impl SwapTracking {
         self.destination_setup_progress = None;
     }
 
+    /// Replaces the swap's route, or drops it with `None`. A read still opening a route through
+    /// the previous `opening` never installs it afterwards.
+    fn set_route(&mut self, client: Option<CowOrderbookClient>) {
+        self.orderbook = client;
+        self.opening = Arc::default();
+    }
+
+    /// The route cell a read of the swap goes over: a fresh one holding the kept route, or the
+    /// shared `opening` while the swap keeps none.
+    fn route_cell(&self) -> Arc<tokio::sync::OnceCell<CowOrderbookClient>> {
+        match &self.orderbook {
+            Some(orderbook) => Arc::new(orderbook.clone().into()),
+            None => Arc::clone(&self.opening),
+        }
+    }
+
+    /// Keeps the route a background read opened through the swap's current `opening`. A read
+    /// over a kept route, or over an opening that a later route change replaced, keeps nothing.
+    fn keep_route(&mut self, cell: &Arc<tokio::sync::OnceCell<CowOrderbookClient>>) {
+        if Arc::ptr_eq(cell, &self.opening)
+            && let Some(client) = cell.get()
+        {
+            self.orderbook.get_or_insert_with(|| client.clone());
+            self.opening = Arc::default();
+        }
+    }
+
     /// Makes the next bridge provider poll of `uid` wait longer, after one without an outcome.
     fn back_off_bridge_poll(&mut self, uid: OrderUid, now: Instant) {
         let attempts = self.bridge_polls.get(&uid).map_or(0, |poll| poll.attempts);
@@ -465,6 +501,93 @@ fn bridge_poll_interval(attempts: u32) -> Duration {
     SWAP_OBSERVATION_INTERVAL
         .saturating_mul(2_u32.saturating_pow(attempts))
         .min(MAX_BRIDGE_POLL_INTERVAL)
+}
+
+/// A random 9-15 s wait before a swap's next poll, chosen afresh for each poll.
+fn swap_poll_interval() -> Duration {
+    Duration::from_millis(rand::rng().random_range(9_000..=15_000))
+}
+
+/// When each tracked swap is next polled. Every swap keeps its own due time, a fresh
+/// interval after its previous poll completed, so swaps are polled out of step rather than on
+/// one shared tick.
+struct SwapSchedule<K> {
+    due: BTreeMap<K, Instant>,
+    /// Swaps woken since their last poll was dispatched, which its completion leaves due.
+    woken: BTreeSet<K>,
+    interval: fn() -> Duration,
+    /// When the view started, until the first pass.
+    start: Option<Instant>,
+}
+
+impl<K: Ord + Copy> SwapSchedule<K> {
+    fn new() -> Self {
+        Self::with_interval(swap_poll_interval, Instant::now())
+    }
+
+    const fn with_interval(interval: fn() -> Duration, start: Instant) -> Self {
+        Self {
+            due: BTreeMap::new(),
+            woken: BTreeSet::new(),
+            interval,
+            start: Some(start),
+        }
+    }
+
+    /// Keeps the `items` of the swaps due at `now`, and makes each of those swaps next due an
+    /// interval from `now` while its poll runs. The swaps of `items` are the tracked ones: a swap
+    /// first seen is due an interval from the view's start on the first pass and from `now`
+    /// after it, and one absent from `items` is forgotten.
+    fn poll_due<T>(&mut self, mut items: Vec<T>, key: impl Fn(&T) -> K, now: Instant) -> Vec<T> {
+        let interval = self.interval;
+        let seen = self.start.take().unwrap_or(now);
+        let tracked = items.iter().map(&key).collect::<BTreeSet<_>>();
+        self.due.retain(|swap, _| tracked.contains(swap));
+        self.woken.retain(|swap| tracked.contains(swap));
+        let mut due = BTreeSet::new();
+        for swap in tracked {
+            let at = self.due.entry(swap).or_insert_with(|| seen + interval());
+            if *at <= now {
+                *at = now + interval();
+                self.woken.remove(&swap);
+                due.insert(swap);
+            }
+        }
+        items.retain(|item| due.contains(&key(item)));
+        items
+    }
+
+    /// Makes each still tracked swap of `swaps`, whose poll completed at `now`, next due a fresh
+    /// interval from `now`, so a poll slower than its interval isn't repeated at once. A swap
+    /// woken since its poll was dispatched stays due.
+    fn polled(&mut self, swaps: &BTreeSet<K>, now: Instant) {
+        for swap in swaps {
+            if !self.woken.contains(swap)
+                && let Some(at) = self.due.get_mut(swap)
+            {
+                *at = now + (self.interval)();
+            }
+        }
+    }
+
+    /// Makes `swap` due at `now`.
+    fn wake(&mut self, swap: K, now: Instant) {
+        self.due.insert(swap, now);
+        self.woken.insert(swap);
+    }
+
+    fn next_due(&self) -> Option<Instant> {
+        self.due.values().min().copied()
+    }
+}
+
+/// How long a polling loop waits for the next swap due at `next`: at most
+/// [`SWAP_OBSERVATION_INTERVAL`].
+fn poll_wait(next: Option<Instant>) -> Duration {
+    next.map_or(SWAP_OBSERVATION_INTERVAL, |at| {
+        at.saturating_duration_since(Instant::now())
+    })
+    .min(SWAP_OBSERVATION_INTERVAL)
 }
 
 /// What the orderbook last reported about one order.
@@ -615,6 +738,8 @@ pub(super) struct PrivateSwapsView {
     owner: Option<Arc<ExecutorOwner>>,
     public_records: Vec<(u64, ExecutorRecord)>,
     public_tracking: BTreeSet<(u64, ExecutorOperationId, SwapUseId)>,
+    /// When each Public account swap's status is next checked in the background.
+    public_schedule: SwapSchedule<(u64, ExecutorOperationId, SwapUseId)>,
     /// Confirmed destination token balances from explicit held-proceeds checks this session.
     public_destination_balances:
         BTreeMap<(u64, ExecutorOperationId, SwapUseId), (U256, alloy::eips::BlockNumHash)>,
@@ -646,6 +771,8 @@ pub(super) struct PrivateSwapsView {
     /// Counts setups private sync newly showed. The observation loop starts its next pass
     /// when it changes, so wakes during a pass coalesce into one follow-up pass.
     observation_wake: watch::Sender<u64>,
+    /// When each swap's pages are next observed, by the swap's operation.
+    observation_schedule: SwapSchedule<ExecutorOperationId>,
     tracking: BTreeMap<ExecutorOperationId, SwapTracking>,
     /// Each private Bridge swap's destination stealth account record, by the swap's operation,
     /// as last read from the destination network's own executor records. An entry exists once
@@ -1004,18 +1131,16 @@ impl PrivateSwapsView {
         let observation_wake = watch::channel(0).0;
         let mut wake = observation_wake.subscribe();
         let polling = cx.spawn_in(window, async move |this, cx| {
-            let mut catchup = Vec::new();
+            let mut wait = MIN_SWAP_POLL_INTERVAL;
             loop {
                 let mut woken = false;
-                if catchup.is_empty() {
-                    tokio::select! {
-                        () = cx.background_executor().timer(SWAP_OBSERVATION_INTERVAL) => {}
-                        changed = wake.changed() => {
-                            if changed.is_err() {
-                                break;
-                            }
-                            woken = true;
+                tokio::select! {
+                    () = cx.background_executor().timer(wait) => {}
+                    changed = wake.changed() => {
+                        if changed.is_err() {
+                            break;
                         }
+                        woken = true;
                     }
                 }
                 let Ok(work) = this.update_in(cx, |this, window, cx| {
@@ -1030,42 +1155,84 @@ impl PrivateSwapsView {
                     this.continue_public_swap_after_setup(window, cx);
                     this.refresh_destinations(cx);
                     this.continue_approved_swaps(window, cx);
-                    let (runtime, owner, mut pages) = this.next_observations(cx)?;
-                    if !catchup.is_empty() {
-                        // Drain only successful, lagging scans. Caught-up and failed
-                        // accounts keep the normal polling interval.
-                        pages.retain(|page| catchup.contains(&page.operation));
-                    }
-                    (!pages.is_empty()).then_some((runtime, owner, pages))
+                    this.track_records();
+                    let (work, pages) = match this.next_observations(cx) {
+                        Some((runtime, owner, pages)) => (Some((runtime, owner)), pages),
+                        None => (None, Vec::new()),
+                    };
+                    // Only the swaps due now are observed.
+                    let pages = this.observation_schedule.poll_due(
+                        pages,
+                        ObservationPage::swap,
+                        Instant::now(),
+                    );
+                    work.filter(|_| !pages.is_empty())
+                        .map(|(runtime, owner)| (runtime, owner, pages))
                 }) else {
                     break;
                 };
-                catchup.clear();
                 if let Some((runtime, owner, pages)) = work {
+                    let polled = pages
+                        .iter()
+                        .map(ObservationPage::swap)
+                        .collect::<BTreeSet<_>>();
                     let results = runtime.spawn(observe_pages(owner, pages)).await;
-                    let Ok(next) = this.update_in(cx, |this, window, cx| {
-                        results.map_or_else(
-                            |_| Vec::new(),
-                            |results| this.apply_observations(results, window, cx),
-                        )
-                    }) else {
+                    if this
+                        .update_in(cx, |this, window, cx| {
+                            let now = Instant::now();
+                            this.observation_schedule.polled(&polled, now);
+                            if let Ok(results) = results {
+                                // A successful, lagging scan is drained at once. Caught-up
+                                // and failed accounts keep their schedule.
+                                for operation in this.apply_observations(results, window, cx) {
+                                    this.observation_schedule.wake(operation, now);
+                                }
+                            }
+                        })
+                        .is_err()
+                    {
                         break;
-                    };
-                    catchup = next;
+                    }
                 }
+                let Ok(next) = this.update_in(cx, |this, _, _| {
+                    this.observation_schedule
+                        .next_due()
+                        .into_iter()
+                        .chain(this.public_schedule.next_due())
+                        .min()
+                }) else {
+                    break;
+                };
+                wait = poll_wait(next);
             }
         });
         // Orderbook reports only add copy, so they poll on their own loop: a stalled orderbook
         // never delays canonical observation or order placement. At most one batch is in flight.
         let hint_polling = cx.spawn_in(window, async move |this, cx| {
+            // Each swap's orders are asked about on its own schedule.
+            let mut schedule = SwapSchedule::<ExecutorOperationId>::new();
+            let mut first_wait = Some(MIN_SWAP_POLL_INTERVAL);
             loop {
                 cx.background_executor()
-                    .timer(SWAP_OBSERVATION_INTERVAL)
+                    .timer(
+                        first_wait
+                            .take()
+                            .unwrap_or_else(|| poll_wait(schedule.next_due())),
+                    )
                     .await;
-                let Ok(hints) = this.update_in(cx, |this, _, cx| this.next_order_hints(cx)) else {
+                let Ok(hints) = this.update_in(cx, |this, _, cx| {
+                    this.track_records();
+                    this.next_order_hints(cx)
+                }) else {
                     break;
                 };
-                let Some((runtime, owner, requests)) = hints else {
+                let (work, requests) = match hints {
+                    Some((runtime, owner, requests)) => (Some((runtime, owner)), requests),
+                    None => (None, Vec::new()),
+                };
+                let requests =
+                    schedule.poll_due(requests, |request| request.operation, Instant::now());
+                let Some((runtime, owner)) = work.filter(|_| !requests.is_empty()) else {
                     continue;
                 };
                 let _ = this.update_in(cx, |this, _, cx| {
@@ -1081,7 +1248,12 @@ impl PrivateSwapsView {
                         });
                     }
                 });
+                let polled = requests
+                    .iter()
+                    .map(|request| request.operation)
+                    .collect::<BTreeSet<_>>();
                 let results = runtime.spawn(fetch_order_hints(owner, requests)).await;
+                schedule.polled(&polled, Instant::now());
                 if this
                     .update_in(cx, |this, _, cx| {
                         if let Ok(results) = results {
@@ -1101,6 +1273,7 @@ impl PrivateSwapsView {
             owner,
             public_records: Vec::new(),
             public_tracking: BTreeSet::new(),
+            public_schedule: SwapSchedule::new(),
             public_destination_balances: BTreeMap::new(),
             public_railgun: BTreeMap::new(),
             public_synced: BTreeSet::new(),
@@ -1116,6 +1289,7 @@ impl PrivateSwapsView {
             records: Vec::new(),
             setup_inclusions: None,
             observation_wake,
+            observation_schedule: SwapSchedule::new(),
             tracking: BTreeMap::new(),
             destinations: BTreeMap::new(),
             attributions: BTreeMap::new(),
@@ -1151,6 +1325,35 @@ impl PrivateSwapsView {
     /// The origin network's executor owner, as [`Self::private_session`] is available.
     const fn private_owner(&self) -> Option<&Arc<ExecutorOwner>> {
         self.owner.as_ref()
+    }
+
+    /// The wallet's network context, which opens the routes of swaps and checks.
+    fn http(&self, cx: &gpui::App) -> Option<wallet_ops::HttpContext> {
+        Some(self.root.upgrade()?.read(cx).http.clone())
+    }
+
+    /// Gives every loaded swap a tracking entry, so that both polling loops share the route
+    /// either of them opens for it.
+    fn track_records(&mut self) {
+        for record in &self.records {
+            self.tracking.entry(record.operation()).or_default();
+        }
+    }
+
+    /// The route the swap `operation` is read over: the one it keeps, or the one its tracking
+    /// entry opens once for both polling loops.
+    fn swap_route(
+        &self,
+        http: &wallet_ops::HttpContext,
+        operation: ExecutorOperationId,
+    ) -> SwapRoute {
+        SwapRoute {
+            http: http.clone(),
+            orderbook: self
+                .tracking
+                .get(&operation)
+                .map_or_else(Arc::default, SwapTracking::route_cell),
+        }
     }
 
     fn public_record_chain(&self, record: &ExecutorRecord) -> Option<u64> {
@@ -1195,7 +1398,7 @@ impl PrivateSwapsView {
                 records
                     .sort_by_key(|record| std::cmp::Reverse((record.created_at(), record.index())));
                 // Only a setup that private sync newly shows in a transaction recorded for it
-                // wakes the observation loop: it makes the setup's account check due at once,
+                // wakes the observation loop: it makes that swap's account check due at once,
                 // with its read at the latest block, also beside an order placed on it.
                 // Waking on every owner change would spin, since each pass records its own
                 // observations.
@@ -1209,11 +1412,13 @@ impl PrivateSwapsView {
                         .map_or(&[][..], |observation| &observation.snapshot.utxos[..]);
                     synced_setup_inclusions(&records, utxos)
                 };
-                if self
-                    .setup_inclusions
-                    .as_ref()
-                    .is_some_and(|known| !inclusions.is_subset(known))
+                if let Some(known) = &self.setup_inclusions
+                    && !inclusions.is_subset(known)
                 {
+                    let now = Instant::now();
+                    for &operation in inclusions.difference(known) {
+                        self.observation_schedule.wake(operation, now);
+                    }
                     self.observation_wake
                         .send_modify(|wakes| *wakes = wakes.wrapping_add(1));
                 }
@@ -1710,7 +1915,7 @@ impl PrivateSwapsView {
         let Some((_, owner)) = self.destination_owner(chain_id, cx) else {
             return;
         };
-        let Some(origin) = self.private_owner().cloned() else {
+        let (Some(origin), Some(http)) = (self.private_owner().cloned(), self.http(cx)) else {
             return;
         };
         drop(self.runtime.spawn(async move {
@@ -1724,9 +1929,16 @@ impl PrivateSwapsView {
             })
             .await
             .unwrap_or_default();
+            if delivered.is_empty() {
+                return;
+            }
+            // This reconciliation's own route. A failed read, or a route that can't open, leaves
+            // the account unavailable until the swap is checked again.
+            let Ok(client) = http.operation_http_client().await else {
+                return;
+            };
             for account in delivered {
-                // A failed read leaves the account unavailable until the swap is checked again.
-                let _ = Box::pin(owner.reconcile_account(account)).await;
+                let _ = Box::pin(owner.reconcile_account(account, &client)).await;
             }
         }));
     }
@@ -2738,6 +2950,7 @@ impl PrivateSwapsView {
             return None;
         }
         let confirmed = self.confirmed_block(cx)?;
+        let http = self.http(cx)?;
         let busy = self.job.as_ref().map(|job| job.operation);
         let pages = self
             .records
@@ -2781,6 +2994,7 @@ impl PrivateSwapsView {
                                 // catch up.
                                 range: Some(confirmed..confirmed.saturating_add(1)),
                                 destination: None,
+                                route: self.swap_route(&http, record.operation()),
                             })
                         })
                         .collect::<Vec<_>>();
@@ -2793,6 +3007,7 @@ impl PrivateSwapsView {
                             settlement: None,
                             range: None,
                             destination: None,
+                            route: self.swap_route(&http, record.operation()),
                         })
                         .into_iter()
                         .collect();
@@ -2805,6 +3020,7 @@ impl PrivateSwapsView {
                         settlement: None,
                         range: Some(swap_observation_range(cursor, confirmed)),
                         destination: None,
+                        route: self.swap_route(&http, record.operation()),
                     })
                     .into_iter()
                     .collect()
@@ -2826,13 +3042,14 @@ impl PrivateSwapsView {
                         settlement: None,
                         range: None,
                         destination: None,
+                        route: self.swap_route(&http, record.operation()),
                     }),
             )
             .chain(
                 self.records
                     .iter()
                     .filter(|record| Some(record.operation()) != busy)
-                    .filter_map(|record| self.destination_observation(record, cx)),
+                    .filter_map(|record| self.destination_observation(record, &http, cx)),
             )
             .collect::<Vec<_>>();
         let owner = self.private_owner().filter(|_| !pages.is_empty())?;
@@ -2847,6 +3064,7 @@ impl PrivateSwapsView {
     fn destination_observation(
         &self,
         record: &ExecutorRecord,
+        http: &wallet_ops::HttpContext,
         cx: &gpui::App,
     ) -> Option<ObservationPage> {
         if record.is_swap_setup_stopped() {
@@ -2892,6 +3110,8 @@ impl PrivateSwapsView {
                 owner,
                 origin: record.operation(),
             }),
+            // A private Bridge swap's two accounts share its route.
+            route: self.swap_route(http, record.operation()),
         })
     }
 
@@ -2921,6 +3141,7 @@ impl PrivateSwapsView {
         if ui_fixture::holds_swaps() || self.session.is_none() || !self.session_is_current(cx) {
             return None;
         }
+        let http = self.http(cx)?;
         let root = self.root.upgrade();
         let chains = root
             .as_ref()
@@ -2994,7 +3215,7 @@ impl PrivateSwapsView {
                                 uid: order.uid(),
                                 hint: wanted,
                                 fee,
-                                client: tracking.and_then(|tracking| tracking.orderbook.clone()),
+                                route: self.swap_route(&http, record.operation()),
                                 bridges: std::mem::take(&mut bridges),
                                 early,
                                 destination: early
@@ -3038,9 +3259,7 @@ impl PrivateSwapsView {
         let mut settled = Vec::new();
         for result in results {
             let tracking = self.tracking.entry(result.operation).or_default();
-            if tracking.orderbook.is_none() {
-                tracking.orderbook = result.client;
-            }
+            tracking.keep_route(&result.route);
             if result.fee {
                 tracking.fee_asked.insert(result.uid);
             }
@@ -3146,6 +3365,11 @@ impl PrivateSwapsView {
         let confirmed = self.confirmed_block(cx);
         let mut catchup = Vec::new();
         for result in results {
+            // The swap keeps a route its read opened, whatever the read found.
+            self.tracking
+                .entry(result.destination.unwrap_or(result.operation))
+                .or_default()
+                .keep_route(&result.route);
             // Another task updated the account during this background read. Keep the page
             // due for the next pass; no action failed and no stale result may advance it.
             if result
@@ -3891,6 +4115,41 @@ struct ObservationPage {
     /// Set when `operation` is a private Bridge swap's destination stealth account, which
     /// its own network's owner observes.
     destination: Option<DestinationPage>,
+    /// The swap's route, which the page is read over.
+    route: SwapRoute,
+}
+
+impl ObservationPage {
+    /// The swap the page is observed for, whose schedule it follows: a destination account's
+    /// page follows its swap's.
+    fn swap(&self) -> ExecutorOperationId {
+        self.destination
+            .as_ref()
+            .map_or(self.operation, |destination| destination.origin)
+    }
+}
+
+/// A swap's own network route, as a page or hint request carries it to the runtime. Its
+/// orderbook client's HTTP client carries the swap's RPC reads too, so a route replaced by an
+/// explicit status check moves both. A swap that keeps none opens one here, once for both
+/// polling loops; a route that can't open fails the read, which never falls back to a shared
+/// route.
+#[derive(Clone)]
+struct SwapRoute {
+    http: wallet_ops::HttpContext,
+    orderbook: Arc<tokio::sync::OnceCell<CowOrderbookClient>>,
+}
+
+impl SwapRoute {
+    /// The swap's orderbook client, opened through `owner`, the swap's own network's.
+    async fn orderbook(&self, owner: &ExecutorOwner) -> eyre::Result<CowOrderbookClient> {
+        self.orderbook
+            .get_or_try_init(|| async {
+                owner.swap_orderbook_client(&self.http.operation_http_client().await?)
+            })
+            .await
+            .cloned()
+    }
 }
 
 struct DestinationPage {
@@ -3907,6 +4166,8 @@ struct ObservationResult {
     outcome: eyre::Result<Option<SwapSetupObservation>>,
     /// A destination account's swap.
     destination: Option<ExecutorOperationId>,
+    /// The cell of the swap's route the page was read over.
+    route: Arc<tokio::sync::OnceCell<CowOrderbookClient>>,
 }
 
 struct HintRequest {
@@ -3916,8 +4177,8 @@ struct HintRequest {
     hint: bool,
     /// Whether to read the traded order's executed fee, once per session.
     fee: bool,
-    /// The swap's own orderbook route, when this session has one.
-    client: Option<CowOrderbookClient>,
+    /// The swap's own route.
+    route: SwapRoute,
     /// Handed-off Bridge orders to poll, with their destination chain.
     bridges: Vec<(OrderUid, EffectiveChainConfig)>,
     /// Set when `uid` is due an early request: a Bridge order's provider, and what is known
@@ -3931,7 +4192,8 @@ struct HintRequest {
 struct HintResult {
     operation: ExecutorOperationId,
     uid: OrderUid,
-    client: Option<CowOrderbookClient>,
+    /// The cell of the swap's route the request went over.
+    route: Arc<tokio::sync::OnceCell<CowOrderbookClient>>,
     /// The executed fee was asked for, whether or not the read succeeded.
     fee: bool,
     /// Each polled Bridge order, and whether it has an outcome now.
@@ -3960,10 +4222,7 @@ async fn fetch_order_hints(
 ) -> Vec<HintResult> {
     let mut results = Vec::with_capacity(requests.len());
     for request in requests {
-        let client = match request.client {
-            Some(client) => Some(client),
-            None => owner.swap_orderbook_client().await.ok(),
-        };
+        let client = request.route.orderbook(&owner).await.ok();
         let report = if request.hint
             && let Some(client) = &client
             && let Ok(status) = client.order_status_hint(&request.uid).await
@@ -3984,24 +4243,26 @@ async fn fetch_order_hints(
                 Box::pin(owner.observe_swap_executed_fee(request.operation, request.uid, client))
                     .await;
         }
-        // Without clients, every poll counts as one without an outcome.
+        // Without clients, every poll counts as one without an outcome. The swap's RPC reads go
+        // over the same route.
         let early_provider = request.early.and_then(|(provider, _)| provider);
         let clients = if request.bridges.is_empty() && early_provider.is_none() {
             None
         } else {
             client
                 .as_ref()
-                .and_then(|client| owner.swap_bridge_clients(client).ok())
+                .and_then(|client| Some((owner.swap_bridge_clients(client).ok()?, client.http())))
         };
         let mut bridges = Vec::with_capacity(request.bridges.len());
         for (uid, destination) in &request.bridges {
-            let outcome = if let Some(clients) = &clients {
+            let outcome = if let Some((clients, rpc)) = &clients {
                 matches!(
                     Box::pin(owner.observe_swap_bridge(
                         request.operation,
                         *uid,
                         clients,
                         destination,
+                        rpc,
                     ))
                     .await,
                     Ok(Some(_))
@@ -4015,10 +4276,12 @@ async fn fetch_order_hints(
             Some((provider, mut hint)) => {
                 if !hint.block_read
                     && let Some(block) = hint.trade_block
+                    && let Some(client) = &client
                     && let Ok(settlement) = Box::pin(owner.read_swap_settlement_hint(
                         request.operation,
                         request.uid,
                         block,
+                        client.http(),
                     ))
                     .await
                 {
@@ -4029,13 +4292,14 @@ async fn fetch_order_hints(
                 if let Some(provider) = provider
                     && !hint.ends_polling()
                     && (provider == BridgeProvider::NearIntents || handoff.is_some())
-                    && let Some(clients) = &clients
+                    && let Some((clients, rpc)) = &clients
                     && let Ok(report) = Box::pin(owner.swap_bridge_report(
                         request.operation,
                         request.uid,
                         handoff,
                         clients,
                         request.destination.as_deref(),
+                        rpc,
                     ))
                     .await
                 {
@@ -4048,7 +4312,7 @@ async fn fetch_order_hints(
         results.push(HintResult {
             operation: request.operation,
             uid: request.uid,
-            client,
+            route: request.route.orderbook,
             fee: request.fee,
             bridges,
             report,
@@ -4067,28 +4331,37 @@ async fn observe_pages(
 ) -> Vec<ObservationResult> {
     let mut results = Vec::with_capacity(pages.len());
     for page in pages {
+        // The swap's route is opened on its own network, also for a destination page.
+        let route = page.route.orderbook(&owner).await;
         let owner = page
             .destination
             .as_ref()
             .map_or(&owner, |destination| &destination.owner);
-        let outcome = if let Some((uid, block)) = page.settlement {
-            Box::pin(owner.observe_swap_settlement(page.operation, uid, block))
-                .await
-                .map(|()| None)
-        } else if let Some(range) = page.range.clone() {
-            Box::pin(owner.observe_swap(page.operation, range))
-                .await
-                .map(|_| None)
-        } else {
-            Box::pin(owner.observe_swap_setup(page.operation))
-                .await
-                .map(Some)
+        let outcome = match route {
+            Ok(orderbook) => {
+                let client = orderbook.http();
+                if let Some((uid, block)) = page.settlement {
+                    Box::pin(owner.observe_swap_settlement(page.operation, uid, block, client))
+                        .await
+                        .map(|()| None)
+                } else if let Some(range) = page.range.clone() {
+                    Box::pin(owner.observe_swap(page.operation, range, client))
+                        .await
+                        .map(|_| None)
+                } else {
+                    Box::pin(owner.observe_swap_setup(page.operation, client))
+                        .await
+                        .map(Some)
+                }
+            }
+            Err(error) => Err(error),
         };
         results.push(ObservationResult {
             operation: page.operation,
             range_end: page.range.map(|range| range.end),
             outcome,
             destination: page.destination.map(|destination| destination.origin),
+            route: page.route.orderbook,
         });
     }
     results
@@ -4248,5 +4521,142 @@ mod tests {
         assert_eq!(bridge_poll_interval(1), SWAP_OBSERVATION_INTERVAL * 2);
         assert_eq!(bridge_poll_interval(5), MAX_BRIDGE_POLL_INTERVAL);
         assert_eq!(bridge_poll_interval(u32::MAX), MAX_BRIDGE_POLL_INTERVAL);
+    }
+
+    /// Two swaps tracked together are each polled only once due, a fresh 9-15 s after their
+    /// previous poll or first sight, so never on a shared tick; catch-up makes one due at once.
+    #[test]
+    fn swaps_are_polled_out_of_step_within_their_intervals() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn scripted() -> Duration {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            const SECS: [u64; 5] = [9, 14, 15, 11, 12];
+            Duration::from_secs(SECS[NEXT.fetch_add(1, Ordering::Relaxed) % SECS.len()])
+        }
+        let bounds = Duration::from_secs(9)..=Duration::from_secs(15);
+        for _ in 0..1_000 {
+            assert!(bounds.contains(&swap_poll_interval()));
+        }
+
+        let base = Instant::now();
+        let mut schedule = SwapSchedule::with_interval(scripted, base);
+        let mut polls = BTreeMap::<char, Vec<Duration>>::new();
+        // The loop is driven once a second; a swap's page runs only when it is due.
+        for second in 0..=60 {
+            let now = base + Duration::from_secs(second);
+            let due = schedule.poll_due(vec!['a', 'b'], |swap| *swap, now);
+            assert!(due.len() <= 1, "both swaps polled at {second} s");
+            for swap in due {
+                polls.entry(swap).or_default().push(now - base);
+            }
+            assert!(schedule.next_due().is_some_and(|next| next > now));
+        }
+        assert_ne!(polls.get(&'a'), polls.get(&'b'));
+        for (swap, times) in &polls {
+            assert!(times.len() >= 4, "{swap}: {times:?}");
+            let mut previous = Duration::ZERO;
+            for &at in times {
+                assert!(
+                    bounds.contains(&at.saturating_sub(previous)),
+                    "{swap}: {times:?}"
+                );
+                previous = at;
+            }
+        }
+
+        // A lagging swap is due again at once; the other keeps its schedule.
+        let now = base + Duration::from_secs(61);
+        schedule.wake('b', now);
+        assert_eq!(schedule.poll_due(vec!['a', 'b'], |swap| *swap, now), ['b']);
+    }
+
+    /// Swaps loaded with the view are first due 9-15 s after it opened, and later swaps 9-15 s
+    /// after they are first seen. A poll slower than its interval waits a fresh one from its
+    /// completion, unless the swap was woken while it ran.
+    #[test]
+    fn swaps_wait_from_their_poll_completion_and_loaded_swaps_from_the_start() {
+        let secs = Duration::from_secs;
+        let within = |at: Instant, from: Instant| (from + secs(9)..=from + secs(15)).contains(&at);
+        let start = Instant::now();
+        let mut schedule = SwapSchedule::with_interval(swap_poll_interval, start);
+        assert!(
+            schedule
+                .poll_due(vec!['a'], |swap| *swap, start + secs(5))
+                .is_empty()
+        );
+        assert!(within(schedule.due[&'a'], start));
+        let later = start + secs(8);
+        assert!(
+            schedule
+                .poll_due(vec!['a', 'b'], |swap| *swap, later)
+                .is_empty()
+        );
+        assert!(within(schedule.due[&'b'], later));
+
+        let polled = BTreeSet::from(['a']);
+        let t0 = start + secs(15);
+        assert!(
+            schedule
+                .poll_due(vec!['a', 'b'], |swap| *swap, t0)
+                .contains(&'a')
+        );
+        let done = t0 + secs(20);
+        schedule.polled(&polled, done);
+        assert!(
+            !schedule
+                .poll_due(vec!['a', 'b'], |swap| *swap, done)
+                .contains(&'a')
+        );
+        assert!(within(schedule.due[&'a'], done));
+
+        let t1 = schedule.due[&'a'];
+        assert!(
+            schedule
+                .poll_due(vec!['a', 'b'], |swap| *swap, t1)
+                .contains(&'a')
+        );
+        schedule.wake('a', t1 + secs(1));
+        schedule.polled(&polled, t1 + secs(20));
+        assert!(
+            schedule
+                .poll_due(vec!['a', 'b'], |swap| *swap, t1 + secs(20))
+                .contains(&'a')
+        );
+    }
+
+    /// A background read installs the route it opened only through the swap's current opening:
+    /// neither a read over a route Retry then dropped, nor an opening Retry interrupted, brings
+    /// a route back.
+    #[test]
+    fn background_reads_keep_only_a_route_opened_through_the_current_opening() {
+        let client = || {
+            CowOrderbookClient::new(
+                wallet_ops::OperationHttpClient::for_tests(
+                    reqwest::Client::new(),
+                    wallet_ops::OperationNetworkIsolation::Dedicated,
+                ),
+                "http://127.0.0.1:1".parse().unwrap(),
+                1,
+            )
+            .unwrap()
+        };
+        let mut tracking = SwapTracking::default();
+        tracking.set_route(Some(client()));
+        let kept = tracking.route_cell();
+        tracking.set_route(None);
+        tracking.keep_route(&kept);
+        assert!(tracking.orderbook.is_none());
+
+        let interrupted = tracking.route_cell();
+        assert!(interrupted.set(client()).is_ok());
+        tracking.set_route(None);
+        tracking.keep_route(&interrupted);
+        assert!(tracking.orderbook.is_none());
+
+        let current = tracking.route_cell();
+        assert!(current.set(client()).is_ok());
+        tracking.keep_route(&current);
+        assert!(tracking.orderbook.is_some());
     }
 }

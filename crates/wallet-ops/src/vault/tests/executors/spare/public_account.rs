@@ -33,6 +33,7 @@ async fn registration_rejects_prepared_executor_retry_and_shutdown_cancels_publi
             )),
             &[],
             None,
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -60,7 +61,8 @@ async fn registration_rejects_prepared_executor_retry_and_shutdown_cancels_publi
                 &[],
                 &crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
                     TEST_PASSWORD.into()
-                ))
+                )),
+                crate::OperationHttpClient::direct_for_tests()
             )
             .await
             .is_err()
@@ -74,7 +76,8 @@ async fn registration_rejects_prepared_executor_retry_and_shutdown_cancels_publi
                     TEST_PASSWORD.into()
                 )),
                 &[],
-                None
+                None,
+                crate::OperationHttpClient::direct_for_tests()
             )
             .await
             .is_err()
@@ -90,6 +93,7 @@ async fn registration_rejects_prepared_executor_retry_and_shutdown_cancels_publi
         None,
         Some(&owner),
         1,
+        crate::OperationHttpClient::direct_for_tests(),
     )
     .await
     .unwrap();
@@ -184,18 +188,24 @@ async fn public_signing_reconciles_issued_payloads() {
         message: b"guarded dapp request".to_vec(),
         event_tx: None,
     };
-    let error = walletconnect_sign_personal_message(request(&account))
-        .await
-        .unwrap_err();
+    let error = walletconnect_sign_personal_message(
+        request(&account),
+        crate::OperationHttpClient::direct_for_tests(),
+    )
+    .await
+    .unwrap_err();
     assert!(format!("{error:#}").contains("earlier signed operation"));
     // A confirmed read past the payload's nonce resolves it, with no action named. It reads
     // the account's delegation and nonce and no block history.
     rpc.state.used.lock().unwrap().insert(address);
     let before = rpc.state.requests.lock().unwrap().len();
     assert!(
-        walletconnect_sign_personal_message(request(&account))
-            .await
-            .is_ok()
+        walletconnect_sign_personal_message(
+            request(&account),
+            crate::OperationHttpClient::direct_for_tests()
+        )
+        .await
+        .is_ok()
     );
     assert!(!store.records().unwrap()[0].has_unresolved_issued_work());
     {
@@ -219,18 +229,24 @@ async fn public_signing_reconciles_issued_payloads() {
     rpc.set_delegated_account(address, record.delegate(), U256::ONE);
     rpc.state.calls.lock().unwrap().insert(address, None);
     assert!(
-        walletconnect_sign_personal_message(request(&account))
-            .await
-            .is_err()
+        walletconnect_sign_personal_message(
+            request(&account),
+            crate::OperationHttpClient::direct_for_tests()
+        )
+        .await
+        .is_err()
     );
     rpc.state.codes.lock().unwrap().remove(&address);
     rpc.state.calls.lock().unwrap().remove(&address);
     // A saved resolution must be revalidated, including in the same owner.
     rpc.state.used.lock().unwrap().remove(&address);
     assert!(
-        walletconnect_sign_personal_message(request(&account))
-            .await
-            .is_err()
+        walletconnect_sign_personal_message(
+            request(&account),
+            crate::OperationHttpClient::direct_for_tests()
+        )
+        .await
+        .is_err()
     );
     let (_, recovered) = vault
         .executor_spend_signers_for_session(
@@ -254,9 +270,12 @@ async fn public_signing_reconciles_issued_payloads() {
         .await
         .unwrap();
     assert!(
-        walletconnect_sign_personal_message(request(&account))
-            .await
-            .is_ok()
+        walletconnect_sign_personal_message(
+            request(&account),
+            crate::OperationHttpClient::direct_for_tests()
+        )
+        .await
+        .is_ok()
     );
     // A private Bridge swap's destination account that is registered in Public can't pay a
     // refund's gas while the shield it signed can still execute at its nonce.
@@ -317,7 +336,12 @@ async fn public_signing_reconciles_issued_payloads() {
         .await
         .unwrap();
     let Err(error) = owner
-        .admit_authorized_gas_signer(&view, &account, &authorization)
+        .admit_authorized_gas_signer(
+            &view,
+            &account,
+            &authorization,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
     else {
         panic!("an executable destination shield refuses the gas signer");

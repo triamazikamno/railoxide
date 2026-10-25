@@ -131,7 +131,8 @@ impl DesktopUnshieldPreparedPlan {
 }
 
 pub(super) struct DesktopUnshieldPlanRequest<'a> {
-    pub(super) executor: Option<&'a PreparedExecutorOperation>,
+    /// The executor preparation, with the operation's client its issuance reads over.
+    pub(super) executor: Option<(&'a PreparedExecutorOperation, &'a OperationHttpClient)>,
     pub(super) chain_id: u64,
     pub(super) effective_chain: &'a settings::EffectiveChainConfig,
     pub(super) view_session: &'a vault::DesktopViewSession,

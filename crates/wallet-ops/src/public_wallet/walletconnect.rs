@@ -23,8 +23,10 @@ use crate::hardware_typed_data::HardwareEip712Model;
 use crate::walletconnect::WalletConnectSupportedMethod;
 use crate::{HttpContext, OperationHttpClient, report_chain_string};
 
+/// A stealth-account signer's admission reads go over `client`.
 pub async fn walletconnect_sign_personal_message(
     request: WalletConnectPersonalSignRequest,
+    client: &OperationHttpClient,
 ) -> Result<String> {
     if let Some(control) = request.request_control.as_ref() {
         control.ensure_current()?;
@@ -38,6 +40,7 @@ pub async fn walletconnect_sign_personal_message(
         request.trezor_pin_matrix_provider,
         request.executor_owner.as_ref(),
         request.chain_id,
+        client,
     )
     .await?
     .with_request_control(request.request_control.clone());
@@ -84,9 +87,11 @@ pub async fn walletconnect_sign_personal_message(
         .await
 }
 
+/// A stealth-account signer's admission reads go over `client`.
 pub async fn walletconnect_sign_typed_data(
     request: WalletConnectTypedDataSignRequest,
     method: WalletConnectSupportedMethod,
+    client: &OperationHttpClient,
 ) -> Result<String> {
     let operation = match method {
         WalletConnectSupportedMethod::EthSignTypedData
@@ -110,6 +115,7 @@ pub async fn walletconnect_sign_typed_data(
         request.trezor_pin_matrix_provider,
         request.executor_owner.as_ref(),
         request.chain_id,
+        client,
     )
     .await
     .wrap_err_with(|| format!("WalletConnect {operation}"))?
@@ -201,8 +207,14 @@ pub async fn walletconnect_sign_typed_data(
 
 pub async fn walletconnect_sign_typed_data_v4(
     request: WalletConnectTypedDataSignRequest,
+    client: &OperationHttpClient,
 ) -> Result<String> {
-    walletconnect_sign_typed_data(request, WalletConnectSupportedMethod::EthSignTypedDataV4).await
+    walletconnect_sign_typed_data(
+        request,
+        WalletConnectSupportedMethod::EthSignTypedDataV4,
+        client,
+    )
+    .await
 }
 
 pub async fn walletconnect_probe_hardware_typed_data_signing_mode(
@@ -258,6 +270,7 @@ pub async fn submit_walletconnect_send_transaction(
         request.trezor_pin_matrix_provider,
         request.executor_owner.as_ref(),
         request.chain_id,
+        client,
     )
     .await?
     .with_request_control(request.request_control.clone());

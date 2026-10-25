@@ -425,6 +425,7 @@ impl Wallet {
                 setup_approval(self.weth(), self.pair.0, self.pair.1),
                 None,
                 &authorization,
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .unwrap();
@@ -484,6 +485,7 @@ impl Wallet {
                 approval,
                 authorization: &authorization,
                 destination_authorization: Some(&destination_authorization),
+                client: crate::OperationHttpClient::direct_for_tests(),
             },
         )
         .await
@@ -534,7 +536,10 @@ impl Wallet {
         // stands in for it here.
         let SwapSetupStatus::Delegated(observed) = destination
             .owner
-            .observe_swap_setup(destination_operation)
+            .observe_swap_setup(
+                destination_operation,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap()
             .status
@@ -582,6 +587,7 @@ impl Wallet {
                 destination_candidate: None,
                 authorization: &authorization,
                 destination_authorization: Some(&destination_authorization),
+                client: crate::OperationHttpClient::direct_for_tests(),
             },
         )
         .await
@@ -640,6 +646,7 @@ impl Wallet {
                 confirmed,
                 SwapAccountRole::Source,
                 SwapAccountUse::Claimed(swap_use),
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .unwrap()
@@ -656,6 +663,7 @@ impl Wallet {
                 swap_use,
                 destination_executor,
                 Some(&notes),
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .unwrap();
@@ -684,7 +692,10 @@ impl Wallet {
         assert!(receipt.status(), "the setup delegates the executor");
         fork.mine(chain.finality_depth).await;
         let SwapSetupStatus::Delegated(delegated) = owner
-            .observe_swap_setup(prepared.operation())
+            .observe_swap_setup(
+                prepared.operation(),
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap()
             .status
@@ -728,7 +739,13 @@ impl Wallet {
             .into(),
         };
         let issued = owner
-            .issue_operation(prepared, &setup, std::slice::from_ref(&fee), authorization)
+            .issue_operation(
+                prepared,
+                &setup,
+                std::slice::from_ref(&fee),
+                authorization,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         (issued, fee)
@@ -750,6 +767,7 @@ impl Wallet {
                 setup_approval(self.weth(), self.pair.0, self.pair.1),
                 None,
                 &authorization,
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .unwrap();
@@ -765,7 +783,11 @@ impl Wallet {
         let included = receipt.block_number.unwrap();
 
         // The confirmed block doesn't show the setup yet. The latest one does.
-        let observation = self.owner.observe_swap_setup(operation).await.unwrap();
+        let observation = self
+            .owner
+            .observe_swap_setup(operation, crate::OperationHttpClient::direct_for_tests())
+            .await
+            .unwrap();
         assert_eq!(observation.status, SwapSetupStatus::Pending);
         assert_eq!(
             observation
@@ -781,6 +803,7 @@ impl Wallet {
                 confirmed,
                 SwapAccountRole::Source,
                 SwapAccountUse::Claimed(SwapUseId::first(operation)),
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .unwrap()
@@ -828,7 +851,10 @@ impl Wallet {
         assert!(fork.code(placed.swap.executor).await.is_empty());
         let observation = self
             .owner
-            .observe_swap_setup(placed.swap.operation)
+            .observe_swap_setup(
+                placed.swap.operation,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -842,7 +868,12 @@ impl Wallet {
         let delegate = self.chain.accepted_executor_profile().unwrap().delegate();
         let retry = self
             .owner
-            .resume_swap_setup(operation, broadcaster(delegate), &password())
+            .resume_swap_setup(
+                operation,
+                broadcaster(delegate),
+                &password(),
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         assert_eq!(retry.context().execution_nonce, U256::ZERO);
@@ -853,7 +884,7 @@ impl Wallet {
     async fn redelegate(&self, operation: ExecutorOperationId) -> DelegatedSwapExecutor {
         let SwapSetupStatus::Delegated(delegated) = self
             .owner
-            .observe_swap_setup(operation)
+            .observe_swap_setup(operation, crate::OperationHttpClient::direct_for_tests())
             .await
             .unwrap()
             .status
@@ -1280,7 +1311,12 @@ impl Wallet {
         let settled = receipt.block_number.unwrap();
         fork.mine(self.chain.finality_depth).await;
         self.owner
-            .observe_swap_settlement(swap.operation, swap.uid, settled)
+            .observe_swap_settlement(
+                swap.operation,
+                swap.uid,
+                settled,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         (swap, receipt, terms)
@@ -1323,6 +1359,7 @@ impl Wallet {
                             maximum_private_fee: U256::from(1_000),
                         },
                         &password(),
+                        crate::OperationHttpClient::direct_for_tests(),
                     )
                     .await
             }
@@ -1333,6 +1370,7 @@ impl Wallet {
                         broadcaster(delegate),
                         U256::from(1_000),
                         &password(),
+                        crate::OperationHttpClient::direct_for_tests(),
                     )
                     .await
             }
@@ -1378,7 +1416,13 @@ impl Wallet {
             .into(),
         };
         self.owner
-            .issue_operation(&preparation, &call, std::slice::from_ref(&fee), &password())
+            .issue_operation(
+                &preparation,
+                &call,
+                std::slice::from_ref(&fee),
+                &password(),
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap()
     }
@@ -1478,7 +1522,11 @@ impl Wallet {
         blocks: std::ops::Range<u64>,
     ) -> ExecutorRecord {
         self.owner
-            .observe_swap(operation, blocks)
+            .observe_swap(
+                operation,
+                blocks,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap()
             .record()
@@ -1721,7 +1769,12 @@ async fn swap_fork_external_settlement_pays_the_receiver_and_completes_on_the_tr
         // The deployed settlement's Trade event alone completes the order.
         wallet
             .owner
-            .observe_swap_settlement(swap.operation, swap.uid, settled)
+            .observe_swap_settlement(
+                swap.operation,
+                swap.uid,
+                settled,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         let record = wallet
@@ -2092,7 +2145,12 @@ async fn speed_up_fill_scenario(speed_up_trades: bool, speed_up_shields: bool) {
     fork.mine(wallet.chain.finality_depth).await;
     wallet
         .owner
-        .observe_swap_settlement(operation, traded.uid, settled)
+        .observe_swap_settlement(
+            operation,
+            traded.uid,
+            settled,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     let record = wallet.record(operation);
@@ -2349,7 +2407,12 @@ async fn swap_fork_retry_invalidates_an_order_stalled_by_an_older_post_hook() {
     );
     let observed = wallet
         .owner
-        .observe_swap_synced(operation, cancelled..cancelled + 1, Some(sync))
+        .observe_swap_synced(
+            operation,
+            cancelled..cancelled + 1,
+            Some(sync),
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap()
         .record()
@@ -3379,7 +3442,12 @@ async fn swap_fork_retry_settlement_deposits_an_expired_attempts_across_terms() 
         fork.mine(finality).await;
         wallet
             .owner
-            .observe_swap_settlement(operation, retry.uid, settled)
+            .observe_swap_settlement(
+                operation,
+                retry.uid,
+                settled,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         let record = wallet.record(operation);
@@ -3546,7 +3614,12 @@ async fn swap_fork_open_order_settlement_deposits_its_speed_ups_across_terms() {
     fork.mine(finality).await;
     wallet
         .owner
-        .observe_swap_settlement(operation, first.uid, settled)
+        .observe_swap_settlement(
+            operation,
+            first.uid,
+            settled,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     let record = wallet.record(operation);
@@ -3779,7 +3852,13 @@ async fn swap_fork_spoke_pool_rejects_a_deposit_past_its_quote_age() {
     let continuing = || async {
         wallet
             .owner
-            .swap_continuing_approvals(swap.operation, swap.swap_use, delivery, Some(pre_nonce))
+            .swap_continuing_approvals(
+                swap.operation,
+                swap.swap_use,
+                delivery,
+                Some(pre_nonce),
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap()
             .approvals()
@@ -4310,6 +4389,7 @@ async fn verify_fill(
             placed.swap.uid,
             &clients,
             &destination.chain,
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -4971,6 +5051,7 @@ async fn swap_fork_public_usdt_approval_resets_a_short_allowance_first() {
             true,
             MAX_FEE_PER_GAS,
             MAX_PRIORITY_FEE_PER_GAS,
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -5026,6 +5107,7 @@ async fn swap_fork_public_usdt_approval_resets_a_short_allowance_first() {
                 max_fee_per_gas: MAX_FEE_PER_GAS,
                 max_priority_fee_per_gas: MAX_PRIORITY_FEE_PER_GAS,
             },
+            crate::OperationHttpClient::direct_for_tests(),
             &mut |_| {},
         )
         .await
@@ -5390,6 +5472,7 @@ impl Wallet {
                 !order,
                 PUBLIC_MAX_FEE_PER_GAS,
                 PUBLIC_MAX_PRIORITY_FEE_PER_GAS,
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .unwrap();
@@ -5427,7 +5510,13 @@ impl Wallet {
         let mut candidate = broadcaster(delegate);
         candidate.chain_id = destination.chain.chain_id;
         let SwapPairSide::Setup(prepared) = owner
-            .prepare_public_swap_destination(operation, id, Some(candidate), &authorization)
+            .prepare_public_swap_destination(
+                operation,
+                id,
+                Some(candidate),
+                &authorization,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap()
         else {
@@ -5444,7 +5533,13 @@ impl Wallet {
             .await;
         let confirmed = destination_fork.block_number().await - destination.chain.finality_depth;
         let account = owner
-            .delegated_public_swap_destination(operation, confirmed, id, None)
+            .delegated_public_swap_destination(
+                operation,
+                confirmed,
+                id,
+                None,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5490,6 +5585,7 @@ impl Wallet {
                 valid_to,
                 authorization: &password(),
                 notes: None,
+                client: crate::OperationHttpClient::direct_for_tests(),
             })
             .await
             .unwrap();
@@ -5568,6 +5664,7 @@ async fn deposit_from_public_account(
             PUBLIC_GAS_FEE,
             &signed.delivery,
             &signed.terms,
+            crate::OperationHttpClient::direct_for_tests(),
             &mut |_| {},
         )
         .await
@@ -5646,7 +5743,14 @@ async fn observe_public_handoff(
 ) {
     let origin = &wallet.chain;
     let owner = &wallet.destination.as_ref().unwrap().owner;
-    let observe = || owner.observe_public_swap_handoff(swap.operation, swap.id, origin);
+    let observe = || {
+        owner.observe_public_swap_handoff(
+            swap.operation,
+            swap.id,
+            origin,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
+    };
     assert_eq!(
         observe().await.unwrap(),
         None,
@@ -5764,7 +5868,12 @@ async fn verify_public_delivery(
     let (across, _, stub) = across_deposit_stub(located).await;
     let outcome = destination
         .owner
-        .check_public_swap_bridge(swap.operation, swap.id, &across)
+        .check_public_swap_bridge(
+            swap.operation,
+            swap.id,
+            &across,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     stub.abort();
@@ -5840,6 +5949,7 @@ async fn swap_fork_public_deposit_is_filled_and_shielded_on_the_destination_chai
                 origin,
                 &signer,
                 PUBLIC_GAS_FEE,
+                crate::OperationHttpClient::direct_for_tests(),
                 &mut |_| {},
             )
             .await
@@ -5916,7 +6026,12 @@ async fn swap_fork_public_deposit_is_filled_and_shielded_on_the_destination_chai
     let (across, reply, stub) = across_deposit_stub(expired(None)).await;
     assert_eq!(
         owner
-            .check_public_swap_bridge(withheld.operation, withheld.id, &across)
+            .check_public_swap_bridge(
+                withheld.operation,
+                withheld.id,
+                &across,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .unwrap(),
         Some(SwapBridgeOutcome::Refunding)
@@ -5924,8 +6039,15 @@ async fn swap_fork_public_deposit_is_filled_and_shielded_on_the_destination_chai
     let (refunding, shield) = public_swap_record(&wallet, &withheld);
     assert_eq!(shield, Some(SwapDestinationOutcome::Unfilled));
     assert_eq!(refunding.observations().bridge_refund, None);
-    let refund =
-        || owner.observe_public_swap_refund(withheld.operation, withheld.id, origin, &across);
+    let refund = || {
+        owner.observe_public_swap_refund(
+            withheld.operation,
+            withheld.id,
+            origin,
+            &across,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
+    };
     // Across names no refund transaction yet.
     assert_eq!(refund().await.unwrap(), None);
 
@@ -6116,6 +6238,7 @@ async fn place_public_order(
             origin,
             signer,
             PUBLIC_GAS_FEE,
+            crate::OperationHttpClient::direct_for_tests(),
             &mut |_| {},
         )
         .await
@@ -6212,6 +6335,7 @@ async fn observe_public_settlement(
             placed.swap.id,
             origin,
             &placed.orderbook.client,
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -6335,6 +6459,7 @@ async fn public_order_scenario(route: OrderDestination) {
                 placed.swap.id,
                 origin,
                 &placed.orderbook.client,
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
     };
@@ -6518,6 +6643,7 @@ async fn public_order_scenario(route: OrderDestination) {
             origin,
             PUBLIC_MAX_FEE_PER_GAS,
             PUBLIC_MAX_PRIORITY_FEE_PER_GAS,
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -6536,6 +6662,7 @@ async fn public_order_scenario(route: OrderDestination) {
             PUBLIC_GAS_FEE,
             &review,
             false,
+            crate::OperationHttpClient::direct_for_tests(),
             &mut |_| {},
         )
         .await
@@ -6606,6 +6733,7 @@ async fn public_order_scenario(route: OrderDestination) {
             PUBLIC_GAS_FEE,
             &open.orderbook.client,
             INVALIDATION_GAS_LIMIT,
+            crate::OperationHttpClient::direct_for_tests(),
             &mut |_| {},
         )
         .await
@@ -6920,6 +7048,7 @@ async fn public_permit_order_scenario(route: PermitOrigin) {
             token_registry: &registry,
             max_fee_per_gas: PUBLIC_MAX_FEE_PER_GAS,
             max_priority_fee_per_gas: PUBLIC_MAX_PRIORITY_FEE_PER_GAS,
+            client: crate::OperationHttpClient::direct_for_tests(),
         })
         .await
         .unwrap();
@@ -6990,6 +7119,7 @@ async fn public_permit_order_scenario(route: PermitOrigin) {
             origin,
             &signer,
             PUBLIC_GAS_FEE,
+            crate::OperationHttpClient::direct_for_tests(),
             &mut |_| {},
         )
         .await

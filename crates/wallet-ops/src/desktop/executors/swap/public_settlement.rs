@@ -30,7 +30,6 @@ use super::destination::{finalized_receipts, still_canonical};
 use super::observation::{MAX_OBSERVATION_BLOCKS, filled_amount};
 use super::public_transactions::{DepositorSearch, ExpectedHandoff, find_handoff_by_depositor};
 use super::settlement::{ExpectedTrade, Transfer, order_trade, settlement_payout, trade_amounts};
-use crate::ExecutorOwner;
 use crate::cow::CowOrderbookClient;
 use crate::desktop::executor_observation::{ObservationEndpoints, trace_step};
 use crate::settings::EffectiveChainConfig;
@@ -39,6 +38,7 @@ use crate::vault::{
     PublicSwapObservations, PublicSwapProxyHolding, PublicSwapRecord, PublicSwapTransactionKind,
     SwapBridgeHandoff, SwapObservation, SwapTradeAmounts, SwapUseId,
 };
+use crate::{ExecutorOwner, OperationHttpClient};
 
 /// Where a Public-paid order stands on its own chain, from its record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,15 +114,23 @@ impl ExecutorOwner {
     /// Each call advances as far as finalized evidence allows, from the record alone, and a
     /// call that finds nothing new changes nothing. Withdrawals and invalidations are concluded
     /// only from finalized canonical evidence, including when their inclusion was never
-    /// recorded. A swap without an order is returned as it is.
+    /// recorded. A swap without an order is returned as it is. Its RPC reads go over `client`.
     pub async fn observe_public_swap_order(
         &self,
         operation: ExecutorOperationId,
         swap_use: SwapUseId,
         origin: &EffectiveChainConfig,
         orderbook: &CowOrderbookClient,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorRecord> {
-        Box::pin(self.advance_public_swap_order(operation, swap_use, origin, Some(orderbook))).await
+        Box::pin(self.advance_public_swap_order(
+            operation,
+            swap_use,
+            origin,
+            Some(orderbook),
+            client,
+        ))
+        .await
     }
 
     /// [`Self::observe_public_swap_order`], with the orderbook only when the caller has one.
@@ -134,6 +142,7 @@ impl ExecutorOwner {
         swap_use: SwapUseId,
         origin: &EffectiveChainConfig,
         orderbook: Option<&CowOrderbookClient>,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorRecord> {
         let claimed = self.claimed_public_swap(operation, swap_use, origin)?;
         let swap = &claimed.swap;
@@ -186,7 +195,7 @@ impl ExecutorOwner {
                 .any(|transaction| transaction.kind == PublicSwapTransactionKind::Invalidation),
         };
         let mut next = if read.pending() {
-            self.read_public_swap_order(origin, &read).await?
+            self.read_public_swap_order(origin, &read, client).await?
         } else {
             observed
         };
@@ -265,9 +274,14 @@ impl ExecutorOwner {
         &self,
         origin: &EffectiveChainConfig,
         read: &OrderRead<'_>,
+        client: &OperationHttpClient,
     ) -> Result<PublicSwapObservations> {
-        let endpoints =
-            ObservationEndpoints::new(origin, &self.http, crate::RpcTrafficClass::Sensitive)?;
+        let endpoints = ObservationEndpoints::new(
+            origin,
+            &self.http,
+            crate::RpcTrafficClass::Sensitive,
+            client,
+        )?;
         for endpoint in endpoints.providers().await {
             let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = endpoint.index);
             let result = trace_step(

@@ -919,7 +919,7 @@ impl PrivateSwapsView {
         cx: &mut Context<'_, Self>,
     ) {
         let (operation, side) = (retry.operation, retry.side);
-        let Some(owner) = self.private_owner().cloned() else {
+        let (Some(owner), Some(http)) = (self.private_owner().cloned(), self.http(cx)) else {
             return;
         };
         let (session, account_owner) = match side {
@@ -964,6 +964,8 @@ impl PrivateSwapsView {
         }
         tracking.error = None;
         tracking.auto_place = true;
+        // The setup's account reads go over the swap's route.
+        let route = self.swap_route(&http, operation);
         // Only this account's stages start over. The other account's stay as they ended.
         let progress = self.start_setup_progress(operation, side, cx);
         let replaces_own = retry.replaces && side == SetupSide::Origin;
@@ -995,6 +997,8 @@ impl PrivateSwapsView {
                             swap.1 = Some(replacement.replacement);
                         }
                     }
+                    let orderbook = route.orderbook(&owner).await?;
+                    let client = orderbook.http();
                     let mut accounts = SwapAccountReplacements::new(
                         owner.as_ref(),
                         destination
@@ -1005,9 +1009,13 @@ impl PrivateSwapsView {
                         retry.swap_use,
                         &mut report,
                     );
-                    let prepared =
-                        Box::pin(accounts.resume_setup(use_side, &retry.candidate, &authorization))
-                            .await?;
+                    let prepared = Box::pin(accounts.resume_setup(
+                        use_side,
+                        &retry.candidate,
+                        &authorization,
+                        client,
+                    ))
+                    .await?;
                     // The swap's approval binds the accounts as they are derived by now, which a
                     // preparation interrupted before their derivation left unbound, and a
                     // replacement left for its new account: the swap's own, and the destination
@@ -1036,6 +1044,7 @@ impl PrivateSwapsView {
                         progress_tx: Some(progress),
                         response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
                         republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
+                        client: client.clone(),
                     };
                     let mut prepared = SwapPairSide::Setup(prepared);
                     let sent = match use_side {

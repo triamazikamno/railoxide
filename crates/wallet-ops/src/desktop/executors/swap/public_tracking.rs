@@ -13,12 +13,12 @@ use eyre::{Result, eyre};
 
 use super::public_order::RESUBMISSION_MARGIN;
 use super::public_settlement::unix_now;
-use crate::ExecutorOwner;
 use crate::bridge::AcrossClient;
 use crate::cow::CowOrderbookClient;
 use crate::desktop::executor_observation::read_executor_asset_balance;
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{ExecutorOperationId, SwapBridgeOutcome, SwapSubmissionStatus, SwapUseId};
+use crate::{ExecutorOwner, OperationHttpClient};
 
 /// What a tracking step of a swap paid from a Public account reads through.
 pub struct PublicSwapTracking<'a> {
@@ -29,6 +29,8 @@ pub struct PublicSwapTracking<'a> {
     pub orderbook: Option<&'a CowOrderbookClient>,
     /// An explicit status check, which may replace a recorded outcome.
     pub explicit: bool,
+    /// The swap's route, which every RPC read of the step goes over.
+    pub client: &'a OperationHttpClient,
 }
 
 /// What one tracking step found, for the caller to refresh what it shows.
@@ -77,6 +79,7 @@ impl ExecutorOwner {
             across,
             orderbook,
             explicit,
+            client,
         } = tracking;
         let claimed = self.claimed_public_swap(operation, swap_use, origin)?;
         let before = &claimed.swap;
@@ -96,10 +99,12 @@ impl ExecutorOwner {
                     )
                     .await?;
                 }
-                Box::pin(self.observe_public_swap_order(operation, swap_use, origin, orderbook))
-                    .await?;
+                Box::pin(
+                    self.observe_public_swap_order(operation, swap_use, origin, orderbook, client),
+                )
+                .await?;
             } else {
-                if Box::pin(self.resend_public_swap_deposit(operation, swap_use, origin))
+                if Box::pin(self.resend_public_swap_deposit(operation, swap_use, origin, client))
                     .await
                     .is_err()
                 {
@@ -108,17 +113,18 @@ impl ExecutorOwner {
                         "resending the signed Public deposit failed"
                     );
                 }
-                Box::pin(self.observe_public_swap_handoff(operation, swap_use, origin)).await?;
+                Box::pin(self.observe_public_swap_handoff(operation, swap_use, origin, client))
+                    .await?;
             }
         }
         // `None` while there is no hand-off.
         let outcome = if explicit {
-            Box::pin(self.check_public_swap_bridge(operation, swap_use, across)).await?
+            Box::pin(self.check_public_swap_bridge(operation, swap_use, across, client)).await?
         } else {
-            Box::pin(self.observe_public_swap_bridge(operation, swap_use, across)).await?
+            Box::pin(self.observe_public_swap_bridge(operation, swap_use, across, client)).await?
         };
         let refunded = if outcome == Some(SwapBridgeOutcome::Refunding) {
-            Box::pin(self.observe_public_swap_refund(operation, swap_use, origin, across))
+            Box::pin(self.observe_public_swap_refund(operation, swap_use, origin, across, client))
                 .await?
                 .is_some()
         } else {
@@ -129,9 +135,10 @@ impl ExecutorOwner {
                 let address = claimed
                     .destination
                     .ok_or_else(|| eyre!("the destination stealth account is unavailable"))?;
+                let endpoints = self.observation_endpoints(client)?;
                 Some(
                     self.while_active(read_executor_asset_balance(
-                        &self.endpoints,
+                        &endpoints,
                         &self.chain,
                         address,
                         crate::ExecutorAsset::Erc20(claimed.destination_token),
@@ -150,9 +157,15 @@ impl ExecutorOwner {
         })?;
         let withdrawn =
             before.observations().withdrawn.is_none() && after.observations().withdrawn.is_some();
-        let permit_changed =
-            Box::pin(self.observe_public_swap_permit(swap_use, origin, claimed.source, after, now))
-                .await?;
+        let permit_changed = Box::pin(self.observe_public_swap_permit(
+            swap_use,
+            origin,
+            claimed.source,
+            after,
+            now,
+            client,
+        ))
+        .await?;
         self.ensure_active()?;
         Ok(PublicSwapProgress {
             changed: after != before || permit_changed,

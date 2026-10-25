@@ -78,24 +78,35 @@ pub(super) async fn approve_walletconnect_request_task(
         let request_method = request.parsed.method();
         let result = match request.parsed.clone() {
             WalletConnectParsedRequest::PersonalSign { message, .. } => {
-                walletconnect_sign_personal_message(WalletConnectPersonalSignRequest {
-                    executor_owner,
-                    chain_id,
-                    request_control: request.request_control.clone(),
-                    view_session,
-                    vault_store,
-                    authorization: Some(spend_authorization),
-                    trezor_app_passphrase,
-                    trezor_pin_matrix_provider,
-                    public_account_uuid: account_binding.public_account_uuid.clone(),
-                    message: walletconnect_personal_message_bytes(&message),
-                    event_tx,
-                })
+                let client = match operation.client().await {
+                    Ok(client) => client,
+                    Err(error) => return (Err(error), submitted_tx_hash),
+                };
+                walletconnect_sign_personal_message(
+                    WalletConnectPersonalSignRequest {
+                        executor_owner,
+                        chain_id,
+                        request_control: request.request_control.clone(),
+                        view_session,
+                        vault_store,
+                        authorization: Some(spend_authorization),
+                        trezor_app_passphrase,
+                        trezor_pin_matrix_provider,
+                        public_account_uuid: account_binding.public_account_uuid.clone(),
+                        message: walletconnect_personal_message_bytes(&message),
+                        event_tx,
+                    },
+                    &client,
+                )
                 .await
                 .map(Value::String)
             }
             WalletConnectParsedRequest::EthSignTypedData { typed_data, .. }
             | WalletConnectParsedRequest::EthSignTypedDataV4 { typed_data, .. } => {
+                let client = match operation.client().await {
+                    Ok(client) => client,
+                    Err(error) => return (Err(error), submitted_tx_hash),
+                };
                 walletconnect_sign_typed_data(
                     WalletConnectTypedDataSignRequest {
                         executor_owner,
@@ -112,6 +123,7 @@ pub(super) async fn approve_walletconnect_request_task(
                         event_tx,
                     },
                     request_method,
+                    &client,
                 )
                 .await
                 .map(Value::String)

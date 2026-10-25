@@ -17,7 +17,8 @@ use crate::vault::{
     swap_receiving_balance_refusal,
 };
 use crate::{
-    ExecutorAsset, ExecutorOwner, UtxoCommitmentKind, UtxoPpoiState, WalletSession, WalletUtxo,
+    ExecutorAsset, ExecutorOwner, OperationHttpClient, UtxoCommitmentKind, UtxoPpoiState,
+    WalletSession, WalletUtxo,
 };
 
 /// The wallet's local notes on a destination chain, read for the verdicts of earlier shields.
@@ -105,6 +106,7 @@ impl ExecutorOwner {
         executor: Address,
         delegate: Address,
         token: Address,
+        client: &OperationHttpClient,
     ) -> Result<()> {
         let asset = ExecutorAsset::Erc20(token);
         // Like every read of a recorded account, the nonce layout is its own delegate's.
@@ -112,7 +114,13 @@ impl ExecutorOwner {
             .chain_for_delegate(delegate)
             .unwrap_or_else(|| self.chain.clone());
         let inspected = self
-            .while_active(inspect_for_signing(&chain, &self.http, executor, &[asset]))
+            .while_active(inspect_for_signing(
+                &chain,
+                &self.http,
+                client,
+                executor,
+                &[asset],
+            ))
             .await;
         self.ensure_active()?;
         let balance = inspected

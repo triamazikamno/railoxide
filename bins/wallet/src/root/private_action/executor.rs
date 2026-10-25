@@ -478,6 +478,8 @@ impl WalletRoot {
                     draft.recipient,
                     if draft.unwrap { " (unwrap)" } else { "" },
                 );
+                // The preparation reads the stealth account over a route of its own.
+                let client = http.operation_http_client().await?;
                 let prepared = Arc::new(
                     owner
                         .prepare_authorized_operation(
@@ -486,6 +488,7 @@ impl WalletRoot {
                             &authorization,
                             &assets,
                             Some(&purpose_summary),
+                            &client,
                         )
                         .await?,
                 );

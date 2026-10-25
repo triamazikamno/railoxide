@@ -11,10 +11,10 @@ use eyre::{Result, eyre};
 use railgun_wallet::Utxo;
 
 use super::ExecutorOwner;
-use crate::WalletSession;
 use crate::vault::{
     ExecutorOperationId, ExecutorPayloadPurpose, ExecutorRecord, IssuedExecutorPayload,
 };
+use crate::{OperationHttpClient, WalletSession};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutorInputLockKind {
@@ -190,6 +190,7 @@ impl ExecutorOwner {
         operation: ExecutorOperationId,
         confirmed: u64,
         notes: &[Utxo],
+        client: &OperationHttpClient,
     ) -> Result<Option<ExecutorInputLock>> {
         let record = self
             .records()?
@@ -198,9 +199,9 @@ impl ExecutorOwner {
             .ok_or_else(|| eyre!("stealth account is unavailable"))?;
         let record = if record.swap().is_some() {
             let range = confirmed..confirmed.saturating_add(1);
-            self.observe_swap(operation, range).await?.record
+            self.observe_swap(operation, range, client).await?.record
         } else {
-            self.read_account(operation).await?
+            self.read_account(operation, client).await?
         };
         Ok(input_lock(&record, notes))
     }
@@ -289,6 +290,7 @@ impl WalletSession {
         &self,
         operation: ExecutorOperationId,
         confirmed: u64,
+        client: &OperationHttpClient,
     ) -> Result<Option<ExecutorInputLock>> {
         let owner = self
             .executor_owner()
@@ -302,7 +304,9 @@ impl WalletSession {
                     &snapshot.pending_overlay,
                 )
             });
-        owner.check_input_lock(operation, confirmed, &notes).await
+        owner
+            .check_input_lock(operation, confirmed, &notes, client)
+            .await
     }
 }
 

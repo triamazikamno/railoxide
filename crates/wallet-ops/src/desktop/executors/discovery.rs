@@ -3,16 +3,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::network::primitives::HeaderResponse as _;
-use alloy::providers::{Provider as _, bindings::IMulticall3};
+use alloy::primitives::Address;
+use alloy::providers::Provider as _;
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall as _;
 use broadcaster_core::contracts::railgun::RelayAdapt7702;
 use eyre::{Result, eyre};
+use rand::RngExt as _;
+use rand::seq::SliceRandom as _;
 
 use super::ExecutorOwner;
 use crate::settings::ExecutorProfile;
 use crate::vault::ExecutorUseObservation;
 use crate::{DesktopPrivateSpendAuthorization, WalletSession};
+
+/// A random 0.5-3 s wait before each address check after the first, so the endpoint can't
+/// time the range's checks together.
+fn check_jitter() -> Duration {
+    let millis = if cfg!(test) { 1..=5 } else { 500..=3_000 };
+    Duration::from_millis(rand::rng().random_range(millis))
+}
 
 /// Counts describe this request, not previous observations or transaction outcomes.
 pub struct ExecutorDiscoveryReport {
@@ -61,14 +71,54 @@ impl ExecutorOwner {
         self.discover_range(authorization, range).await
     }
 
-    /// Retain an explicitly authorized range, then check use in one aggregate.
-    /// This never queries holdings or reconstructs unavailable operation history.
+    /// Retain an explicitly authorized range, then check each address's use on its own route,
+    /// in random order, recording each result as it arrives. Stopping leaves unattempted checks
+    /// unrecorded. This never queries holdings or reconstructs unavailable operation history.
     pub async fn discover_range(
         &self,
         authorization: &DesktopPrivateSpendAuthorization,
         range: Range<u32>,
     ) -> Result<ExecutorDiscoveryReport> {
         self.ensure_active()?;
+        let mut checks = self.retain_range(authorization, range.clone()).await?;
+        checks.shuffle(&mut rand::rng());
+        // Checks run without the activity lock, so a long restore doesn't block other work.
+        self.while_active(async {
+            let mut report = ExecutorDiscoveryReport {
+                range,
+                used: 0,
+                unused: 0,
+                unavailable: 0,
+            };
+            for (position, (address, operation)) in checks.into_iter().enumerate() {
+                if position > 0 {
+                    tokio::time::sleep(check_jitter()).await;
+                }
+                let observation = self.check_use(address).await.ok();
+                {
+                    let _guard = self.lock_activity().await;
+                    // Shutdown closes before taking the lock, so no late result lands.
+                    self.ensure_active()?;
+                    self.store.record_use_check(operation, observation)?;
+                    self.notify_change();
+                }
+                match observation {
+                    Some(observation) if observation.was_used() => report.used += 1,
+                    Some(_) => report.unused += 1,
+                    None => report.unavailable += 1,
+                }
+            }
+            Ok(report)
+        })
+        .await
+    }
+
+    /// Persist the range's derived identities before any address leaves the device.
+    async fn retain_range(
+        &self,
+        authorization: &DesktopPrivateSpendAuthorization,
+        range: Range<u32>,
+    ) -> Result<Vec<(Address, crate::vault::ExecutorOperationId)>> {
         let _guard = self.lock_activity().await;
         self.ensure_active()?;
         self.unused
@@ -109,56 +159,25 @@ impl ExecutorOwner {
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         self.notify_change();
-        let observations = self
-            .while_active(async { Ok(self.check_use(&addresses).await.ok()) })
-            .await?;
-        let mut report = ExecutorDiscoveryReport {
-            range,
-            used: 0,
-            unused: 0,
-            unavailable: 0,
-        };
-        for (index, record) in records.iter().enumerate() {
-            self.ensure_active()?;
-            let observation = observations.as_ref().and_then(|items| items[index]);
-            match observation {
-                Some(observation) if observation.was_used() => report.used += 1,
-                Some(_) => report.unused += 1,
-                None => report.unavailable += 1,
-            }
-            self.store
-                .record_use_check(record.operation(), observation)?;
-        }
-        self.notify_change();
-        Ok(report)
+        Ok(addresses
+            .into_iter()
+            .zip(records)
+            .map(|((_, address), record)| (address, record.operation()))
+            .collect())
     }
 
-    async fn check_use(
-        &self,
-        addresses: &[(u32, alloy::primitives::Address)],
-    ) -> Result<Vec<Option<ExecutorUseObservation>>> {
-        let multicall = self
-            .chain
-            .rpc_route
-            .multicall()
-            .ok_or_else(|| eyre!("Multicall is unavailable for this chain"))?;
-        let call = IMulticall3::tryAggregateCall {
-            requireSuccess: false,
-            calls: addresses
-                .iter()
-                .map(|(_, address)| IMulticall3::Call {
-                    target: *address,
-                    callData: RelayAdapt7702::nonceCall {}.abi_encode().into(),
-                })
-                .collect(),
-        };
+    /// Check one address on a fresh route of its own, never the shared one. Any failure
+    /// leaves the address unavailable.
+    async fn check_use(&self, address: Address) -> Result<ExecutorUseObservation> {
+        let client = self.http.operation_http_client().await?;
         let pool = self
             .chain
             .rpc_route
             .for_class(crate::RpcTrafficClass::Sensitive)?
+            .isolated(client)
             .query_rpc_pool(&self.http.rpc_clients(), Duration::from_secs(30));
         for provider in pool.available_providers() {
-            // Validate the chain before disclosing the derived range.
+            // Validate the chain before disclosing the address.
             if provider.provider.get_chain_id().await.ok() != Some(self.chain.chain_id) {
                 continue;
             }
@@ -170,43 +189,27 @@ impl ExecutorOwner {
                 continue;
             };
             let block = head.header.num_hash();
-            // Send one explicit aggregate, rather than broker members which can
-            // fall back to individual calls. A failed aggregate ends this check.
+            // A failed or reverted call ends this check.
             let output = provider
                 .provider
                 .call(
                     TransactionRequest::default()
-                        .to(multicall)
-                        .input(call.abi_encode().into()),
+                        .to(address)
+                        .input(RelayAdapt7702::nonceCall {}.abi_encode().into()),
                 )
                 .block(BlockId::hash_canonical(block.hash))
                 .await?;
-            let results = IMulticall3::tryAggregateCall::abi_decode_returns_validate(&output)?;
-            if results.len() != addresses.len() {
-                return Err(eyre!("incomplete account use check"));
-            }
             let checked_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-            return Ok(results
-                .into_iter()
-                .map(|result| {
-                    if !result.success {
-                        return None;
-                    }
-                    // Low-level calls to undelegated EOAs succeed with empty bytes.
-                    // A delegated getter returning zero is still evidence of use.
-                    let nonce = if result.returnData.is_empty() {
-                        None
-                    } else {
-                        Some(
-                            RelayAdapt7702::nonceCall::abi_decode_returns_validate(
-                                &result.returnData,
-                            )
-                            .ok()?,
-                        )
-                    };
-                    Some(ExecutorUseObservation::new(block, checked_at, nonce))
-                })
-                .collect());
+            // Calls to undelegated EOAs succeed with empty bytes.
+            // A delegated getter returning zero is still evidence of use.
+            let nonce = if output.is_empty() {
+                None
+            } else {
+                Some(RelayAdapt7702::nonceCall::abi_decode_returns_validate(
+                    &output,
+                )?)
+            };
+            return Ok(ExecutorUseObservation::new(block, checked_at, nonce));
         }
         Err(eyre!("account use check is unavailable"))
     }

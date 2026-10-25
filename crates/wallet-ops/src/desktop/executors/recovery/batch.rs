@@ -18,7 +18,8 @@ use crate::settings::ExecutorProfile;
 use crate::signer::SoftwareEvmSigner;
 use crate::vault::{ExecutorPayloadContext, ExecutorPayloadPurpose, IssuedExecutorPayload};
 use crate::{
-    DesktopPrivateSpendAuthorization, PublicActionProgressStep, PublicActionProgressUpdate,
+    DesktopPrivateSpendAuthorization, OperationHttpClient, PublicActionProgressStep,
+    PublicActionProgressUpdate,
 };
 
 impl ExecutorOwner {
@@ -26,10 +27,12 @@ impl ExecutorOwner {
     /// A signed payload remains durable even if simulation, submission or local waiting fails.
     /// The returned completion is the batch's standing right after the send: its nonce as
     /// the account read shows it, the action attributed there, and its shield in private sync.
+    /// Every read and the send go over `client`, the recovery's route.
     pub async fn submit_native_recovery_batch(
         &self,
         prepared: &PreparedExecutorRecovery,
         authorization: &DesktopPrivateSpendAuthorization,
+        client: &OperationHttpClient,
         mut progress: impl FnMut(PublicActionProgressUpdate) + Send,
     ) -> Result<ExecutorRecoveryBatchOutcome> {
         self.ensure_active()?;
@@ -55,6 +58,7 @@ impl ExecutorOwner {
             .while_active(inspect_for_recovery_batch(
                 &chain,
                 &self.http,
+                client,
                 prepared.source,
                 &[prepared.asset],
             ))
@@ -65,7 +69,9 @@ impl ExecutorOwner {
                 "execution nonce changed; review the rebuilt recovery"
             ));
         }
-        let record = self.admit_signing_read(&record, &chain, observed).await?;
+        let record = self
+            .admit_signing_read(&record, &chain, observed, client)
+            .await?;
         recovery_funding_admission(
             &inspection,
             prepared.asset,
@@ -107,8 +113,6 @@ impl ExecutorOwner {
         let signer = VaultedPublicSigner::Software(SoftwareEvmSigner::from_private_key(
             signer.to_bytes().0,
         )?);
-        // The submitted step's own client, opened before the payload is recorded as issued.
-        let client = self.while_active(self.http.operation_http_client()).await?;
         self.ensure_active()?;
         self.store.record_recovery_issued(
             prepared.operation,
@@ -140,13 +144,13 @@ impl ExecutorOwner {
                 &chain,
                 gas_fee,
                 &self.http,
-                &client,
+                client,
                 &mut handoff,
                 &mut progress,
             )))
             .await?;
         drop(guard);
-        let observed = self.reconcile_account(prepared.operation).await?;
+        let observed = self.reconcile_account(prepared.operation, client).await?;
         let record = observed.record();
         let completion = self
             .attribution(record)

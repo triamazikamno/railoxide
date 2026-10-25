@@ -11,14 +11,18 @@ use sync_service::WalletHandle;
 use tokio::sync::{Mutex, MutexGuard, watch};
 
 use super::executor_observation::{
-    ExecutorAccountRead, read_executor_account, read_executor_asset_balance, trace_step,
+    ExecutorAccountRead, ObservationEndpoints, read_executor_account, read_executor_asset_balance,
+    trace_step,
 };
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
     DesktopVaultStore, DesktopViewSession, ExecutorNonceObservation, ExecutorOperationId,
     ExecutorRecord, ExecutorStore, SwapUseId,
 };
-use crate::{ExecutorAsset, ExecutorInspection, HttpContext, WalletSyncTip, inspect_executor};
+use crate::{
+    ExecutorAsset, ExecutorInspection, HttpContext, OperationHttpClient, WalletSyncTip,
+    inspect_executor,
+};
 
 mod attribution;
 pub use attribution::{
@@ -130,7 +134,6 @@ pub struct ExecutorOwner {
     store: ExecutorStore,
     chain: EffectiveChainConfig,
     http: HttpContext,
-    endpoints: super::executor_observation::ObservationEndpoints,
     closed: watch::Sender<bool>,
     activity: Arc<Mutex<()>>,
     /// The latest confirmed read of each account's execution nonce applied in this session.
@@ -191,11 +194,6 @@ impl ExecutorOwner {
             view,
             vault: DesktopVaultStore::from_db(db),
             store,
-            endpoints: super::executor_observation::ObservationEndpoints::new(
-                &chain,
-                &http,
-                crate::RpcTrafficClass::Sensitive,
-            )?,
             chain,
             http,
             closed: watch::channel(false).0,
@@ -225,10 +223,18 @@ impl ExecutorOwner {
         Some(chain)
     }
 
-    /// Also releases the observation endpoints, so their background admission stops.
+    /// This chain's Sensitive endpoints on `client`'s route, for one read or one caller's reads.
+    fn observation_endpoints(&self, client: &OperationHttpClient) -> Result<ObservationEndpoints> {
+        Ok(ObservationEndpoints::new(
+            &self.chain,
+            &self.http,
+            crate::RpcTrafficClass::Sensitive,
+            client,
+        )?)
+    }
+
     pub(crate) fn close(&self) {
         self.closed.send_replace(true);
-        self.endpoints.release();
         self.synced_observation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -406,6 +412,7 @@ impl ExecutorOwner {
     pub async fn reconcile_account(
         &self,
         operation: ExecutorOperationId,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorReconciliationReport> {
         self.ensure_active()?;
         // Private sync can resolve a payload with no chain read. Only owner closure is
@@ -424,7 +431,11 @@ impl ExecutorOwner {
             self.ensure_active()?;
             self.begin_account_reconciliation(operation)?
         };
-        let read = trace_step("account_read", self.read_account_state(&previous, None)).await?;
+        let read = trace_step(
+            "account_read",
+            self.read_account_state(&previous, None, client),
+        )
+        .await?;
         let _guard = self.lock_activity().await;
         self.ensure_active()?;
         self.apply_account_state(operation, read)
@@ -450,10 +461,15 @@ impl ExecutorOwner {
     async fn reconcile_account_admitted(
         &self,
         operation: ExecutorOperationId,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorReconciliationReport> {
         self.ensure_active()?;
         let previous = self.begin_account_reconciliation(operation)?;
-        let read = trace_step("account_read", self.read_account_state(&previous, None)).await?;
+        let read = trace_step(
+            "account_read",
+            self.read_account_state(&previous, None, client),
+        )
+        .await?;
         self.apply_account_state(operation, read)
     }
 
@@ -473,11 +489,12 @@ impl ExecutorOwner {
     }
 
     /// One read of `record`'s account at `requested`, or at the confirmed tip, under its
-    /// delegate's nonce layout.
+    /// delegate's nonce layout, on `client`'s route.
     async fn read_account_state(
         &self,
         record: &ExecutorRecord,
         requested: Option<u64>,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorAccountRead> {
         let address = record
             .address()
@@ -486,11 +503,9 @@ impl ExecutorOwner {
             .chain_for_delegate(record.delegate())
             .ok_or_else(|| eyre!("chain does not support Railgun"))?;
         chain.enabled = true;
+        let endpoints = self.observation_endpoints(client)?;
         self.while_active(read_executor_account(
-            &self.endpoints,
-            &chain,
-            address,
-            requested,
+            &endpoints, &chain, address, requested,
         ))
         .await
     }
@@ -530,6 +545,7 @@ impl ExecutorOwner {
         record: &ExecutorRecord,
         chain: &EffectiveChainConfig,
         observed: ExecutorNonceObservation,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorRecord> {
         let operation = record.operation();
         self.store.invalidate_observation(operation)?;
@@ -537,9 +553,10 @@ impl ExecutorOwner {
             let address = record
                 .address()
                 .ok_or_else(|| eyre!("executor address is unavailable"))?;
+            let endpoints = self.observation_endpoints(client)?;
             let read = self
                 .while_active(read_executor_account(
-                    &self.endpoints,
+                    &endpoints,
                     chain,
                     address,
                     Some(observed.block().number),
@@ -620,6 +637,7 @@ impl ExecutorOwner {
     pub(super) async fn read_account(
         &self,
         operation: ExecutorOperationId,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorRecord> {
         self.ensure_active()?;
         let record = self
@@ -628,7 +646,11 @@ impl ExecutorOwner {
             .into_iter()
             .find(|record| record.operation() == operation)
             .ok_or_else(|| eyre!("stealth account is unavailable"))?;
-        let read = trace_step("account_read", self.read_account_state(&record, None)).await?;
+        let read = trace_step(
+            "account_read",
+            self.read_account_state(&record, None, client),
+        )
+        .await?;
         let Some(observed) = read.nonce else {
             return Ok(record);
         };
@@ -645,9 +667,10 @@ impl ExecutorOwner {
         &self,
         operation: ExecutorOperationId,
         assets: &[ExecutorAsset],
+        client: &OperationHttpClient,
     ) -> Result<ExecutorInspection> {
-        let inspection = self.inspect_record(operation, assets).await?;
-        if self.read_account(operation).await.is_err() {
+        let inspection = self.inspect_record(operation, assets, client).await?;
+        if self.read_account(operation, client).await.is_err() {
             self.ensure_active()?;
         }
         Ok(inspection)
@@ -658,6 +681,7 @@ impl ExecutorOwner {
         &self,
         operation: ExecutorOperationId,
         assets: &[ExecutorAsset],
+        client: &OperationHttpClient,
     ) -> Result<ExecutorInspection> {
         self.ensure_active()?;
         let _guard = self.lock_activity().await;
@@ -678,6 +702,7 @@ impl ExecutorOwner {
         self.while_active(inspect_executor(
             &historical_chain,
             &self.http,
+            client,
             address,
             assets,
         ))
@@ -690,6 +715,7 @@ impl ExecutorOwner {
         &self,
         operation: ExecutorOperationId,
         asset: ExecutorAsset,
+        client: &OperationHttpClient,
     ) -> Result<(U256, BlockNumHash)> {
         self.ensure_active()?;
         let _guard = self.lock_activity().await;
@@ -703,8 +729,9 @@ impl ExecutorOwner {
         let address = record.address().ok_or_else(|| {
             eyre!("executor address is unavailable; authorize its derivation first")
         })?;
+        let endpoints = self.observation_endpoints(client)?;
         self.while_active(read_executor_asset_balance(
-            &self.endpoints,
+            &endpoints,
             &self.chain,
             address,
             asset,

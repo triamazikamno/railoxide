@@ -30,8 +30,8 @@ use crate::vault::{
     SwapUseRole,
 };
 use crate::{
-    DesktopPrivateSpendAuthorization, ExecutorOwner, PublicBroadcasterCandidate,
-    RAILGUN_PROTOCOL_FEE_BPS,
+    DesktopPrivateSpendAuthorization, ExecutorOwner, OperationHttpClient,
+    PublicBroadcasterCandidate, RAILGUN_PROTOCOL_FEE_BPS,
 };
 
 /// The claim of a swap paid from a Public account: see [`ExecutorOwner::claim_public_swap`].
@@ -63,6 +63,8 @@ pub struct PublicSwapDeliverySigning<'a> {
     pub valid_to: u32,
     pub authorization: &'a DesktopPrivateSpendAuthorization,
     pub notes: Option<&'a dyn SwapShieldNotes>,
+    /// The swap's route, for the destination account's reads.
+    pub client: &'a OperationHttpClient,
 }
 
 /// The signed delivery, or the review change that stopped it.
@@ -209,6 +211,7 @@ impl ExecutorOwner {
         id: SwapUseId,
         candidate: Option<PublicBroadcasterCandidate>,
         authorization: &DesktopPrivateSpendAuthorization,
+        client: &OperationHttpClient,
     ) -> Result<SwapPairSide> {
         self.ensure_active()?;
         let record = self
@@ -227,7 +230,8 @@ impl ExecutorOwner {
         }
         let side = match candidate {
             Some(candidate) => SwapPairSide::Setup(
-                Box::pin(self.resume_swap_setup(operation, candidate, authorization)).await?,
+                Box::pin(self.resume_swap_setup(operation, candidate, authorization, client))
+                    .await?,
             ),
             None => SwapPairSide::Existing {
                 operation,
@@ -255,8 +259,9 @@ impl ExecutorOwner {
         confirmed: u64,
         swap_use: SwapUseId,
         notes: Option<&dyn SwapShieldNotes>,
+        client: &OperationHttpClient,
     ) -> Result<DelegatedSwapExecutor> {
-        self.delegated_destination(operation, confirmed, swap_use, notes, |record| {
+        self.delegated_destination(operation, confirmed, swap_use, notes, client, |record| {
             record.public_swap_use(swap_use).is_some() && record.address().is_some()
         })
         .await
@@ -292,6 +297,7 @@ impl ExecutorOwner {
             valid_to,
             authorization,
             notes,
+            client,
         } = signing;
         self.ensure_active()?;
         let record = self
@@ -365,6 +371,7 @@ impl ExecutorOwner {
                 destination_minimum,
                 authorization,
                 notes,
+                client,
             ),
         )
         .await?;

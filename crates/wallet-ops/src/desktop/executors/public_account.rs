@@ -2,9 +2,9 @@ use super::{
     Arc, DesktopViewSession, ExecutorOperationId, ExecutorOwner, ExecutorReconciliationReport,
     ExecutorRecord, Future, Result, eyre,
 };
-use crate::DesktopPrivateSpendAuthorization;
 use crate::desktop::executor_discovery::inspect_for_recovery_signing;
 use crate::vault::{PublicAccountMetadata, PublicAccountScope, PublicAccountSource};
+use crate::{DesktopPrivateSpendAuthorization, OperationHttpClient};
 
 /// Owned by the Public signer through signed-data handoff. Every signing caller
 /// uses the same owner exclusion, including message and gateway signing.
@@ -26,11 +26,12 @@ impl ExecutorPublicSigningGuard {
         &self,
         owner: &Arc<ExecutorOwner>,
         operation: ExecutorOperationId,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorReconciliationReport> {
         if !Arc::ptr_eq(owner, &self.owner) {
             return Err(eyre!("executor signing owner changed"));
         }
-        owner.reconcile_account_admitted(operation).await
+        owner.reconcile_account_admitted(operation, client).await
     }
 
     pub(crate) fn ensure_chain(&self, chain_id: Option<u64>) -> Result<()> {
@@ -84,8 +85,9 @@ impl ExecutorOwner {
         account: &PublicAccountMetadata,
         grant: &mut crate::vault::SpendGrant,
         seed: Option<&crate::vault::ProtectedSoftwareSeedSession>,
+        client: &OperationHttpClient,
     ) -> Result<(crate::signer::SoftwareEvmSigner, ExecutorPublicSigningGuard)> {
-        self.admit_public_signer_with(view, account, |source| {
+        self.admit_public_signer_with(view, account, client, |source| {
             self.vault
                 .executor_spend_signers_for_session(
                     grant,
@@ -105,9 +107,10 @@ impl ExecutorOwner {
         view: &DesktopViewSession,
         account: &PublicAccountMetadata,
         authorization: &DesktopPrivateSpendAuthorization,
+        client: &OperationHttpClient,
     ) -> Result<(crate::signer::SoftwareEvmSigner, ExecutorPublicSigningGuard)> {
         let admitted = self
-            .admit_public_signer_with(view, account, |source| {
+            .admit_public_signer_with(view, account, client, |source| {
                 self.authorized_executor_signer(
                     authorization,
                     &super::HardwareExecutorAction::Public {
@@ -130,9 +133,10 @@ impl ExecutorOwner {
         view: &DesktopViewSession,
         account: &PublicAccountMetadata,
         authorization: &DesktopPrivateSpendAuthorization,
+        client: &OperationHttpClient,
     ) -> Result<(crate::signer::SoftwareEvmSigner, ExecutorPublicSigningGuard)> {
         let admitted = self
-            .admit_public_signer_with(view, account, |source| {
+            .admit_public_signer_with(view, account, client, |source| {
                 self.authorized_executor_signer(
                     authorization,
                     &super::HardwareExecutorAction::GasPayment {
@@ -154,6 +158,7 @@ impl ExecutorOwner {
         self: &Arc<Self>,
         view: &DesktopViewSession,
         account: &PublicAccountMetadata,
+        client: &OperationHttpClient,
         derive: impl FnOnce(
             crate::vault::ExecutorPublicAccountSource,
         ) -> Result<alloy::signers::local::PrivateKeySigner>,
@@ -207,6 +212,7 @@ impl ExecutorOwner {
                 .while_active(inspect_for_recovery_signing(
                     &chain,
                     &self.http,
+                    client,
                     account.address,
                     &[],
                     !record.issued().is_empty(),
@@ -214,11 +220,13 @@ impl ExecutorOwner {
                 .await?;
             // Without the account's current nonce nothing recorded counts as resolved.
             let observed = nonce.ok_or_else(|| eyre!("executor execution nonce is unknown"))?;
-            let current = self.admit_signing_read(&record, &chain, observed).await?;
+            let current = self
+                .admit_signing_read(&record, &chain, observed, client)
+                .await?;
             require_resolved_public_work(&current)?;
             if current.swap().is_some()
                 && !self
-                    .while_active(self.swap_orders_closed(&chain, &current))
+                    .while_active(self.swap_orders_closed(&chain, &current, client))
                     .await?
             {
                 return Err(eyre!(

@@ -599,6 +599,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
             setup_approval(WETH, USDC, SwapDelivery::Reshield),
             None,
             &password(),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap()
@@ -859,7 +860,10 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
         }
         let unrelated = tokio::time::timeout(
             Duration::from_secs(2),
-            preparing.reconcile_account(ExecutorOperationId::random().unwrap()),
+            preparing.reconcile_account(
+                ExecutorOperationId::random().unwrap(),
+                crate::OperationHttpClient::direct_for_tests(),
+            ),
         )
         .await
         .expect("network preparation must release activity");
@@ -1321,6 +1325,7 @@ async fn swap_is_approved_before_setup_but_signed_only_once_delegated() {
             setup_approval(WETH, USDC, SwapDelivery::Reshield),
             None,
             &password(),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -1654,6 +1659,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
             setup_approval(USDC, Address::ZERO, approved),
             None,
             &password(),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap()
@@ -2240,6 +2246,7 @@ async fn set_up_account(
             &password(),
             &[],
             Some("Private swap"),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -2295,6 +2302,7 @@ impl BridgeOrderFixture {
                 setup_approval(USDC, WETH, SwapDelivery::Bridge(delivery)),
                 None,
                 &password(),
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .unwrap()
@@ -3196,6 +3204,7 @@ async fn a_speed_up_signs_a_second_order_at_the_open_orders_nonce() {
             setup_approval(USDC, WETH, SwapDelivery::Reshield),
             None,
             &password(),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap()
@@ -3628,6 +3637,7 @@ async fn an_order_on_an_included_setup_signs_after_it_on_a_fresh_latest_read() {
             setup_approval(USDC, WETH, SwapDelivery::Reshield),
             None,
             &password(),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -3684,6 +3694,7 @@ async fn an_order_on_an_included_setup_signs_after_it_on_a_fresh_latest_read() {
             &setup_call(&setup_fee),
             std::slice::from_ref(&setup_fee),
             &password(),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -3718,6 +3729,7 @@ async fn an_order_on_an_included_setup_signs_after_it_on_a_fresh_latest_read() {
             13,
             SwapAccountRole::Source,
             SwapAccountUse::Claimed(first_use),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -3964,7 +3976,12 @@ async fn an_order_on_an_included_setup_signs_after_it_on_a_fresh_latest_read() {
     rpc.set_head_account(executor, None);
     assert!(owner.swap_setup_preview(operation).is_ok());
     let retry = owner
-        .resume_swap_setup(operation, broadcaster(delegate), &password())
+        .resume_swap_setup(
+            operation,
+            broadcaster(delegate),
+            &password(),
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     assert_eq!(retry.context().execution_nonce, U256::ZERO);
@@ -3979,6 +3996,7 @@ async fn an_order_on_an_included_setup_signs_after_it_on_a_fresh_latest_read() {
             &setup_call(&retry_fee),
             std::slice::from_ref(&retry_fee),
             &password(),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -4000,7 +4018,10 @@ async fn an_order_on_an_included_setup_signs_after_it_on_a_fresh_latest_read() {
     // pending at the account's nonce.
     rpc.state.head.store(15, Ordering::Relaxed);
     rpc.set_delegated_account(executor, delegate, U256::ONE);
-    let checked = owner.observe_swap_setup(operation).await.unwrap();
+    let checked = owner
+        .observe_swap_setup(operation, crate::OperationHttpClient::direct_for_tests())
+        .await
+        .unwrap();
     assert!(matches!(checked.status, SwapSetupStatus::Delegated(_)));
     assert_eq!(checked.inclusion, None);
     let resolved = record_of();
@@ -4454,6 +4475,7 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
                 destination_candidate: destination_new.then_some(destination_candidate),
                 authorization: &authorization,
                 destination_authorization: Some(&destination_authorization),
+                client: crate::OperationHttpClient::direct_for_tests(),
             },
         )
         .await
@@ -4490,6 +4512,7 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
                     crate::vault::SwapUseId::first(operation),
                     destination_executor,
                     None,
+                    crate::OperationHttpClient::direct_for_tests(),
                 )
                 .await
                 .unwrap_err();
@@ -4976,6 +4999,7 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
                 U256::from(1_001),
                 &destination_authorization,
                 None,
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .unwrap();
@@ -5146,6 +5170,7 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
                 39,
                 SwapAccountRole::Source,
                 SwapAccountUse::New,
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .unwrap();
@@ -5198,6 +5223,7 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
                 second,
                 destination_executor,
                 Some(&notes),
+                crate::OperationHttpClient::direct_for_tests(),
             )
         };
         let refusal = |error: eyre::Report| {
@@ -5238,6 +5264,7 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
                 U256::from(1_000),
                 &destination_authorization,
                 Some(&notes),
+                crate::OperationHttpClient::direct_for_tests(),
             )
         };
         hold(shield_note(Some(crate::PoiStatus::ShieldBlocked), false));

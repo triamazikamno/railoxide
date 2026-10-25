@@ -1164,7 +1164,8 @@ impl ClassRoute {
             route: self.route.isolated(client),
         }
     }
-    pub(super) const fn route(&self) -> &RpcChainRoute {
+    /// The chain route restricted to this class's endpoints.
+    pub(crate) const fn route(&self) -> &RpcChainRoute {
         &self.route
     }
 }

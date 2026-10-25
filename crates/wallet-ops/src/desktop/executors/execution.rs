@@ -24,7 +24,10 @@ use crate::vault::{
     ExecutorInputIdentity, ExecutorOperationId, ExecutorPayloadContext, ExecutorPayloadPurpose,
     IssuedExecutorPayload,
 };
-use crate::{ExecutorActivity, ExecutorAsset, ExecutorInspection, PublicBroadcasterCandidate};
+use crate::{
+    ExecutorActivity, ExecutorAsset, ExecutorInspection, OperationHttpClient,
+    PublicBroadcasterCandidate,
+};
 
 /// Funding selection precedes allocation. Existing sponsored Send and Unshield
 /// select their legacy route before reaching this owner.
@@ -302,9 +305,17 @@ impl ExecutorOwner {
         authorization: &crate::DesktopPrivateSpendAuthorization,
         assets: &[ExecutorAsset],
         purpose_summary: Option<&str>,
+        client: &OperationHttpClient,
     ) -> Result<PreparedExecutorOperation> {
-        self.prepare_operation(operation, delivery, authorization, assets, purpose_summary)
-            .await
+        self.prepare_operation(
+            operation,
+            delivery,
+            authorization,
+            assets,
+            purpose_summary,
+            client,
+        )
+        .await
     }
 
     /// Recheck native ownership before quoting or proving an existing preparation.
@@ -408,6 +419,7 @@ impl ExecutorOwner {
         authorization: &crate::DesktopPrivateSpendAuthorization,
         assets: &[ExecutorAsset],
         purpose_summary: Option<&str>,
+        client: &OperationHttpClient,
     ) -> Result<PreparedExecutorOperation> {
         self.prepare_reserved_operation(
             operation,
@@ -419,6 +431,7 @@ impl ExecutorOwner {
                 swap_approval: None,
                 destination_operation: None,
             },
+            client,
         )
         .await
     }
@@ -458,6 +471,7 @@ impl ExecutorOwner {
         authorization: &crate::DesktopPrivateSpendAuthorization,
         assets: &[ExecutorAsset],
         reservation: OperationReservation<'_>,
+        client: &OperationHttpClient,
     ) -> Result<PreparedExecutorOperation> {
         self.require_executor_authorization(
             authorization,
@@ -542,12 +556,13 @@ impl ExecutorOwner {
         let started = Instant::now();
         tracing::info!(target: "executor_preparation", step = "chain_inspection", "started");
         let result = if record.issued().is_empty() {
-            self.unused_inspection(record.index(), address, assets)
+            self.unused_inspection(record.index(), address, assets, client)
                 .await
         } else {
             self.while_active(inspect_for_signing(
                 &self.chain,
                 &self.http,
+                client,
                 address,
                 assets,
             ))
@@ -612,8 +627,9 @@ impl ExecutorOwner {
         call: &TransactionCall,
         inputs: &[Utxo],
         authorization: &crate::DesktopPrivateSpendAuthorization,
+        client: &OperationHttpClient,
     ) -> Result<IssuedExecutorTransaction> {
-        self.issue_operation_with(prepared, call, inputs, authorization, None)
+        self.issue_operation_with(prepared, call, inputs, authorization, None, client)
             .await
     }
 
@@ -626,8 +642,9 @@ impl ExecutorOwner {
         inputs: &[Utxo],
         authorization: &crate::DesktopPrivateSpendAuthorization,
         retry: &mut IssueRetry,
+        client: &OperationHttpClient,
     ) -> Result<IssuedExecutorTransaction> {
-        self.issue_operation_with(prepared, call, inputs, authorization, Some(retry))
+        self.issue_operation_with(prepared, call, inputs, authorization, Some(retry), client)
             .await
     }
 
@@ -638,8 +655,9 @@ impl ExecutorOwner {
         inputs: &[Utxo],
         authorization: &crate::DesktopPrivateSpendAuthorization,
         retry: Option<&mut IssueRetry>,
+        client: &OperationHttpClient,
     ) -> Result<IssuedExecutorTransaction> {
-        self.issue_payload(prepared, authorization, retry, |_| {
+        self.issue_payload(prepared, authorization, retry, client, |_| {
             let hash = prepared.context.signing_hash(call)?;
             // The durable reservation must cover precisely the private inputs whose
             // nullifiers the signed execute can spend, including every inner transaction.
@@ -715,6 +733,7 @@ impl ExecutorOwner {
         prepared: &PreparedExecutorOperation,
         authorization: &crate::DesktopPrivateSpendAuthorization,
         mut retry: Option<&mut IssueRetry>,
+        client: &OperationHttpClient,
         payload: impl FnOnce(&crate::vault::ExecutorRecord) -> Result<PayloadToSign<'a>>,
     ) -> Result<IssuedExecutorTransaction> {
         self.ensure_active()?;
@@ -759,6 +778,7 @@ impl ExecutorOwner {
                 record.index(),
                 prepared.context.executor,
                 &prepared.inspection_assets,
+                client,
             )
             .await?
         } else {
@@ -769,6 +789,7 @@ impl ExecutorOwner {
                     crate::desktop::executor_discovery::inspect_for_recovery_batch(
                         &chain,
                         &self.http,
+                        client,
                         prepared.context.executor,
                         &[recovery.asset()],
                     ),
@@ -778,6 +799,7 @@ impl ExecutorOwner {
                 self.while_active(inspect_for_signing(
                     &chain,
                     &self.http,
+                    client,
                     prepared.context.executor,
                     &[],
                 ))
@@ -821,7 +843,9 @@ impl ExecutorOwner {
         // An unresolved earlier nonce keeps future-nonce signing blocked. A reused round
         // keeps the durable observation its evidence matched.
         if reused.is_none() {
-            let reconciled = self.admit_signing_read(&record, &chain, observed).await?;
+            let reconciled = self
+                .admit_signing_read(&record, &chain, observed, client)
+                .await?;
             if prepared.recovery.is_none() {
                 require_unfinished_operation(&reconciled)?;
             }

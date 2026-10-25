@@ -923,6 +923,7 @@ fn walletconnect_personal_sign_uses_spend_authorized_public_signer() {
             message: b"hello".to_vec(),
             event_tx: None,
         },
+        crate::OperationHttpClient::direct_for_tests(),
     ));
     assert!(denied.is_err());
 
@@ -946,6 +947,7 @@ fn walletconnect_personal_sign_uses_spend_authorized_public_signer() {
                 message: b"hello".to_vec(),
                 event_tx: None,
             },
+            crate::OperationHttpClient::direct_for_tests(),
         ))
         .expect("personal sign");
 
@@ -1016,6 +1018,7 @@ fn walletconnect_typed_data_signs_for_software_public_account() {
                 hash_fallback_confirmed: false,
                 event_tx: None,
             },
+            crate::OperationHttpClient::direct_for_tests(),
         ))
         .expect("typed-data sign");
 
@@ -1089,6 +1092,7 @@ fn walletconnect_typed_data_signs_primitive_prefixed_custom_types_for_software_p
                 hash_fallback_confirmed: false,
                 event_tx: None,
             },
+            crate::OperationHttpClient::direct_for_tests(),
         ))
         .expect("typed-data sign");
 
@@ -1143,6 +1147,7 @@ fn walletconnect_typed_data_signing_error_preserves_method_label() {
                     event_tx: None,
                 },
                 method,
+                crate::OperationHttpClient::direct_for_tests(),
             ))
             .expect_err("typed-data signing should fail with the wrong password");
         let message = error
@@ -3743,7 +3748,7 @@ fn vaulted_public_signer_resolves_private_self_broadcast_gas_payers() {
             }),
             hash_fallback_confirmed: false,
             event_tx: Some(events),
-        })).unwrap_err();
+        }, crate::OperationHttpClient::direct_for_tests())).unwrap_err();
         assert!(
             matches!(error.downcast_ref::<crate::walletconnect::WalletConnectError>(),
             Some(crate::walletconnect::WalletConnectError::UnsupportedMethod(method)) if method == "eth_signTypedData_v4")
@@ -3844,6 +3849,7 @@ fn passphrase_walletconnect_signer_requires_the_active_protected_session() {
             message: b"passphrase session".to_vec(),
             event_tx: None,
         },
+        crate::OperationHttpClient::direct_for_tests(),
     ));
     assert!(missing.is_err());
 
@@ -3886,6 +3892,7 @@ fn passphrase_walletconnect_signer_requires_the_active_protected_session() {
             message: b"passphrase session".to_vec(),
             event_tx: None,
         },
+        crate::OperationHttpClient::direct_for_tests(),
     ));
     assert!(wrong.is_err());
 
@@ -3909,6 +3916,7 @@ fn passphrase_walletconnect_signer_requires_the_active_protected_session() {
                 message: b"passphrase session".to_vec(),
                 event_tx: None,
             },
+            crate::OperationHttpClient::direct_for_tests(),
         ))
         .expect("passphrase WalletConnect signature");
     assert!(signature.starts_with("0x"));
@@ -4403,45 +4411,51 @@ async fn invalidated_dapp_signing_requests_stop_before_spend_authorization() {
     );
     control.invalidate(&crate::RpcBrokerError::OriginRejected);
     // Invalid vault credentials distinguish request rejection from signer construction.
-    let personal = walletconnect_sign_personal_message(WalletConnectPersonalSignRequest {
-        executor_owner: None,
-        chain_id: 1,
-        request_control: Some(control.clone()),
-        view_session: view_session.clone(),
-        vault_store: store.clone(),
-        authorization: Some(
-            crate::DesktopPrivateSpendAuthorization::from_software_credentials(
-                Zeroizing::new("wrong password".into()),
-                None,
+    let personal = walletconnect_sign_personal_message(
+        WalletConnectPersonalSignRequest {
+            executor_owner: None,
+            chain_id: 1,
+            request_control: Some(control.clone()),
+            view_session: view_session.clone(),
+            vault_store: store.clone(),
+            authorization: Some(
+                crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                    Zeroizing::new("wrong password".into()),
+                    None,
+                ),
             ),
-        ),
-        trezor_app_passphrase: None,
-        trezor_pin_matrix_provider: None,
-        public_account_uuid: "missing".into(),
-        message: b"hello".to_vec(),
-        event_tx: None,
-    })
+            trezor_app_passphrase: None,
+            trezor_pin_matrix_provider: None,
+            public_account_uuid: "missing".into(),
+            message: b"hello".to_vec(),
+            event_tx: None,
+        },
+        crate::OperationHttpClient::direct_for_tests(),
+    )
     .await
     .unwrap_err();
-    let typed = walletconnect_sign_typed_data_v4(WalletConnectTypedDataSignRequest {
-        executor_owner: None,
-        chain_id: 1,
-        request_control: Some(control),
-        view_session: view_session.clone(),
-        vault_store: store.clone(),
-        authorization: Some(
-            crate::DesktopPrivateSpendAuthorization::from_software_credentials(
-                Zeroizing::new("wrong password".into()),
-                None,
+    let typed = walletconnect_sign_typed_data_v4(
+        WalletConnectTypedDataSignRequest {
+            executor_owner: None,
+            chain_id: 1,
+            request_control: Some(control),
+            view_session: view_session.clone(),
+            vault_store: store.clone(),
+            authorization: Some(
+                crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                    Zeroizing::new("wrong password".into()),
+                    None,
+                ),
             ),
-        ),
-        trezor_app_passphrase: None,
-        trezor_pin_matrix_provider: None,
-        public_account_uuid: "missing".into(),
-        typed_data: Value::Null,
-        hash_fallback_confirmed: false,
-        event_tx: None,
-    })
+            trezor_app_passphrase: None,
+            trezor_pin_matrix_provider: None,
+            public_account_uuid: "missing".into(),
+            typed_data: Value::Null,
+            hash_fallback_confirmed: false,
+            event_tx: None,
+        },
+        crate::OperationHttpClient::direct_for_tests(),
+    )
     .await
     .unwrap_err();
     for error in [personal, typed] {

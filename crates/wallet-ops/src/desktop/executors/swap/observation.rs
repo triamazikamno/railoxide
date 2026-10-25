@@ -32,6 +32,7 @@ use super::super::attribution::{
     ExecutorAttributionEvidence, InvalidatedSwapOrders, attributed_action,
 };
 use crate::ExecutorOwner;
+use crate::OperationHttpClient;
 use crate::desktop::executor_discovery::execution_nonce_at;
 use crate::desktop::executor_observation::{
     ObservationEndpoints, expected_shields, private_effects_present, trace_step,
@@ -195,9 +196,10 @@ impl ExecutorOwner {
         &self,
         operation: ExecutorOperationId,
         range: Range<u64>,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorReconciliationReport> {
         let sync = self.synced_snapshot();
-        Box::pin(self.observe_swap_synced(operation, range, sync)).await
+        Box::pin(self.observe_swap_synced(operation, range, sync, client)).await
     }
 
     /// Private sync's current snapshot. `None` before sync is attached and while it has none.
@@ -220,6 +222,7 @@ impl ExecutorOwner {
         operation: ExecutorOperationId,
         range: Range<u64>,
         sync: Option<Arc<WalletCurrentSnapshot>>,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorReconciliationReport> {
         if self
             .swap_record(operation)?
@@ -227,9 +230,9 @@ impl ExecutorOwner {
         {
             return Err(eyre!("swap order is unavailable"));
         }
-        let report = trace_step("swap_account", self.reconcile_account(operation)).await?;
+        let report = trace_step("swap_account", self.reconcile_account(operation, client)).await?;
         let observed = self
-            .read_swap_observations(report.record(), range, sync.as_deref())
+            .read_swap_observations(report.record(), range, sync.as_deref(), client)
             .await;
         let _guard = self.lock_activity().await;
         self.require_record_unchanged(report.record())?;
@@ -241,19 +244,17 @@ impl ExecutorOwner {
         record: &ExecutorRecord,
         range: Range<u64>,
         sync: Option<&WalletCurrentSnapshot>,
+        client: &OperationHttpClient,
     ) -> Result<SwapObserved> {
         let mut chain = self
             .chain_for_delegate(record.delegate())
             .ok_or_else(|| eyre!("chain does not support Railgun"))?;
         chain.enabled = true;
+        let endpoints = self.observation_endpoints(client)?;
         trace_step(
             "swap_orders",
             self.while_active(Box::pin(observe_swap_orders(
-                &self.endpoints,
-                &chain,
-                record,
-                range,
-                sync,
+                &endpoints, &chain, record, range, sync,
             ))),
         )
         .await
@@ -307,8 +308,10 @@ impl ExecutorOwner {
         &self,
         chain: &EffectiveChainConfig,
         record: &ExecutorRecord,
+        client: &OperationHttpClient,
     ) -> Result<bool> {
-        for provider in self.endpoints.providers().await {
+        let endpoints = self.observation_endpoints(client)?;
+        for provider in endpoints.providers().await {
             let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = provider.index);
             match trace_step(
                 "swap_orders_closed_rpc",
@@ -318,10 +321,10 @@ impl ExecutorOwner {
             .await
             {
                 Ok(closed) => {
-                    self.endpoints.succeeded(&provider);
+                    endpoints.succeeded(&provider);
                     return Ok(closed);
                 }
-                Err(error) => self.endpoints.failed(&provider, &error),
+                Err(error) => endpoints.failed(&provider, &error),
             }
         }
         Err(eyre!("swap order state is unavailable"))

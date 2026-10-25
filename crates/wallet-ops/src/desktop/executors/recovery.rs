@@ -20,7 +20,7 @@ use crate::public_wallet::{PublicErc20, public_native_action_gas_units_with_buff
 use crate::settings::ExecutorProfile;
 use crate::vault::{ExecutorOperationId, ExecutorRecord, SwapUseId};
 use crate::{
-    DesktopPrivateSpendAuthorization, ExecutorAsset, ExecutorInspection,
+    DesktopPrivateSpendAuthorization, ExecutorAsset, ExecutorInspection, OperationHttpClient,
     PublicActionGasFeeSelection, PublicActionProgressStep, PublicBroadcasterCandidate,
 };
 
@@ -221,6 +221,7 @@ impl ExecutorOwner {
         amount: U256,
         funding: ExecutorRecoveryFunding,
         authorization: &DesktopPrivateSpendAuthorization,
+        client: &OperationHttpClient,
     ) -> Result<PreparedExecutorRecovery> {
         self.prepare_recovery_amount(
             operation,
@@ -229,6 +230,7 @@ impl ExecutorOwner {
             funding,
             authorization,
             false,
+            client,
         )
         .await
     }
@@ -241,6 +243,7 @@ impl ExecutorOwner {
         maximum_amount: U256,
         funding: ExecutorRecoveryFunding,
         authorization: &DesktopPrivateSpendAuthorization,
+        client: &OperationHttpClient,
     ) -> Result<PreparedExecutorRecovery> {
         if !matches!(funding, ExecutorRecoveryFunding::ExecutorNative { .. }) {
             return Err(eyre!(
@@ -254,6 +257,7 @@ impl ExecutorOwner {
             funding,
             authorization,
             true,
+            client,
         )
         .await
     }
@@ -268,6 +272,7 @@ impl ExecutorOwner {
         funding: ExecutorRecoveryFunding,
         authorization: &DesktopPrivateSpendAuthorization,
         reserve_native_gas: bool,
+        client: &OperationHttpClient,
     ) -> Result<PreparedExecutorRecovery> {
         self.ensure_active()?;
         let _guard = self.lock_activity().await;
@@ -336,6 +341,7 @@ impl ExecutorOwner {
             .while_active(inspect_recovery_executor(
                 &chain,
                 &self.http,
+                client,
                 source,
                 &[inspected],
             ))
@@ -370,7 +376,7 @@ impl ExecutorOwner {
         };
         // A swap executor's orders become unfillable in the same batch that recovers assets.
         let swap_calls = self
-            .swap_recovery_preparation(&chain, &record, &inspection, nonce, asset.is_none())
+            .swap_recovery_preparation(&chain, &record, &inspection, nonce, asset.is_none(), client)
             .await?;
         let recipient = self.view.receive_address()?;
         let buffer = self.chain.gas.gas_limit_buffer;
@@ -382,6 +388,7 @@ impl ExecutorOwner {
                 .while_active(recovery_allowance(
                     &chain,
                     &self.http,
+                    client,
                     &inspection,
                     &token,
                     railgun,
@@ -541,6 +548,7 @@ fn recovery_token(asset: ExecutorAsset, wrapped: Option<Address>) -> Result<Toke
 pub(super) async fn recovery_allowance(
     chain: &crate::settings::EffectiveChainConfig,
     http: &crate::HttpContext,
+    client: &OperationHttpClient,
     inspection: &ExecutorInspection,
     token: &TokenData,
     railgun: Address,
@@ -560,6 +568,7 @@ pub(super) async fn recovery_allowance(
     let pool = chain
         .rpc_route
         .for_class(crate::RpcTrafficClass::Sensitive)?
+        .isolated(client.clone())
         .query_rpc_pool(&http.rpc_clients(), Duration::from_secs(30));
     for endpoint in pool.available_providers() {
         let provider = &endpoint.provider;

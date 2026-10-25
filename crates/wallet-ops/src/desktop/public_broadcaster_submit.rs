@@ -36,6 +36,8 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         return Err(eyre!("selected token does not support unwrap-to-native"));
     }
 
+    // One client for the setup's reads and the executor's issuance reads.
+    let client = http.operation_http_client().await?;
     let PublicBroadcasterSetup {
         chain,
         broadcaster,
@@ -59,7 +61,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         &request.trust_filter,
         request.anchor_cache.as_ref(),
         http,
-        &http.operation_http_client().await?,
+        &client,
     )
     .await?;
     if let Some(prepared) = &request.executor {
@@ -360,7 +362,10 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         let gas_started = Instant::now();
         let mut transaction = issue_desktop_executor_plan(
             &request.session,
-            request.executor.as_deref(),
+            request
+                .executor
+                .as_deref()
+                .map(|prepared| (prepared, &client)),
             &request.spend_authorization,
             &plan,
         )

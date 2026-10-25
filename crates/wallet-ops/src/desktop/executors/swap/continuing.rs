@@ -15,13 +15,13 @@ use eyre::{Result, eyre};
 use tracing::Instrument as _;
 
 use super::observation::call_at;
-use crate::ExecutorOwner;
 use crate::desktop::executor_discovery::execution_nonce_at;
 use crate::desktop::executor_observation::trace_step;
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
     BridgeOrderTerms, BridgeProvider, ExecutorOperationId, ExecutorRecord, SwapDelivery, SwapUseId,
 };
+use crate::{ExecutorOwner, OperationHttpClient};
 
 // The pinned shared `SpokePool` binding declares `depositV3` and the deposit and fill events,
 // and no getter for the quote-age limit. This matches the deployed contracts.
@@ -146,13 +146,15 @@ impl ExecutorOwner {
     /// The continuing approvals of `swap_use` for an attempt with `delivery` whose pre-hook is
     /// signed at `pre_hook_nonce`, read for review and again for signing. Nothing is requested
     /// when the nonce comparison alone leaves none. Otherwise the quote-age evidence is read
-    /// from one finalized block; when it can't be read, every remaining approval is kept.
+    /// from one finalized block over `client`; when it can't be read, every remaining approval
+    /// is kept.
     pub async fn swap_continuing_approvals(
         &self,
         operation: ExecutorOperationId,
         swap_use: SwapUseId,
         delivery: SwapDelivery,
         pre_hook_nonce: Option<U256>,
+        client: &OperationHttpClient,
     ) -> Result<SwapContinuingApprovals> {
         let record = self
             .swap_account_record(operation)?
@@ -161,7 +163,7 @@ impl ExecutorOwner {
         if retained.approvals().is_empty() {
             return Ok(retained);
         }
-        Ok(match self.swap_quote_age_evidence(&record).await {
+        Ok(match self.swap_quote_age_evidence(&record, client).await {
             Some(evidence) => swap_continuing_approvals(
                 &record,
                 swap_use,
@@ -177,6 +179,7 @@ impl ExecutorOwner {
     async fn swap_quote_age_evidence(
         &self,
         record: &ExecutorRecord,
+        client: &OperationHttpClient,
     ) -> Option<SwapQuoteAgeEvidence> {
         // Only this chain's own SpokePool takes the deposits of its orders.
         let spoke_pool = self
@@ -186,7 +189,8 @@ impl ExecutorOwner {
         let executor = record.address()?;
         let mut chain = self.chain_for_delegate(record.delegate())?;
         chain.enabled = true;
-        for endpoint in self.endpoints.providers().await {
+        let endpoints = self.observation_endpoints(client).ok()?;
+        for endpoint in endpoints.providers().await {
             let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = endpoint.index);
             let result = trace_step(
                 "swap_quote_age",
@@ -201,10 +205,10 @@ impl ExecutorOwner {
             .await;
             match result {
                 Ok(evidence) => {
-                    self.endpoints.succeeded(&endpoint);
+                    endpoints.succeeded(&endpoint);
                     return evidence;
                 }
-                Err(error) => self.endpoints.failed(&endpoint, &error),
+                Err(error) => endpoints.failed(&endpoint, &error),
             }
         }
         None

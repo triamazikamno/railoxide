@@ -8,6 +8,7 @@ use alloy::rpc::types::TransactionRequest;
 use eyre::{Result, WrapErr, eyre};
 use zeroize::Zeroizing;
 
+use crate::OperationHttpClient;
 #[cfg(feature = "hardware")]
 use crate::hardware::{DEFAULT_HARDWARE_DERIVATION_PATH, parse_bip32_path};
 use crate::hardware::{HardwarePublicAccountDescriptor, HardwareTypedDataSigningMode};
@@ -866,7 +867,8 @@ pub(crate) fn vaulted_public_signer(
 }
 
 /// Resolve the Public source under its native owner before exposing any signer.
-/// The returned executor signer owns the activity guard for its entire lifetime.
+/// The returned executor signer owns the activity guard for its entire lifetime. A stealth
+/// account's admission reads go over `client`.
 pub(crate) async fn admitted_public_signer_authorized(
     vault_store: &DesktopVaultStore,
     view_session: &DesktopViewSession,
@@ -876,6 +878,7 @@ pub(crate) async fn admitted_public_signer_authorized(
     trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     executor_owner: Option<&std::sync::Arc<crate::ExecutorOwner>>,
     chain_id: u64,
+    client: &OperationHttpClient,
 ) -> Result<VaultedPublicSigner> {
     use crate::DesktopPrivateSpendAuthorization;
     let (password, seed) = match authorization {
@@ -902,6 +905,7 @@ pub(crate) async fn admitted_public_signer_authorized(
                 view_session,
                 &account,
                 authorization,
+                client,
             ))
             .await?;
             return Ok(VaultedPublicSigner::Executor(signer, guard));
@@ -929,6 +933,7 @@ pub(crate) async fn admitted_public_signer_authorized(
         trezor_pin_matrix_provider,
         executor_owner,
         chain_id,
+        client,
     )
     .await
 }
@@ -942,6 +947,7 @@ pub(crate) async fn admitted_gas_payer_signer(
     public_account_uuid: &str,
     executor_owner: Option<&std::sync::Arc<crate::ExecutorOwner>>,
     chain_id: u64,
+    client: &OperationHttpClient,
 ) -> Result<VaultedPublicSigner> {
     let crate::DesktopPrivateSpendAuthorization::HardwareExecutor(hardware) = authorization else {
         return Err(eyre!("Authorize the reviewed gas payer again."));
@@ -957,6 +963,7 @@ pub(crate) async fn admitted_gas_payer_signer(
         None,
         executor_owner,
         chain_id,
+        client,
     )
     .await
 }
@@ -971,6 +978,7 @@ pub(crate) async fn admitted_public_signer(
     trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     executor_owner: Option<&std::sync::Arc<crate::ExecutorOwner>>,
     chain_id: u64,
+    client: &OperationHttpClient,
 ) -> Result<VaultedPublicSigner> {
     let account = vault_store
         .list_public_accounts_for_session(view_session, true)?
@@ -997,6 +1005,7 @@ pub(crate) async fn admitted_public_signer(
             &account,
             &mut grant,
             protected_seed_session,
+            client,
         ))
         .await?;
         return Ok(VaultedPublicSigner::Executor(signer, guard));

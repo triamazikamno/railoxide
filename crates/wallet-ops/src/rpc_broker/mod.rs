@@ -25,6 +25,7 @@ mod scheduler;
 #[cfg(test)]
 pub(crate) mod tests;
 mod warmup;
+pub(crate) use actor::EndpointHealthOutcome;
 pub use broker::RpcBroker;
 pub(crate) use candidates::RpcCandidates;
 pub(crate) use model::{BalanceRead, TransactionHashRead, total_failure};

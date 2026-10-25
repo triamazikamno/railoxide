@@ -70,7 +70,7 @@ use crate::vault::{
     PublicSwapOrder, PublicSwapPath, SwapApprovedAccount, SwapApprovedBounds, SwapSetupFeeLimit,
     SwapSubmission, SwapSubmissionStatus, SwapUseId,
 };
-use crate::{ExecutorOwner, TokenAnchorRateCache, check_quote_against_anchor};
+use crate::{ExecutorOwner, OperationHttpClient, TokenAnchorRateCache, check_quote_against_anchor};
 
 const ORDER_DATA_TOO_LARGE: &str = "the swap's order data is too large for CoW's orderbook";
 pub(super) const NO_PUBLIC_SWAPS: &str = "swaps aren't available from this network";
@@ -125,6 +125,8 @@ pub struct PublicSwapReviewRequest<'a> {
     /// The fee the Public account pays for its own transactions.
     pub max_fee_per_gas: u128,
     pub max_priority_fee_per_gas: u128,
+    /// The swap form's route, for its reads of the Public account and the origin chain.
+    pub client: &'a OperationHttpClient,
 }
 
 /// Terms the user reviews before approving a swap paid from a Public account.
@@ -883,15 +885,17 @@ impl ExecutorOwner {
     pub async fn public_swap_orders_available(
         &self,
         origin: &EffectiveChainConfig,
+        client: &OperationHttpClient,
     ) -> Result<bool> {
         let Some(profile) = origin.public_swap_profile() else {
             return Ok(false);
         };
-        // Asked within a Public account's swap, so it shares the swap's class.
+        // Asked within a Public account's swap, so it shares the swap's class and route.
         let pool = query_rpc_pool_for_route(
             &origin
                 .rpc_route
-                .for_class(crate::RpcTrafficClass::Sensitive)?,
+                .for_class(crate::RpcTrafficClass::Sensitive)?
+                .isolated(client.clone()),
             &self.http,
         );
         self.while_active(swap_math_deployed(&pool, profile.math()))
@@ -899,8 +903,12 @@ impl ExecutorOwner {
     }
 
     /// Refuse an order on `origin` unless [`Self::public_swap_orders_available`] holds.
-    async fn require_public_swap_orders(&self, origin: &EffectiveChainConfig) -> Result<()> {
-        if self.public_swap_orders_available(origin).await? {
+    async fn require_public_swap_orders(
+        &self,
+        origin: &EffectiveChainConfig,
+        client: &OperationHttpClient,
+    ) -> Result<()> {
+        if self.public_swap_orders_available(origin, client).await? {
             Ok(())
         } else {
             Err(PublicSwapUnavailable::OrdersNotEnabled {
@@ -942,6 +950,7 @@ impl ExecutorOwner {
             token_registry,
             max_fee_per_gas,
             max_priority_fee_per_gas,
+            client,
         } = request;
         if origin.chain_id == self.chain.chain_id {
             return Err(eyre!(
@@ -1012,6 +1021,7 @@ impl ExecutorOwner {
                         spoke_pool,
                         sell_amount,
                         false,
+                        client,
                     )
                     .await?;
                 (None, price, plan)
@@ -1031,7 +1041,7 @@ impl ExecutorOwner {
                 let orderbook = orderbook
                     .ok_or_else(|| eyre!("an order's review needs its network's orderbook"))?;
                 // Without the math contract the post-hook fails after the trade.
-                self.require_public_swap_orders(origin).await?;
+                self.require_public_swap_orders(origin, client).await?;
                 let valid_for = profile.valid_to_window();
                 let valid_for_secs = u32::try_from(valid_for.as_secs())
                     .map_err(|_| eyre!("the order's validity is out of range"))?;
@@ -1042,7 +1052,8 @@ impl ExecutorOwner {
                 );
                 let route = origin
                     .rpc_route
-                    .for_class(crate::RpcTrafficClass::Sensitive)?;
+                    .for_class(crate::RpcTrafficClass::Sensitive)?
+                    .isolated(client.clone());
                 let pool = query_rpc_pool_for_route(&route, &self.http);
                 // The first batch of an account deploys its proxy, which costs the hook more.
                 let deployed = proxy_deployed(&pool, proxy).await?;
@@ -1056,6 +1067,7 @@ impl ExecutorOwner {
                         profile.vault_relayer(),
                         sell_amount,
                         true,
+                        client,
                     )
                     .await?;
                 let permit_hook_gas_limit = plan
@@ -1198,6 +1210,7 @@ impl ExecutorOwner {
         review: &PublicSwapReview,
         origin: &EffectiveChainConfig,
         source: Address,
+        client: &OperationHttpClient,
     ) -> Result<(PublicSwapApprovalPlan, PublicSwapGasPlan)> {
         let spender = if review.order.is_some() {
             origin
@@ -1215,6 +1228,7 @@ impl ExecutorOwner {
                 spender,
                 review.sell_amount,
                 review.order.is_some(),
+                client,
             )
             .await?;
         if plan.signs_permit() && !review.signs_permit() {
@@ -1241,6 +1255,7 @@ impl ExecutorOwner {
         review: &PublicSwapReview,
         origin: &EffectiveChainConfig,
         source: Address,
+        client: &OperationHttpClient,
     ) -> Result<PublicSwapReview> {
         self.while_active(Box::pin(async {
             if origin.chain_id != review.origin_chain
@@ -1249,7 +1264,7 @@ impl ExecutorOwner {
                 return Err(eyre!("the reviewed swap belongs to another network"));
             }
             let (approval_plan, gas_plan) = self
-                .requote_public_swap_plan(review, origin, source)
+                .requote_public_swap_plan(review, origin, source, client)
                 .await?;
             Ok(PublicSwapReview {
                 approval_plan,
@@ -1270,6 +1285,7 @@ impl ExecutorOwner {
         quote: &PublicSwapDeliveryQuote,
         origin: &EffectiveChainConfig,
         source: Address,
+        client: &OperationHttpClient,
     ) -> Result<PublicSwapReview> {
         self.while_active(Box::pin(async {
             if origin.chain_id != review.origin_chain
@@ -1279,7 +1295,7 @@ impl ExecutorOwner {
             }
             let mut corrected = review.with_delivery_quote(quote)?;
             (corrected.approval_plan, corrected.gas_plan) = self
-                .requote_public_swap_plan(review, origin, source)
+                .requote_public_swap_plan(review, origin, source, client)
                 .await?;
             Ok(corrected)
         }))
@@ -1442,6 +1458,8 @@ impl ExecutorOwner {
         quote_id: Option<i64>,
         hash_fallback_confirmed: bool,
     ) -> Result<PublicSwapOrderOutcome> {
+        // The orderbook's route is the swap form's, which its RPC reads share.
+        let client = orderbook.http();
         let claimed = self.claimed_public_swap(operation, swap_use, origin)?;
         require_public_swap_source(signer, &claimed)?;
         let (approval, intent) = (claimed.swap.approval(), claimed.swap.intent());
@@ -1472,7 +1490,7 @@ impl ExecutorOwner {
         }
         // The review this order follows can be old, so the math contract is read again before
         // anything is signed.
-        self.require_public_swap_orders(origin).await?;
+        self.require_public_swap_orders(origin, client).await?;
 
         let source = claimed.source;
         let sell_token = approval.sell_token;
@@ -1544,7 +1562,8 @@ impl ExecutorOwner {
         );
         let route = origin
             .rpc_route
-            .for_class(crate::RpcTrafficClass::Sensitive)?;
+            .for_class(crate::RpcTrafficClass::Sensitive)?
+            .isolated(client.clone());
         let balance = self
             .while_active(async {
                 Ok(query_erc20_balance(&route, &self.http, intent.bridged_token, proxy).await)
@@ -1615,6 +1634,7 @@ impl ExecutorOwner {
                 approval.bounds.sell_amount,
                 valid_to,
                 hash_fallback_confirmed,
+                client,
             ))
             .await?
         };

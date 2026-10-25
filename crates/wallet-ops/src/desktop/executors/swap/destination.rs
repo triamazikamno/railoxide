@@ -53,7 +53,7 @@ use crate::vault::{
     BridgeSurplus, ExecutorOperationId, ExecutorRecord, SwapBridgeOutcome, SwapDelivery,
     SwapObservation, SwapUseId, SwapUseRecord, SwapUseRole,
 };
-use crate::{ExecutorOwner, RpcTrafficClass};
+use crate::{ExecutorOwner, OperationHttpClient, RpcTrafficClass};
 
 /// What a private delivery's reported fill block shows on the destination chain before
 /// finality depth. A hint for display: never persisted, never an outcome.
@@ -92,15 +92,16 @@ impl ExecutorOwner {
     /// after the poll, persisting a new one. Orders without a hand-off, or with an outcome,
     /// are left alone: `NeedsAttention` and a delivery Across only reported wait for
     /// [`Self::check_swap_bridge`].
-    /// `destination` is the delivery's destination chain.
+    /// `destination` is the delivery's destination chain. Its RPC reads go over `client`.
     pub async fn observe_swap_bridge(
         &self,
         operation: ExecutorOperationId,
         uid: OrderUid,
         clients: &SwapBridgeClients,
         destination: &EffectiveChainConfig,
+        client: &OperationHttpClient,
     ) -> Result<Option<SwapBridgeOutcome>> {
-        self.track_swap_bridge(operation, uid, clients, destination, false)
+        self.track_swap_bridge(operation, uid, clients, destination, false, client)
             .await
     }
 
@@ -114,8 +115,9 @@ impl ExecutorOwner {
         uid: OrderUid,
         clients: &SwapBridgeClients,
         destination: &EffectiveChainConfig,
+        client: &OperationHttpClient,
     ) -> Result<Option<SwapBridgeOutcome>> {
-        self.track_swap_bridge(operation, uid, clients, destination, true)
+        self.track_swap_bridge(operation, uid, clients, destination, true, client)
             .await
     }
 
@@ -126,6 +128,7 @@ impl ExecutorOwner {
         clients: &SwapBridgeClients,
         destination: &EffectiveChainConfig,
         explicit: bool,
+        client: &OperationHttpClient,
     ) -> Result<Option<SwapBridgeOutcome>> {
         let record = self
             .swap_record(operation)?
@@ -174,7 +177,7 @@ impl ExecutorOwner {
                         fill,
                         known,
                         destination,
-                        endpoints: None,
+                        client,
                     },
                 ))
                 .await?
@@ -194,7 +197,7 @@ impl ExecutorOwner {
             && current == Some(SwapBridgeOutcome::Refunding)
             && let Some(refund_tx) = refund_tx
         {
-            Box::pin(self.observe_swap_bridge_refund(operation, uid, refund_tx)).await?;
+            Box::pin(self.observe_swap_bridge_refund(operation, uid, refund_tx, client)).await?;
         }
         Ok(current)
     }
@@ -214,6 +217,7 @@ impl ExecutorOwner {
         handoff: Option<SwapHandoffHint>,
         clients: &SwapBridgeClients,
         destination: Option<&EffectiveChainConfig>,
+        client: &OperationHttpClient,
     ) -> Result<SwapBridgeReport> {
         let record = self
             .swap_record(operation)?
@@ -254,8 +258,13 @@ impl ExecutorOwner {
                                     delivery,
                                     terms: *across,
                                 };
-                                Box::pin(self.across_delivery_seen(destination, number, &fill))
-                                    .await
+                                Box::pin(self.across_delivery_seen(
+                                    destination,
+                                    number,
+                                    &fill,
+                                    client,
+                                ))
+                                .await
                             }
                             _ => None,
                         };
@@ -303,6 +312,7 @@ impl ExecutorOwner {
         destination: &EffectiveChainConfig,
         number: u64,
         fill: &ExpectedFill,
+        client: &OperationHttpClient,
     ) -> Option<SwapDeliverySeen> {
         resolve_effective_chain_rpc_route(fill.delivery.destination_chain, destination).ok()?;
         let spoke_pool = destination.bridge_destination()?.spoke_pool();
@@ -311,7 +321,8 @@ impl ExecutorOwner {
             railgun: destination.require_railgun().ok()?.deployment.contract,
         };
         let endpoints =
-            ObservationEndpoints::new(destination, &self.http, RpcTrafficClass::Sensitive).ok()?;
+            ObservationEndpoints::new(destination, &self.http, RpcTrafficClass::Sensitive, client)
+                .ok()?;
         let read = self
             .while_active(async {
                 Ok(Box::pin(read_fill_from_endpoints(
@@ -357,13 +368,13 @@ impl ExecutorOwner {
             fill,
             known,
             destination,
-            endpoints,
+            client,
         } = tracking;
         let (outcome, refund_tx) = self
             .while_active(Box::pin(self.across_outcome(
                 across,
                 destination,
-                endpoints,
+                client,
                 fill,
             )))
             .await?;
@@ -416,8 +427,8 @@ impl ExecutorOwner {
 
     /// Across's report locates a fill block, which is then checked on the destination chain.
     /// Expiry and refund are Across's word, returned with the refund transaction it names.
-    /// The fill is read through `endpoints`, or through endpoints opened for `destination`
-    /// once there is a fill block to read.
+    /// The fill is read through endpoints opened for `destination` on `client`'s route once
+    /// there is a fill block to read.
     ///
     /// A public delivery is `DeliveredReported`, with the amount and fill transaction Across
     /// names, in two cases: an endpoint read the final fill block whole and it holds no
@@ -429,7 +440,7 @@ impl ExecutorOwner {
         &self,
         across: &AcrossClient,
         destination: &EffectiveChainConfig,
-        endpoints: Option<&ObservationEndpoints>,
+        client: &OperationHttpClient,
         fill: ExpectedFill,
     ) -> Result<(Option<SwapBridgeOutcome>, Option<B256>)> {
         let Some(deposit) = trace_step(
@@ -477,16 +488,10 @@ impl ExecutorOwner {
                 amount_out: Some(deposit.output_amount),
                 transaction_hash: deposit.fill_tx,
             });
-        let opened;
-        let endpoints = if let Some(endpoints) = endpoints {
-            endpoints
-        } else {
-            opened =
-                ObservationEndpoints::new(destination, &self.http, RpcTrafficClass::Sensitive)?;
-            &opened
-        };
+        let endpoints =
+            ObservationEndpoints::new(destination, &self.http, RpcTrafficClass::Sensitive, client)?;
         let read = Box::pin(read_fill_from_endpoints(
-            endpoints,
+            &endpoints,
             destination,
             number,
             spoke_pool,
@@ -527,6 +532,7 @@ impl ExecutorOwner {
         operation: ExecutorOperationId,
         uid: OrderUid,
         refund_tx: B256,
+        client: &OperationHttpClient,
     ) -> Result<()> {
         let record = self
             .swap_record(operation)?
@@ -552,13 +558,9 @@ impl ExecutorOwner {
             payee: executor,
             amount: terms.input_amount,
         };
+        let endpoints = self.observation_endpoints(client)?;
         let Some(found) = self
-            .read_refund_from_endpoints(
-                &self.endpoints,
-                self.chain.finality_depth,
-                refund_tx,
-                &refund,
-            )
+            .read_refund_from_endpoints(&endpoints, self.chain.finality_depth, refund_tx, &refund)
             .await?
         else {
             return Ok(());
@@ -608,14 +610,15 @@ impl ExecutorOwner {
 
     /// Track the Across deposit of a Public-paid swap on this chain, as `observe_swap_bridge`
     /// does for a stealth pair. This chain is the delivery's destination, so the fill is read
-    /// through this owner's own endpoints. `None` while there is no hand-off yet.
+    /// through this owner's own endpoints, over `client`. `None` while there is no hand-off yet.
     pub async fn observe_public_swap_bridge(
         &self,
         operation: ExecutorOperationId,
         swap_use: SwapUseId,
         across: &AcrossClient,
+        client: &OperationHttpClient,
     ) -> Result<Option<SwapBridgeOutcome>> {
-        self.track_public_swap_bridge(operation, swap_use, across, false)
+        self.track_public_swap_bridge(operation, swap_use, across, false, client)
             .await
     }
 
@@ -628,8 +631,9 @@ impl ExecutorOwner {
         operation: ExecutorOperationId,
         swap_use: SwapUseId,
         across: &AcrossClient,
+        client: &OperationHttpClient,
     ) -> Result<Option<SwapBridgeOutcome>> {
-        self.track_public_swap_bridge(operation, swap_use, across, true)
+        self.track_public_swap_bridge(operation, swap_use, across, true, client)
             .await
     }
 
@@ -639,6 +643,7 @@ impl ExecutorOwner {
         swap_use: SwapUseId,
         across: &AcrossClient,
         explicit: bool,
+        client: &OperationHttpClient,
     ) -> Result<Option<SwapBridgeOutcome>> {
         let record = self
             .swap_account_record(operation)?
@@ -702,7 +707,7 @@ impl ExecutorOwner {
                 fill,
                 known,
                 destination: &self.chain,
-                endpoints: Some(&self.endpoints),
+                client,
             },
         ))
         .await?;
@@ -726,6 +731,7 @@ impl ExecutorOwner {
         swap_use: SwapUseId,
         origin: &EffectiveChainConfig,
         across: &AcrossClient,
+        client: &OperationHttpClient,
     ) -> Result<Option<SwapObservation>> {
         let claimed = self.claimed_public_swap(operation, swap_use, origin)?;
         let observed = claimed.swap.observations();
@@ -761,7 +767,8 @@ impl ExecutorOwner {
             payee: claimed.source,
             amount: deposited.input_amount,
         };
-        let endpoints = ObservationEndpoints::new(origin, &self.http, RpcTrafficClass::Sensitive)?;
+        let endpoints =
+            ObservationEndpoints::new(origin, &self.http, RpcTrafficClass::Sensitive, client)?;
         let Some(found) = self
             .read_refund_from_endpoints(&endpoints, origin.finality_depth, refund_tx, &refund)
             .await?
@@ -817,9 +824,8 @@ struct BridgeTracking<'a> {
     known: Option<SwapBridgeOutcome>,
     /// The chain the fill is read on.
     destination: &'a EffectiveChainConfig,
-    /// That chain's endpoints, when it is this owner's own. Otherwise they are opened for the
-    /// read.
-    endpoints: Option<&'a ObservationEndpoints>,
+    /// The route the fill is read over.
+    client: &'a OperationHttpClient,
 }
 
 /// Where a tracked deposit's outcome is written in its record.

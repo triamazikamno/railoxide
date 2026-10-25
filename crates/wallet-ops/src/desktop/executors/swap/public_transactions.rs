@@ -334,9 +334,12 @@ impl ExecutorOwner {
         deposit: bool,
         max_fee_per_gas: u128,
         max_priority_fee_per_gas: u128,
+        client: &OperationHttpClient,
     ) -> Result<PublicSwapGasPlan> {
         let plan = self
-            .public_swap_approval_plan(origin, source, sell_token, spender, amount, !deposit)
+            .public_swap_approval_plan(
+                origin, source, sell_token, spender, amount, !deposit, client,
+            )
             .await?;
         public_swap_gas_plan(
             origin,
@@ -356,6 +359,7 @@ impl ExecutorOwner {
         origin: &EffectiveChainConfig,
         source: &AuthorizedPublicSwapSource,
         gas_fee: PublicActionGasFeeSelection,
+        client: &OperationHttpClient,
         progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
     ) -> Result<PublicSwapApprovalsOutcome> {
         Box::pin(self.submit_public_swap_approvals_with_signer(
@@ -364,6 +368,7 @@ impl ExecutorOwner {
             origin,
             &source.signer,
             gas_fee,
+            client,
             progress,
         ))
         .await
@@ -383,6 +388,7 @@ impl ExecutorOwner {
         origin: &EffectiveChainConfig,
         signer: &VaultedPublicSigner,
         mut gas_fee: PublicActionGasFeeSelection,
+        client: &OperationHttpClient,
         progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
     ) -> Result<PublicSwapApprovalsOutcome> {
         let claimed = self.claimed_public_swap(operation, swap_use, origin)?;
@@ -413,6 +419,7 @@ impl ExecutorOwner {
                 spender,
                 amount,
                 intent.order,
+                client,
             )
             .await?;
         if plan.signs_permit() {
@@ -479,6 +486,7 @@ impl ExecutorOwner {
                     PublicActionProgressStep::Approve,
                     transaction,
                     gas_fee,
+                    client,
                     progress,
                 )
                 .await?;
@@ -505,6 +513,7 @@ impl ExecutorOwner {
         gas_fee: PublicActionGasFeeSelection,
         delivery: &AcrossPrivateDelivery,
         terms: &AcrossOrderTerms,
+        client: &OperationHttpClient,
         progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
     ) -> Result<PublicSwapTransactionOutcome> {
         Box::pin(self.submit_public_swap_deposit_with_signer(
@@ -515,6 +524,7 @@ impl ExecutorOwner {
             gas_fee,
             delivery,
             terms,
+            client,
             progress,
         ))
         .await
@@ -536,6 +546,7 @@ impl ExecutorOwner {
         gas_fee: PublicActionGasFeeSelection,
         delivery: &AcrossPrivateDelivery,
         terms: &AcrossOrderTerms,
+        client: &OperationHttpClient,
         progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
     ) -> Result<PublicSwapTransactionOutcome> {
         let claimed = self.claimed_public_swap(operation, swap_use, origin)?;
@@ -635,6 +646,7 @@ impl ExecutorOwner {
             transaction,
             gas_fee,
             PublicActionStepEnd::HandOff,
+            client,
             progress,
         ))
         .await?;
@@ -654,12 +666,14 @@ impl ExecutorOwner {
     /// boundary, matching the hash locally and saving progress for restart. A deposit those
     /// blocks don't hold, with no inclusion or one its final block no longer holds, is ruled
     /// out once the Public account's nonce at the last of them, still canonical, passed its
-    /// own. A stopped swap's deposit is read too, and a ruled-out deposit isn't.
+    /// own. A stopped swap's deposit is read too, and a ruled-out deposit isn't. The reads go
+    /// over `client`.
     pub async fn observe_public_swap_handoff(
         &self,
         operation: ExecutorOperationId,
         swap_use: SwapUseId,
         origin: &EffectiveChainConfig,
+        client: &OperationHttpClient,
     ) -> Result<Option<SwapBridgeHandoff>> {
         let claimed = self.claimed_public_swap(operation, swap_use, origin)?;
         let swap = &claimed.swap;
@@ -679,8 +693,12 @@ impl ExecutorOwner {
             destination_chain: self.chain.chain_id,
             terms,
         };
-        let endpoints =
-            ObservationEndpoints::new(origin, &self.http, crate::RpcTrafficClass::Sensitive)?;
+        let endpoints = ObservationEndpoints::new(
+            origin,
+            &self.http,
+            crate::RpcTrafficClass::Sensitive,
+            client,
+        )?;
         for endpoint in endpoints.providers().await {
             let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = endpoint.index);
             let result = trace_step(
@@ -802,6 +820,7 @@ impl ExecutorOwner {
         origin: &EffectiveChainConfig,
         max_fee_per_gas: u128,
         max_priority_fee_per_gas: u128,
+        client: &OperationHttpClient,
     ) -> Result<PublicSwapWithdrawalReview> {
         let claimed = self.claimed_public_swap(operation, swap_use, origin)?;
         let (proxy, token) = held_proceeds(&claimed.swap)?;
@@ -812,7 +831,8 @@ impl ExecutorOwner {
         }
         let route = origin
             .rpc_route
-            .for_class(crate::RpcTrafficClass::Sensitive)?;
+            .for_class(crate::RpcTrafficClass::Sensitive)?
+            .isolated(client.clone());
         let amount = self
             .while_active(query_erc20_balance(&route, &self.http, token, proxy))
             .await
@@ -855,6 +875,7 @@ impl ExecutorOwner {
         gas_fee: PublicActionGasFeeSelection,
         review: &PublicSwapWithdrawalReview,
         hash_fallback_confirmed: bool,
+        client: &OperationHttpClient,
         progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
     ) -> Result<PublicSwapTransactionOutcome> {
         Box::pin(self.submit_public_swap_withdrawal_with_signer(
@@ -865,6 +886,7 @@ impl ExecutorOwner {
             gas_fee,
             review,
             hash_fallback_confirmed,
+            client,
             progress,
         ))
         .await
@@ -886,6 +908,7 @@ impl ExecutorOwner {
         gas_fee: PublicActionGasFeeSelection,
         review: &PublicSwapWithdrawalReview,
         hash_fallback_confirmed: bool,
+        client: &OperationHttpClient,
         progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
     ) -> Result<PublicSwapTransactionOutcome> {
         let claimed = self.claimed_public_swap(operation, swap_use, origin)?;
@@ -959,6 +982,7 @@ impl ExecutorOwner {
                 PublicActionProgressStep::Send,
                 transaction,
                 gas_fee,
+                client,
                 progress,
             )
             .await?;
@@ -967,7 +991,8 @@ impl ExecutorOwner {
         // the swap's next observation, so it doesn't fail a withdrawal that was sent.
         if matches!(outcome, PublicSwapTransactionOutcome::Included { .. }) {
             let _ =
-                Box::pin(self.advance_public_swap_order(operation, swap_use, origin, None)).await;
+                Box::pin(self.advance_public_swap_order(operation, swap_use, origin, None, client))
+                    .await;
         }
         Ok(outcome)
     }
@@ -983,6 +1008,7 @@ impl ExecutorOwner {
         gas_fee: PublicActionGasFeeSelection,
         orderbook: &CowOrderbookClient,
         max_gas_limit: u64,
+        client: &OperationHttpClient,
         progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
     ) -> Result<PublicSwapTransactionOutcome> {
         Box::pin(self.submit_public_swap_invalidation_with_signer(
@@ -993,6 +1019,7 @@ impl ExecutorOwner {
             gas_fee,
             orderbook,
             max_gas_limit,
+            client,
             progress,
         ))
         .await
@@ -1015,6 +1042,7 @@ impl ExecutorOwner {
         gas_fee: PublicActionGasFeeSelection,
         orderbook: &CowOrderbookClient,
         max_gas_limit: u64,
+        client: &OperationHttpClient,
         progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
     ) -> Result<PublicSwapTransactionOutcome> {
         let claimed = self.claimed_public_swap(operation, swap_use, origin)?;
@@ -1050,6 +1078,7 @@ impl ExecutorOwner {
                 PublicActionProgressStep::Send,
                 transaction,
                 gas_fee,
+                client,
                 progress,
             )
             .await?;
@@ -1058,9 +1087,10 @@ impl ExecutorOwner {
         // is repeated by the swap's next observation, so it doesn't fail an invalidation that
         // was sent.
         if matches!(outcome, PublicSwapTransactionOutcome::Included { .. }) {
-            let _ =
-                Box::pin(self.observe_public_swap_order(operation, swap_use, origin, orderbook))
-                    .await;
+            let _ = Box::pin(
+                self.observe_public_swap_order(operation, swap_use, origin, orderbook, client),
+            )
+            .await;
         }
         Ok(outcome)
     }
@@ -1114,6 +1144,7 @@ impl ExecutorOwner {
         &self,
         origin: &EffectiveChainConfig,
         source: PublicSwapSource<'_>,
+        client: &OperationHttpClient,
     ) -> Result<AuthorizedPublicSwapSource> {
         self.ensure_active()?;
         let signer = Box::pin(admitted_public_signer_authorized(
@@ -1125,6 +1156,7 @@ impl ExecutorOwner {
             source.trezor_pin_matrix_provider,
             None,
             origin.chain_id,
+            client,
         ))
         .await?;
         Ok(AuthorizedPublicSwapSource { signer })
@@ -1137,11 +1169,13 @@ impl ExecutorOwner {
         source: Address,
         token: Address,
         spender: Address,
+        client: &OperationHttpClient,
     ) -> Result<U256> {
         self.while_active(query_erc20_allowance(
             &origin
                 .rpc_route
-                .for_class(crate::RpcTrafficClass::Sensitive)?,
+                .for_class(crate::RpcTrafficClass::Sensitive)?
+                .isolated(client.clone()),
             &self.http,
             PublicAssetId::Erc20(token),
             source,
@@ -1165,6 +1199,7 @@ impl ExecutorOwner {
         step: PublicActionProgressStep,
         transaction: TransactionRequest,
         gas_fee: PublicActionGasFeeSelection,
+        client: &OperationHttpClient,
         progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
     ) -> Result<PublicSwapStepOutcome> {
         match Box::pin(self.send_public_swap_transaction(
@@ -1177,6 +1212,7 @@ impl ExecutorOwner {
             transaction,
             gas_fee,
             PublicActionStepEnd::Receipt,
+            client,
             progress,
         ))
         .await?
@@ -1204,12 +1240,12 @@ impl ExecutorOwner {
         transaction: TransactionRequest,
         gas_fee: PublicActionGasFeeSelection,
         end: PublicActionStepEnd,
+        client: &OperationHttpClient,
         progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
     ) -> Result<PublicSwapSent> {
-        // One client per submitted step covers its head read, submission and inclusion read.
-        let client = self.while_active(self.http.operation_http_client()).await?;
+        // The swap's client covers the step's head read, submission and inclusion read.
         let submitted_from_block = self
-            .while_active(origin_head(origin, &self.http, &client))
+            .while_active(origin_head(origin, &self.http, client))
             .await?;
         let ends_swap = matches!(
             kind,
@@ -1249,7 +1285,7 @@ impl ExecutorOwner {
                 origin,
                 gas_fee,
                 &self.http,
-                &client,
+                client,
                 &mut handoff,
                 end,
                 progress,
@@ -1263,7 +1299,7 @@ impl ExecutorOwner {
         let hash: B256 = outcome.receipt.tx_hash.parse()?;
         // The step reports the block's number. Its hash is read by that number, and the
         // hand-off's read checks the transaction against the final block again.
-        let block = origin_block(origin, &self.http, &client, outcome.receipt.block_number).await?;
+        let block = origin_block(origin, &self.http, client, outcome.receipt.block_number).await?;
         self.store.record_public_swap_inclusion(
             operation,
             swap_use,
@@ -1291,6 +1327,7 @@ impl ExecutorOwner {
         operation: ExecutorOperationId,
         swap_use: SwapUseId,
         origin: &EffectiveChainConfig,
+        client: &OperationHttpClient,
     ) -> Result<()> {
         let claimed = self.claimed_public_swap(operation, swap_use, origin)?;
         if !claimed.live || claimed.swap.observations().bridge_handoff.is_some() {
@@ -1305,14 +1342,13 @@ impl ExecutorOwner {
         if unresolved.is_empty() {
             return Ok(());
         }
-        // Stored signed deposits are resent only where submission is allowed, over a client of
-        // this resend's own.
-        let client = self.while_active(self.http.operation_http_client()).await?;
+        // Stored signed deposits are resent only where submission is allowed, over the swap's
+        // client.
         let pool = query_rpc_pool_for_route(
             &origin
                 .rpc_route
                 .for_class(crate::RpcTrafficClass::Submission)?
-                .isolated(client),
+                .isolated(client.clone()),
             &self.http,
         );
         for (hash, signed) in unresolved {

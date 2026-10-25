@@ -222,6 +222,7 @@ async fn each_swap_setup_gets_its_own_executor_and_authorizes_only_that_executor
             setup_approval(WETH, USDC, SwapDelivery::Reshield),
             None,
             &password(),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -232,6 +233,7 @@ async fn each_swap_setup_gets_its_own_executor_and_authorizes_only_that_executor
             setup_approval(WETH, USDC, SwapDelivery::Reshield),
             None,
             &password(),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -244,13 +246,19 @@ async fn each_swap_setup_gets_its_own_executor_and_authorizes_only_that_executor
                 setup_approval(WETH, USDC, SwapDelivery::Reshield),
                 None,
                 &password(),
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .is_err(),
         "a new swap never takes over a recorded swap's executor"
     );
     let resumed = owner
-        .resume_swap_setup(operation, broadcaster(delegate), &password())
+        .resume_swap_setup(
+            operation,
+            broadcaster(delegate),
+            &password(),
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     assert_eq!(resumed.context().executor, first.context().executor);
@@ -296,7 +304,13 @@ async fn each_swap_setup_gets_its_own_executor_and_authorizes_only_that_executor
         .into(),
     };
     let issued = owner
-        .issue_operation(&resumed, &call, std::slice::from_ref(&input), &password())
+        .issue_operation(
+            &resumed,
+            &call,
+            std::slice::from_ref(&input),
+            &password(),
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     let Some([authorization]) = issued.transaction().authorization_list.as_deref() else {
@@ -316,7 +330,12 @@ async fn each_swap_setup_gets_its_own_executor_and_authorizes_only_that_executor
     another.railgun_address = "0zk-another-broadcaster".into();
     another.fees_id = "new-fees".into();
     let replacement = owner
-        .resume_swap_setup(operation, another.clone(), &password())
+        .resume_swap_setup(
+            operation,
+            another.clone(),
+            &password(),
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     replacement.require_broadcaster(&another).unwrap();
@@ -344,6 +363,7 @@ async fn each_swap_setup_gets_its_own_executor_and_authorizes_only_that_executor
             &replacement_call,
             std::slice::from_ref(&input),
             &password(),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -365,7 +385,12 @@ async fn each_swap_setup_gets_its_own_executor_and_authorizes_only_that_executor
     assert!(owner.swap_setup_preview(operation).is_err());
     assert!(
         owner
-            .resume_swap_setup(operation, another, &password())
+            .resume_swap_setup(
+                operation,
+                another,
+                &password(),
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .is_err()
     );
@@ -374,7 +399,13 @@ async fn each_swap_setup_gets_its_own_executor_and_authorizes_only_that_executor
     replacement_call.data = decoded.abi_encode().into();
     assert!(
         owner
-            .issue_operation(&replacement, &replacement_call, &[input], &password())
+            .issue_operation(
+                &replacement,
+                &replacement_call,
+                &[input],
+                &password(),
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .is_err()
     );
@@ -430,6 +461,7 @@ async fn a_used_new_account_is_replaced_and_the_swap_sets_up_the_next_one() {
             approval.clone(),
             None,
             &password(),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -450,10 +482,17 @@ async fn a_used_new_account_is_replaced_and_the_swap_sets_up_the_next_one() {
             approval.clone(),
             None,
             &password(),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await;
     let prepared = accounts
-        .prepare_setup(SwapUseSide::Source, prepared, &candidate, &password())
+        .prepare_setup(
+            SwapUseSide::Source,
+            prepared,
+            &candidate,
+            &password(),
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     let replacement = accounts.operation();
@@ -569,6 +608,7 @@ async fn a_replaced_source_is_bound_in_the_approval_without_the_destination_owne
                 approval: private_bridge_approval(),
                 authorization: &authorization,
                 destination_authorization: Some(&destination_authorization),
+                client: crate::OperationHttpClient::direct_for_tests(),
             },
         )
         .await
@@ -612,7 +652,12 @@ async fn a_replaced_source_is_bound_in_the_approval_without_the_destination_owne
         if at_submission {
             // A submission retires the used account with the error a preparation gives.
             let found = origin
-                .resume_swap_setup(operation, candidate.clone(), &authorization)
+                .resume_swap_setup(
+                    operation,
+                    candidate.clone(),
+                    &authorization,
+                    crate::OperationHttpClient::direct_for_tests(),
+                )
                 .await
                 .err()
                 .unwrap();
@@ -622,6 +667,7 @@ async fn a_replaced_source_is_bound_in_the_approval_without_the_destination_owne
                     &mut side,
                     Some(Err(found)),
                     &authorization,
+                    crate::OperationHttpClient::direct_for_tests(),
                     |_, prepared| async move {
                         let unsent = eyre::eyre!("no broadcaster took the setup");
                         (prepared, Err::<(), _>(unsent))
@@ -631,7 +677,12 @@ async fn a_replaced_source_is_bound_in_the_approval_without_the_destination_owne
             assert!(sent.is_some_and(|sent| sent.is_err()));
         } else {
             let resumed = accounts
-                .resume_setup(SwapUseSide::Source, &candidate, &authorization)
+                .resume_setup(
+                    SwapUseSide::Source,
+                    &candidate,
+                    &authorization,
+                    crate::OperationHttpClient::direct_for_tests(),
+                )
                 .await
                 .unwrap();
             side = SwapPairSide::Setup(resumed);
@@ -738,10 +789,17 @@ async fn replacing_used_accounts_stops_at_the_limit_and_for_a_hardware_authoriza
                 setup_approval(WETH, USDC, SwapDelivery::Reshield),
                 None,
                 &authorization,
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await;
         let Err(error) = accounts
-            .prepare_setup(SwapUseSide::Source, prepared, &candidate, &authorization)
+            .prepare_setup(
+                SwapUseSide::Source,
+                prepared,
+                &candidate,
+                &authorization,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
         else {
             panic!("every account is used");
@@ -836,6 +894,7 @@ async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_a
         approval,
         authorization: &authorization,
         destination_authorization: Some(&destination_authorization),
+        client: crate::OperationHttpClient::direct_for_tests(),
     };
 
     // Nothing is reserved for terms that are not a private Bridge delivery with a destination
@@ -863,7 +922,14 @@ async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_a
         let candidate = broadcaster(profile.delegate());
         assert!(
             origin
-                .prepare_swap_setup(operation, candidate, approval, link, &authorization)
+                .prepare_swap_setup(
+                    operation,
+                    candidate,
+                    approval,
+                    link,
+                    &authorization,
+                    crate::OperationHttpClient::direct_for_tests()
+                )
                 .await
                 .is_err()
         );
@@ -985,7 +1051,12 @@ async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_a
     // accounts and the delivery's receiver, and takes a fee limit reviewed since. No other term
     // changes.
     let resumed = origin
-        .resume_swap_setup(operation, broadcaster(profile.delegate()), &authorization)
+        .resume_swap_setup(
+            operation,
+            broadcaster(profile.delegate()),
+            &authorization,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     let mut raised = private_bridge_approval();
@@ -1185,13 +1256,19 @@ async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_a
             destination_operation,
             destination_candidate.clone(),
             &destination_authorization,
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
     assert_eq!(retried.context().executor, executor);
     assert!(
         origin
-            .resume_swap_setup(operation, broadcaster(profile.delegate()), &authorization)
+            .resume_swap_setup(
+                operation,
+                broadcaster(profile.delegate()),
+                &authorization,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .is_err()
     );
@@ -1215,6 +1292,7 @@ async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_a
             destination_operation,
             destination_candidate.clone(),
             &destination_authorization,
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -1258,6 +1336,7 @@ async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_a
                 destination_operation,
                 destination_candidate,
                 &destination_authorization,
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .is_err()
@@ -1349,6 +1428,7 @@ async fn swap_pair_sets_up_only_its_new_accounts() {
                 destination_candidate,
                 authorization: &authorization,
                 destination_authorization: Some(&destination_authorization),
+                client: crate::OperationHttpClient::direct_for_tests(),
             };
         // The broadcaster of each side that needs setup.
         let source_setup = source_new.then(|| candidate.clone());
@@ -1634,7 +1714,12 @@ async fn swap_pair_sets_up_only_its_new_accounts() {
         ] {
             let saved = record(owner, side.operation());
             let retried = owner
-                .resume_swap_setup(side.operation(), candidate.clone(), authorization)
+                .resume_swap_setup(
+                    side.operation(),
+                    candidate.clone(),
+                    authorization,
+                    crate::OperationHttpClient::direct_for_tests(),
+                )
                 .await;
             if side.requires_setup() {
                 assert_eq!(retried.unwrap().context().executor, side.executor());
@@ -1733,6 +1818,7 @@ async fn a_swap_use_cancelled_during_inspection_refuses_its_late_preparation() {
         approval: private_bridge_approval(),
         authorization: &authorization,
         destination_authorization: Some(&destination_authorization),
+        client: crate::OperationHttpClient::direct_for_tests(),
     };
 
     // The user cancels while the destination account is still being inspected. Neither fresh
@@ -1816,6 +1902,7 @@ async fn swap_setup_completes_only_with_observed_delegation_and_consumed_nonce()
             setup_approval(WETH, USDC, SwapDelivery::Reshield),
             None,
             &password(),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -1859,7 +1946,13 @@ async fn swap_setup_completes_only_with_observed_delegation_and_consumed_nonce()
         .into(),
     };
     let setup = owner
-        .issue_operation(&prepared, &call, std::slice::from_ref(&input), &password())
+        .issue_operation(
+            &prepared,
+            &call,
+            std::slice::from_ref(&input),
+            &password(),
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap()
         .payload_hash();
@@ -1878,7 +1971,11 @@ async fn swap_setup_completes_only_with_observed_delegation_and_consumed_nonce()
     let pass = async |head: u64| {
         rpc.state.head.store(head, Ordering::Relaxed);
         let before = rpc.state.requests.lock().unwrap().len();
-        let status = owner.observe_swap_setup(operation).await.unwrap().status;
+        let status = owner
+            .observe_swap_setup(operation, crate::OperationHttpClient::direct_for_tests())
+            .await
+            .unwrap()
+            .status;
         let requests = rpc.state.requests.lock().unwrap()[before..].to_vec();
         (status, requests)
     };
@@ -1909,12 +2006,15 @@ async fn swap_setup_completes_only_with_observed_delegation_and_consumed_nonce()
     // Another writer changes the record while the pass reads. The pass keeps waiting.
     rpc.hold.send_replace(Some(executor));
     let held = rpc.state.requests.lock().unwrap().len();
-    let (status, ()) = tokio::join!(owner.observe_swap_setup(operation), async {
-        rpc.wait_for(|requests| reads_account(&requests[held..]))
-            .await;
-        owner.set_hidden(operation, true).unwrap();
-        rpc.hold.send_replace(None);
-    });
+    let (status, ()) = tokio::join!(
+        owner.observe_swap_setup(operation, crate::OperationHttpClient::direct_for_tests()),
+        async {
+            rpc.wait_for(|requests| reads_account(&requests[held..]))
+                .await;
+            owner.set_hidden(operation, true).unwrap();
+            rpc.hold.send_replace(None);
+        }
+    );
     assert_eq!(status.unwrap().status, SwapSetupStatus::Pending);
     owner.set_hidden(operation, false).unwrap();
 
@@ -1945,7 +2045,12 @@ async fn swap_setup_completes_only_with_observed_delegation_and_consumed_nonce()
         .relay_adapt_7702_delegates[0]
         .address;
     let retried = owner
-        .resume_swap_setup(operation, broadcaster(earlier), &password())
+        .resume_swap_setup(
+            operation,
+            broadcaster(earlier),
+            &password(),
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     assert_eq!(retried.context().executor, executor);

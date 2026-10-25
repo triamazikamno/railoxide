@@ -679,6 +679,7 @@ pub async fn submit_governance_action_with_progress(
         request.public_send.trezor_pin_matrix_provider,
         request.public_send.executor_owner.as_ref(),
         request.public_send.chain_id,
+        client,
     )
     .await?;
     signer
@@ -801,6 +802,7 @@ pub async fn submit_governance_workflow_with_progress(
         initial.public_send.trezor_pin_matrix_provider,
         initial.public_send.executor_owner.as_ref(),
         initial.public_send.chain_id,
+        client,
     )
     .await?;
     signer

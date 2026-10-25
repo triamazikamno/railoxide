@@ -31,10 +31,11 @@ use crate::poi_contexts::{
 use crate::settings::ExecutorProfile;
 use crate::vault::{ExecutorOperationId, SwapSetupFeeLimit};
 use crate::{
-    DesktopPrivateSpendAuthorization, ExecutorAsset, ExecutorDelivery, PreparedExecutorOperation,
-    PublicBroadcasterCandidate, PublicBroadcasterResultKind, TransactionGenerationProgressSender,
-    TransactionGenerationStage, WakuClient, WalletSession, broadcaster_fee_amount,
-    public_broadcaster_bound_min_gas_price, public_broadcaster_service_gas_price,
+    DesktopPrivateSpendAuthorization, ExecutorAsset, ExecutorDelivery, OperationHttpClient,
+    PreparedExecutorOperation, PublicBroadcasterCandidate, PublicBroadcasterResultKind,
+    TransactionGenerationProgressSender, TransactionGenerationStage, WakuClient, WalletSession,
+    broadcaster_fee_amount, public_broadcaster_bound_min_gas_price,
+    public_broadcaster_service_gas_price,
 };
 
 #[derive(Clone)]
@@ -109,6 +110,8 @@ impl ExecutorRecoveryFeeEstimate {
 
 pub struct ExecutorPaidRecoveryRequest {
     pub recovery: Arc<PreparedExecutorRecovery>,
+    /// The recovery's route, for its fee, signing and estimate reads.
+    pub client: OperationHttpClient,
     pub session: Arc<WalletSession>,
     pub authorization: DesktopPrivateSpendAuthorization,
     pub waku: Arc<WakuClient>,
@@ -389,6 +392,7 @@ impl ExecutorOwner {
             request.progress_tx.as_ref(),
             request.response_timeout,
             request.republish_interval,
+            &request.client,
         )
         .await
     }
@@ -412,6 +416,7 @@ impl ExecutorOwner {
         progress_tx: Option<&TransactionGenerationProgressSender>,
         response_timeout: Duration,
         republish_interval: Duration,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorPaidRecoveryOutcome> {
         let span = tracing::debug_span!(target: "executor_observation", "paid_execution",
             purpose = purpose.label());
@@ -431,6 +436,7 @@ impl ExecutorOwner {
                 progress_tx,
                 response_timeout,
                 republish_interval,
+                client,
             ),
         )
         .instrument(span)
@@ -452,12 +458,14 @@ impl ExecutorOwner {
         progress_tx: Option<&TransactionGenerationProgressSender>,
         response_timeout: Duration,
         republish_interval: Duration,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorPaidRecoveryOutcome> {
         preparation.require_broadcaster(candidate)?;
         let chain = effective_desktop_chain_config(self.chain.chain_id, &self.chain)?;
         let route = chain
             .rpc_route
-            .for_class(crate::RpcTrafficClass::Sensitive)?;
+            .for_class(crate::RpcTrafficClass::Sensitive)?
+            .isolated(client.clone());
         let query_rpc_pool = query_rpc_pool_for_route(&route, &self.http);
         let min_gas_price = trace_step("paid_gas_price", async {
             let candidates = acquire_fee_candidates(&self.http, &route, None).await?;
@@ -561,6 +569,7 @@ impl ExecutorOwner {
                     &inputs,
                     authorization.borrow(),
                     &mut issue_retry,
+                    client,
                 ),
             )
             .instrument(span.clone())

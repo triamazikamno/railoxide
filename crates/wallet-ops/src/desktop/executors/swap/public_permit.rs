@@ -28,7 +28,7 @@ use crate::public_wallet::{PublicErc20, VaultedPublicSigner, sign_public_swap_ty
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{ExecutorOperationId, PublicSwapPermit, PublicSwapRecord, SwapUseId};
 use crate::{
-    ExecutorOwner, RpcBrokerError, RpcRoute, RpcTrafficClass, WalletRpcOrigin,
+    ExecutorOwner, OperationHttpClient, RpcBrokerError, RpcRoute, RpcTrafficClass, WalletRpcOrigin,
     query_rpc_pool_for_route,
 };
 
@@ -413,6 +413,7 @@ impl ExecutorOwner {
         spender: Address,
         amount: U256,
         order: bool,
+        client: &OperationHttpClient,
     ) -> Result<PublicSwapApprovalPlan> {
         self.ensure_active()?;
         // The native asset is deposited as value and takes no approval.
@@ -421,7 +422,7 @@ impl ExecutorOwner {
         }
         if !order {
             let allowance = self
-                .public_swap_allowance(origin, source, token, spender)
+                .public_swap_allowance(origin, source, token, spender, client)
                 .await?;
             return Ok(PublicSwapApprovalPlan::new(allowance, amount, None));
         }
@@ -452,7 +453,12 @@ impl ExecutorOwner {
                     .http
                     .rpc_broker()
                     .submit_eth_calls(
-                        RpcRoute::from(origin.rpc_route.for_class(RpcTrafficClass::Sensitive)?),
+                        RpcRoute::from(
+                            origin
+                                .rpc_route
+                                .for_class(RpcTrafficClass::Sensitive)?
+                                .isolated(client.clone()),
+                        ),
                         calls,
                         WalletRpcOrigin::PublicWallet.into(),
                     )
@@ -514,10 +520,11 @@ impl ExecutorOwner {
         value: U256,
         valid_to: u32,
         hash_fallback_confirmed: bool,
+        client: &OperationHttpClient,
     ) -> Result<Option<PublicSwapPermit>> {
         let owner = signer.address();
         let plan = match self
-            .public_swap_approval_plan(origin, owner, token, spender, value, true)
+            .public_swap_approval_plan(origin, owner, token, spender, value, true, client)
             .await?
         {
             PublicSwapApprovalPlan::None => return Ok(None),
@@ -544,7 +551,10 @@ impl ExecutorOwner {
             ))
             .await?;
         let pool = query_rpc_pool_for_route(
-            &origin.rpc_route.for_class(RpcTrafficClass::Sensitive)?,
+            &origin
+                .rpc_route
+                .for_class(RpcTrafficClass::Sensitive)?
+                .isolated(client.clone()),
             &self.http,
         );
         let call = TransactionRequest::default()
@@ -552,7 +562,7 @@ impl ExecutorOwner {
             .input(permit_calldata(&permit, &signature).into());
         if !self.while_active(permit_executes(&pool, &call)).await? {
             let key = (origin.chain_id, token);
-            let detection = self.redetect_permit(origin, token, owner).await;
+            let detection = self.redetect_permit(origin, token, owner, client).await;
             let mut support = self.permit_support()?;
             match detection {
                 PermitDetection::Confirmed { domain, .. } if domain != plan.domain => {
@@ -584,6 +594,7 @@ impl ExecutorOwner {
         origin: &EffectiveChainConfig,
         token: Address,
         owner: Address,
+        client: &OperationHttpClient,
     ) -> PermitDetection {
         let results = self
             .while_active(async {
@@ -591,7 +602,12 @@ impl ExecutorOwner {
                     .http
                     .rpc_broker()
                     .submit_eth_calls(
-                        RpcRoute::from(origin.rpc_route.for_class(RpcTrafficClass::Sensitive)?),
+                        RpcRoute::from(
+                            origin
+                                .rpc_route
+                                .for_class(RpcTrafficClass::Sensitive)?
+                                .isolated(client.clone()),
+                        ),
                         detection_calls(token, owner).to_vec(),
                         WalletRpcOrigin::PublicWallet.into(),
                     )
@@ -616,6 +632,7 @@ impl ExecutorOwner {
         spender: Address,
         settlement: Address,
         uid: OrderUid,
+        client: &OperationHttpClient,
     ) -> Option<(U256, U256, U256)> {
         let calls = vec![
             (
@@ -643,7 +660,12 @@ impl ExecutorOwner {
                     .http
                     .rpc_broker()
                     .submit_eth_calls(
-                        RpcRoute::from(origin.rpc_route.for_class(RpcTrafficClass::Sensitive)?),
+                        RpcRoute::from(
+                            origin
+                                .rpc_route
+                                .for_class(RpcTrafficClass::Sensitive)?
+                                .isolated(client.clone()),
+                        ),
                         calls,
                         WalletRpcOrigin::PublicWallet.into(),
                     )
@@ -715,6 +737,7 @@ impl ExecutorOwner {
         source: Address,
         swap: &PublicSwapRecord,
         now: u64,
+        client: &OperationHttpClient,
     ) -> Result<bool> {
         let open = swap
             .order()
@@ -735,6 +758,7 @@ impl ExecutorOwner {
                 profile.vault_relayer(),
                 profile.settlement(),
                 order.uid(),
+                client,
             )
             .await
         else {

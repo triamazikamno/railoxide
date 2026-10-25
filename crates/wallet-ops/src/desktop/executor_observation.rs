@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -15,14 +14,14 @@ use broadcaster_core::contracts::railgun::{
 };
 use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool, RpcAdmission};
 use eyre::{Result, eyre};
+use poi::SensitiveUrl;
 use tracing::Instrument as _;
 
-use crate::HttpContext;
+use crate::rpc_broker::EndpointHealthOutcome;
 use crate::settings::EffectiveChainConfig;
 use crate::vault::ExecutorNonceObservation;
+use crate::{HttpContext, OperationHttpClient};
 
-/// How long an endpoint whose request failed sits out executor observations.
-const ENDPOINT_COOLDOWN: Duration = Duration::from_mins(3);
 /// How long in all one observation waits in [`ObservationEndpoints::later_providers`]: just
 /// above the RPC identity check's timeout, by which every endpoint's first check finished.
 /// Tests wait less.
@@ -53,48 +52,41 @@ pub(super) fn trace_step<T, E>(
     }
 }
 
-/// The chain endpoints one executor owner observes through, kept for its session.
+/// The chain endpoints one executor read observes through, over its operation's client.
 ///
 /// Admission is the wallet's RPC identity admission: a route that requires identity
 /// checks verifies each endpoint's chain once, and a failed check is retried in the
-/// background with backoff while the owner lives, not on every observation. An
-/// endpoint whose request fails sits out [`ENDPOINT_COOLDOWN`] unless it is the last
-/// one available. The endpoint that served the last observation is tried first.
+/// background with backoff while the pool lives, not on every observation. Endpoint
+/// health is the wallet-wide RPC broker's: each attempt's outcome is reported to it, and
+/// endpoints it has withdrawn are left out, in its order, unless no other admitted one is
+/// eligible.
 ///
-/// The pool lives until [`Self::release`]. Admission's background retries hold only
-/// a weak reference to it, so releasing the pool lets them stop. A released owner
-/// never rebuilds the pool and has no endpoints.
+/// The pool lives until this is dropped. Admission's background retries hold only a weak
+/// reference to it, so dropping this lets them stop.
 pub(super) struct ObservationEndpoints {
     route: crate::ClassRoute,
     clients: crate::rpc_broker::RpcClients,
+    broker: Arc<crate::RpcBroker>,
     /// Completes once the first admission returned, whether or not the pool was kept.
     admitted: tokio::sync::OnceCell<()>,
     /// Never locked across an await.
-    pool: Mutex<PoolSlot>,
-    /// Pool index of the last endpoint that served an observation, or `usize::MAX`.
-    preferred: AtomicUsize,
-}
-
-#[derive(Default)]
-struct PoolSlot {
-    pool: Option<Arc<QueryRpcPool>>,
-    /// Terminal: once set, the pool is gone and is never published again.
-    released: bool,
+    pool: Mutex<Option<Arc<QueryRpcPool>>>,
 }
 
 impl ObservationEndpoints {
-    /// Observes through `chain`'s endpoints that accept `class`.
+    /// Observes through `chain`'s endpoints that accept `class`, on `client`'s route.
     pub(super) fn new(
         chain: &EffectiveChainConfig,
         http: &HttpContext,
         class: crate::RpcTrafficClass,
+        client: &OperationHttpClient,
     ) -> Result<Self, crate::RpcClassUnavailable> {
         Ok(Self {
-            route: chain.rpc_route.for_class(class)?,
+            route: chain.rpc_route.for_class(class)?.isolated(client.clone()),
             clients: http.rpc_clients(),
+            broker: http.rpc_broker(),
             admitted: tokio::sync::OnceCell::new(),
-            pool: Mutex::new(PoolSlot::default()),
-            preferred: AtomicUsize::new(usize::MAX),
+            pool: Mutex::new(None),
         })
     }
 
@@ -104,28 +96,25 @@ impl ObservationEndpoints {
         self.route.endpoints().len()
     }
 
-    fn slot(&self) -> std::sync::MutexGuard<'_, PoolSlot> {
-        self.pool.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     fn current_pool(&self) -> Option<Arc<QueryRpcPool>> {
-        self.slot().pool.clone()
+        self.pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
-    /// Drops the pool for good. Idempotent. Admission still in flight completes
-    /// without publishing its pool.
-    pub(super) fn release(&self) {
-        let mut slot = self.slot();
-        slot.released = true;
-        slot.pool = None;
+    /// The broker's eligible endpoints for this route, in its order. `None` when the lookup
+    /// fails; selection then keeps the pool's order rather than failing the read.
+    async fn candidates(&self) -> Option<Vec<SensitiveUrl>> {
+        self.broker
+            .endpoint_candidates(self.route.route(), None)
+            .await
+            .ok()
     }
 
-    /// Admitted endpoints outside their cool-down, the preferred one first. Empty
-    /// once released.
+    /// Admitted endpoints the broker reports eligible, in its order. When none of them is
+    /// admitted, every admitted endpoint, so withdrawals can't stop every observation.
     pub(super) async fn providers(&self) -> Vec<ProviderHandle> {
-        if self.slot().released {
-            return Vec::new();
-        }
         let started = Instant::now();
         tracing::debug!(
             target: "executor_observation",
@@ -135,66 +124,82 @@ impl ObservationEndpoints {
         );
         self.admitted
             .get_or_init(|| async {
+                // Nothing marks this pool's endpoints bad; the broker keeps their health.
                 let pool = Arc::new(
                     self.route
-                        .query_rpc_pool(&self.clients, ENDPOINT_COOLDOWN)
+                        .query_rpc_pool(&self.clients, Duration::ZERO)
                         .with_pending_admission(),
                 );
                 // Returns at the first admitted endpoint or once every first check
                 // failed. The pool is kept either way and admits endpoints as they
-                // pass, unless the owner released it meanwhile.
+                // pass.
                 let _ = self.route.admit_sync_pool(&self.clients, &pool, None).await;
-                let mut slot = self.slot();
-                if !slot.released {
-                    slot.pool = Some(pool);
-                }
+                *self.pool.lock().unwrap_or_else(PoisonError::into_inner) = Some(pool);
             })
             .await;
         let Some(pool) = self.current_pool() else {
             return Vec::new();
         };
-        let mut providers = pool.available_providers();
+        let candidates = self.candidates().await;
+        let available = pool.available_providers();
         tracing::debug!(
             target: "executor_observation",
             step = "endpoint_admission",
             elapsed_ms = started.elapsed().as_millis(),
-            available = providers.len(),
+            available = available.len(),
             "finished"
         );
-        let preferred = self.preferred.load(Ordering::Relaxed);
-        if let Some(position) = providers
-            .iter()
-            .position(|provider| provider.index == preferred)
-        {
-            providers[..=position].rotate_right(1);
+        let Some(candidates) = candidates else {
+            return available;
+        };
+        let eligible = in_candidate_order(available.clone(), &candidates);
+        if eligible.is_empty() {
+            available
+        } else {
+            eligible
         }
-        providers
     }
 
-    /// Endpoints admitted since an earlier [`Self::providers`] call: the available ones whose
-    /// pool index isn't in `tried`, as soon as there is one, waiting until `deadline` while an
-    /// untried endpoint's admission is pending. Empty at the deadline, once no such admission
-    /// is pending, and once released.
+    /// Endpoints admitted since an earlier [`Self::providers`] call: the available ones the
+    /// broker reports eligible whose pool index isn't in `tried`, as soon as there is one,
+    /// waiting until `deadline` while such an endpoint's admission is pending. Empty at the
+    /// deadline, and once no such admission is pending.
     pub(super) async fn later_providers(
         &self,
         tried: &BTreeSet<usize>,
         deadline: tokio::time::Instant,
     ) -> Vec<ProviderHandle> {
+        // One lookup for the whole wait; withdrawals during it apply to the next read.
+        let candidates = self.candidates().await;
+        let eligible = |url: &SensitiveUrl| {
+            candidates
+                .as_ref()
+                .is_none_or(|candidates| candidates.contains(url))
+        };
         loop {
-            // The pool is looked up on every pass and not held while waiting, so a release
-            // still drops it.
+            // The pool is looked up on every pass and not held while waiting.
             let pending = {
                 let Some(pool) = self.current_pool() else {
                     return Vec::new();
                 };
                 // Read before the providers: an endpoint admitted between the two reads then
                 // still counts as pending, and the next pass finds it.
-                let pending = (0..pool.len()).any(|index| {
-                    !tried.contains(&index)
-                        && pool.provider_admission(index) == Some(RpcAdmission::Pending)
-                });
+                let pending = self
+                    .route
+                    .endpoints()
+                    .iter()
+                    .enumerate()
+                    .any(|(index, url)| {
+                        !tried.contains(&index)
+                            && eligible(url)
+                            && pool.provider_admission(index) == Some(RpcAdmission::Pending)
+                    });
                 let mut providers = pool.available_providers();
                 providers.retain(|provider| !tried.contains(&provider.index));
+                let providers = match &candidates {
+                    Some(candidates) => in_candidate_order(providers, candidates),
+                    None => providers,
+                };
                 if !providers.is_empty() {
                     return providers;
                 }
@@ -209,12 +214,17 @@ impl ObservationEndpoints {
     }
 
     pub(super) fn succeeded(&self, provider: &ProviderHandle) {
-        self.preferred.store(provider.index, Ordering::Relaxed);
+        self.report(provider, EndpointHealthOutcome::Healthy);
     }
 
-    /// Cools `provider` down when the endpoint failed rather than the observation:
+    fn report(&self, provider: &ProviderHandle, outcome: EndpointHealthOutcome) {
+        self.broker
+            .report_endpoint_outcome(self.route.chain_id(), &provider.url, outcome);
+    }
+
+    /// Reports a strike to the broker when the endpoint failed rather than the observation:
     /// a transport or HTTP failure, an unusable response, or an error response
-    /// other than a revert. A chain change doesn't count.
+    /// other than a revert. A chain change doesn't count; other failures are reported neutral.
     pub(super) fn failed(&self, provider: &ProviderHandle, error: &eyre::Report) {
         // RPC error text can contain response bodies, addresses, or endpoint credentials.
         let (failure, rpc_code) = match error.downcast_ref::<TransportError>() {
@@ -232,9 +242,6 @@ impl ObservationEndpoints {
             rpc_code,
             "observation failed"
         );
-        let Some(pool) = self.current_pool() else {
-            return;
-        };
         let endpoint_failed =
             error
                 .downcast_ref::<TransportError>()
@@ -245,21 +252,34 @@ impl ObservationEndpoints {
                     RpcError::ErrorResp(payload) => !payload.message.contains("revert"),
                     _ => false,
                 });
-        if !endpoint_failed {
-            return;
-        }
-        let _ = self.preferred.compare_exchange(
-            provider.index,
-            usize::MAX,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
+        self.report(
+            provider,
+            if endpoint_failed {
+                EndpointHealthOutcome::Strike
+            } else {
+                EndpointHealthOutcome::Neutral
+            },
         );
-        // Keep one endpoint to try, so a local outage can't stop every observation
-        // for a whole cool-down.
-        if pool.available_providers().len() > 1 {
-            pool.mark_bad_provider(provider);
-        }
     }
+}
+
+/// `providers` whose URL is among `candidates`, in candidate order. Pool indices are per
+/// pool, so they are matched by URL.
+fn in_candidate_order(
+    providers: Vec<ProviderHandle>,
+    candidates: &[SensitiveUrl],
+) -> Vec<ProviderHandle> {
+    let mut ranked = providers
+        .into_iter()
+        .filter_map(|provider| {
+            let rank = candidates
+                .iter()
+                .position(|candidate| *candidate.expose_url() == provider.url)?;
+            Some((rank, provider))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(rank, _)| *rank);
+    ranked.into_iter().map(|(_, provider)| provider).collect()
 }
 
 /// An account's code and execution nonce at one canonical block: a confirmed one, or the
@@ -299,8 +319,8 @@ pub(super) async fn read_executor_account(
 }
 
 /// Read an account's state by address at the latest block, which a reorg can still remove.
-/// It goes through the same endpoints as [`read_executor_account`], the one that served the
-/// last read first. Nothing may apply it to a record: only a confirmed read resolves a nonce.
+/// It goes through the same endpoints as [`read_executor_account`]. Nothing may apply it to a
+/// record: only a confirmed read resolves a nonce.
 pub(super) async fn read_executor_account_at_latest(
     endpoints: &ObservationEndpoints,
     chain: &EffectiveChainConfig,
@@ -575,6 +595,38 @@ mod tests {
     #[tokio::test]
     async fn a_failed_endpoint_sits_out_and_a_verified_one_is_not_rechecked() {
         use serde_json::{Value, json};
+        /// New endpoints, as each executor owner read observes through, once both are admitted.
+        async fn admitted_endpoints(
+            chain: &EffectiveChainConfig,
+            http: &HttpContext,
+            client: &OperationHttpClient,
+        ) -> ObservationEndpoints {
+            let endpoints =
+                ObservationEndpoints::new(chain, http, crate::RpcTrafficClass::Sensitive, client)
+                    .unwrap();
+            endpoints.providers().await;
+            // Admission returns at the first verified endpoint and admits the other after.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while endpoints
+                    .current_pool()
+                    .unwrap()
+                    .available_providers()
+                    .len()
+                    < 2
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            endpoints
+        }
+        async fn read(endpoints: &ObservationEndpoints, chain: &EffectiveChainConfig) {
+            let read = read_executor_account(endpoints, chain, Address::repeat_byte(1), None)
+                .await
+                .unwrap();
+            assert_eq!(read.block, BlockNumHash::new(50, B256::repeat_byte(50)));
+        }
         let mut chain = crate::settings::build_effective_chain_configs(
             &crate::settings::WalletSettings::default(),
         )
@@ -629,27 +681,50 @@ mod tests {
         .await;
         chain.rpc_route =
             crate::RpcChainRoute::new(1, vec![failing, serving]).with_identity_verification();
-        let endpoints = ObservationEndpoints::new(
-            &chain,
-            &HttpContext::direct_for_tests(),
-            crate::RpcTrafficClass::Sensitive,
-        )
-        .unwrap();
-        // Admission returns at the first verified endpoint and admits the other after.
+        let client = OperationHttpClient::for_tests(
+            reqwest::Client::new(),
+            crate::OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Direct),
+        );
+        // The broker breaks candidate ties in configured order, so the failing endpoint is
+        // tried first while both are healthy.
+        let http = HttpContext::direct_for_tests();
+        read(&admitted_endpoints(&chain, &http, &client).await, &chain).await;
+
+        let endpoints = admitted_endpoints(&chain, &http, &client).await;
+        let serving = &endpoints.route.endpoints()[1..];
+        // The strike reaches the broker on its advisory channel.
         tokio::time::timeout(Duration::from_secs(5), async {
-            while endpoints.providers().await.len() < 2 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            while http
+                .rpc_broker()
+                .endpoint_candidates(endpoints.route.route(), None)
+                .await
+                .unwrap()
+                != serving
+            {
+                tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        for _ in 0..2 {
-            let read = read_executor_account(&endpoints, &chain, Address::repeat_byte(1), None)
-                .await
-                .unwrap();
-            assert_eq!(read.block, BlockNumHash::new(50, B256::repeat_byte(50)));
-        }
-        // The first observation tried the failing endpoint once. The second skipped it.
+        // Both endpoints are admitted, yet only the healthy one is offered, now or later.
+        let indices = |providers: Vec<ProviderHandle>| {
+            providers
+                .into_iter()
+                .map(|provider| provider.index)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(indices(endpoints.providers().await), vec![1]);
+        assert_eq!(
+            indices(
+                endpoints
+                    .later_providers(&BTreeSet::new(), tokio::time::Instant::now())
+                    .await
+            ),
+            vec![1]
+        );
+        read(&endpoints, &chain).await;
+        // The first read tried the failing endpoint once. The second, on new endpoints,
+        // skipped it during its withdrawal.
         assert_eq!(
             *failing_methods.lock().unwrap(),
             vec!["eth_chainId", "eth_blockNumber"]
@@ -658,28 +733,6 @@ mod tests {
         let count = |method: &str| served.iter().filter(|call| *call == method).count();
         assert_eq!((count("eth_chainId"), count("eth_blockNumber")), (1, 2));
 
-        // Releasing drops the pool, so admission's weak reference can't keep it, and
-        // nothing rebuilds it.
-        let pool = Arc::downgrade(&endpoints.current_pool().unwrap());
-        endpoints.release();
-        endpoints.release();
-        assert!(endpoints.providers().await.is_empty());
-        assert!(pool.upgrade().is_none());
-        assert!(endpoints.current_pool().is_none());
-
-        // A release while the first admission is pending wins over its completion.
-        let pending_endpoints = ObservationEndpoints::new(
-            &chain,
-            &HttpContext::direct_for_tests(),
-            crate::RpcTrafficClass::Sensitive,
-        )
-        .unwrap();
-        let mut pending = std::pin::pin!(pending_endpoints.providers());
-        assert!(futures_util::poll!(&mut pending).is_pending());
-        pending_endpoints.release();
-        assert!(pending.await.is_empty());
-        assert!(pending_endpoints.current_pool().is_none());
-        assert!(pending_endpoints.providers().await.is_empty());
         failing_server.abort();
         serving_server.abort();
     }

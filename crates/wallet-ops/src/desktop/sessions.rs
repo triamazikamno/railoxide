@@ -1103,10 +1103,15 @@ mod tests {
             )
             .unwrap();
         let reading_owner = owner.clone();
-        let reading =
-            tokio::spawn(
-                async move { reading_owner.inspect_record(record.operation(), &[]).await },
-            );
+        let reading = tokio::spawn(async move {
+            reading_owner
+                .inspect_record(
+                    record.operation(),
+                    &[],
+                    crate::OperationHttpClient::direct_for_tests(),
+                )
+                .await
+        });
         let (_connection, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
             .await
             .unwrap()

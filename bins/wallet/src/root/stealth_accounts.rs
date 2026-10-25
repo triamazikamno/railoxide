@@ -583,6 +583,9 @@ impl StealthAccountsView {
         if self.job.is_some() || !self.session_is_current(cx) {
             return;
         }
+        let Some(http) = self.root.upgrade().map(|root| root.read(cx).http.clone()) else {
+            return;
+        };
         let mut assets = assets;
         if !assets.contains(&ExecutorAsset::Native) {
             assets.push(ExecutorAsset::Native);
@@ -593,7 +596,14 @@ impl StealthAccountsView {
             .begin(&assets);
         let owner = Arc::clone(&self.owner);
         self.start_job(
-            async move { Ok((owner.check_record(operation, &assets).await, assets)) },
+            // The check reads the account over a route of its own.
+            async move {
+                let result = match http.operation_http_client().await {
+                    Ok(client) => owner.check_record(operation, &assets, &client).await,
+                    Err(error) => Err(error),
+                };
+                Ok((result, assets))
+            },
             move |this, (result, assets)| {
                 let observations = this.observations.entry(operation).or_default();
                 match result {
@@ -643,8 +653,8 @@ impl StealthAccountsView {
         let summary = SpendAuthorizationSummary::new("Restore stealth accounts", "Derives these accounts and checks whether they have been used. This does not sign or submit a transaction.", vec![
             SpendAuthorizationSummaryRow::new("Chain", railgun_ui::chain_name(self.session.chain_id).map_or_else(|| self.session.chain_id.to_string(), str::to_owned)),
             SpendAuthorizationSummaryRow::new("Account indices", format!("{}–{}", range.start, range.end - 1)),
-            SpendAuthorizationSummaryRow::new("Sent as", format!("One request with all {} addresses", range.end - range.start)),
-            SpendAuthorizationSummaryRow::new("Endpoint learns", "These addresses belong together, Tor or not"),
+            SpendAuthorizationSummaryRow::new("Sent as", "One request per address, in random order, 0.5–3 s apart"),
+            SpendAuthorizationSummaryRow::new("Route", "Each address on its own Tor route. Proxy and direct modes don't isolate them"),
             SpendAuthorizationSummaryRow::new("Checks", "Use only. Balances and history are not read"),
         ]).with_confirm_label("Restore").requiring_explicit_review();
         self.request_authorization(StealthAction::Discover { range }, summary, window, cx);

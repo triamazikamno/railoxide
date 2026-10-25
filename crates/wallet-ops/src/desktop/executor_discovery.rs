@@ -14,10 +14,10 @@ use broadcaster_core::contracts::railgun::RelayAdapt7702;
 use eyre::{Result, eyre};
 use futures_util::future::{join, join_all, join3};
 
-use crate::HttpContext;
 use crate::desktop::executor_observation::trace_step;
 use crate::public_wallet::PublicErc20;
 use crate::settings::{EffectiveChainConfig, ExecutorProfile};
+use crate::{HttpContext, OperationHttpClient};
 
 // The pinned shared bindings have no NFT reads. Match the standard IERC721 API
 // used by the accepted RelayAdapt7702; ERC1155 shielding is explicitly unsupported there.
@@ -116,15 +116,17 @@ impl ExecutorInspection {
 pub async fn inspect_executor(
     chain: &EffectiveChainConfig,
     http: &HttpContext,
+    client: &OperationHttpClient,
     address: Address,
     assets: &[ExecutorAsset],
 ) -> Result<ExecutorInspection> {
-    inspect_executor_state(chain, http, address, assets, false).await
+    inspect_executor_state(chain, http, client, address, assets, false).await
 }
 
 async fn inspect_executor_state(
     chain: &EffectiveChainConfig,
     http: &HttpContext,
+    client: &OperationHttpClient,
     address: Address,
     assets: &[ExecutorAsset],
     recovery: bool,
@@ -132,6 +134,7 @@ async fn inspect_executor_state(
     let pool = chain
         .rpc_route
         .for_class(crate::RpcTrafficClass::Sensitive)?
+        .isolated(client.clone())
         .query_rpc_pool(&http.rpc_clients(), Duration::from_secs(30));
     for provider in pool.available_providers() {
         // Avoid leaking the selected address to an endpoint serving a different chain.
@@ -163,10 +166,11 @@ async fn inspect_executor_state(
 pub(super) async fn inspect_recovery_executor(
     chain: &EffectiveChainConfig,
     http: &HttpContext,
+    client: &OperationHttpClient,
     address: Address,
     assets: &[ExecutorAsset],
 ) -> Result<ExecutorInspection> {
-    inspect_executor_state(chain, http, address, assets, true).await
+    inspect_executor_state(chain, http, client, address, assets, true).await
 }
 
 pub(super) async fn inspect_at(
@@ -334,11 +338,12 @@ pub(super) async fn execution_nonce_with_code(
 pub(super) async fn inspect_for_signing(
     chain: &EffectiveChainConfig,
     http: &HttpContext,
+    client: &OperationHttpClient,
     address: Address,
     assets: &[ExecutorAsset],
 ) -> Result<(ExecutorInspection, crate::vault::ExecutorNonceObservation)> {
     let (inspection, observed) = Box::pin(inspect_for_recovery_signing(
-        chain, http, address, assets, true,
+        chain, http, client, address, assets, true,
     ))
     .await?;
     Ok((
@@ -352,6 +357,7 @@ pub(super) async fn inspect_for_signing(
 pub(super) async fn inspect_for_recovery_signing(
     chain: &EffectiveChainConfig,
     http: &HttpContext,
+    client: &OperationHttpClient,
     address: Address,
     assets: &[ExecutorAsset],
     require_execution_nonce: bool,
@@ -359,17 +365,27 @@ pub(super) async fn inspect_for_recovery_signing(
     ExecutorInspection,
     Option<crate::vault::ExecutorNonceObservation>,
 )> {
-    inspect_signing_state(chain, http, address, assets, require_execution_nonce, false).await
+    inspect_signing_state(
+        chain,
+        http,
+        client,
+        address,
+        assets,
+        require_execution_nonce,
+        false,
+    )
+    .await
 }
 
 pub(super) async fn inspect_for_recovery_batch(
     chain: &EffectiveChainConfig,
     http: &HttpContext,
+    client: &OperationHttpClient,
     address: Address,
     assets: &[ExecutorAsset],
 ) -> Result<(ExecutorInspection, crate::vault::ExecutorNonceObservation)> {
     let (inspection, observed) =
-        inspect_signing_state(chain, http, address, assets, true, true).await?;
+        inspect_signing_state(chain, http, client, address, assets, true, true).await?;
     Ok((
         inspection,
         observed.ok_or_else(|| eyre!("recovery execution nonce is unknown"))?,
@@ -379,6 +395,7 @@ pub(super) async fn inspect_for_recovery_batch(
 async fn inspect_signing_state(
     chain: &EffectiveChainConfig,
     http: &HttpContext,
+    client: &OperationHttpClient,
     address: Address,
     assets: &[ExecutorAsset],
     require_execution_nonce: bool,
@@ -390,6 +407,7 @@ async fn inspect_signing_state(
     let pool = chain
         .rpc_route
         .for_class(crate::RpcTrafficClass::Sensitive)?
+        .isolated(client.clone())
         .query_rpc_pool(&http.rpc_clients(), Duration::from_secs(30));
     for endpoint in pool.available_providers() {
         let provider = &endpoint.provider;
@@ -548,6 +566,10 @@ mod tests {
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
+        let client = OperationHttpClient::for_tests(
+            rpc_client.clone(),
+            crate::OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Proxy),
+        );
         let http =
             HttpContext::with_rpc_client_for_tests(rpc_client, crate::WalletNetworkMode::Proxy);
         let proxy_request = tokio::spawn(async move {
@@ -595,6 +617,7 @@ mod tests {
             inspect_executor(
                 &chain,
                 &http,
+                &client,
                 Address::repeat_byte(1),
                 &[ExecutorAsset::Native],
             ),

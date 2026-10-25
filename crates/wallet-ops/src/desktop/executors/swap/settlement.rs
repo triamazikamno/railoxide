@@ -20,7 +20,6 @@ use tracing::Instrument as _;
 
 use super::observation::{SwapSettlement, issued, shielded_amount};
 use super::order::cow_buy_token;
-use crate::ExecutorOwner;
 use crate::block_observer::{BlockReceiptsError, fetch_checked_block_receipts};
 use crate::cow::CowOrderbookClient;
 use crate::desktop::executor_observation::{expected_shields, trace_step};
@@ -30,6 +29,7 @@ use crate::vault::{
     ExecutorOperationId, ExecutorRecord, SwapBridgeHandoff, SwapDelivery, SwapObservation,
     SwapOrderRecord, SwapSettlementEvidence, SwapShieldObservation, SwapTradeAmounts,
 };
+use crate::{ExecutorOwner, OperationHttpClient};
 
 // The pinned shared ERC20 bindings do not expose the Transfer event.
 alloy::sol! {
@@ -77,6 +77,7 @@ impl ExecutorOwner {
         operation: ExecutorOperationId,
         uid: OrderUid,
         number: u64,
+        client: &OperationHttpClient,
     ) -> Result<()> {
         let record = self
             .swap_record(operation)?
@@ -92,7 +93,8 @@ impl ExecutorOwner {
         {
             return Ok(());
         }
-        for endpoint in self.endpoints.providers().await {
+        let endpoints = self.observation_endpoints(client)?;
+        for endpoint in endpoints.providers().await {
             let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = endpoint.index);
             let result = trace_step(
                 "swap_settlement_receipts",
@@ -108,7 +110,7 @@ impl ExecutorOwner {
             .await;
             match result {
                 Ok(Some(settlement)) => {
-                    self.endpoints.succeeded(&endpoint);
+                    endpoints.succeeded(&endpoint);
                     let _guard = self.lock_activity().await;
                     self.require_record_unchanged(&record)?;
                     self.store.record_swap_settlement(
@@ -126,10 +128,10 @@ impl ExecutorOwner {
                     return Ok(());
                 }
                 Ok(None) => {
-                    self.endpoints.succeeded(&endpoint);
+                    endpoints.succeeded(&endpoint);
                     return Ok(());
                 }
-                Err(error) => self.endpoints.failed(&endpoint, &error),
+                Err(error) => endpoints.failed(&endpoint, &error),
             }
         }
         Err(eyre!(
@@ -148,6 +150,7 @@ impl ExecutorOwner {
         operation: ExecutorOperationId,
         uid: OrderUid,
         number: u64,
+        client: &OperationHttpClient,
     ) -> Result<Option<SwapSettlementHint>> {
         let record = self
             .swap_record(operation)?
@@ -163,7 +166,8 @@ impl ExecutorOwner {
         }
         let mut tried = 0_usize;
         let mut unsupported = 0_usize;
-        for endpoint in self.endpoints.providers().await {
+        let endpoints = self.observation_endpoints(client)?;
+        for endpoint in endpoints.providers().await {
             tried += 1;
             let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = endpoint.index);
             let result = trace_step(
@@ -180,7 +184,7 @@ impl ExecutorOwner {
             .await;
             match result {
                 Ok(settlement) => {
-                    self.endpoints.succeeded(&endpoint);
+                    endpoints.succeeded(&endpoint);
                     return Ok(settlement.map(|settlement| {
                         let handoff = settlement.handoff.map(|handoff| {
                             // The deposit matched the signed input amount of the attempt it is
@@ -221,7 +225,7 @@ impl ExecutorOwner {
                     ) {
                         unsupported += 1;
                     }
-                    self.endpoints.failed(&endpoint, &error);
+                    endpoints.failed(&endpoint, &error);
                 }
             }
         }

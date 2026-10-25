@@ -24,8 +24,8 @@ use super::{SwapOrderState, swap_order_state};
 use crate::settings::{EffectiveChainConfig, ExecutorProfile, SwapProfile};
 use crate::vault::{ExecutorOperationId, ExecutorRecord};
 use crate::{
-    DesktopPrivateSpendAuthorization, ExecutorInspection, PublicActionProgressStep,
-    PublicBroadcasterCandidate, WalletSession,
+    DesktopPrivateSpendAuthorization, ExecutorInspection, OperationHttpClient,
+    PublicActionProgressStep, PublicBroadcasterCandidate, WalletSession,
 };
 
 impl ExecutorOwner {
@@ -68,6 +68,7 @@ impl ExecutorOwner {
         candidate: PublicBroadcasterCandidate,
         maximum_private_fee: U256,
         authorization: &DesktopPrivateSpendAuthorization,
+        client: &OperationHttpClient,
     ) -> Result<PreparedExecutorRecovery> {
         self.swap_order_record(operation)?;
         self.prepare_recovery_amount(
@@ -80,6 +81,7 @@ impl ExecutorOwner {
             },
             authorization,
             false,
+            client,
         )
         .await
     }
@@ -94,6 +96,7 @@ impl ExecutorOwner {
         inspection: &ExecutorInspection,
         nonce: U256,
         cancellation: bool,
+        client: &OperationHttpClient,
     ) -> Result<Vec<Call>> {
         let Some(swap) = record.swap() else {
             return Ok(Vec::new());
@@ -115,6 +118,7 @@ impl ExecutorOwner {
                 .while_active(recovery_allowance(
                     chain,
                     &self.http,
+                    client,
                     inspection,
                     &TokenData::erc20(token),
                     profile.vault_relayer(),

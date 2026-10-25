@@ -986,6 +986,25 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
             }
             assert!(panel.read_with(cx, |panel, _| panel.job.is_none()));
         }
+        // Each operation client the wallet opens from here on is counted.
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&opens);
+        root.update(cx, |root, _| {
+            root.http = wallet_ops::HttpContext::with_rpc_client_for_tests(
+                reqwest::Client::new(),
+                wallet_ops::WalletNetworkMode::Direct,
+            )
+            .with_operation_clients_for_tests(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(wallet_ops::OperationHttpClient::for_tests(
+                    reqwest::Client::new(),
+                    wallet_ops::OperationNetworkIsolation::Unavailable(
+                        wallet_ops::WalletNetworkMode::Direct,
+                    ),
+                ))
+            });
+        });
+        let opened = || opens.load(std::sync::atomic::Ordering::SeqCst);
         // Selecting another asset replaces the amount with its balance. Native
         // funding also follows balance changes while the modal remains open.
         cx.update(|window, cx| {
@@ -1197,25 +1216,34 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
                 });
                 assert!(cx.debug_bounds("stealth-recovery-progress").is_some());
             };
-        begin_preparation(cx);
-        assert!(panel.read_with(cx, |panel, _| panel.job.is_some()));
-        cx.simulate_keystrokes("escape");
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(cx.debug_bounds("stealth-recovery-progress").is_none());
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while panel.read_with(cx, |panel, _| panel.job.is_some()) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "preparation did not finish"
-            );
-            runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
-            cx.run_until_parked();
+        // The open form keeps one client for all its steps, so a second preparation opens none.
+        let before = opened();
+        for _ in 0..2 {
+            begin_preparation(cx);
+            assert!(panel.read_with(cx, |panel, _| panel.job.is_some()));
+            cx.simulate_keystrokes("escape");
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(cx.debug_bounds("stealth-recovery-progress").is_none());
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while panel.read_with(cx, |panel, _| panel.job.is_some()) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "preparation did not finish"
+                );
+                runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
+                cx.run_until_parked();
+            }
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            assert!(cx.debug_bounds("stealth-recovery-progress").is_none());
+            assert!(panel.read_with(cx, |panel, _| panel.error.is_some()
+                && panel.recovery.prepared.is_none()
+                && panel.pending_authorization.is_none()));
         }
-        cx.update(|window, cx| window.draw(cx).clear(cx));
-        assert!(cx.debug_bounds("stealth-recovery-progress").is_none());
-        assert!(panel.read_with(cx, |panel, _| panel.error.is_some()
-            && panel.recovery.prepared.is_none()
-            && panel.pending_authorization.is_none()));
+        assert_eq!(
+            opened() - before,
+            1,
+            "both preparations read over the form's client"
+        );
         // Form/quote invalidation must not discard the completed progress result.
         panel.update(cx, |panel, cx| {
             panel.invalidate_recovery();
@@ -1252,6 +1280,10 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
         assert!(cx.debug_bounds("stealth-recovery-progress").is_none());
         cx.simulate_keystrokes("escape");
         cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            panel.read_with(cx, |panel, _| panel.recovery.client.is_none()),
+            "the closed form drops its client"
+        );
         panel.update(cx, |panel, cx| {
             panel.observations.clear();
             cx.notify();

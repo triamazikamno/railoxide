@@ -91,9 +91,9 @@ use crate::vault::{
 };
 use crate::{
     AnchorBlocked, DesktopPrivateSpendAuthorization, ExecutorOwner, FEE_BASIS_POINTS_DENOMINATOR,
-    HardwareExecutorAction, OperationNetworkIsolation, PairAnchorRate, QuoteDeviationError,
-    RAILGUN_PROTOCOL_FEE_BPS, TokenAnchorRateCache, WalletSession, check_quote_against_anchor,
-    railgun_protocol_fee_amount,
+    HardwareExecutorAction, OperationHttpClient, OperationNetworkIsolation, PairAnchorRate,
+    QuoteDeviationError, RAILGUN_PROTOCOL_FEE_BPS, TokenAnchorRateCache, WalletSession,
+    check_quote_against_anchor, railgun_protocol_fee_amount,
 };
 
 /// Widest pre-hook transaction: a full circuit with an unshield and a change output. Eight of
@@ -1715,30 +1715,34 @@ enum SwapRecheck {
 }
 
 impl ExecutorOwner {
-    /// An orderbook client on a network route dedicated to one swap. Keep it for that swap's
-    /// quotes and its order submission.
-    pub async fn swap_orderbook_client(&self) -> Result<CowOrderbookClient> {
+    /// An orderbook client on `client`, the network route dedicated to one swap. Keep it for
+    /// that swap's quotes and its order submission, and read the swap's accounts over the same
+    /// client.
+    pub fn swap_orderbook_client(
+        &self,
+        client: &OperationHttpClient,
+    ) -> Result<CowOrderbookClient> {
+        self.ensure_active()?;
         let profile = self.swap_order_profile()?;
         let base_url = Url::parse(profile.orderbook_api_base())?;
-        let http = self.while_active(self.http.operation_http_client()).await?;
         Ok(CowOrderbookClient::new(
-            http,
+            client.clone(),
             base_url,
             self.chain.chain_id,
         )?)
     }
 
-    /// `orderbook` and `bridge` on one new network route of the swap's own, for an explicit
-    /// status check, so a route its provider rejects isn't asked again. Other swaps and the
-    /// shared session are untouched.
-    pub async fn swap_clients_on_fresh_route(
+    /// `orderbook` and `bridge` on `client`, a new network route of the swap's own, for an
+    /// explicit status check, so a route its provider rejects isn't asked again. Other swaps
+    /// and the shared session are untouched.
+    pub fn swap_clients_on_fresh_route(
         &self,
         orderbook: &CowOrderbookClient,
         bridge: &SwapBridgeClients,
+        client: &OperationHttpClient,
     ) -> Result<(CowOrderbookClient, SwapBridgeClients)> {
-        let http = self.while_active(self.http.operation_http_client()).await?;
-        let bridge = bridge.on_route(&http);
-        Ok((orderbook.on_route(http), bridge))
+        self.ensure_active()?;
+        Ok((orderbook.on_route(client.clone()), bridge.on_route(client)))
     }
 
     /// Plan the pre-hook's notes for `request` from POI-spendable notes that no other executor
@@ -2078,6 +2082,7 @@ impl ExecutorOwner {
                     speed_up.swap_use,
                     review.plan.delivery,
                     Some(speed_up.pre_hook_nonce),
+                    orderbook.http(),
                 )
                 .await?;
         }
@@ -2161,6 +2166,8 @@ impl ExecutorOwner {
             verify_proof,
         } = request;
         self.require_swap_session(&session)?;
+        // The orderbook's route is the swap's, which every account read of the order shares.
+        let client = orderbook.http();
         review.require_approval(private_minimum, destination_minimum, price_acknowledged)?;
         bridge_route(&review.plan, bridge)?;
         if review.plan.delivery.private_bridge().is_some() != destination.is_some() {
@@ -2207,7 +2214,7 @@ impl ExecutorOwner {
         let (source, destination) = tokio::join!(
             trace_step(
                 "order_account_refresh",
-                self.refresh_swap_executor(&mut review, confirmed, account_use),
+                self.refresh_swap_executor(&mut review, confirmed, account_use, client),
             ),
             async {
                 let Some((context, destination_operation, confirmed, receiver)) =
@@ -2225,6 +2232,7 @@ impl ExecutorOwner {
                         swap_use,
                         receiver,
                         Some(&*context.session),
+                        client,
                     ),
                 )
                 .await?;
@@ -2473,6 +2481,7 @@ impl ExecutorOwner {
             destination,
             continuing_minimum,
         } = signing;
+        let client = orderbook.http();
         let plan = &review.plan;
         let delegated = require_delegated_plan(plan)?;
         let (operation, executor) = (delegated.operation(), delegated.executor());
@@ -2740,6 +2749,7 @@ impl ExecutorOwner {
                                 destination_minimum,
                                 destination.authorization,
                                 destination.notes,
+                                client,
                             )),
                         )
                         .await?;
@@ -2878,7 +2888,13 @@ impl ExecutorOwner {
         {
             let continuing = trace_step(
                 "order_continuing_approvals",
-                self.swap_continuing_approvals(operation, swap_use, plan.delivery, Some(nonce)),
+                self.swap_continuing_approvals(
+                    operation,
+                    swap_use,
+                    plan.delivery,
+                    Some(nonce),
+                    client,
+                ),
             )
             .await?;
             if let Some(current) = continuing.lower_minimum(destination_minimum)
@@ -3073,11 +3089,14 @@ impl ExecutorOwner {
         // again, under the lock the write holds. When a reorg removed the setup since the
         // account was refreshed, nothing is written or sent.
         let inclusion = if delegated.inclusion().is_some() {
-            let inclusion =
-                trace_step("order_included_setup", self.latest_setup_inclusion(&record))
-                    .await?
-                    .filter(|inclusion| inclusion.nonce() == nonce)
-                    .ok_or(SwapAccountRefusal::SetupUnconfirmed)?;
+            let endpoints = self.observation_endpoints(client)?;
+            let inclusion = trace_step(
+                "order_included_setup",
+                self.latest_setup_inclusion(&record, &endpoints),
+            )
+            .await?
+            .filter(|inclusion| inclusion.nonce() == nonce)
+            .ok_or(SwapAccountRefusal::SetupUnconfirmed)?;
             require_swap_account(
                 &record,
                 chain_id,
@@ -3190,6 +3209,7 @@ impl ExecutorOwner {
             executor,
             &pre_hook,
             plan.pre_hook_gas_limit(),
+            client,
         )
         .await?;
         swap_submission_outcome(submitted, uid, app_data.document.len(), plan.byte_budget)
@@ -3216,6 +3236,7 @@ impl ExecutorOwner {
         amount: U256,
         authorization: &DesktopPrivateSpendAuthorization,
         notes: Option<&dyn SwapShieldNotes>,
+        client: &OperationHttpClient,
     ) -> Result<Bytes> {
         self.ensure_active()?;
         let (operation, executor) = (delegated.operation(), delegated.executor());
@@ -3259,7 +3280,7 @@ impl ExecutorOwner {
                 SwapAccountUse::Claimed(swap_use),
                 SwapAdmissionEvidence::Fresh,
             )?;
-            self.require_empty_receiving_balance(executor, delegated.delegate(), token)
+            self.require_empty_receiving_balance(executor, delegated.delegate(), token, client)
                 .await?;
         }
         let signer = self.authorized_executor_signer(
@@ -3447,6 +3468,7 @@ impl ExecutorOwner {
             executor,
             &pre_hook,
             bounds.pre_hook_gas_limit,
+            orderbook.http(),
         )
         .await?;
         swap_submission_outcome(
@@ -3467,6 +3489,7 @@ impl ExecutorOwner {
         executor: Address,
         pre_hook: &Bytes,
         gas_limit: u64,
+        client: &OperationHttpClient,
     ) -> Result<()> {
         let Err(CowApiError::Rejected { error_type, .. }) = result else {
             return Ok(());
@@ -3477,11 +3500,12 @@ impl ExecutorOwner {
         ) {
             return Ok(());
         }
+        let endpoints = self.observation_endpoints(client)?;
         let simulation = trace_step(
             "order_pre_hook_simulation",
             self.while_active(async {
                 Ok(simulate_pre_hook(
-                    &self.endpoints,
+                    &endpoints,
                     trampoline,
                     executor,
                     pre_hook,
@@ -3913,6 +3937,7 @@ impl ExecutorOwner {
         review: &mut SwapReview,
         confirmed: u64,
         swap_use: SwapAccountUse,
+        client: &OperationHttpClient,
     ) -> Result<Option<SwapReviewChange>> {
         let plan = &review.plan;
         if plan.executor.requires_setup() {
@@ -3924,7 +3949,13 @@ impl ExecutorOwner {
             .operation()
             .ok_or_else(|| eyre!("swap executor is unavailable"))?;
         let mut executor = self
-            .reuse_swap_account(operation, confirmed, SwapAccountRole::Source, swap_use)
+            .reuse_swap_account(
+                operation,
+                confirmed,
+                SwapAccountRole::Source,
+                swap_use,
+                client,
+            )
             .await?;
         if executor.executor() != plan.executor() || executor.delegate() != plan.context.delegate {
             return Err(eyre!("the swap executor changed; plan the swap again"));
@@ -3984,6 +4015,7 @@ impl ExecutorOwner {
         confirmed: u64,
         role: SwapAccountRole,
         swap_use: SwapAccountUse,
+        client: &OperationHttpClient,
     ) -> Result<SwapExecutor> {
         let chain_id = self.chain.chain_id;
         let record = self
@@ -4003,7 +4035,7 @@ impl ExecutorOwner {
         if record.settled_swaps_at(confirmed) {
             let mut executor = trace_step(
                 "reuse_finalized",
-                self.refresh_settled_swap(&record, role, swap_use),
+                self.refresh_settled_swap(&record, role, swap_use, client),
             )
             .await?;
             executor.reused = true;
@@ -4011,22 +4043,23 @@ impl ExecutorOwner {
         }
         let report = if record.swap().is_some() {
             let range = confirmed..confirmed.saturating_add(1);
-            trace_step("reuse_orders", self.observe_swap(operation, range)).await?
+            trace_step("reuse_orders", self.observe_swap(operation, range, client)).await?
         } else {
-            trace_step("reuse_account", self.reconcile_account(operation)).await?
+            trace_step("reuse_account", self.reconcile_account(operation, client)).await?
         };
-        let delegated = match trace_step("reuse_setup", self.check_swap_setup(&report)).await? {
-            super::SwapSetupStatus::Delegated(delegated) => Some(delegated),
-            // The swap's own setup can be included before the record resolves it.
-            super::SwapSetupStatus::Pending => {
-                trace_step(
-                    "reuse_included_setup",
-                    self.included_swap_setup(report.record(), role, swap_use),
-                )
-                .await?
-            }
-            super::SwapSetupStatus::MissingDelegation => None,
-        };
+        let delegated =
+            match trace_step("reuse_setup", self.check_swap_setup(&report, client)).await? {
+                super::SwapSetupStatus::Delegated(delegated) => Some(delegated),
+                // The swap's own setup can be included before the record resolves it.
+                super::SwapSetupStatus::Pending => {
+                    trace_step(
+                        "reuse_included_setup",
+                        self.included_swap_setup(report.record(), role, swap_use, client),
+                    )
+                    .await?
+                }
+                super::SwapSetupStatus::MissingDelegation => None,
+            };
         let Some(delegated) = delegated else {
             return Err(SwapAccountRefusal::SetupUnconfirmed.into());
         };

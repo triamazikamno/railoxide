@@ -197,9 +197,13 @@ pub(super) async fn submit_self_broadcast_plan(
             let owner = session
                 .executor_owner()
                 .ok_or_else(|| eyre!("Open the owning wallet and chain before signing"))?;
-            let (signer, guard) =
-                Box::pin(owner.admit_authorized_gas_signer(view_session, &account, authorization))
-                    .await?;
+            let (signer, guard) = Box::pin(owner.admit_authorized_gas_signer(
+                view_session,
+                &account,
+                authorization,
+                client,
+            ))
+            .await?;
             VaultedPublicSigner::Executor(signer, guard)
         } else {
             admitted_public_signer(
@@ -212,6 +216,7 @@ pub(super) async fn submit_self_broadcast_plan(
                 trezor_pin_matrix_provider,
                 session.executor_owner().as_ref(),
                 chain_id,
+                client,
             )
             .await?
         };
@@ -373,8 +378,8 @@ pub(super) async fn submit_self_broadcast_plan(
                             && let SelfBroadcastTxOutcome::Receipt(receipt) = tx
                         {
                             let reconciliation = match &signer {
-                                VaultedPublicSigner::Executor(_, guard) => guard.reconcile_account(owner, identity.operation()).await,
-                                _ => owner.reconcile_account(identity.operation()).await,
+                                VaultedPublicSigner::Executor(_, guard) => guard.reconcile_account(owner, identity.operation(), client).await,
+                                _ => owner.reconcile_account(identity.operation(), client).await,
                             };
                             let state = reconciliation
                                 .ok()
@@ -1979,6 +1984,7 @@ pub(super) async fn submit_prepared_sponsored_self_broadcast(
                 &request.view_session,
                 &account,
                 authorization,
+                client,
             ))
             .await?;
             VaultedPublicSigner::Executor(signer, guard)
@@ -1993,6 +1999,7 @@ pub(super) async fn submit_prepared_sponsored_self_broadcast(
                 request.trezor_pin_matrix_provider,
                 request.session.executor_owner().as_ref(),
                 request.chain_id,
+                client,
             )
             .await?
         };

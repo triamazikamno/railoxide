@@ -527,9 +527,11 @@ fn public_quote_failure_offers_details_except_for_an_amount_too_small(cx: &mut T
 
 #[gpui::test]
 fn quote_retry_discards_the_old_route_and_ignores_its_late_response(cx: &mut TestAppContext) {
-    with_swap_view(cx, |_, swaps, _, operation, runtime, cx| {
+    with_swap_view(cx, |root, swaps, _, operation, runtime, cx| {
         let owner = swaps.read_with(cx, |swaps, _| Arc::clone(swaps.private_owner().unwrap()));
-        let old_client = runtime.block_on(owner.swap_orderbook_client()).unwrap();
+        let http = root.read_with(cx, |root, _| root.http.clone());
+        let route = runtime.block_on(http.operation_http_client()).unwrap();
+        let old_client = owner.swap_orderbook_client(&route).unwrap();
         for operation in [None, Some(operation)] {
             let mut old_revision = 0;
             cx.update(|window, cx| {
@@ -899,6 +901,7 @@ fn setup_read(operation: ExecutorOperationId, included: Option<u64>) -> Observat
                 .map(|block| wallet_ops::SwapSetupInclusion::for_tests(block, U256::ONE)),
         })),
         destination: None,
+        route: Arc::default(),
     }
 }
 
@@ -1672,6 +1675,7 @@ fn stale_setup_read_is_dropped_and_a_failed_read_records_its_error(cx: &mut Test
                         range_end: None,
                         outcome,
                         destination: None,
+                        route: Arc::default(),
                     }]
                 };
                 // Either account's background read can lose a race with confirmation.
@@ -4955,7 +4959,7 @@ fn routine_order_polling_waits_for_a_settlement_hint_without_reconciling_history
                 let result = |block| HintResult {
                     operation,
                     uid,
-                    client: None,
+                    route: Arc::default(),
                     fee: false,
                     report: Some((
                         CowOrderStatusReport {
@@ -10507,7 +10511,7 @@ fn competing_orders_follow_the_one_that_traded(cx: &mut TestAppContext, original
         let report = |uid, status, block: Option<u64>| HintResult {
             operation,
             uid,
-            client: None,
+            route: Arc::default(),
             fee: false,
             report: Some((
                 CowOrderStatusReport {
@@ -12701,7 +12705,7 @@ fn reported_fill(
     HintResult {
         operation,
         uid,
-        client: None,
+        route: Arc::default(),
         fee: false,
         report: Some((
             CowOrderStatusReport {
@@ -14621,14 +14625,16 @@ fn manual_checks_reconcile_destination_payloads_even_after_a_later_error(cx: &mu
 }
 
 /// A NEAR Intents deposit that needs attention has its own My orders group, apart from
-/// recovery, and shows its deposit address in full. Check status asks 1Click again on the
-/// swap's own route and records the delivery it reports.
+/// recovery, and shows its deposit address in full. Check status asks 1Click again on a fresh
+/// route of the swap's own and records the delivery it reports. The swap's next RPC page reads
+/// over that route.
 #[gpui::test]
 fn near_intents_deposit_that_needs_attention_is_checked_with_the_provider(cx: &mut TestAppContext) {
     use wallet_ops::vault::{BridgeDelivery, BridgeProvider, BridgeSurplus, SwapBridgeOutcome};
 
     let stubs = SwapStubs::start();
-    with_approved_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
+    let rpc = Some(stubs.rpc());
+    with_approved_swap_view_and_rpc(cx, rpc, |root, swaps, executors, operation, runtime, cx| {
         let delivery = SwapDelivery::Bridge(BridgeDelivery {
             provider: BridgeProvider::NearIntents,
             destination_chain: 137,
@@ -14647,7 +14653,10 @@ fn near_intents_deposit_that_needs_attention_is_checked_with_the_provider(cx: &m
             .unwrap();
         let orderbook = stub_orderbook(&stubs, runtime);
         cx.update(|_, cx| {
-            root.update(cx, |root, _| enable_stub_chain(root, &stubs, 137));
+            root.update(cx, |root, _| {
+                enable_stub_chain(root, &stubs, 137);
+                root.http = tagged_operation_http();
+            });
             swaps.update(cx, |swaps, cx| {
                 swaps.reload_records();
                 let record = swaps.record(operation).unwrap();
@@ -14681,10 +14690,38 @@ fn near_intents_deposit_that_needs_attention_is_checked_with_the_provider(cx: &m
         assert!(cx.debug_bounds("swap-detail-deposit-address").is_some());
         assert!(cx.debug_bounds("swap-progress-recover").is_none());
         let check = cx.debug_bounds("swap-progress-check").unwrap();
+        let before_check = stubs.request_count();
         cx.simulate_click(check.center(), gpui::Modifiers::none());
         drive_until(cx, runtime, |cx| {
             swaps.read_with(cx, |swaps, _| swaps.job.is_none())
         });
+        // Untagged requests come from the stub orderbook's route or the wallet session.
+        let tagged = |routes: BTreeSet<Option<String>>| {
+            routes.into_iter().flatten().collect::<BTreeSet<_>>()
+        };
+        let checked = tagged(stubs.routes_since(before_check, "/near/"));
+        assert_eq!(
+            checked.len(),
+            1,
+            "the check asks on one fresh route: {checked:?}"
+        );
+        // The swap's next RPC page goes over the route the check replaced its own with.
+        let (owner, page) = cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                let http = swaps.http(cx).unwrap();
+                let page = ObservationPage {
+                    operation,
+                    settlement: None,
+                    range: Some(0..1),
+                    destination: None,
+                    route: swaps.swap_route(&http, operation),
+                };
+                (Arc::clone(swaps.private_owner().unwrap()), page)
+            })
+        });
+        let before_page = stubs.request_count();
+        runtime.block_on(observe_pages(owner, vec![page]));
+        assert_eq!(tagged(stubs.routes_since(before_page, "/rpc")), checked);
         cx.update(|_, cx| {
             swaps.update(cx, |swaps, cx| {
                 let record = swaps.record(operation).unwrap();
@@ -14954,6 +14991,9 @@ const STUB_BUY_AMOUNT: u64 = 400_000_000_000_000;
 /// The fee the stub orderbook reports it charged any order, in `Address::repeat_byte(2)`.
 const STUB_EXECUTED_FEE: u64 = 464_572;
 
+/// Each stub request's path and the `x-route` tag of the client that sent it.
+type StubRequests = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
 /// Local stand-ins for the chain RPC, the `CoW` orderbook and the bridge providers, served from
 /// their own thread, so a quote goes through the real planning and review without live
 /// services. The RPC answers `eth_gasPrice` and fails everything else, like the unreachable RPC
@@ -14967,8 +15007,9 @@ struct SwapStubs {
     quotes: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     bridge_requests: Arc<std::sync::Mutex<Vec<String>>>,
     order_requests: Arc<std::sync::Mutex<Vec<String>>>,
-    /// The path of each RPC request, which tells apart chains given their own path.
-    rpc_requests: Arc<std::sync::Mutex<Vec<String>>>,
+    /// The path of each request, which tells apart chains given their own RPC path, with the
+    /// `x-route` tag of the client it came from.
+    requests: StubRequests,
     across_fee_bps: Arc<std::sync::atomic::AtomicU64>,
     across_relayer_gas_bps: Arc<std::sync::atomic::AtomicU64>,
     across_delay_ms: Arc<std::sync::atomic::AtomicU64>,
@@ -15008,7 +15049,7 @@ impl SwapStubs {
         let quotes = Arc::<std::sync::Mutex<Vec<serde_json::Value>>>::default();
         let bridge_requests = Arc::<std::sync::Mutex<Vec<String>>>::default();
         let order_requests = Arc::<std::sync::Mutex<Vec<String>>>::default();
-        let rpc_requests = Arc::<std::sync::Mutex<Vec<String>>>::default();
+        let requests = Arc::<std::sync::Mutex<Vec<(String, Option<String>)>>>::default();
         let across_fee_bps = Arc::new(std::sync::atomic::AtomicU64::new(10));
         let across_relayer_gas_bps = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let across_delay_ms = Arc::<std::sync::atomic::AtomicU64>::default();
@@ -15023,7 +15064,7 @@ impl SwapStubs {
         let recorded = Arc::clone(&quotes);
         let recorded_bridge = Arc::clone(&bridge_requests);
         let recorded_orders = Arc::clone(&order_requests);
-        let recorded_rpc = Arc::clone(&rpc_requests);
+        let recorded_requests = Arc::clone(&requests);
         let bridge = StubBridge {
             spoke_pool: wallet_ops::settings::build_effective_chain_configs(
                 &wallet_ops::settings::WalletSettings::default(),
@@ -15057,7 +15098,7 @@ impl SwapStubs {
                             Arc::clone(&recorded),
                             Arc::clone(&recorded_bridge),
                             Arc::clone(&recorded_orders),
-                            Arc::clone(&recorded_rpc),
+                            Arc::clone(&recorded_requests),
                             bridge.clone(),
                             Arc::clone(&served_gas_price),
                             Arc::clone(&served_fee_amount),
@@ -15075,7 +15116,7 @@ impl SwapStubs {
             quotes,
             bridge_requests,
             order_requests,
-            rpc_requests,
+            requests,
             across_fee_bps,
             across_relayer_gas_bps,
             across_delay_ms,
@@ -15160,8 +15201,26 @@ impl SwapStubs {
 
     /// How many RPC requests arrived on `path` so far.
     fn rpc_requests_on(&self, path: &str) -> usize {
-        let requests = self.rpc_requests.lock().unwrap();
-        requests.iter().filter(|request| *request == path).count()
+        let requests = self.requests.lock().unwrap();
+        requests
+            .iter()
+            .filter(|(request, _)| request == path)
+            .count()
+    }
+
+    /// How many requests arrived so far, to tell later ones apart.
+    fn request_count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+
+    /// The `x-route` tags of the requests after the first `from` whose path starts with
+    /// `prefix`, each once.
+    fn routes_since(&self, from: usize, prefix: &str) -> BTreeSet<Option<String>> {
+        self.requests.lock().unwrap()[from..]
+            .iter()
+            .filter(|(path, _)| path.starts_with(prefix))
+            .map(|(_, route)| route.clone())
+            .collect()
     }
 }
 
@@ -15182,7 +15241,7 @@ async fn stub_response(
     quotes: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     bridge_requests: Arc<std::sync::Mutex<Vec<String>>>,
     order_requests: Arc<std::sync::Mutex<Vec<String>>>,
-    rpc_requests: Arc<std::sync::Mutex<Vec<String>>>,
+    requests: StubRequests,
     bridge: StubBridge,
     gas_price_wei: Arc<std::sync::atomic::AtomicU64>,
     fee_amount: Arc<std::sync::atomic::AtomicU64>,
@@ -15194,6 +15253,7 @@ async fn stub_response(
         return;
     }
     let mut length = 0;
+    let mut route = None;
     loop {
         let mut line = String::new();
         if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
@@ -15202,8 +15262,12 @@ async fn stub_response(
         if line == "\r\n" {
             break;
         }
-        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+        let line = line.to_ascii_lowercase();
+        if let Some(value) = line.strip_prefix("content-length:") {
             length = value.trim().parse().unwrap_or(0);
+        }
+        if let Some(value) = line.strip_prefix("x-route:") {
+            route = Some(value.trim().to_owned());
         }
     }
     let mut body = vec![0; length];
@@ -15212,9 +15276,7 @@ async fn stub_response(
     }
     let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
     let path = request_line.split(' ').nth(1).unwrap_or_default();
-    if path.starts_with("/rpc") {
-        rpc_requests.lock().unwrap().push(path.to_owned());
-    }
+    requests.lock().unwrap().push((path.to_owned(), route));
     let failing = bridge
         .failing
         .lock()
@@ -15660,6 +15722,240 @@ fn drive_until(
     panic!("the swap's requests didn't finish");
 }
 
+/// Direct-mode wallet HTTP whose every operation client tags its requests with an `x-route`
+/// header of its own, which [`SwapStubs`] records.
+fn tagged_operation_http() -> wallet_ops::HttpContext {
+    let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    wallet_ops::HttpContext::with_rpc_client_for_tests(
+        reqwest::Client::new(),
+        wallet_ops::WalletNetworkMode::Direct,
+    )
+    .with_operation_clients_for_tests(move || {
+        let tag = opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-route", format!("route-{tag}").parse()?);
+        Ok(wallet_ops::OperationHttpClient::for_tests(
+            reqwest::Client::builder()
+                .default_headers(headers)
+                .build()?,
+            wallet_ops::OperationNetworkIsolation::Unavailable(
+                wallet_ops::WalletNetworkMode::Direct,
+            ),
+        ))
+    })
+}
+
+/// One pass of the observation loop over the pages of the swap `operation`, a private Bridge
+/// swap's destination page included. Returns the routes its RPC requests went over, and
+/// whether each page read a destination account.
+fn observation_routes(
+    swaps: &Entity<PrivateSwapsView>,
+    stubs: &SwapStubs,
+    operation: ExecutorOperationId,
+    runtime: &tokio::runtime::Runtime,
+    cx: &mut gpui::VisualTestContext,
+) -> (BTreeSet<String>, Vec<bool>) {
+    let (owner, pages) = cx.update(|_, cx| {
+        swaps.update(cx, |swaps, cx| {
+            swaps.reload_records();
+            swaps.reload_destinations(cx);
+            swaps.track_records();
+            let (_, owner, pages) = swaps.next_observations(cx).expect("pages to observe");
+            let pages = pages
+                .into_iter()
+                .filter(|page| {
+                    page.operation == operation
+                        || page
+                            .destination
+                            .as_ref()
+                            .is_some_and(|destination| destination.origin == operation)
+                })
+                .collect::<Vec<_>>();
+            (owner, pages)
+        })
+    });
+    let read = pages
+        .iter()
+        .map(|page| page.destination.is_some())
+        .collect();
+    let from = stubs.request_count();
+    let results = runtime.block_on(observe_pages(owner, pages));
+    cx.update(|window, cx| {
+        swaps.update(cx, |swaps, cx| {
+            swaps.apply_observations(results, window, cx);
+        });
+    });
+    let routes = stubs.routes_since(from, "/rpc").into_iter().flatten();
+    (routes.collect(), read)
+}
+
+/// Sets the synced head of each of `chains`, so their confirmed blocks are known.
+fn sync_heads(root: &Entity<WalletRoot>, chains: &[u64], cx: &mut gpui::VisualTestContext) {
+    cx.update(|_, cx| {
+        root.update(cx, |root, _| {
+            for chain in chains {
+                let Some(ChainUtxoState::Ready { sync_tip, .. }) = root.chain_states.get_mut(chain)
+                else {
+                    panic!("ready chain {chain}");
+                };
+                sync_tip.head_block = Some(10_000);
+            }
+        });
+    });
+}
+
+/// Each tracked swap's account is read over a route of its own, which its later pages keep.
+/// Two swaps never share one.
+#[gpui::test]
+fn two_tracked_swaps_are_read_over_routes_of_their_own(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_approved_swap_view_and_rpc(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, executors, operation, runtime, cx| {
+            let issued = pending_setup(executors, operation);
+            let other = ExecutorOperationId::random().unwrap();
+            executors
+                .reserve_with_swap_approval(
+                    other,
+                    issued.delegate(),
+                    Some("Private swap"),
+                    &[
+                        wallet_ops::ExecutorAsset::Erc20(Address::repeat_byte(1)),
+                        wallet_ops::ExecutorAsset::Erc20(Address::repeat_byte(2)),
+                    ],
+                    Some(test_approval()),
+                    None,
+                )
+                .unwrap();
+            executors
+                .bind_address(other, Address::repeat_byte(0x35))
+                .unwrap();
+            record_setup(
+                executors,
+                other,
+                issued.delegate(),
+                B256::repeat_byte(5),
+                Vec::new(),
+            );
+            cx.update(|_, cx| root.update(cx, |root, _| root.http = tagged_operation_http()));
+            sync_heads(root, &[1], cx);
+
+            let (first, _) = observation_routes(swaps, &stubs, operation, runtime, cx);
+            let (second, _) = observation_routes(swaps, &stubs, other, runtime, cx);
+            assert_eq!(first.len(), 1, "{first:?}");
+            assert_eq!(second.len(), 1, "{second:?}");
+            assert_ne!(first, second, "two swaps never share a route");
+            let (again, _) = observation_routes(swaps, &stubs, operation, runtime, cx);
+            assert_eq!(again, first, "a swap's later pages keep its route");
+        },
+    );
+}
+
+/// A private Bridge swap's setup pages read its own account and its destination account over
+/// the swap's one route.
+#[gpui::test]
+fn a_private_bridge_swaps_origin_and_destination_pages_share_its_route(cx: &mut TestAppContext) {
+    use wallet_ops::vault::{SwapApprovalTokens, SwapDestinationClaim, SwapPairClaim};
+    let stubs = SwapStubs::start();
+    with_swap_view_and_store(
+        cx,
+        Some(stubs.rpc()),
+        |root, swaps, executors, _, runtime, store, cx| {
+            cx.update(|_, cx| root.update(cx, |root, _| enable_stub_chain(root, &stubs, 137)));
+            let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
+            let (polygon_store, _) = reusable_polygon_account(root, cx);
+            let (origin_delegate, polygon_delegate) = root.read_with(cx, |root, _| {
+                let delegate = |chain_id| {
+                    root.effective_chain_configs
+                        .get(chain_id)
+                        .unwrap()
+                        .accepted_executor_profile()
+                        .unwrap()
+                        .delegate()
+                };
+                (delegate(1), delegate(137))
+            });
+            // Both accounts are new, and each setup was sent.
+            let source = ExecutorOperationId::random().unwrap();
+            let destination = ExecutorOperationId::random().unwrap();
+            let receiver = Address::repeat_byte(0x61);
+            let approval = SwapApproval {
+                delivery: SwapDelivery::Bridge(BridgeDelivery {
+                    provider: BridgeProvider::Across,
+                    destination_chain: 137,
+                    receiver,
+                    destination_token: STUB_POLYGON_USDT,
+                    surplus: BridgeSurplus::Reshield,
+                    private: Some(BridgePrivateDelivery {
+                        on_shield_failure: BridgeShieldFailure::RefundOnOrigin,
+                    }),
+                }),
+                tokens: Some(SwapApprovalTokens {
+                    sell: Address::repeat_byte(1),
+                    buy: Address::repeat_byte(2),
+                }),
+                accounts: Some(SwapApprovedAccounts {
+                    source: SwapApprovedAccount {
+                        address: None,
+                        setup: true,
+                    },
+                    destination: Some(SwapApprovedAccount {
+                        address: None,
+                        setup: true,
+                    }),
+                }),
+                ..test_approval()
+            };
+            executors
+                .claim_swap_pair(SwapPairClaim {
+                    id: SwapUseId::first(source),
+                    source: SwapAccountChoice::New(source),
+                    delegate: origin_delegate,
+                    purpose_summary: Some("Private swap".into()),
+                    assets: Vec::new(),
+                    approval,
+                    destination: Some(SwapDestinationClaim {
+                        chain_id: 137,
+                        account: SwapAccountChoice::New(destination),
+                        delegate: polygon_delegate,
+                        destination_token: STUB_POLYGON_USDT,
+                    }),
+                })
+                .unwrap();
+            executors
+                .bind_address(source, Address::repeat_byte(0x33))
+                .unwrap();
+            polygon_store.bind_address(destination, receiver).unwrap();
+            record_setup(
+                executors,
+                source,
+                origin_delegate,
+                B256::repeat_byte(0x43),
+                Vec::new(),
+            );
+            record_setup(
+                &polygon_store,
+                destination,
+                polygon_delegate,
+                B256::repeat_byte(0x44),
+                Vec::new(),
+            );
+            cx.update(|_, cx| root.update(cx, |root, _| root.http = tagged_operation_http()));
+            sync_heads(root, &[1, 137], cx);
+
+            let (routes, read) = observation_routes(swaps, &stubs, source, runtime, cx);
+            assert_eq!(
+                read,
+                [false, true],
+                "the swap's own page and its destination's"
+            );
+            assert_eq!(routes.len(), 1, "{routes:?}");
+            runtime.block_on(polygon.stop()).unwrap();
+        },
+    );
+}
+
 /// The form's quote, once it's ready.
 fn ready_review(
     swaps: &Entity<PrivateSwapsView>,
@@ -16033,6 +16329,7 @@ fn public_review_fixture(
                 token_registry: &registry,
                 max_fee_per_gas: 1,
                 max_priority_fee_per_gas: 1,
+                client: orderbook.http(),
             },
         ))
         .unwrap();

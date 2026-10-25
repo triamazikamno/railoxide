@@ -35,6 +35,8 @@ const DEVICE_SIGNATURES_TITLE: &str = "Approve and place order";
 struct PublicSwapClients {
     across: AcrossClient,
     orderbook: Option<CowOrderbookClient>,
+    /// The form's route, which both providers' clients are on, for its RPC reads.
+    http: wallet_ops::OperationHttpClient,
 }
 
 pub(super) struct PublicSwapForm {
@@ -292,6 +294,9 @@ pub(in crate::root) struct PublicSwapAuthorization {
     action: PublicSwapCommand,
     summary: SpendAuthorizationSummary,
     revision: u64,
+    /// The route of the command's reads and transactions: the form's, or the recovery
+    /// review's.
+    client: wallet_ops::OperationHttpClient,
 }
 
 #[derive(Clone)]
@@ -385,13 +390,17 @@ async fn public_swap_clients(
     let across = AcrossClient::new(route.clone(), bridge.across_api_base().parse()?)?;
     let orderbook = match origin.public_swap_profile() {
         Some(profile) => Some(CowOrderbookClient::new(
-            route,
+            route.clone(),
             profile.orderbook_api_base().parse()?,
             origin.chain_id,
         )?),
         None => None,
     };
-    Ok(PublicSwapClients { across, orderbook })
+    Ok(PublicSwapClients {
+        across,
+        orderbook,
+        http: route,
+    })
 }
 
 fn public_sell(origin: &EffectiveChainConfig, token: Address) -> eyre::Result<PublicSellAsset> {
@@ -546,10 +555,18 @@ impl PrivateSwapsView {
         else {
             return;
         };
+        // The form's route, or one of the read's own before the form has one.
+        let client = public.clients.as_ref().map(|clients| clients.http.clone());
+        let http = root.read(cx).http.clone();
         let runtime = self.runtime.clone();
         let task = cx.spawn_in(window, async move |view, cx| {
-            let task =
-                runtime.spawn(async move { owner.public_swap_orders_available(&origin).await });
+            let task = runtime.spawn(async move {
+                let client = match client {
+                    Some(client) => client,
+                    None => http.operation_http_client().await?,
+                };
+                owner.public_swap_orders_available(&origin, &client).await
+            });
             let _abort = AbortOnDrop(task.abort_handle());
             // A chain that couldn't be read stays unread, so the next quote reads it again.
             let available = match task.await {
@@ -798,6 +815,7 @@ impl PrivateSwapsView {
                         token_registry: &registry,
                         max_fee_per_gas: fee.suggested_max_fee_per_gas,
                         max_priority_fee_per_gas: fee.suggested_max_priority_fee_per_gas,
+                        client: &clients.http,
                     })
                     .await?;
                 Ok::<_, eyre::Report>((clients, review, quoted))
@@ -1110,7 +1128,12 @@ impl PrivateSwapsView {
         let public = form.public.as_mut().expect("Public test form");
         public.review = Some(Arc::new(review));
         public.quote_terms = Some(terms);
-        public.clients = Some(PublicSwapClients { across, orderbook });
+        let http = orderbook.as_ref().expect("test orderbook").http().clone();
+        public.clients = Some(PublicSwapClients {
+            across,
+            orderbook,
+            http,
+        });
     }
 
     #[cfg(test)]
@@ -1473,6 +1496,7 @@ impl PrivateSwapsView {
             owner,
             operation,
             swap_use,
+            client: clients.http.clone(),
             action: PublicSwapCommand::Swap {
                 account,
                 destination_token: form.buy.ok_or("Choose a destination token.")?,
@@ -2089,6 +2113,7 @@ impl PrivateSwapsView {
                             trezor_app_passphrase,
                             trezor_pin_matrix_provider,
                         },
+                        &command.client,
                     )
                     .await?;
                 drop(public_authorization);
@@ -2851,6 +2876,12 @@ impl PrivateSwapsView {
                 })
             })
             .collect::<Vec<_>>();
+        // Each swap is checked on its own schedule.
+        let requests = self.public_schedule.poll_due(
+            requests,
+            |&(chain, operation, id, _)| (chain, operation, id),
+            std::time::Instant::now(),
+        );
         for (chain, operation, id, origin) in requests {
             self.track_public_swap_request(chain, operation, id, origin, false, window, cx);
         }
@@ -2913,6 +2944,7 @@ impl PrivateSwapsView {
                             across: &clients.across,
                             orderbook: clients.orderbook.as_ref(),
                             explicit,
+                            client: &clients.http,
                         },
                     )
                     .await
@@ -2921,6 +2953,10 @@ impl PrivateSwapsView {
             let result = task.await;
             let _ = view.update(cx, |view, cx| {
                 view.public_tracking.remove(&key);
+                view.public_schedule.polled(
+                    &std::collections::BTreeSet::from([key]),
+                    std::time::Instant::now(),
+                );
                 if !view.session_is_current(cx)
                     || !view
                         .destination_owner(chain, cx)
@@ -3286,7 +3322,9 @@ impl PrivateSwapsView {
                     max_fee_per_gas: fee.suggested_max_fee_per_gas,
                     max_priority_fee_per_gas: fee.suggested_max_priority_fee_per_gas,
                 };
-                let (command, max_gas_cost) = if action == PublicSwapAction::Withdraw {
+                let (command, max_gas_cost, client) = if action == PublicSwapAction::Withdraw {
+                    // The recovery's route, from its review through its transaction.
+                    let client = http.operation_http_client().await?;
                     let review = owner
                         .review_public_swap_withdrawal(
                             identity.operation,
@@ -3294,6 +3332,7 @@ impl PrivateSwapsView {
                             &origin,
                             fee.suggested_max_fee_per_gas,
                             fee.suggested_max_priority_fee_per_gas,
+                            &client,
                         )
                         .await?;
                     (
@@ -3302,6 +3341,7 @@ impl PrivateSwapsView {
                             fee: gas_fee,
                         },
                         review.max_gas_cost,
+                        client,
                     )
                 } else {
                     let clients = public_swap_clients(&origin, &http).await?;
@@ -3318,16 +3358,33 @@ impl PrivateSwapsView {
                             orderbook,
                         },
                         U256::from(gas_limit) * U256::from(fee.suggested_max_fee_per_gas),
+                        clients.http,
                     )
                 };
-                Ok::<_, eyre::Report>((source, origin, session, owner, command, max_gas_cost))
+                Ok::<_, eyre::Report>((
+                    source,
+                    origin,
+                    session,
+                    owner,
+                    command,
+                    max_gas_cost,
+                    client,
+                ))
             });
             let _abort = AbortOnDrop(task.abort_handle());
             let result = task.await;
             let _ = view.update_in(cx, |view, window, cx| {
                 view.public_job = None;
                 match result {
-                    Ok(Ok((source, origin, destination_session, owner, action, max_gas_cost))) => {
+                    Ok(Ok((
+                        source,
+                        origin,
+                        destination_session,
+                        owner,
+                        action,
+                        max_gas_cost,
+                        client,
+                    ))) => {
                         // The review's amounts and accounts are formatted here, with the
                         // wallet's token metadata.
                         let summary = view.public_recovery_summary(
@@ -3347,6 +3404,7 @@ impl PrivateSwapsView {
                             action,
                             summary: summary.clone(),
                             revision: 0,
+                            client,
                         });
                         view.public_authorization = Some(command.clone());
                         let entity = cx.entity();
@@ -4819,6 +4877,7 @@ async fn prepare_public_execution(
                     *fee,
                     review,
                     true,
+                    &command.client,
                     &mut |_| {},
                 )
                 .await?;
@@ -4852,6 +4911,7 @@ async fn prepare_public_execution(
                     *fee,
                     orderbook,
                     *gas_limit,
+                    &command.client,
                     &mut |_| {},
                 )
                 .await?;
@@ -4909,6 +4969,7 @@ async fn prepare_public_destination(
                     .private_authorization
                     .as_ref()
                     .expect("destination authorization"),
+                &command.client,
             )
             .await?;
         if let SwapPairSide::Setup(prepared) = side {
@@ -4934,6 +4995,7 @@ async fn prepare_public_destination(
                         progress_tx: None,
                         response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
                         republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
+                        client: command.client.clone(),
                     },
                 )
                 .await?;
@@ -4967,6 +5029,7 @@ async fn changed_public_delivery(
                     quote,
                     &command.origin,
                     command.source.address,
+                    &command.client,
                 )
                 .await?,
         )),
@@ -5001,7 +5064,7 @@ async fn advance_public_execution(
         // pending is read again on the next pass.
         match command
             .owner
-            .observe_swap_setup(command.operation)
+            .observe_swap_setup(command.operation, &command.client)
             .await?
             .status
         {
@@ -5038,6 +5101,7 @@ async fn advance_public_execution(
                     confirmed,
                     command.swap_use,
                     notes,
+                    &command.client,
                 )
                 .await?;
             match command
@@ -5052,6 +5116,7 @@ async fn advance_public_execution(
                     valid_to,
                     authorization,
                     notes,
+                    client: &command.client,
                 })
                 .await
             {
@@ -5082,6 +5147,7 @@ async fn advance_public_execution(
             &command.origin,
             &execution.signer,
             public_gas_fee(review),
+            &command.client,
             &mut |_| {},
         )
         .await?
@@ -5092,7 +5158,12 @@ async fn advance_public_execution(
             Some(Arc::new(
                 command
                     .owner
-                    .requote_public_swap_approvals(review, &command.origin, command.source.address)
+                    .requote_public_swap_approvals(
+                        review,
+                        &command.origin,
+                        command.source.address,
+                        &command.client,
+                    )
                     .await?,
             ))
         } else {
@@ -5208,6 +5279,7 @@ async fn submit_public_execution(
                 public_gas_fee(review),
                 &signed.delivery,
                 &signed.terms,
+                &command.client,
                 &mut |_| {},
             )
             .await?;

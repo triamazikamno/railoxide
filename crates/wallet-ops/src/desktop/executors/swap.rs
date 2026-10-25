@@ -29,7 +29,7 @@ use crate::vault::{
     SwapUseId, SwapUseRecord, SwapUseRole, SwapUseSide, swap_account_refusal,
 };
 use crate::{
-    DesktopPrivateSpendAuthorization, ExecutorAsset, HardwareExecutorAction,
+    DesktopPrivateSpendAuthorization, ExecutorAsset, HardwareExecutorAction, OperationHttpClient,
     PublicBroadcasterCandidate, TransactionGenerationProgressSender, WakuClient, WalletSession,
 };
 
@@ -167,6 +167,8 @@ pub struct SwapSetupRequest<A = DesktopPrivateSpendAuthorization> {
     pub progress_tx: Option<TransactionGenerationProgressSender>,
     pub response_timeout: Duration,
     pub republish_interval: Duration,
+    /// The swap's route, for the setup's fee, signing and estimate reads.
+    pub client: OperationHttpClient,
 }
 
 /// The accounts a swap use claims before any of its preparation: see
@@ -207,6 +209,8 @@ pub struct SwapPairPreparation<'a> {
     pub authorization: &'a DesktopPrivateSpendAuthorization,
     /// Required with a destination account, whether it is new or existing.
     pub destination_authorization: Option<&'a DesktopPrivateSpendAuthorization>,
+    /// The swap's route, for both accounts' inspections.
+    pub client: &'a OperationHttpClient,
 }
 
 /// One account of a prepared swap pair.
@@ -291,6 +295,7 @@ pub async fn prepare_swap_pair(
         destination_candidate,
         authorization,
         destination_authorization,
+        client,
     } = request;
     let delivery = approval.delivery.private_bridge();
     let destination = match (delivery, destination, destination_account) {
@@ -365,7 +370,8 @@ pub async fn prepare_swap_pair(
     let prepared_destination = match (destination, destination_candidate) {
         (Some((owner, SwapAccountChoice::New(operation), authorization)), Some(candidate)) => {
             Some(SwapPairSide::Setup(
-                Box::pin(owner.resume_swap_setup(operation, candidate, authorization)).await?,
+                Box::pin(owner.resume_swap_setup(operation, candidate, authorization, client))
+                    .await?,
             ))
         }
         (Some((_, account, _)), _) => Some(SwapPairSide::Existing {
@@ -376,7 +382,7 @@ pub async fn prepare_swap_pair(
     };
     let prepared_origin = match (source, candidate) {
         (SwapAccountChoice::New(operation), Some(candidate)) => SwapPairSide::Setup(
-            Box::pin(origin.resume_swap_setup(operation, candidate, authorization)).await?,
+            Box::pin(origin.resume_swap_setup(operation, candidate, authorization, client)).await?,
         ),
         _ => SwapPairSide::Existing {
             operation: source.operation(),
@@ -675,6 +681,7 @@ impl<'a> SwapAccountReplacements<'a> {
         mut prepared: Result<PreparedExecutorOperation>,
         candidate: &PublicBroadcasterCandidate,
         authorization: &DesktopPrivateSpendAuthorization,
+        client: &OperationHttpClient,
     ) -> Result<PreparedExecutorOperation> {
         loop {
             let error = match prepared {
@@ -687,6 +694,7 @@ impl<'a> SwapAccountReplacements<'a> {
                 replaced.replacement,
                 candidate.clone(),
                 authorization,
+                client,
             ))
             .await;
         }
@@ -699,6 +707,7 @@ impl<'a> SwapAccountReplacements<'a> {
         side: SwapUseSide,
         candidate: &PublicBroadcasterCandidate,
         authorization: &DesktopPrivateSpendAuthorization,
+        client: &OperationHttpClient,
     ) -> Result<PreparedExecutorOperation> {
         let operation = self
             .account(side)
@@ -707,9 +716,10 @@ impl<'a> SwapAccountReplacements<'a> {
             operation,
             candidate.clone(),
             authorization,
+            client,
         ))
         .await;
-        Box::pin(self.prepare_setup(side, prepared, candidate, authorization)).await
+        Box::pin(self.prepare_setup(side, prepared, candidate, authorization, client)).await
     }
 
     /// [`prepare_swap_pair`] for the swap this follows, which `request` names. A new account
@@ -729,6 +739,7 @@ impl<'a> SwapAccountReplacements<'a> {
             destination_candidate,
             authorization,
             destination_authorization,
+            client,
         } = request;
         loop {
             let prepared = Box::pin(prepare_swap_pair(
@@ -743,6 +754,7 @@ impl<'a> SwapAccountReplacements<'a> {
                     destination_candidate: destination_candidate.clone(),
                     authorization,
                     destination_authorization,
+                    client,
                 },
             ))
             .await;
@@ -826,7 +838,8 @@ impl<'a> SwapAccountReplacements<'a> {
                 (prepared, sent)
             }
         };
-        Box::pin(self.resubmit_with(side, account, sent, authorization, submit)).await
+        Box::pin(self.resubmit_with(side, account, sent, authorization, &request.client, submit))
+            .await
     }
 
     /// [`Self::resubmit`] over `submit`, which hands a replacement's prepared setup off and
@@ -837,6 +850,7 @@ impl<'a> SwapAccountReplacements<'a> {
         account: &mut SwapPairSide,
         mut sent: Option<Result<T>>,
         authorization: &DesktopPrivateSpendAuthorization,
+        client: &OperationHttpClient,
         submit: F,
     ) -> Option<Result<T>>
     where
@@ -869,6 +883,7 @@ impl<'a> SwapAccountReplacements<'a> {
                     replaced.replacement,
                     candidate,
                     authorization,
+                    client,
                 ))
                 .await?;
                 // The stored approval says whether the swap binds its accounts. This job may
@@ -1612,6 +1627,7 @@ impl ExecutorOwner {
         approval: SwapApproval,
         destination_operation: Option<ExecutorOperationId>,
         authorization: &DesktopPrivateSpendAuthorization,
+        client: &OperationHttpClient,
     ) -> Result<PreparedExecutorOperation> {
         self.ensure_active()?;
         let private_bridge = approval.delivery.private_bridge().is_some();
@@ -1639,6 +1655,7 @@ impl ExecutorOwner {
                     swap_approval: Some(&approval),
                     destination_operation,
                 },
+                client,
             )
             .await?;
         self.require_live_swap_use(operation, Some(SwapUseId::first(operation)))?;
@@ -1652,6 +1669,7 @@ impl ExecutorOwner {
         operation: ExecutorOperationId,
         candidate: PublicBroadcasterCandidate,
         authorization: &DesktopPrivateSpendAuthorization,
+        client: &OperationHttpClient,
     ) -> Result<PreparedExecutorOperation> {
         self.ensure_active()?;
         let record = self
@@ -1681,6 +1699,7 @@ impl ExecutorOwner {
                 authorization,
                 record.assets(),
                 reservation,
+                client,
             )
             .await?;
         self.require_live_swap_use(operation, swap_use)?;
@@ -1766,6 +1785,7 @@ impl ExecutorOwner {
             request.progress_tx.as_ref(),
             request.response_timeout,
             request.republish_interval,
+            &request.client,
         )
         .await
     }
@@ -1788,6 +1808,7 @@ impl ExecutorOwner {
     pub async fn observe_swap_setup(
         &self,
         operation: ExecutorOperationId,
+        client: &OperationHttpClient,
     ) -> Result<SwapSetupObservation> {
         let pending = SwapSetupObservation {
             status: SwapSetupStatus::Pending,
@@ -1805,14 +1826,10 @@ impl ExecutorOwner {
             .chain_for_delegate(record.delegate())
             .ok_or_else(|| eyre!("chain does not support Railgun"))?;
         chain.enabled = true;
+        let endpoints = self.observation_endpoints(client)?;
         let read = trace_step(
             "setup_account",
-            self.while_active(read_executor_account(
-                &self.endpoints,
-                &chain,
-                executor,
-                None,
-            )),
+            self.while_active(read_executor_account(&endpoints, &chain, executor, None)),
         )
         .await?;
         // Code the execution nonce is not read under shows nothing about the setup's nonce.
@@ -1825,7 +1842,11 @@ impl ExecutorOwner {
             self.apply_account_read(operation, observed)?
         };
         let status = swap_setup_status(&record, read.block, &read.code, profile);
-        let inclusion = self.latest_setup_inclusion(&record).await.ok().flatten();
+        let inclusion = self
+            .latest_setup_inclusion(&record, &endpoints)
+            .await
+            .ok()
+            .flatten();
         Ok(SwapSetupObservation { status, inclusion })
     }
 
@@ -1835,6 +1856,7 @@ impl ExecutorOwner {
     async fn latest_setup_inclusion(
         &self,
         record: &ExecutorRecord,
+        endpoints: &ObservationEndpoints,
     ) -> Result<Option<SwapSetupInclusion>> {
         let Some(executor) = record.address() else {
             return Ok(None);
@@ -1850,11 +1872,7 @@ impl ExecutorOwner {
         chain.enabled = true;
         let latest = trace_step(
             "setup_latest_account",
-            self.while_active(read_executor_account_at_latest(
-                &self.endpoints,
-                &chain,
-                executor,
-            )),
+            self.while_active(read_executor_account_at_latest(endpoints, &chain, executor)),
         )
         .await?;
         Ok(setup_inclusion(record, &latest, profile))
@@ -1870,6 +1888,7 @@ impl ExecutorOwner {
         record: &ExecutorRecord,
         role: SwapAccountRole,
         swap_use: SwapAccountUse,
+        client: &OperationHttpClient,
     ) -> Result<Option<DelegatedSwapExecutor>> {
         let (
             SwapAccountRole::Source,
@@ -1899,7 +1918,8 @@ impl ExecutorOwner {
         else {
             return Ok(None);
         };
-        let Some(inclusion) = self.latest_setup_inclusion(record).await? else {
+        let endpoints = self.observation_endpoints(client)?;
+        let Some(inclusion) = self.latest_setup_inclusion(record, &endpoints).await? else {
             return Ok(None);
         };
         Ok(Some(DelegatedSwapExecutor {
@@ -1932,8 +1952,9 @@ impl ExecutorOwner {
         swap_use: SwapUseId,
         receiver: Address,
         notes: Option<&dyn SwapShieldNotes>,
+        client: &OperationHttpClient,
     ) -> Result<DelegatedSwapExecutor> {
-        self.delegated_destination(operation, confirmed, swap_use, notes, |record| {
+        self.delegated_destination(operation, confirmed, swap_use, notes, client, |record| {
             record.serves_swap_use(swap_use, origin_chain, origin_operation)
                 && record.address() == Some(receiver)
         })
@@ -1949,6 +1970,7 @@ impl ExecutorOwner {
         confirmed: u64,
         swap_use: SwapUseId,
         notes: Option<&dyn SwapShieldNotes>,
+        client: &OperationHttpClient,
         claimed: impl Fn(&ExecutorRecord) -> bool,
     ) -> Result<DelegatedSwapExecutor> {
         let serves = |record: &ExecutorRecord| {
@@ -1987,6 +2009,7 @@ impl ExecutorOwner {
                     confirmed,
                     SwapAccountRole::Destination { token },
                     SwapAccountUse::Claimed(swap_use),
+                    client,
                 ))
                 .await?;
                 let delegated = executor.delegated().ok_or_else(unavailable)?;
@@ -1997,10 +2020,13 @@ impl ExecutorOwner {
                 admission::require_earlier_shields_resolved(&record, swap_use, notes)?;
                 return Ok(delegated);
             }
-            let report =
-                trace_step("destination_account", self.reconcile_account(operation)).await?;
+            let report = trace_step(
+                "destination_account",
+                self.reconcile_account(operation, client),
+            )
+            .await?;
             let SwapSetupStatus::Delegated(delegated) =
-                trace_step("destination_setup", self.check_swap_setup(&report)).await?
+                trace_step("destination_setup", self.check_swap_setup(&report, client)).await?
             else {
                 return Err(eyre!(
                     "the stealth account's setup on the destination network ({}) is not confirmed; finish or retry it first",
@@ -2021,6 +2047,7 @@ impl ExecutorOwner {
     async fn check_swap_setup(
         &self,
         report: &ExecutorReconciliationReport,
+        client: &OperationHttpClient,
     ) -> Result<SwapSetupStatus> {
         let record = report.record();
         let (Some(observed), Some(executor)) = (record.nonce_observation(), record.address())
@@ -2037,9 +2064,10 @@ impl ExecutorOwner {
         } else if report.code.0 == observed.block() {
             report.code.1.clone()
         } else {
+            let endpoints = self.observation_endpoints(client)?;
             trace_step(
                 "setup_delegation",
-                self.while_active(code_at(&self.endpoints, executor, observed.block())),
+                self.while_active(code_at(&endpoints, executor, observed.block())),
             )
             .await?
         };
@@ -2174,6 +2202,7 @@ impl ExecutorOwner {
         previous: &ExecutorRecord,
         role: SwapAccountRole,
         swap_use: SwapAccountUse,
+        client: &OperationHttpClient,
     ) -> Result<SwapExecutor> {
         let executor = previous
             .address()
@@ -2181,7 +2210,8 @@ impl ExecutorOwner {
         let chain = self
             .chain_for_delegate(previous.delegate())
             .ok_or_else(|| eyre!("chain does not support Railgun"))?;
-        for endpoint in self.endpoints.providers().await {
+        let endpoints = self.observation_endpoints(client)?;
+        for endpoint in endpoints.providers().await {
             let span = tracing::debug_span!(target: "executor_observation", "endpoint", rpc_index = endpoint.index);
             let result = trace_step(
                 "reuse_current_account",
@@ -2239,7 +2269,7 @@ impl ExecutorOwner {
             .await;
             match result {
                 Ok(observed) => {
-                    self.endpoints.succeeded(&endpoint);
+                    endpoints.succeeded(&endpoint);
                     let _guard = self.lock_activity().await;
                     self.require_record_unchanged(previous)?;
                     let record = self.store.refresh_settled_swap_nonce(previous, observed)?;
@@ -2263,7 +2293,7 @@ impl ExecutorOwner {
                         inclusion: None,
                     }));
                 }
-                Err(error) => self.endpoints.failed(&endpoint, &error),
+                Err(error) => endpoints.failed(&endpoint, &error),
             }
         }
         Err(eyre!(

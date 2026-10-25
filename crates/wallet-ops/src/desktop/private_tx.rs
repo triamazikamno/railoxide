@@ -20,7 +20,10 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
         request.executor.is_some(),
     )?;
     let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain)?;
-    let executor = validate_desktop_executor_preparation(request.session, request.executor)?;
+    let executor = validate_desktop_executor_preparation(
+        request.session,
+        request.executor.map(|(prepared, _)| prepared),
+    )?;
     if request.unwrap && !is_effective_wrapped_native_token(request.chain_id, request.token, &chain)
     {
         return Err(eyre!("selected token does not support unwrap-to-native"));
@@ -37,7 +40,7 @@ pub(super) async fn prepare_desktop_unshield_plan_without_broadcaster_fee(
     let mut forest = chain_handle.forest.read().await.clone();
     forest.compute_roots();
 
-    let utxos = if let Some(prepared) = request.executor {
+    let utxos = if let Some((prepared, _)) = request.executor {
         request.session.unspent_utxos_for_executor(prepared)?
     } else {
         request.session.unspent_utxos()
@@ -153,13 +156,14 @@ pub(super) fn validate_desktop_executor_preparation(
         .transpose()
 }
 
+/// Issues `prepared`'s execute, its account reads going over the operation's client.
 pub(super) async fn issue_desktop_executor_plan(
     session: &WalletSession,
-    prepared: Option<&PreparedExecutorOperation>,
+    prepared: Option<(&PreparedExecutorOperation, &OperationHttpClient)>,
     authorization: &DesktopPrivateSpendAuthorization,
     plan: &DesktopUnshieldPreparedPlan,
 ) -> Result<Option<TransactionRequest>> {
-    let Some(prepared) = prepared else {
+    let Some((prepared, client)) = prepared else {
         return Ok(None);
     };
     let owner = session
@@ -174,6 +178,7 @@ pub(super) async fn issue_desktop_executor_plan(
             },
             &plan.input_utxos(),
             authorization,
+            client,
         )
         .await?;
     Ok(Some(issued.transaction().clone()))
@@ -2870,7 +2875,10 @@ pub async fn submit_desktop_unshield_self_broadcast(
     }
     let prepared = prepare_desktop_unshield_plan_without_broadcaster_fee(
         DesktopUnshieldPlanRequest {
-            executor: request.executor.as_deref(),
+            executor: request
+                .executor
+                .as_deref()
+                .map(|prepared| (prepared, client)),
             chain_id: request.chain_id,
             effective_chain: &request.effective_chain,
             view_session: request.view_session.as_ref(),

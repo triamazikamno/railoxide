@@ -745,7 +745,10 @@ impl Fixture {
             setup_call,
             private_logs(0x11, 0x12),
         );
-        let reconciled = owner.reconcile_account(operation).await.unwrap();
+        let reconciled = owner
+            .reconcile_account(operation, crate::OperationHttpClient::direct_for_tests())
+            .await
+            .unwrap();
         assert_eq!(
             reconciled.record().payload_state(setup),
             Some(if resolves {
@@ -979,7 +982,11 @@ impl Fixture {
     async fn observe(&self, head: u64, start: u64) -> ExecutorRecord {
         self.chain.lock().unwrap().head = head;
         self.owner
-            .observe_swap(self.operation, start..head)
+            .observe_swap(
+                self.operation,
+                start..head,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap()
             .record()
@@ -995,7 +1002,12 @@ impl Fixture {
     ) -> ExecutorRecord {
         self.chain.lock().unwrap().head = head;
         self.owner
-            .observe_swap_synced(self.operation, start..head, Some(sync))
+            .observe_swap_synced(
+                self.operation,
+                start..head,
+                Some(sync),
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap()
             .record()
@@ -1006,7 +1018,11 @@ impl Fixture {
     /// end before the confirmed block.
     async fn observe_page(&self, range: std::ops::Range<u64>) -> ExecutorRecord {
         self.owner
-            .observe_swap(self.operation, range)
+            .observe_swap(
+                self.operation,
+                range,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap()
             .record()
@@ -1165,6 +1181,7 @@ async fn recorded_swap_quote_defers_nonce_and_reorg_checks_until_preparation() {
                 &mut review,
                 15,
                 SwapAccountUse::Claimed(crate::vault::SwapUseId::first(fixture.operation)),
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .unwrap(),
@@ -1217,6 +1234,7 @@ async fn recorded_swap_quote_defers_nonce_and_reorg_checks_until_preparation() {
                 &mut review,
                 15,
                 SwapAccountUse::Claimed(crate::vault::SwapUseId::first(fixture.operation)),
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .is_err()
@@ -1240,6 +1258,7 @@ async fn reusing_an_account_for_another_pair_does_not_credit_the_old_tokens_shie
             13,
             SwapAccountRole::Source,
             SwapAccountUse::New,
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -1286,6 +1305,7 @@ async fn reusing_an_account_for_another_pair_does_not_credit_the_old_tokens_shie
             30,
             SwapAccountRole::Source,
             SwapAccountUse::New,
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -1334,6 +1354,7 @@ async fn reusing_an_account_for_another_pair_does_not_credit_the_old_tokens_shie
             30,
             SwapAccountRole::Source,
             SwapAccountUse::New,
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap_err();
@@ -1559,6 +1580,7 @@ async fn only_a_speed_up_is_admitted_while_the_first_order_is_still_live() {
             30,
             SwapAccountRole::Source,
             SwapAccountUse::Claimed(swap_use),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap_err();
@@ -1575,6 +1597,7 @@ async fn only_a_speed_up_is_admitted_while_the_first_order_is_still_live() {
             30,
             SwapAccountRole::Source,
             SwapAccountUse::SpeedUp(binding),
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -1924,7 +1947,10 @@ async fn a_pending_setup_pass_reads_the_latest_block_once_and_records_nothing() 
         };
         let observed = fixture
             .owner
-            .observe_swap_setup(fixture.operation)
+            .observe_swap_setup(
+                fixture.operation,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         assert_eq!(observed.status, crate::SwapSetupStatus::Pending);
@@ -1962,7 +1988,10 @@ async fn a_pending_setup_pass_reads_the_latest_block_once_and_records_nothing() 
     };
     let observed = fixture
         .owner
-        .observe_swap_setup(fixture.operation)
+        .observe_swap_setup(
+            fixture.operation,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -2125,7 +2154,10 @@ async fn a_cancelled_source_is_offered_again_once_its_setup_and_work_resolve() {
     }
     fixture
         .owner
-        .reconcile_account(fixture.operation)
+        .reconcile_account(
+            fixture.operation,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     assert_eq!(refusal(SwapAccountRole::Source), None);
@@ -2161,6 +2193,7 @@ async fn a_cancelled_source_is_offered_again_once_its_setup_and_work_resolve() {
             15,
             SwapAccountRole::Source,
             SwapAccountUse::New,
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap();
@@ -2557,14 +2590,21 @@ async fn orders_closed_at(fixture: &Fixture, head: u64) -> (ExecutorRecord, eyre
     fixture.chain.lock().unwrap().head = head;
     let record = fixture
         .owner
-        .reconcile_account(fixture.operation)
+        .reconcile_account(
+            fixture.operation,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap()
         .record()
         .clone();
     let closed = fixture
         .owner
-        .swap_orders_closed(&fixture.config, &record)
+        .swap_orders_closed(
+            &fixture.config,
+            &record,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await;
     (record, closed)
 }
@@ -2597,7 +2637,11 @@ async fn public_signing_needs_every_order_closed_at_the_fresh_confirmed_block() 
     assert!(
         fixture
             .owner
-            .swap_orders_closed(&fixture.config, &filled)
+            .swap_orders_closed(
+                &fixture.config,
+                &filled,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .is_err()
     );
@@ -2617,11 +2661,109 @@ async fn public_signing_needs_every_order_closed_at_the_fresh_confirmed_block() 
     assert!(
         fixture
             .owner
-            .swap_orders_closed(&fixture.config, &expired)
+            .swap_orders_closed(
+                &fixture.config,
+                &expired,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .is_err()
     );
     fixture.finish().await;
+}
+
+/// A stealth account's confirmed read, its swap's order observation and a signing inspection
+/// go only over the account's operation client, never over the session's shared RPC client.
+#[tokio::test]
+async fn stealth_account_reads_use_only_the_account_client() {
+    use crate::rpc_broker::tests::{spawn_recording_rpc_mock, tagged_reqwest_client};
+    let shared = || {
+        HttpContext::with_rpc_client_for_tests(
+            tagged_reqwest_client("shared"),
+            crate::WalletNetworkMode::Direct,
+        )
+    };
+    let account = crate::OperationHttpClient::for_tests(
+        tagged_reqwest_client("account"),
+        crate::OperationNetworkIsolation::Dedicated,
+    );
+    let only_account = |routes: &[Option<String>]| {
+        assert!(!routes.is_empty());
+        assert!(
+            routes
+                .iter()
+                .all(|route| route.as_deref() == Some("account")),
+            "{routes:?}"
+        );
+    };
+
+    // The swap's account: its confirmed read, then its order observation.
+    let fixture = Fixture::start().await;
+    fixture.record_attempt(0, 100);
+    fixture.chain.lock().unwrap().head = 31;
+    let served = fixture.chain.clone();
+    let (endpoint, recorded, server) = spawn_recording_rpc_mock(Arc::new(move |request: Value| {
+        served.lock().unwrap().respond(&request)
+    }))
+    .await;
+    let mut config = fixture.config.clone();
+    config.rpc_route = crate::RpcChainRoute::new(1, vec![endpoint]);
+    let owner = ExecutorOwner::new(
+        1,
+        fixture.db.clone(),
+        fixture.view.clone(),
+        config,
+        shared(),
+    )
+    .unwrap();
+    owner
+        .reconcile_account(fixture.operation, &account)
+        .await
+        .unwrap();
+    owner
+        .observe_swap(fixture.operation, 20..31, &account)
+        .await
+        .unwrap();
+    let routes: Vec<_> = recorded
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(route, _)| route.clone())
+        .collect();
+    only_account(&routes);
+    server.abort();
+    owner.shutdown().await;
+    drop(owner);
+    fixture.finish().await;
+
+    // A fresh account's signing inspection while it is prepared.
+    let rpc = super::Rpc::start().await;
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let owner =
+        ExecutorOwner::new(0, db.clone(), view.clone(), super::chain(&rpc), shared()).unwrap();
+    owner
+        .prepare_operation(
+            ExecutorOperationId::random().unwrap(),
+            super::delivery(),
+            &super::swap_setup::password(),
+            &[],
+            None,
+            &account,
+        )
+        .await
+        .unwrap();
+    only_account(&rpc.state.routes.lock().unwrap());
+    owner.shutdown().await;
+    drop(owner);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -2669,7 +2811,12 @@ async fn checking_an_expired_orders_lock_observes_the_order_and_frees_its_notes(
     fixture.chain.lock().unwrap().head = 31;
     let lock = fixture
         .owner
-        .check_input_lock(fixture.operation, 30, &notes)
+        .check_input_lock(
+            fixture.operation,
+            30,
+            &notes,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     assert!(lock.is_none());
@@ -3926,7 +4073,12 @@ async fn pending_observations_release_activity_and_never_overwrite_concurrent_ch
             // The order is settled history and both of its hooks' nonces are consumed.
             fixture
                 .owner
-                .observe_swap_settlement(fixture.operation, uid(1, 20), 15)
+                .observe_swap_settlement(
+                    fixture.operation,
+                    uid(1, 20),
+                    15,
+                    crate::OperationHttpClient::direct_for_tests(),
+                )
                 .await
                 .unwrap();
             fixture.chain.lock().unwrap().nonces.push((15, 3));
@@ -3958,14 +4110,28 @@ async fn pending_observations_release_activity_and_never_overwrite_concurrent_ch
             match path {
                 "settlement" => {
                     owner
-                        .observe_swap_settlement(operation, uid(1, 20), 15)
+                        .observe_swap_settlement(
+                            operation,
+                            uid(1, 20),
+                            15,
+                            crate::OperationHttpClient::direct_for_tests(),
+                        )
                         .await
                 }
                 "settled reuse" => owner
-                    .reuse_swap_account(operation, 15, SwapAccountRole::Source, SwapAccountUse::New)
+                    .reuse_swap_account(
+                        operation,
+                        15,
+                        SwapAccountRole::Source,
+                        SwapAccountUse::New,
+                        crate::OperationHttpClient::direct_for_tests(),
+                    )
                     .await
                     .map(|_| ()),
-                _ => owner.reconcile_account(operation).await.map(|_| ()),
+                _ => owner
+                    .reconcile_account(operation, crate::OperationHttpClient::direct_for_tests())
+                    .await
+                    .map(|_| ()),
             }
         };
         tokio::pin!(pending);
@@ -3977,7 +4143,10 @@ async fn pending_observations_release_activity_and_never_overwrite_concurrent_ch
         assert!(
             tokio::time::timeout(
                 Duration::from_secs(2),
-                owner.reconcile_account(ExecutorOperationId::random().unwrap()),
+                owner.reconcile_account(
+                    ExecutorOperationId::random().unwrap(),
+                    crate::OperationHttpClient::direct_for_tests()
+                ),
             )
             .await
             .expect("pending observation must release activity")
@@ -4043,7 +4212,12 @@ async fn settlement_receipts_confirm_at_safety_depth_without_account_queries() {
     // CoW can locate an unconfirmed block but cannot advance canonical progress.
     fixture
         .owner
-        .observe_swap_settlement(fixture.operation, uid(1, 20), 15)
+        .observe_swap_settlement(
+            fixture.operation,
+            uid(1, 20),
+            15,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     assert!(
@@ -4055,7 +4229,12 @@ async fn settlement_receipts_confirm_at_safety_depth_without_account_queries() {
     fixture.chain.lock().unwrap().head = 16;
     fixture
         .owner
-        .observe_swap_settlement(fixture.operation, uid(1, 20), 15)
+        .observe_swap_settlement(
+            fixture.operation,
+            uid(1, 20),
+            15,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     let record = fixture.record();
@@ -4107,7 +4286,12 @@ async fn settlement_receipts_confirm_at_safety_depth_without_account_queries() {
     fixture.chain.lock().unwrap().rpc_requests.clear();
     fixture
         .owner
-        .observe_swap_settlement(fixture.operation, uid(1, 20), 15)
+        .observe_swap_settlement(
+            fixture.operation,
+            uid(1, 20),
+            15,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     assert!(fixture.chain.lock().unwrap().rpc_requests.is_empty());
@@ -4119,8 +4303,15 @@ async fn settlement_receipts_confirm_at_safety_depth_without_account_queries() {
         chain.head = 17;
         chain.nonces.push((15, 2));
     }
-    let reuse =
-        |role| restarted.reuse_swap_account(fixture.operation, 16, role, SwapAccountUse::New);
+    let reuse = |role| {
+        restarted.reuse_swap_account(
+            fixture.operation,
+            16,
+            role,
+            SwapAccountUse::New,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
+    };
     // A stale nonce, still at the post-hook's, can't refresh the settled account.
     assert!(reuse(SwapAccountRole::Source).await.is_err());
     assert_eq!(fixture.record().nonce_observation(), nonce_before);
@@ -4251,7 +4442,12 @@ async fn the_executed_fee_is_read_once_after_the_trade_and_kept_by_later_settlem
     // this owner nor one after a restart asks again.
     fixture
         .owner
-        .observe_swap_settlement(fixture.operation, order, 15)
+        .observe_swap_settlement(
+            fixture.operation,
+            order,
+            15,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     assert_eq!(fee(&fixture.record()), charged);
@@ -4309,7 +4505,12 @@ async fn settlement_receipts_do_not_complete_an_early_or_copied_or_small_shield(
         }
         fixture
             .owner
-            .observe_swap_settlement(fixture.operation, uid(1, 20), 15)
+            .observe_swap_settlement(
+                fixture.operation,
+                uid(1, 20),
+                15,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         let record = fixture.record();
@@ -4362,7 +4563,12 @@ async fn settlement_receipts_deliver_external_orders_from_the_trade_alone() {
         }
         fixture
             .owner
-            .observe_swap_settlement(fixture.operation, order, 15)
+            .observe_swap_settlement(
+                fixture.operation,
+                order,
+                15,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         let record = fixture.record();
@@ -4514,7 +4720,12 @@ async fn confirm_settlement(fixture: &Fixture, logs: Vec<(Address, LogData)>) ->
     }
     fixture
         .owner
-        .observe_swap_settlement(fixture.operation, uid(1, 20), 15)
+        .observe_swap_settlement(
+            fixture.operation,
+            uid(1, 20),
+            15,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     let chain = fixture.chain.lock().unwrap();
@@ -4667,7 +4878,12 @@ async fn an_unconfirmed_settlement_block_hints_what_it_shows_and_records_nothing
         let before = fixture.record();
         let hint = fixture
             .owner
-            .read_swap_settlement_hint(fixture.operation, uid(1, 20), 15)
+            .read_swap_settlement_hint(
+                fixture.operation,
+                uid(1, 20),
+                15,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -4736,6 +4952,7 @@ async fn continuing_approvals_read_the_quote_age_from_one_finalized_block() {
                 swap_use,
                 SwapDelivery::Bridge(delivery),
                 Some(U256::from(nonce)),
+                crate::OperationHttpClient::direct_for_tests(),
             )
             .await
             .unwrap()
@@ -4816,7 +5033,12 @@ async fn settle_retry(
     }
     fixture
         .owner
-        .observe_swap_settlement(fixture.operation, retry, block)
+        .observe_swap_settlement(
+            fixture.operation,
+            retry,
+            block,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await?;
     let chain = fixture.chain.lock().unwrap();
     let block = chain.block(block);
@@ -4974,7 +5196,12 @@ async fn a_retrys_settlement_hands_off_with_the_expired_attempts_across_deposit(
                 fixture.chain.lock().unwrap().rpc_requests.clear();
                 fixture
                     .owner
-                    .observe_swap_settlement(fixture.operation, uid(2, 40), 30)
+                    .observe_swap_settlement(
+                        fixture.operation,
+                        uid(2, 40),
+                        30,
+                        crate::OperationHttpClient::direct_for_tests(),
+                    )
                     .await
                     .unwrap();
                 assert!(fixture.chain.lock().unwrap().rpc_requests.is_empty());
@@ -5086,7 +5313,11 @@ async fn a_retrys_settlement_hands_off_with_the_expired_attempts_across_deposit(
                 };
                 let restarted = restarted_owner(&fixture);
                 let reopened = restarted
-                    .observe_swap(fixture.operation, 32..34)
+                    .observe_swap(
+                        fixture.operation,
+                        32..34,
+                        crate::OperationHttpClient::direct_for_tests(),
+                    )
                     .await
                     .unwrap()
                     .record()
@@ -5100,6 +5331,7 @@ async fn a_retrys_settlement_hands_off_with_the_expired_attempts_across_deposit(
                         33,
                         SwapAccountRole::Source,
                         SwapAccountUse::New,
+                        crate::OperationHttpClient::direct_for_tests(),
                     )
                 };
                 let refused = reuse().await.unwrap_err();
@@ -5165,6 +5397,7 @@ async fn reuse_refusal(
             confirmed,
             SwapAccountRole::Source,
             SwapAccountUse::New,
+            crate::OperationHttpClient::direct_for_tests(),
         )
         .await
         .unwrap_err();
@@ -5340,7 +5573,13 @@ async fn a_split_swaps_bridge_outcome_follows_the_expired_attempts_deposit() {
             let restarted = restarted_owner(&fixture);
             assert_eq!(
                 restarted
-                    .check_swap_bridge(fixture.operation, uid(1, 20), &clients, &config)
+                    .check_swap_bridge(
+                        fixture.operation,
+                        uid(1, 20),
+                        &clients,
+                        &config,
+                        crate::OperationHttpClient::direct_for_tests()
+                    )
                     .await
                     .unwrap(),
                 Some(SwapBridgeOutcome::Refunding),
@@ -5453,6 +5692,7 @@ async fn a_split_swaps_bridge_outcome_follows_the_expired_attempts_deposit() {
                     33,
                     SwapAccountRole::Source,
                     SwapAccountUse::New,
+                    crate::OperationHttpClient::direct_for_tests(),
                 )
                 .await
                 .unwrap();
@@ -5495,7 +5735,13 @@ async fn track_across_fill(
     let clients = bridge_clients(fixture, &url);
     let tracked = fixture
         .owner
-        .observe_swap_bridge(fixture.operation, order, &clients, &config)
+        .observe_swap_bridge(
+            fixture.operation,
+            order,
+            &clients,
+            &config,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     stub.abort();
@@ -5936,7 +6182,13 @@ async fn observe_bridge(
 ) -> Option<SwapBridgeOutcome> {
     fixture
         .owner
-        .observe_swap_bridge(fixture.operation, uid(1, 20), clients, destination)
+        .observe_swap_bridge(
+            fixture.operation,
+            uid(1, 20),
+            clients,
+            destination,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap()
 }
@@ -6079,7 +6331,13 @@ async fn across_delivery_is_verified_from_finalized_destination_receipts() {
             assert!(
                 fixture
                     .owner
-                    .observe_swap_bridge(fixture.operation, uid(1, 20), &clients, &config)
+                    .observe_swap_bridge(
+                        fixture.operation,
+                        uid(1, 20),
+                        &clients,
+                        &config,
+                        crate::OperationHttpClient::direct_for_tests()
+                    )
                     .await
                     .is_err()
             );
@@ -6175,7 +6433,13 @@ async fn an_explicit_check_corrects_an_across_refund_with_a_verified_fill() {
     assert_eq!(fixture.record().swap_bridges_to_track().count(), 0);
     let outcome = fixture
         .owner
-        .check_swap_bridge(fixture.operation, uid(1, 20), &clients, &config)
+        .check_swap_bridge(
+            fixture.operation,
+            uid(1, 20),
+            &clients,
+            &config,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     let expected = {
@@ -6295,7 +6559,13 @@ async fn an_explicit_check_verifies_an_across_refund_on_this_chain() {
         assert_eq!(
             fixture
                 .owner
-                .check_swap_bridge(fixture.operation, uid(1, 20), &clients, &arbitrum)
+                .check_swap_bridge(
+                    fixture.operation,
+                    uid(1, 20),
+                    &clients,
+                    &arbitrum,
+                    crate::OperationHttpClient::direct_for_tests()
+                )
                 .await
                 .unwrap(),
             Some(SwapBridgeOutcome::Refunding)
@@ -6517,7 +6787,13 @@ async fn across_fills_need_the_pinned_pool_or_the_token_transfer_and_are_otherwi
         let clients = bridge_clients(&fixture, &url);
         let result = fixture
             .owner
-            .observe_swap_bridge(fixture.operation, uid(1, 20), &clients, &config)
+            .observe_swap_bridge(
+                fixture.operation,
+                uid(1, 20),
+                &clients,
+                &config,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await;
         let (outcome, expected_state) = {
             let chain = destination.lock().unwrap();
@@ -6682,7 +6958,13 @@ async fn across_reports_a_delivery_only_when_no_later_read_could_verify_it() {
         let clients = bridge_clients(&fixture, &url);
         let result = fixture
             .owner
-            .observe_swap_bridge(fixture.operation, uid(1, 20), &clients, &config)
+            .observe_swap_bridge(
+                fixture.operation,
+                uid(1, 20),
+                &clients,
+                &config,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await;
         let expected = match scenario {
             1 | 3 | 6 => Some(across_reported()),
@@ -6783,7 +7065,13 @@ async fn an_explicit_check_of_an_across_report_verifies_it_or_finds_its_refund()
         }
         let checked = fixture
             .owner
-            .check_swap_bridge(fixture.operation, uid(1, 20), &clients, &config)
+            .check_swap_bridge(
+                fixture.operation,
+                uid(1, 20),
+                &clients,
+                &config,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await
             .unwrap();
         assert_eq!(lookups.lock().unwrap().len(), 2);
@@ -6901,7 +7189,13 @@ async fn near_intents_reports_set_the_outcome_and_final_ones_stop_tracking() {
             assert_eq!(
                 fixture
                     .owner
-                    .check_swap_bridge(fixture.operation, uid(1, 20), &clients, &bnb)
+                    .check_swap_bridge(
+                        fixture.operation,
+                        uid(1, 20),
+                        &clients,
+                        &bnb,
+                        crate::OperationHttpClient::direct_for_tests()
+                    )
                     .await
                     .unwrap(),
                 expected
@@ -6965,7 +7259,14 @@ async fn a_providers_report_before_the_recorded_handoff_is_returned_and_records_
         assert_eq!(
             fixture
                 .owner
-                .swap_bridge_report(fixture.operation, uid(1, 20), handoff, &clients, None)
+                .swap_bridge_report(
+                    fixture.operation,
+                    uid(1, 20),
+                    handoff,
+                    &clients,
+                    None,
+                    crate::OperationHttpClient::direct_for_tests()
+                )
                 .await
                 .unwrap(),
             expected,
@@ -7057,7 +7358,8 @@ async fn a_private_across_report_says_what_the_unconfirmed_fill_block_shows_and_
                     uid(1, 20),
                     handoff,
                     &clients,
-                    Some(&config)
+                    Some(&config),
+                    crate::OperationHttpClient::direct_for_tests()
                 )
                 .await
                 .unwrap(),
@@ -7227,7 +7529,13 @@ async fn near_intents_tracking_follows_the_traded_attempts_deposit_address() {
     assert_eq!(
         fixture
             .owner
-            .observe_swap_bridge(fixture.operation, newer_uid, &clients, &bnb)
+            .observe_swap_bridge(
+                fixture.operation,
+                newer_uid,
+                &clients,
+                &bnb,
+                crate::OperationHttpClient::direct_for_tests()
+            )
             .await
             .unwrap(),
         None
@@ -7253,7 +7561,13 @@ async fn near_intents_tracking_follows_the_traded_attempts_deposit_address() {
     for attempt in [traded_uid, newer_uid] {
         assert_eq!(
             restarted
-                .observe_swap_bridge(fixture.operation, attempt, &clients, &bnb)
+                .observe_swap_bridge(
+                    fixture.operation,
+                    attempt,
+                    &clients,
+                    &bnb,
+                    crate::OperationHttpClient::direct_for_tests()
+                )
                 .await
                 .unwrap(),
             if attempt == traded_uid {
@@ -7278,7 +7592,13 @@ async fn track_bridge(
     destination: &crate::settings::EffectiveChainConfig,
 ) -> Option<SwapBridgeOutcome> {
     owner
-        .observe_swap_bridge(operation, order, clients, destination)
+        .observe_swap_bridge(
+            operation,
+            order,
+            clients,
+            destination,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap()
 }
@@ -7501,7 +7821,12 @@ async fn settlement_receipt_failures_and_reorgs_preserve_pending_state_without_f
         }
         let result = fixture
             .owner
-            .observe_swap_settlement(fixture.operation, uid(1, 20), 15)
+            .observe_swap_settlement(
+                fixture.operation,
+                uid(1, 20),
+                15,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
             .await;
         assert_eq!(result.is_err(), scenario < 3);
         let record = fixture.record();
@@ -7569,7 +7894,12 @@ async fn settlement_receipts_fail_over_to_another_whole_block_provider() {
     )
     .unwrap();
     owner
-        .observe_swap_settlement(fixture.operation, uid(1, 20), 15)
+        .observe_swap_settlement(
+            fixture.operation,
+            uid(1, 20),
+            15,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
         .await
         .unwrap();
     assert_eq!(

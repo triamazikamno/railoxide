@@ -2721,21 +2721,20 @@ impl PrivateSwapsView {
             cx.notify();
             return;
         };
-        let Some(owner) = self.private_owner().cloned() else {
+        let (Some(owner), Some(http)) = (self.private_owner().cloned(), self.http(cx)) else {
             return;
         };
-        let client = self
-            .tracking
-            .get(&operation)
-            .and_then(|tracking| tracking.orderbook.clone());
+        let route = self.swap_route(&http, operation);
         self.start_job(
             operation,
             SwapJobKind::Check,
             async move {
+                // The check reads the account over a route of its own.
+                let check = http.operation_http_client().await?;
                 let fee_uid = loop {
                     let range = super::model::swap_observation_range(cursor, confirmed);
                     cursor = range.end;
-                    let report = owner.observe_swap(operation, range).await?;
+                    let report = owner.observe_swap(operation, range, &check).await?;
                     if cursor > confirmed
                         || !super::model::swap_stage(
                             report.record(),
@@ -2755,10 +2754,7 @@ impl PrivateSwapsView {
                 let Some(uid) = fee_uid else {
                     return Ok(None);
                 };
-                let client = match client {
-                    Some(client) => Some(client),
-                    None => owner.swap_orderbook_client().await.ok(),
-                };
+                let client = route.orderbook(&owner).await.ok();
                 if let Some(client) = &client {
                     let _ = Box::pin(owner.observe_swap_executed_fee(operation, uid, client)).await;
                 }
@@ -2774,8 +2770,8 @@ impl PrivateSwapsView {
                 tracking.status_checked = uid.map(|uid| (uid, now_unix()));
                 if let Some((uid, client)) = fee {
                     tracking.fee_asked.insert(uid);
-                    if tracking.orderbook.is_none() {
-                        tracking.orderbook = client;
+                    if client.is_some() {
+                        tracking.set_route(client);
                     }
                 }
             },
@@ -2826,13 +2822,16 @@ impl PrivateSwapsView {
         let tracking = self.tracking.get(&operation);
         let client = tracking.and_then(|tracking| tracking.orderbook.clone());
         let clients = tracking.and_then(|tracking| tracking.bridge_clients.clone());
-        let Some(owner) = self.private_owner().cloned() else {
+        let (Some(owner), Some(http)) = (self.private_owner().cloned(), self.http(cx)) else {
             return;
         };
         self.start_job(
             operation,
             SwapJobKind::Check,
             async move {
+                // The check's own route, opened once when it first reads: the provider's
+                // replacement route, and the stealth account's reads.
+                let check = wallet_ops::OperationHttpClientSlot::new(http);
                 let asked = if stage == SwapStage::Order(SwapOrderState::NeedsAttention)
                     || across_refund
                     || across_reported
@@ -2843,11 +2842,12 @@ impl PrivateSwapsView {
                     let ask = async {
                         let destination = destination?;
                         // An explicit check leaves the route the provider may have rejected.
+                        let route = check.client().await?;
                         let (client, clients) =
                             if let (Some(client), Some(clients)) = (client, clients) {
-                                owner.swap_clients_on_fresh_route(&client, &clients).await?
+                                owner.swap_clients_on_fresh_route(&client, &clients, &route)?
                             } else {
-                                let client = owner.swap_orderbook_client().await?;
+                                let client = owner.swap_orderbook_client(&route)?;
                                 let clients = owner.swap_bridge_clients(&client)?;
                                 (client, clients)
                             };
@@ -2856,6 +2856,7 @@ impl PrivateSwapsView {
                             uid,
                             &clients,
                             &destination,
+                            &route,
                         ))
                         .await?;
                         Ok::<_, eyre::Report>((client, clients, outcome))
@@ -2885,7 +2886,9 @@ impl PrivateSwapsView {
                         if refunding || stage == SwapStage::Order(SwapOrderState::NotDelivered) =>
                     {
                         let asset = ExecutorAsset::Erc20(buy);
-                        let inspection = owner.inspect_record(operation, &[asset]).await?;
+                        let inspection = owner
+                            .inspect_record(operation, &[asset], &check.client().await?)
+                            .await?;
                         inspection
                             .balances()
                             .get(&asset)
@@ -2900,7 +2903,7 @@ impl PrivateSwapsView {
             move |this, (route, balance, problem), _, _| {
                 let tracking = this.tracking.entry(operation).or_default();
                 if let Some((client, clients)) = route {
-                    tracking.orderbook = Some(client);
+                    tracking.set_route(Some(client));
                     tracking.bridge_clients = Some(clients);
                 }
                 if balance.is_some() {
@@ -2925,26 +2928,23 @@ impl PrivateSwapsView {
         if self.busy() {
             return;
         }
-        let client = self
-            .tracking
-            .get(&operation)
-            .and_then(|tracking| tracking.orderbook.clone());
-        let Some(owner) = self.private_owner().cloned() else {
+        let (Some(owner), Some(http)) = (self.private_owner().cloned(), self.http(cx)) else {
             return;
         };
+        let route = self.swap_route(&http, operation);
         self.start_job(
             operation,
             SwapJobKind::Order,
             async move {
-                let client = match client {
-                    Some(client) => client,
-                    None => owner.swap_orderbook_client().await?,
-                };
+                let client = route.orderbook(&owner).await?;
                 let outcome = owner.resubmit_swap_order(operation, &client).await?;
                 Ok((client, outcome))
             },
             move |this, (client, outcome), window, cx| {
-                this.tracking.entry(operation).or_default().orderbook = Some(client);
+                this.tracking
+                    .entry(operation)
+                    .or_default()
+                    .set_route(Some(client));
                 this.finish_order(operation, outcome, window, cx);
             },
             window,
@@ -3121,9 +3121,10 @@ impl PrivateSwapsView {
         cx: &mut Context<'_, Self>,
     ) {
         let operation = approval.operation;
-        let (Some(owner), Some(session)) = (
+        let (Some(owner), Some(session), Some(http)) = (
             self.private_owner().cloned(),
             self.private_session().cloned(),
+            self.http(cx),
         ) else {
             return;
         };
@@ -3131,11 +3132,14 @@ impl PrivateSwapsView {
             operation,
             SwapJobKind::Cancel,
             async move {
+                // One route for the cancellation's reads and its paid execution.
+                let client = http.operation_http_client().await?;
                 let prepared = Box::pin(owner.prepare_swap_cancellation(
                     operation,
                     approval.candidate,
                     approval.maximum_private_fee,
                     &authorization,
+                    &client,
                 ))
                 .await?;
                 let outcome = Box::pin(owner.submit_paid_recovery(ExecutorPaidRecoveryRequest {
@@ -3147,6 +3151,7 @@ impl PrivateSwapsView {
                     progress_tx: None,
                     response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
                     republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
+                    client,
                 }))
                 .await?;
                 Ok(outcome.result)
@@ -3291,12 +3296,16 @@ impl PrivateSwapsView {
             .and_then(|record| record.swap()?.orders().last())
             .map(SwapOrderRecord::uid);
         let asset = ExecutorAsset::Erc20(delivery.destination_token);
+        let Some(http) = self.http(cx) else {
+            return;
+        };
         self.start_job(
             operation,
             SwapJobKind::Check,
             async move {
                 owner.reconcile_swap_destinations()?;
-                owner.read_record_balance(destination, asset).await
+                let client = http.operation_http_client().await?;
+                owner.read_record_balance(destination, asset, &client).await
             },
             move |this, (balance, read_at), _, _| {
                 let tracking = this.tracking.entry(operation).or_default();

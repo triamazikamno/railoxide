@@ -61,6 +61,7 @@ pub async fn submit_public_send_with_progress(
         request.trezor_pin_matrix_provider,
         request.executor_owner.as_ref(),
         request.chain_id,
+        client,
     )
     .await?;
     signer
@@ -282,6 +283,7 @@ pub async fn submit_public_shield_with_progress(
             &request.public_account_uuid,
             request.executor_owner.as_ref(),
             request.chain_id,
+            client,
         )
         .await?
     } else {
@@ -294,6 +296,7 @@ pub async fn submit_public_shield_with_progress(
             request.trezor_pin_matrix_provider.take(),
             request.executor_owner.as_ref(),
             request.chain_id,
+            client,
         )
         .await?
     };
@@ -306,6 +309,7 @@ pub async fn submit_public_shield_with_progress(
             &pools,
             &addr_data,
             http,
+            client,
             &mut progress,
         ))
         .await;
@@ -660,6 +664,7 @@ async fn submit_stealth_native_shield(
     pools: &PublicActionPools,
     recipient: &broadcaster_core::crypto::railgun::AddressData,
     http: &HttpContext,
+    client: &OperationHttpClient,
     progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
 ) -> Result<ShieldSendOutput> {
     let mut command_rx = request.command_rx.take();
@@ -720,6 +725,7 @@ async fn submit_stealth_native_shield(
             request.amount,
             shield_request,
             &purpose_summary,
+            client,
         )
         .await?;
     let stealth_account = issued
@@ -739,6 +745,7 @@ async fn submit_stealth_native_shield(
                 None,
                 Some(owner),
                 request.chain_id,
+                client,
             )
             .await?
         }
@@ -845,7 +852,7 @@ async fn submit_stealth_native_shield(
     // A settled account needs no attention; a failed write only leaves its row visible.
     let _ = owner.set_hidden(operation, true);
     // The shield is proven; a failed read leaves the account to its next reconciliation.
-    let _ = owner.reconcile_account(operation).await;
+    let _ = owner.reconcile_account(operation, client).await;
     Ok(ShieldSendOutput {
         wrap: None,
         approve: None,
