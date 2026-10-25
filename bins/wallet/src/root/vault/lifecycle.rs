@@ -1238,6 +1238,7 @@ impl WalletRoot {
         self.retire_gateway_unlock();
         self.shutdown_wallet_session_store();
         self.invalidate_governance_context();
+        self.governance.proposal_participation.clear_session();
         self.invalidate_proposals_chain(self.selected_chain);
         self.clear_private_broadcaster_progress_state();
         self.stop_waku();

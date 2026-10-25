@@ -188,25 +188,118 @@ pub(super) enum ProposalParticipationRow {
     Unavailable(Arc<str>),
 }
 
+/// Chain, contract version, contract, proposal index and account of a loaded row.
+type LoadedParticipationKey = (u64, GovernanceContractVersion, Address, U256, Address);
+
+/// Chain, contract version, contract and account of an action's invalidation.
+type ContractAccountKey = (u64, GovernanceContractVersion, Address, Address);
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct ProposalParticipationState {
     pub key: Option<ProposalParticipationKey>,
     pub generation: u64,
-    pub loading: bool,
-    pub rows: BTreeMap<Address, ProposalParticipationRow>,
+    /// `Loading` and `Unavailable` rows of the current request for `key`.
+    requested: BTreeMap<Address, ProposalParticipationRow>,
+    /// `Ready` rows loaded this wallet session, with the sequence of the read that loaded each.
+    loaded: BTreeMap<LoadedParticipationKey, (ProposalParticipationRow, u64)>,
+    /// Sequence at the latest successful action of an account on a contract. Reads started
+    /// before it are not stored there.
+    invalidated: BTreeMap<ContractAccountKey, u64>,
+    /// Sequence source of reads and invalidations; it never resets.
+    sequence: u64,
+    /// Sequence of the current request's read.
+    request_read: u64,
+    /// Sequence at the last session clear. Reads started before it are not stored.
+    session_start: u64,
+}
+
+const fn participation_intervals(participation: &GovernanceParticipation) -> (U256, U256) {
+    (
+        participation.sponsorship_snapshot.interval,
+        participation.voting_snapshot.interval,
+    )
+}
+
+const fn proposal_intervals(proposal: &GovernanceProposal) -> (U256, U256) {
+    (
+        proposal.sponsor_snapshot_interval,
+        proposal.voting_snapshot_interval,
+    )
 }
 
 impl ProposalParticipationState {
-    pub(super) fn begin(&mut self, key: &ProposalParticipationKey) -> u64 {
+    const fn next_sequence(&mut self) -> u64 {
+        self.sequence += 1;
+        self.sequence
+    }
+
+    /// Stores `participation` read by `read` unless an action on its contract or a session clear
+    /// came after the read started, or the stored row is newer. Snapshot intervals only move
+    /// forward for a proposal, so a row with older intervals is stale; with equal intervals the
+    /// later read wins.
+    fn admit(
+        &mut self,
+        loaded: LoadedParticipationKey,
+        read: u64,
+        participation: GovernanceParticipation,
+    ) -> bool {
+        let (chain, version, contract, _, account) = loaded;
+        if read <= self.session_start
+            || self
+                .invalidated
+                .get(&(chain, version, contract, account))
+                .is_some_and(|invalidated| *invalidated > read)
+        {
+            return false;
+        }
+        if let Some((ProposalParticipationRow::Ready(stored), stored_read)) =
+            self.loaded.get(&loaded)
+            && (participation_intervals(stored), *stored_read)
+                > (participation_intervals(&participation), read)
+        {
+            return false;
+        }
+        self.loaded.insert(
+            loaded,
+            (
+                ProposalParticipationRow::Ready(Box::new(participation)),
+                read,
+            ),
+        );
+        true
+    }
+
+    const fn loaded_key(
+        key: &ProposalParticipationKey,
+        account: Address,
+    ) -> LoadedParticipationKey {
+        (
+            key.context.chain_id,
+            key.version,
+            key.contract,
+            key.index,
+            account,
+        )
+    }
+
+    /// Shows `key` without reading; an in-flight request for the same key keeps running.
+    pub(super) fn show(&mut self, key: &ProposalParticipationKey) {
+        if self.key.as_ref() != Some(key) {
+            self.generation = self.generation.wrapping_add(1);
+            self.key = Some(key.clone());
+            self.requested.clear();
+        }
+    }
+
+    /// Starts a request for `accounts`, replacing the current request's rows.
+    pub(super) fn begin(&mut self, key: &ProposalParticipationKey, accounts: &[Address]) -> u64 {
         self.generation = self.generation.wrapping_add(1);
+        self.request_read = self.next_sequence();
         self.key = Some(key.clone());
-        self.rows = key
-            .context
-            .participants
+        self.requested = accounts
             .iter()
-            .map(|participant| (participant.address, ProposalParticipationRow::Loading))
+            .map(|account| (*account, ProposalParticipationRow::Loading))
             .collect();
-        self.loading = !self.rows.is_empty();
         self.generation
     }
 
@@ -214,6 +307,7 @@ impl ProposalParticipationState {
         self.generation == generation && self.key.as_ref() == Some(key)
     }
 
+    /// Applies a read of the current request; a read retired by an action is dropped.
     pub(super) fn apply(
         &mut self,
         key: &ProposalParticipationKey,
@@ -221,26 +315,152 @@ impl ProposalParticipationState {
         account: Address,
         row: Result<GovernanceParticipation, Arc<str>>,
     ) -> bool {
-        if !self.current(key, generation) {
+        if !self.current(key, generation)
+            || !matches!(
+                self.requested.get(&account),
+                Some(ProposalParticipationRow::Loading)
+            )
+        {
             return false;
         }
-        let state = match row {
-            Ok(value) => ProposalParticipationRow::Ready(Box::new(value)),
-            Err(error) => ProposalParticipationRow::Unavailable(error),
-        };
-        self.rows.insert(account, state);
-        self.loading = self
-            .rows
-            .values()
-            .any(|row| matches!(row, ProposalParticipationRow::Loading));
+        match row {
+            Ok(value) => {
+                self.requested.remove(&account);
+                self.admit(Self::loaded_key(key, account), self.request_read, value);
+            }
+            Err(error) => {
+                self.requested
+                    .insert(account, ProposalParticipationRow::Unavailable(error));
+            }
+        }
         true
     }
 
+    /// The row shown for `account` on `proposal`, or `None` when it is not loaded.
+    pub(super) fn row(
+        &self,
+        proposal: &GovernanceProposal,
+        account: &Address,
+    ) -> Option<&ProposalParticipationRow> {
+        let key = self.key.as_ref().filter(|key| {
+            key.version == proposal.contract_version
+                && key.contract == proposal.contract_address
+                && key.index == proposal.index
+        })?;
+        if let Some(row) = self.requested.get(account) {
+            return Some(row);
+        }
+        // A row read before the vote was called has a stale voting interval and is not loaded.
+        self.loaded
+            .get(&Self::loaded_key(key, *account))
+            .map(|(row, _)| row)
+            .filter(|row| {
+                matches!(row, ProposalParticipationRow::Ready(participation)
+                    if participation_intervals(participation) == proposal_intervals(proposal))
+            })
+    }
+
+    /// The key's participants without a `Ready` row for `proposal`. A row newer than `proposal`
+    /// shows once its page refreshes, so it is not read again.
+    pub(super) fn unloaded(&self, proposal: &GovernanceProposal) -> Vec<Address> {
+        self.key.as_ref().map_or_else(Vec::new, |key| {
+            key.context
+                .participants
+                .iter()
+                .map(|participant| participant.address)
+                .filter(|account| {
+                    !matches!(
+                        self.row(proposal, account),
+                        Some(ProposalParticipationRow::Ready(_))
+                    ) && !self
+                        .loaded
+                        .get(&Self::loaded_key(key, *account))
+                        .is_some_and(|(row, _)| {
+                            matches!(row, ProposalParticipationRow::Ready(participation)
+                                if participation_intervals(participation)
+                                    > proposal_intervals(proposal))
+                        })
+                })
+                .collect()
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn loading(&self) -> bool {
+        self.requested
+            .values()
+            .any(|row| matches!(row, ProposalParticipationRow::Loading))
+    }
+
+    /// Drops the actor's pre-action rows on every proposal of the acted contract, since
+    /// `lastSponsored` is per account and contract, and retires every read of the actor there
+    /// started before, including the current request's. Returns the sequence of the action's own
+    /// read, which `apply_action_read` takes.
+    pub(super) fn invalidate_actor_on_contract(
+        &mut self,
+        key: &ProposalParticipationKey,
+        actor: Address,
+    ) -> u64 {
+        let acted = (key.context.chain_id, key.version, key.contract, actor);
+        let same_contract = |(chain, version, contract, _, account): &LoadedParticipationKey| {
+            (*chain, *version, *contract, *account) == acted
+        };
+        let invalidated = self.next_sequence();
+        self.invalidated.insert(acted, invalidated);
+        self.loaded.retain(|loaded, _| !same_contract(loaded));
+        if self
+            .key
+            .as_ref()
+            .is_some_and(|current| same_contract(&Self::loaded_key(current, actor)))
+        {
+            self.requested.remove(&actor);
+        }
+        self.next_sequence()
+    }
+
+    /// Stores the actor's row read after its action on `chain_id`'s fresh `proposal`. It replaces
+    /// the current request's row for the actor there, which would otherwise hide it.
+    pub(super) fn apply_action_read(
+        &mut self,
+        chain_id: u64,
+        proposal: &GovernanceProposal,
+        actor: Address,
+        read: u64,
+        participation: GovernanceParticipation,
+    ) -> bool {
+        let loaded = (
+            chain_id,
+            proposal.contract_version,
+            proposal.contract_address,
+            proposal.index,
+            actor,
+        );
+        if !self.admit(loaded, read, participation) {
+            return false;
+        }
+        if self
+            .key
+            .as_ref()
+            .is_some_and(|key| Self::loaded_key(key, actor) == loaded)
+        {
+            self.requested.remove(&actor);
+        }
+        true
+    }
+
+    /// Stops the current request; loaded rows stay for the session.
     pub(super) fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.key = None;
-        self.loading = false;
-        self.rows.clear();
+        self.requested.clear();
+    }
+
+    /// Discards everything loaded this wallet session, and every read still outstanding.
+    pub(super) fn clear_session(&mut self) {
+        self.invalidate();
+        self.loaded.clear();
+        self.invalidated.clear();
+        self.session_start = self.sequence;
     }
 }
 
@@ -746,6 +966,7 @@ impl WalletRoot {
             operation,
         } = draft;
         let continuation_operation = operation.clone();
+        let submitted_chain = resolved_chain.clone();
         let continuation_view_session = view_session.clone();
         let continuation_vault_store = vault_store.clone();
         #[cfg(feature = "hardware")]
@@ -773,6 +994,7 @@ impl WalletRoot {
                 }
             };
         let active_wallet_id = self.selected_wallet_id.clone();
+        let active_wallet_generation = self.active_wallet_generation;
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let progress_step = Self::governance_progress_step(
@@ -905,6 +1127,23 @@ impl WalletRoot {
         cx.spawn_in(window, async move |this, cx| {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
+                if let (
+                    Ok(Ok(_)),
+                    Some(wallet_id),
+                    GovernanceDraftRecipe::Proposal { proposal, .. },
+                ) = (&result, active_wallet_id.as_deref(), &recipe)
+                {
+                    root.record_governance_action_success(
+                        wallet_id,
+                        active_wallet_generation,
+                        &submitted_target,
+                        proposal,
+                        context.actor,
+                        &submitted_chain,
+                        &continuation_operation,
+                        cx,
+                    );
+                }
                 if root.selected_wallet_id != active_wallet_id || root.selected_chain != chain_id {
                     return;
                 }
@@ -989,24 +1228,72 @@ impl WalletRoot {
         }
     }
 
-    fn refresh_governance_proposal_participation_for_key(
+    /// Records a successful proposal action submitted in the current wallet session, whatever
+    /// chain, tab or progress is shown now. It drops the actor's pre-action rows on the acted
+    /// contract and the cached pages showing the proposal, which the action made stale (a called
+    /// vote changes its voting interval), then reads the fresh proposal and the actor's
+    /// participation once over the action's own route, which already carried this actor's
+    /// transaction for this proposal. A failed read stores nothing and leaves the actor to be
+    /// shown on request.
+    pub(super) fn record_governance_action_success(
         &mut self,
-        key: &ProposalParticipationKey,
-        cx: &mut Context<'_, Self>,
+        wallet_id: &str,
+        wallet_generation: u64,
+        target: &GovernanceRefreshTarget,
+        proposal: &GovernanceProposal,
+        actor: Address,
+        effective_chain: &wallet_ops::settings::EffectiveChainConfig,
+        operation: &wallet_ops::OperationHttpClientSlot,
+        cx: &Context<'_, Self>,
     ) {
-        let selected = self
-            .proposals
-            .selected_proposal()
-            .filter(|proposal| {
-                proposal.contract_version == key.version
-                    && proposal.contract_address == key.contract
-                    && proposal.index == key.index
-            })
-            .cloned();
-        if let Some(proposal) = selected.as_ref() {
-            self.start_proposal_participation(proposal, cx);
+        let GovernanceRefreshTarget::Proposal(key) = target else {
+            return;
+        };
+        if !self.is_active_wallet_generation(wallet_id, wallet_generation) {
+            return;
         }
-        self.refresh_selected_proposal_page(cx);
+        let read = self
+            .governance
+            .proposal_participation
+            .invalidate_actor_on_contract(key, actor);
+        self.evict_acted_proposal(key, cx);
+        let chain_id = key.context.chain_id;
+        let wallet_id = wallet_id.to_owned();
+        let proposal = proposal.clone();
+        let effective_chain = effective_chain.clone();
+        let operation = operation.clone();
+        let http = self.http.clone();
+        cx.spawn(async move |this, cx| {
+            let state = match super::governance::action_governance_route(
+                chain_id,
+                &effective_chain,
+                &operation,
+            )
+            .await
+            {
+                Ok((route, _)) => {
+                    read_proposal_action_state(chain_id, &proposal, actor, &route, &http).await
+                }
+                Err(error) => Err(error),
+            };
+            let Ok((fresh, _, _, participation)) = state else {
+                return;
+            };
+            let _ = this.update(cx, |root, cx| {
+                if root.is_active_wallet_generation(&wallet_id, wallet_generation)
+                    && root.governance.proposal_participation.apply_action_read(
+                        chain_id,
+                        &fresh,
+                        actor,
+                        read,
+                        participation,
+                    )
+                {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     pub(super) fn refresh_governance_after_target(
@@ -1014,18 +1301,14 @@ impl WalletRoot {
         target: &GovernanceRefreshTarget,
         cx: &mut Context<'_, Self>,
     ) {
-        match target {
-            GovernanceRefreshTarget::Proposal(key) => {
-                self.refresh_governance_proposal_participation_for_key(key, cx);
+        // A proposal action's participation and page were refreshed when its success was recorded.
+        if let GovernanceRefreshTarget::Staking(key) = target {
+            if self.governance.tab == super::governance::GovernanceTab::Staking
+                && self.governance_context_key() == *key
+            {
+                self.start_staking_refresh(cx);
             }
-            GovernanceRefreshTarget::Staking(key) => {
-                if self.governance.tab == super::governance::GovernanceTab::Staking
-                    && self.governance_context_key() == *key
-                {
-                    self.start_staking_refresh(cx);
-                }
-                self.refresh_selected_proposal_page(cx);
-            }
+            self.refresh_selected_proposal_page(cx);
         }
     }
 }

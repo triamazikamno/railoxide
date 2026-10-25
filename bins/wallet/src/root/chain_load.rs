@@ -1574,6 +1574,7 @@ impl WalletRoot {
 
     pub(super) fn reset_wallet_scoped_state(&mut self, cx: &mut Context<'_, Self>) {
         self.invalidate_governance_context();
+        self.governance.proposal_participation.clear_session();
         self.invalidate_proposals_chain(self.selected_chain);
         self.clear_protected_software_seed_session(cx);
         self.send_forms.clear();

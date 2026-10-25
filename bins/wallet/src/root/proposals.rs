@@ -471,7 +471,7 @@ pub(super) struct ResolvedProposal {
 }
 
 impl ResolvedProposal {
-    const fn identity(&self) -> ProposalIdentity {
+    pub(super) const fn identity(&self) -> ProposalIdentity {
         ProposalIdentity {
             contract_version: self.proposal.contract_version,
             contract_address: self.proposal.contract_address,
@@ -815,6 +815,33 @@ impl ProposalsState {
         self.loading_pages.remove(&page);
         self.hydrating_pages.remove(&page);
     }
+    /// Drops every cached page of `chain_id` showing `identity`, the prefetch, and the current
+    /// page's work when that page was dropped or is still loading, since that work may carry the
+    /// proposal's stale data. Returns whether the current page must be requested again.
+    fn evict_proposal(&mut self, chain_id: u64, identity: &ProposalIdentity) -> bool {
+        if chain_id != self.chain_id {
+            return false;
+        }
+        let stale = self
+            .pages
+            .iter()
+            .filter(|(_, page)| page.rows.iter().any(|row| row.identity() == *identity))
+            .map(|(page, _)| *page)
+            .collect::<Vec<_>>();
+        for page in &stale {
+            self.pages.remove(page);
+            self.proposal_lists.remove(page);
+            self.loading_pages.remove(page);
+            self.hydrating_pages.remove(page);
+        }
+        self.cancel_prefetch();
+        let current = self.current_page;
+        let reload = stale.contains(&current) || self.loading_pages.contains(&current);
+        if reload {
+            self.cancel_active_page(current);
+        }
+        reload
+    }
     fn owns_page_work(&self, page: usize, prefetch: bool, token: u64) -> bool {
         if prefetch {
             self.prefetch_page == Some(page) && self.prefetch_token == token
@@ -822,7 +849,7 @@ impl ProposalsState {
             self.current_page == page && self.active_page_token == token
         }
     }
-    fn rows(&self, page: usize) -> Option<&[ResolvedProposal]> {
+    pub(super) fn rows(&self, page: usize) -> Option<&[ResolvedProposal]> {
         self.pages.get(&page).map(|p| p.rows.as_slice())
     }
 
@@ -1111,7 +1138,7 @@ impl WalletRoot {
                 })
             });
             if let Some(proposal) = selected.as_ref() {
-                self.start_proposal_participation(proposal, cx);
+                self.show_proposal_participation(proposal);
             }
         }
         cx.notify();
@@ -1222,7 +1249,7 @@ impl WalletRoot {
                                 })
                             });
                         if let Some(proposal) = selected_proposal.as_ref() {
-                            root.start_proposal_participation(proposal, cx);
+                            root.show_proposal_participation(proposal);
                         }
                         if root.proposals.overview.is_some() {
                             root.start_proposals_time_tick(cx);
@@ -1302,7 +1329,7 @@ impl WalletRoot {
                 .map(|row| row.proposal.clone())
         });
         if let Some(proposal) = selected_proposal.as_ref() {
-            self.start_proposal_participation(proposal, cx);
+            self.show_proposal_participation(proposal);
         }
         self.proposal_detail_focus.focus(window, cx);
         cx.notify();
@@ -1442,7 +1469,7 @@ impl WalletRoot {
                                     })
                                 });
                             if let Some(proposal) = selected_proposal.as_ref() {
-                                root.start_proposal_participation(proposal, cx);
+                                root.show_proposal_participation(proposal);
                             }
                         }
                     }
@@ -1466,11 +1493,32 @@ impl WalletRoot {
             .selected
             .as_ref()
             .map_or(self.proposals.current_page, |selection| selection.page);
+        // A load started before the refresh must not land.
+        self.proposals.cancel_active_page(page);
         self.proposals.pages.remove(&page);
         self.proposals.proposal_lists.remove(&page);
-        self.proposals.loading_pages.remove(&page);
         self.request_proposals_page(page, false, cx);
         cx.notify();
+    }
+
+    /// Drops the cached pages showing the proposal of `key` after an action on it, and reloads
+    /// the current page when it was dropped or its load was cancelled.
+    pub(super) fn evict_acted_proposal(
+        &mut self,
+        key: &super::governance_action::ProposalParticipationKey,
+        cx: &Context<'_, Self>,
+    ) {
+        let identity = ProposalIdentity {
+            contract_version: key.version,
+            contract_address: key.contract,
+            index: key.index,
+        };
+        if self
+            .proposals
+            .evict_proposal(key.context.chain_id, &identity)
+        {
+            self.request_proposals_page(self.proposals.current_page, false, cx);
+        }
     }
     fn resume_active_proposals_page(&mut self, page: usize, cx: &Context<'_, Self>) {
         self.start_proposals_hydration(page, false, cx);
@@ -2493,6 +2541,7 @@ fn per_mille(numerator: U256, denominator: U256) -> u16 {
 enum ProposalCapacitySummaryState {
     Empty,
     Loading,
+    NotLoaded,
     Unavailable,
     Full,
     Partial,
@@ -2879,14 +2928,14 @@ fn render_proposal_participation_card(
     let mut inactive_count = 0usize;
     let mut loading_count = 0usize;
     let mut unavailable_count = 0usize;
+    let mut not_loaded_count = 0usize;
     let mut closed_sponsored = Some(U256::ZERO);
     let mut closed_voted = Some(U256::ZERO);
     for account in &participants {
         let row = wallet
             .governance
             .proposal_participation
-            .rows
-            .get(&account.address);
+            .row(&proposal.proposal, &account.address);
         if account.status == wallet_ops::vault::PublicAccountStatus::Inactive {
             inactive_count += 1;
         }
@@ -2894,7 +2943,8 @@ fn render_proposal_participation_card(
             continue;
         }
         match row {
-            Some(ProposalParticipationRow::Loading) | None => loading_count += 1,
+            Some(ProposalParticipationRow::Loading) => loading_count += 1,
+            None => not_loaded_count += 1,
             Some(ProposalParticipationRow::Unavailable(_)) => unavailable_count += 1,
             Some(ProposalParticipationRow::Ready(participation)) => {
                 let participation_matches = participation.proposal_version
@@ -2973,8 +3023,7 @@ fn render_proposal_participation_card(
         let row = wallet
             .governance
             .proposal_participation
-            .rows
-            .get(&account.address);
+            .row(&proposal.proposal, &account.address);
         let mut row_card = div()
             .flex()
             .flex_wrap()
@@ -3257,9 +3306,13 @@ fn render_proposal_participation_card(
                             .text_size(px(11.0)),
                     );
             }
-            Some(ProposalParticipationRow::Loading) | None => {
+            Some(ProposalParticipationRow::Loading) => {
                 capacity_column = capacity_column
                     .child(app_muted_text("Loading account participation…").text_size(px(11.0)));
+            }
+            None => {
+                capacity_column = capacity_column
+                    .child(app_muted_text("Participation not loaded").text_size(px(11.0)));
             }
         }
         row_card = row_card.child(capacity_column).child(actions);
@@ -3276,6 +3329,8 @@ fn render_proposal_participation_card(
         ProposalCapacitySummaryState::Loading
     } else if !aggregate_valid {
         ProposalCapacitySummaryState::Unavailable
+    } else if not_loaded_count > 0 && loading_count == 0 && unavailable_count == 0 {
+        ProposalCapacitySummaryState::NotLoaded
     } else {
         proposal_capacity_summary_state(
             aggregate_available,
@@ -3316,6 +3371,10 @@ fn render_proposal_participation_card(
                     .child(Spinner::new().small())
                     .child(app_muted_text("Loading account participation…").text_size(px(12.0))),
             );
+        }
+        (ProposalCapacitySummaryState::NotLoaded, _) => {
+            summary = summary
+                .child(app_muted_text("Account participation not loaded").text_size(px(12.0)));
         }
         (ProposalCapacitySummaryState::Unavailable, _) => {
             let unavailable_word = if unavailable_count == 1 {
@@ -3451,6 +3510,36 @@ fn render_proposal_participation_card(
             }
         }
     }
+    if key_matches && total_accounts > 0 && loading_count == 0 {
+        let refresh = wallet
+            .governance
+            .proposal_participation
+            .unloaded(&proposal.proposal)
+            .is_empty();
+        let request_root = root.clone();
+        summary = summary.child(
+            div().w_full().flex().justify_end().child(
+                app_button_base(SharedString::from(format!(
+                    "wallet-proposal-participation-request-{}-{}-{}",
+                    proposal_version_label(proposal.proposal.contract_version),
+                    proposal.proposal.contract_address,
+                    proposal.proposal.index,
+                )))
+                .outline()
+                .small()
+                .child(if refresh {
+                    "Refresh participation"
+                } else {
+                    "Show participation"
+                })
+                .on_click(move |_event, _window, cx| {
+                    request_root.update(cx, |root, cx| {
+                        root.request_proposal_participation(refresh, cx);
+                    });
+                }),
+            ),
+        );
+    }
     let toggle_root = root.clone();
     let toggle_id = SharedString::from(format!(
         "wallet-proposal-participation-toggle-{}-{}-{}",
@@ -3556,8 +3645,7 @@ fn render_proposal_action_form(
     let Some(ProposalParticipationRow::Ready(participation)) = wallet
         .governance
         .proposal_participation
-        .rows
-        .get(&selection.actor)
+        .row(&proposal.proposal, &selection.actor)
     else {
         return Some(
             app_muted_text(
@@ -9083,6 +9171,59 @@ mod tests {
         state.cancel_active_page(1);
         assert!(!state.owns_page_work(1, false, old_active_token));
         assert!(state.owns_page_work(1, false, state.active_page_token));
+    }
+
+    #[test]
+    fn evicting_an_acted_proposal_drops_its_pages_and_page_work_that_may_restore_it() {
+        let acted = test_proposal(5, resolved_document()).identity();
+        let mut state = ProposalsState::new(1);
+        state.pages.insert(
+            0,
+            ProposalsPage {
+                rows: Arc::new(vec![test_proposal(5, resolved_document())]),
+            },
+        );
+        state.pages.insert(
+            1,
+            ProposalsPage {
+                rows: Arc::new(vec![test_proposal(0, resolved_document())]),
+            },
+        );
+        state.current_page = 1;
+        state.prefetch_page = Some(0);
+        let active_token = state.active_page_token;
+        let prefetch_token = state.prefetch_token;
+
+        // An action on another chain leaves the cache alone.
+        assert!(!state.evict_proposal(2, &acted));
+        assert_eq!(state.pages.len(), 2);
+
+        // The other proposal's current page stays with its work; the prefetch is cancelled.
+        assert!(!state.evict_proposal(1, &acted));
+        assert!(state.rows(0).is_none());
+        assert!(state.rows(1).is_some());
+        assert!(!state.owns_page_work(0, true, prefetch_token));
+        assert!(state.owns_page_work(1, false, active_token));
+
+        // A current page still loading may carry the proposal's stale data, so its load cannot
+        // land and the page must be requested again.
+        state.current_page = 2;
+        state.loading_pages.insert(2);
+        assert!(state.evict_proposal(1, &acted));
+        assert!(!state.owns_page_work(2, false, active_token));
+        assert!(state.loading_pages.is_empty());
+
+        // So must a dropped current page.
+        state.pages.insert(
+            2,
+            ProposalsPage {
+                rows: Arc::new(vec![test_proposal(5, resolved_document())]),
+            },
+        );
+        let active_token = state.active_page_token;
+        assert!(state.evict_proposal(1, &acted));
+        assert!(state.rows(2).is_none());
+        assert!(!state.owns_page_work(2, false, active_token));
     }
 
     #[test]
