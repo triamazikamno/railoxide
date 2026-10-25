@@ -11,6 +11,8 @@ use tokio::sync::watch;
 pub const DEFAULT_EVENT_CAPACITY: usize = 1_024;
 const MAX_FEE_ANNOUNCEMENT_REFRESH_INTERVAL: Duration = Duration::from_mins(1);
 const MAX_FEE_ANNOUNCEMENT_TTL: Duration = Duration::from_mins(30);
+const FEE_PUBLISHER_EVICTION_GRACE: Duration = Duration::from_mins(10);
+const MAX_FEE_PUBLISHERS_PER_CHAIN: usize = 128;
 
 /// Identifier for a single fee row, keyed by chain, broadcaster, and token.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -56,9 +58,12 @@ struct FeePublisherState {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum FeeAnnouncementAdmission {
-    Rejected,
+    Rejected {
+        revision: Option<u64>,
+    },
     Pending {
         deadline: Instant,
+        revision: Option<u64>,
     },
     Applied {
         revision: Option<u64>,
@@ -70,8 +75,9 @@ impl FeeAnnouncementAdmission {
     #[must_use]
     pub const fn revision(self) -> Option<u64> {
         match self {
-            Self::Applied { revision, .. } => revision,
-            Self::Rejected | Self::Pending { .. } => None,
+            Self::Rejected { revision }
+            | Self::Pending { revision, .. }
+            | Self::Applied { revision, .. } => revision,
         }
     }
 
@@ -79,7 +85,7 @@ impl FeeAnnouncementAdmission {
     pub const fn visible_rows(self) -> usize {
         match self {
             Self::Applied { visible_rows, .. } => visible_rows,
-            Self::Rejected | Self::Pending { .. } => 0,
+            Self::Rejected { .. } | Self::Pending { .. } => 0,
         }
     }
 }
@@ -92,7 +98,6 @@ pub struct FeeRow {
     pub railgun_address: Arc<str>,
     pub token_address: Address,
     pub fee: U256,
-    pub signature_valid: bool,
     pub fees_id: Arc<str>,
     pub fee_expiration: SystemTime,
     pub available_wallets: u32,
@@ -201,34 +206,71 @@ impl MonitorState {
         signed_expiration: SystemTime,
         wall_now: SystemTime,
         monotonic_now: Instant,
-        signature_valid: bool,
         rows: Vec<FeeRow>,
     ) -> FeeAnnouncementAdmission {
-        if !Self::candidate_rows_are_consistent(
+        let evicted_revision = self.evict_expired_fee_publishers(wall_now);
+        let mut admission = self.admit_unevicted_fee_announcement(
             chain_id,
             railgun_address,
             signed_expiration,
-            signature_valid,
-            &rows,
-        ) {
-            return FeeAnnouncementAdmission::Rejected;
+            wall_now,
+            monotonic_now,
+            rows,
+        );
+        let (FeeAnnouncementAdmission::Rejected { revision }
+        | FeeAnnouncementAdmission::Pending { revision, .. }
+        | FeeAnnouncementAdmission::Applied { revision, .. }) = &mut admission;
+        *revision = revision.or(evicted_revision);
+        admission
+    }
+
+    fn evict_expired_fee_publishers(&mut self, wall_now: SystemTime) -> Option<u64> {
+        let evicted: HashSet<_> = self
+            .fee_publishers
+            .extract_if(|_key, publisher| {
+                wall_now
+                    .duration_since(publisher.signed_expiration_high_water)
+                    .is_ok_and(|elapsed| elapsed > FEE_PUBLISHER_EVICTION_GRACE)
+            })
+            .map(|(key, _publisher)| key)
+            .collect();
+        if evicted.is_empty() {
+            return None;
+        }
+        let rows_before = self.fees.len();
+        self.fees.retain(|key, _row| {
+            !evicted.contains(&FeePublisherKey::new(
+                key.chain_id,
+                key.railgun_address.clone(),
+            ))
+        });
+        (self.fees.len() != rows_before).then(|| self.bump_rev())
+    }
+
+    fn admit_unevicted_fee_announcement(
+        &mut self,
+        chain_id: u64,
+        railgun_address: &Arc<str>,
+        signed_expiration: SystemTime,
+        wall_now: SystemTime,
+        monotonic_now: Instant,
+        rows: Vec<FeeRow>,
+    ) -> FeeAnnouncementAdmission {
+        const REJECTED: FeeAnnouncementAdmission =
+            FeeAnnouncementAdmission::Rejected { revision: None };
+        if !Self::candidate_rows_are_consistent(chain_id, railgun_address, signed_expiration, &rows)
+        {
+            return REJECTED;
         }
 
         let publisher_key = FeePublisherKey::new(chain_id, railgun_address.clone());
-        if !signature_valid {
-            if self.fee_publishers.contains_key(&publisher_key) {
-                return FeeAnnouncementAdmission::Rejected;
-            }
-            return self.apply_fee_announcement(chain_id, railgun_address, rows);
-        }
-
         if signed_expiration <= wall_now {
-            return FeeAnnouncementAdmission::Rejected;
+            return REJECTED;
         }
         let Some(refresh_at) =
             Self::fee_refresh_deadline(signed_expiration, wall_now, monotonic_now)
         else {
-            return FeeAnnouncementAdmission::Rejected;
+            return REJECTED;
         };
         let candidate = PendingFeeAnnouncement {
             signed_expiration,
@@ -237,7 +279,7 @@ impl MonitorState {
 
         if let Some(publisher) = self.fee_publishers.get_mut(&publisher_key) {
             if signed_expiration <= publisher.signed_expiration_high_water {
-                return FeeAnnouncementAdmission::Rejected;
+                return REJECTED;
             }
             debug_assert!(signed_expiration > publisher.active.signed_expiration);
             publisher.signed_expiration_high_water = signed_expiration;
@@ -246,7 +288,10 @@ impl MonitorState {
             {
                 let deadline = publisher.active.refresh_at;
                 publisher.pending = Some(candidate);
-                return FeeAnnouncementAdmission::Pending { deadline };
+                return FeeAnnouncementAdmission::Pending {
+                    deadline,
+                    revision: None,
+                };
             }
 
             publisher.active = ActiveVerifiedFeeGeneration {
@@ -255,6 +300,14 @@ impl MonitorState {
             };
             publisher.pending = None;
         } else {
+            let chain_publishers = self
+                .fee_publishers
+                .keys()
+                .filter(|key| key.chain_id == chain_id)
+                .count();
+            if chain_publishers >= MAX_FEE_PUBLISHERS_PER_CHAIN {
+                return REJECTED;
+            }
             self.fee_publishers.insert(
                 publisher_key,
                 FeePublisherState {
@@ -339,7 +392,6 @@ impl MonitorState {
         chain_id: u64,
         railgun_address: &Arc<str>,
         signed_expiration: SystemTime,
-        signature_valid: bool,
         rows: &[FeeRow],
     ) -> bool {
         let mut tokens = HashSet::with_capacity(rows.len());
@@ -347,7 +399,6 @@ impl MonitorState {
             row.chain_id == chain_id
                 && &row.railgun_address == railgun_address
                 && row.fee_expiration == signed_expiration
-                && row.signature_valid == signature_valid
                 && tokens.insert(row.token_address)
         })
     }
@@ -497,7 +548,6 @@ mod tests {
             railgun_address: Arc::from("0zk-test"),
             token_address: token,
             fee: U256::from(fee),
-            signature_valid: true,
             fees_id: Arc::from(fees_id),
             fee_expiration: SystemTime::now(),
             available_wallets,
@@ -520,13 +570,11 @@ mod tests {
         fees_id: &str,
         received_at: SystemTime,
         fee_expiration: SystemTime,
-        signature_valid: bool,
     ) -> FeeRow {
         let mut row = sample_row(chain_id, token, fee, fees_id);
         row.railgun_address = Arc::from(broadcaster);
         row.last_seen = received_at;
         row.fee_expiration = fee_expiration;
-        row.signature_valid = signature_valid;
         row
     }
 
@@ -619,7 +667,6 @@ mod tests {
                     fees_id,
                     wall_now,
                     expiration,
-                    true,
                 )
             })
             .collect();
@@ -629,7 +676,6 @@ mod tests {
             expiration,
             wall_now,
             monotonic_now,
-            true,
             rows,
         )
     }
@@ -674,6 +720,7 @@ mod tests {
             ),
             FeeAnnouncementAdmission::Pending {
                 deadline: monotonic + Duration::from_secs(40),
+                revision: None,
             }
         );
         assert_eq!(state.rev(), 1);
@@ -748,7 +795,7 @@ mod tests {
                     monotonic + Duration::from_secs(30),
                     candidate_expiration,
                 ),
-                FeeAnnouncementAdmission::Rejected
+                FeeAnnouncementAdmission::Rejected { revision: None }
             );
         }
 
@@ -794,7 +841,7 @@ mod tests {
                     monotonic + Duration::from_secs(1),
                     rejected_expiration,
                 ),
-                FeeAnnouncementAdmission::Rejected
+                FeeAnnouncementAdmission::Rejected { revision: None }
             );
         }
         assert_eq!(
@@ -808,7 +855,7 @@ mod tests {
                 monotonic + Duration::from_secs(2),
                 expiration + Duration::from_secs(1),
             ),
-            FeeAnnouncementAdmission::Rejected
+            FeeAnnouncementAdmission::Rejected { revision: None }
         );
         assert_eq!(state.rev(), 1);
         assert_eq!(state.fee_rows()[0].fees_id.as_ref(), "first");
@@ -846,6 +893,7 @@ mod tests {
                 ),
                 FeeAnnouncementAdmission::Pending {
                     deadline: monotonic + Duration::from_secs(expected_interval),
+                    revision: None,
                 }
             );
         }
@@ -920,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_never_changes_publisher_after_verified_admission() {
+    fn direct_upsert_never_changes_verified_publisher() {
         let mut state = MonitorState::new();
         let wall = UNIX_EPOCH + Duration::from_secs(1_000);
         let monotonic = Instant::now();
@@ -948,37 +996,6 @@ mod tests {
             expiration + Duration::from_secs(10),
         );
         let deadline = state.next_pending_fee_announcement_deadline();
-
-        for jumped_wall in [
-            wall - Duration::from_secs(500),
-            wall + Duration::from_hours(24 * 365),
-        ] {
-            let invalid_expiration = jumped_wall + Duration::from_hours(24 * 30);
-            assert_eq!(
-                state.admit_fee_announcement(
-                    1,
-                    &broadcaster,
-                    invalid_expiration,
-                    jumped_wall,
-                    monotonic + Duration::from_secs(20),
-                    false,
-                    vec![announcement_row(
-                        1,
-                        &broadcaster,
-                        token,
-                        999,
-                        "invalid",
-                        jumped_wall,
-                        invalid_expiration,
-                        false,
-                    )],
-                ),
-                FeeAnnouncementAdmission::Rejected
-            );
-        }
-        assert_eq!(state.rev(), 1);
-        assert_eq!(state.next_pending_fee_announcement_deadline(), deadline);
-        assert_eq!(state.fee_rows()[0].fees_id.as_ref(), "verified");
         let bypass_row = announcement_row(
             1,
             &broadcaster,
@@ -987,9 +1004,9 @@ mod tests {
             "direct-upsert",
             wall + Duration::from_hours(24 * 365),
             wall + Duration::from_hours(24 * 366),
-            false,
         );
         assert_eq!(state.upsert_fee(bypass_row), 1);
+        assert_eq!(state.next_pending_fee_announcement_deadline(), deadline);
         assert_eq!(state.fee_rows()[0].fees_id.as_ref(), "verified");
         assert_eq!(
             state.promote_due_fee_announcements(
@@ -1005,13 +1022,14 @@ mod tests {
                 1,
                 &broadcaster,
                 &[(token, 300)],
-                "after-invalid",
+                "after-upsert",
                 wall + Duration::from_secs(41),
                 monotonic + Duration::from_secs(41),
                 expiration + Duration::from_secs(20),
             ),
             FeeAnnouncementAdmission::Pending {
                 deadline: monotonic + Duration::from_secs(70),
+                revision: None,
             }
         );
     }
@@ -1024,14 +1042,6 @@ mod tests {
         let broadcaster: Arc<str> = Arc::from("0zk-a");
         let token = address!("0000000000000000000000000000000000000001");
 
-        assert_eq!(
-            state
-                .admit_fee_announcement(1, &broadcaster, wall, wall, monotonic, false, Vec::new(),),
-            FeeAnnouncementAdmission::Applied {
-                revision: None,
-                visible_rows: 0,
-            }
-        );
         let expiration = wall + Duration::from_mins(2);
         assert_eq!(
             admit_verified(
@@ -1061,7 +1071,7 @@ mod tests {
                 monotonic,
                 expiration,
             ),
-            FeeAnnouncementAdmission::Rejected
+            FeeAnnouncementAdmission::Rejected { revision: None }
         );
         admit_verified(
             &mut state,
@@ -1129,7 +1139,7 @@ mod tests {
                 monotonic,
                 wall + Duration::from_mins(31),
             ),
-            FeeAnnouncementAdmission::Rejected
+            FeeAnnouncementAdmission::Rejected { revision: None }
         );
         assert_eq!(state.rev(), 0);
         assert_eq!(
@@ -1239,6 +1249,272 @@ mod tests {
                 revision: None,
                 visible_rows: 0,
             }
+        );
+    }
+
+    #[test]
+    fn expired_publisher_is_evicted_only_after_grace() {
+        let mut state = MonitorState::new();
+        let wall = UNIX_EPOCH + Duration::from_secs(1_000);
+        let monotonic = Instant::now();
+        let broadcaster_a: Arc<str> = Arc::from("0zk-a");
+        let broadcaster_b: Arc<str> = Arc::from("0zk-b");
+        let token = address!("0000000000000000000000000000000000000001");
+        let a_expiration = wall + Duration::from_mins(2);
+        admit_verified(
+            &mut state,
+            1,
+            &broadcaster_a,
+            &[(token, 100)],
+            "a",
+            wall,
+            monotonic,
+            a_expiration,
+        );
+
+        let within_grace = a_expiration + Duration::from_mins(3);
+        let b_expiration = within_grace + Duration::from_mins(5);
+        admit_verified(
+            &mut state,
+            1,
+            &broadcaster_b,
+            &[(token, 200)],
+            "b",
+            within_grace,
+            monotonic,
+            b_expiration,
+        );
+        assert_eq!(state.fee_rows().len(), 2);
+
+        let past_grace = a_expiration + Duration::from_mins(10) + Duration::from_secs(1);
+        assert_eq!(
+            admit_verified(
+                &mut state,
+                1,
+                &broadcaster_b,
+                &[(token, 200)],
+                "b",
+                past_grace,
+                monotonic,
+                b_expiration,
+            ),
+            FeeAnnouncementAdmission::Rejected { revision: Some(3) }
+        );
+        let rows = state.fee_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].railgun_address, broadcaster_b);
+
+        assert_eq!(
+            admit_verified(
+                &mut state,
+                1,
+                &broadcaster_a,
+                &[(token, 100)],
+                "a",
+                past_grace,
+                monotonic,
+                a_expiration,
+            ),
+            FeeAnnouncementAdmission::Rejected { revision: None }
+        );
+        assert_eq!(state.rev(), 3);
+        assert_eq!(state.fee_rows().len(), 1);
+        // A direct upsert is only accepted for an address without a publisher entry.
+        let probe = announcement_row(
+            1,
+            &broadcaster_a,
+            token,
+            300,
+            "probe",
+            past_grace,
+            past_grace,
+        );
+        assert_eq!(state.upsert_fee(probe), 4);
+    }
+
+    #[test]
+    fn pending_newer_announcement_defers_eviction() {
+        let mut state = MonitorState::new();
+        let wall = UNIX_EPOCH + Duration::from_secs(1_000);
+        let monotonic = Instant::now();
+        let broadcaster_a: Arc<str> = Arc::from("0zk-a");
+        let broadcaster_b: Arc<str> = Arc::from("0zk-b");
+        let token = address!("0000000000000000000000000000000000000001");
+        let active_expiration = wall + Duration::from_mins(2);
+        admit_verified(
+            &mut state,
+            1,
+            &broadcaster_a,
+            &[(token, 100)],
+            "active",
+            wall,
+            monotonic,
+            active_expiration,
+        );
+        let pending_wall = wall + Duration::from_secs(10);
+        assert!(matches!(
+            admit_verified(
+                &mut state,
+                1,
+                &broadcaster_a,
+                &[(token, 200)],
+                "pending",
+                pending_wall,
+                monotonic + Duration::from_secs(10),
+                pending_wall + Duration::from_mins(25),
+            ),
+            FeeAnnouncementAdmission::Pending { .. }
+        ));
+
+        let past_active_grace =
+            active_expiration + Duration::from_mins(10) + Duration::from_secs(1);
+        assert_eq!(
+            admit_verified(
+                &mut state,
+                1,
+                &broadcaster_b,
+                &[(token, 300)],
+                "b",
+                past_active_grace,
+                monotonic + Duration::from_secs(20),
+                past_active_grace + Duration::from_mins(5),
+            ),
+            FeeAnnouncementAdmission::Applied {
+                revision: Some(2),
+                visible_rows: 1,
+            }
+        );
+        assert!(
+            state
+                .fee_rows()
+                .iter()
+                .any(|row| row.railgun_address == broadcaster_a)
+        );
+    }
+
+    #[test]
+    fn full_chain_refuses_only_new_publishers() {
+        let mut state = MonitorState::new();
+        let wall = UNIX_EPOCH + Duration::from_secs(1_000);
+        let monotonic = Instant::now();
+        let token = address!("0000000000000000000000000000000000000001");
+        for i in 0..MAX_FEE_PUBLISHERS_PER_CHAIN {
+            admit_verified(
+                &mut state,
+                1,
+                &Arc::from(format!("0zk-{i}")),
+                &[(token, 100)],
+                "fill",
+                wall,
+                monotonic,
+                wall + Duration::from_mins(5),
+            );
+        }
+        let newcomer: Arc<str> = Arc::from("0zk-new");
+        assert_eq!(
+            admit_verified(
+                &mut state,
+                1,
+                &newcomer,
+                &[(token, 100)],
+                "new",
+                wall,
+                monotonic,
+                wall + Duration::from_mins(5),
+            ),
+            FeeAnnouncementAdmission::Rejected { revision: None }
+        );
+        assert_eq!(state.rev(), 128);
+        assert!(
+            !state
+                .fee_rows()
+                .iter()
+                .any(|row| row.railgun_address == newcomer)
+        );
+
+        let later = wall + Duration::from_mins(2);
+        assert_eq!(
+            admit_verified(
+                &mut state,
+                1,
+                &Arc::from("0zk-0"),
+                &[(token, 200)],
+                "refresh",
+                later,
+                monotonic + Duration::from_mins(2),
+                later + Duration::from_mins(5),
+            ),
+            FeeAnnouncementAdmission::Applied {
+                revision: Some(129),
+                visible_rows: 1,
+            }
+        );
+        assert_eq!(
+            admit_verified(
+                &mut state,
+                137,
+                &newcomer,
+                &[(token, 100)],
+                "other-chain",
+                later,
+                monotonic + Duration::from_mins(2),
+                later + Duration::from_mins(5),
+            ),
+            FeeAnnouncementAdmission::Applied {
+                revision: Some(130),
+                visible_rows: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn evicted_publisher_frees_chain_slot() {
+        let mut state = MonitorState::new();
+        let wall = UNIX_EPOCH + Duration::from_secs(1_000);
+        let monotonic = Instant::now();
+        let token = address!("0000000000000000000000000000000000000001");
+        let short_expiration = wall + Duration::from_mins(1);
+        for i in 0..MAX_FEE_PUBLISHERS_PER_CHAIN {
+            let expiration = if i == 0 {
+                short_expiration
+            } else {
+                wall + Duration::from_mins(30)
+            };
+            admit_verified(
+                &mut state,
+                1,
+                &Arc::from(format!("0zk-{i}")),
+                &[(token, 100)],
+                "fill",
+                wall,
+                monotonic,
+                expiration,
+            );
+        }
+
+        let past_grace = short_expiration + Duration::from_mins(10) + Duration::from_secs(1);
+        assert_eq!(
+            admit_verified(
+                &mut state,
+                1,
+                &Arc::from("0zk-new"),
+                &[(token, 100)],
+                "new",
+                past_grace,
+                monotonic,
+                past_grace + Duration::from_mins(5),
+            ),
+            FeeAnnouncementAdmission::Applied {
+                revision: Some(130),
+                visible_rows: 1,
+            }
+        );
+        let rows = state.fee_rows();
+        assert_eq!(rows.len(), MAX_FEE_PUBLISHERS_PER_CHAIN);
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.railgun_address.as_ref() == "0zk-0")
         );
     }
 }

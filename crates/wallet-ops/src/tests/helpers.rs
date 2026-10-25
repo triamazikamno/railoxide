@@ -338,7 +338,6 @@ pub(super) fn fee_row_with_broadcaster_seed(
         railgun_address: Arc::from(sample_railgun_address(broadcaster_seed)),
         token_address: token,
         fee: U256::from(fee),
-        signature_valid: true,
         fees_id: Arc::from(fees_id),
         fee_expiration: SystemTime::now() + Duration::from_mins(1),
         available_wallets: 1,

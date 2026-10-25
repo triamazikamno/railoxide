@@ -7,10 +7,6 @@ fn public_broadcaster_candidates_filter_unsupported_rows_and_allow_valid_poi_req
     let token = address(0x21);
     let mut rows = vec![fee_row(1, token, 10, 0.9, "ok")];
 
-    let mut invalid_signature = fee_row(1, token, 10, 0.9, "invalid-signature");
-    invalid_signature.signature_valid = false;
-    rows.push(invalid_signature);
-
     let mut expired = fee_row(1, token, 10, 0.9, "expired");
     expired.fee_expiration = SystemTime::now() - Duration::from_secs(1);
     rows.push(expired);

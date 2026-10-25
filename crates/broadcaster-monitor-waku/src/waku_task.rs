@@ -310,6 +310,10 @@ fn handle_fees_message_at(
             return 0;
         }
     };
+    if !signature_valid {
+        tracing::debug!(chain_id, "rejected fees payload with invalid signature");
+        return 0;
+    }
 
     let token_count = body.fees.len();
     let poi_list_key_count = body.required_poi_list_keys.len();
@@ -343,7 +347,6 @@ fn handle_fees_message_at(
             railgun_address: railgun_address.clone(),
             token_address,
             fee,
-            signature_valid,
             fees_id: fees_id.clone(),
             fee_expiration,
             available_wallets: body.available_wallets,
@@ -362,7 +365,6 @@ fn handle_fees_message_at(
         fee_expiration,
         wall_now,
         monotonic_now,
-        signature_valid,
         rows,
     );
     if let Some(rev) = outcome.revision() {
@@ -483,10 +485,8 @@ pub fn peer_row_from_snapshot(snapshot: &PeerSnapshot) -> PeerRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     use alloy::primitives::{Address, U256, address};
-    use alloy::uint;
     use broadcaster_core::crypto::railgun;
     use broadcaster_monitor::{event_channel, shared};
     use public_broadcaster_protocol::Body as FeeBody;
@@ -728,152 +728,6 @@ mod tests {
         assert!(shared.read().fee_rows().is_empty());
     }
 
-    #[test]
-    fn handle_fees_message_retains_fee_metadata() {
-        const RAILGUN_ADDRESS: &str = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp";
-
-        let token = address!("0000000000000000000000000000000000000001");
-        let relay_adapt = address!("0000000000000000000000000000000000000002");
-        let relay_adapt_7702 = address!("0000000000000000000000000000000000000003");
-        let body = FeeBody {
-            fees: HashMap::from([(token, uint!(42_U256))]),
-            fee_expiration: 1_900_000_000_000,
-            fees_id: "fees-id".to_string(),
-            railgun_address: RAILGUN_ADDRESS.into(),
-            available_wallets: 3,
-            version: "8.2.3".to_string(),
-            relay_adapt,
-            relay_adapt_7702: Some(relay_adapt_7702),
-            required_poi_list_keys: vec!["poi-list".to_string()],
-            reliability: 0.91,
-            identifier: Some("broadcaster-one".to_string()),
-        };
-        let payload = FeePayload {
-            data: serde_json::to_vec(&body).expect("serialize fees body"),
-            signature: vec![0; 64],
-        };
-        let payload = serde_json::to_vec(&payload).expect("serialize fees payload");
-        let shared = shared();
-        let (tx, _rx) = event_channel(16);
-
-        let produced = handle_fees_message(1, &payload, &shared, &tx);
-
-        assert_eq!(produced, 1);
-        let rows = shared.read().fee_rows();
-        assert_eq!(rows.len(), 1);
-        let row = &rows[0];
-        assert_eq!(row.available_wallets, 3);
-        assert_eq!(row.version.as_ref(), "8.2.3");
-        assert_eq!(row.relay_adapt, relay_adapt);
-        assert_eq!(row.relay_adapt_7702, Some(relay_adapt_7702));
-        assert_eq!(row.required_poi_list_keys, vec![Arc::from("poi-list")]);
-        assert_eq!(row.identifier.as_deref(), Some("broadcaster-one"));
-        assert!(!row.signature_valid);
-    }
-
-    #[test]
-    fn handle_fees_message_emits_one_revision_for_all_token_rows() {
-        const RAILGUN_ADDRESS: &str = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp";
-
-        let body = FeeBody {
-            fees: HashMap::from([
-                (
-                    address!("0000000000000000000000000000000000000001"),
-                    uint!(42_U256),
-                ),
-                (
-                    address!("0000000000000000000000000000000000000002"),
-                    uint!(84_U256),
-                ),
-            ]),
-            fee_expiration: 1_900_000_000_000,
-            fees_id: "fees-id".to_string(),
-            railgun_address: RAILGUN_ADDRESS.into(),
-            available_wallets: 3,
-            version: "8.2.3".to_string(),
-            relay_adapt: address!("0000000000000000000000000000000000000003"),
-            relay_adapt_7702: None,
-            required_poi_list_keys: Vec::new(),
-            reliability: 0.91,
-            identifier: None,
-        };
-        let payload = FeePayload {
-            data: serde_json::to_vec(&body).expect("serialize fees body"),
-            signature: vec![0; 64],
-        };
-        let payload = serde_json::to_vec(&payload).expect("serialize fees payload");
-        let shared = shared();
-        let (tx, rx) = event_channel(16);
-
-        assert_eq!(handle_fees_message(1, &payload, &shared, &tx), 2);
-        assert_eq!(shared.read().fee_rows().len(), 2);
-        assert_eq!(shared.read().rev(), 1);
-        assert_eq!(*rx.borrow(), 1);
-    }
-
-    #[test]
-    fn handle_fees_message_skips_unverified_replacement_after_verified_generation() {
-        const RAILGUN_ADDRESS: &str = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp";
-
-        let now = SystemTime::now();
-        let expiration = now + Duration::from_mins(5);
-        let broadcaster: Arc<str> = Arc::from(RAILGUN_ADDRESS);
-        let token = address!("0000000000000000000000000000000000000001");
-        let cached_row = FeeRow {
-            chain_id: 1,
-            railgun_address: broadcaster.clone(),
-            token_address: token,
-            fee: uint!(42_U256),
-            signature_valid: true,
-            fees_id: Arc::from("cached-fees-id"),
-            fee_expiration: expiration,
-            available_wallets: 3,
-            version: Arc::from("8.2.3"),
-            relay_adapt: address!("0000000000000000000000000000000000000002"),
-            relay_adapt_7702: None,
-            required_poi_list_keys: Vec::new(),
-            identifier: None,
-            last_seen: now,
-            reliability: 0.91,
-        };
-        let shared = shared();
-        shared.write().admit_fee_announcement(
-            1,
-            &broadcaster,
-            expiration,
-            now,
-            Instant::now(),
-            true,
-            vec![cached_row],
-        );
-
-        let body = FeeBody {
-            fees: HashMap::from([(token, uint!(84_U256))]),
-            fee_expiration: 1_900_000_000_000,
-            fees_id: "replacement-fees-id".to_string(),
-            railgun_address: RAILGUN_ADDRESS.into(),
-            available_wallets: 3,
-            version: "8.2.3".to_string(),
-            relay_adapt: address!("0000000000000000000000000000000000000002"),
-            relay_adapt_7702: None,
-            required_poi_list_keys: Vec::new(),
-            reliability: 0.91,
-            identifier: None,
-        };
-        let payload = FeePayload {
-            data: serde_json::to_vec(&body).expect("serialize fees body"),
-            signature: vec![0; 64],
-        };
-        let payload = serde_json::to_vec(&payload).expect("serialize fees payload");
-        let (tx, rx) = event_channel(16);
-
-        assert_eq!(handle_fees_message(1, &payload, &shared, &tx), 0);
-        let rows = shared.read().fee_rows();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].fees_id.as_ref(), "cached-fees-id");
-        assert_eq!(*rx.borrow(), 0);
-    }
-
     fn signed_fees_payload(
         token_count: u16,
         poi_list_key_count: usize,
@@ -909,6 +763,77 @@ mod tests {
         };
         let payload = body.into_signed_payload(seed).expect("signed fees payload");
         serde_json::to_vec(&payload).expect("serialize fees payload")
+    }
+
+    /// The signed helper's payload with a zeroed signature, so verification fails.
+    fn unsigned_fees_payload(fees_id: &str, fee_expiration: SystemTime) -> Vec<u8> {
+        let mut payload: FeePayload =
+            serde_json::from_slice(&signed_fees_payload(1, 0, fees_id, fee_expiration))
+                .expect("decode fees payload");
+        payload.signature = vec![0; 64];
+        serde_json::to_vec(&payload).expect("serialize fees payload")
+    }
+
+    #[test]
+    fn handle_fees_message_rejects_invalid_signature_from_untracked_address() {
+        let wall = SystemTime::now();
+        let payload = unsigned_fees_payload("unsigned", wall + Duration::from_mins(5));
+        let shared = shared();
+        let (tx, rx) = event_channel(16);
+
+        let produced = handle_fees_message_at(1, &payload, &shared, &tx, wall, Instant::now());
+
+        assert_eq!(produced, 0);
+        assert!(shared.read().fee_rows().is_empty());
+        assert_eq!(shared.read().rev(), 0);
+        assert_eq!(*rx.borrow(), 0);
+    }
+
+    #[test]
+    fn handle_fees_message_rejects_invalid_signature_for_tracked_address() {
+        let wall = SystemTime::now();
+        let monotonic = Instant::now();
+        let shared = shared();
+        let (tx, rx) = event_channel(16);
+        let tracked = signed_fees_payload(1, 0, "tracked", wall + Duration::from_mins(5));
+        assert_eq!(
+            handle_fees_message_at(1, &tracked, &shared, &tx, wall, monotonic),
+            1
+        );
+
+        // Past the refresh deadline with a later expiration, a verified announcement would apply.
+        let later_wall = wall + Duration::from_mins(2);
+        let unsigned = unsigned_fees_payload("unsigned", later_wall + Duration::from_mins(5));
+        let produced = handle_fees_message_at(
+            1,
+            &unsigned,
+            &shared,
+            &tx,
+            later_wall,
+            monotonic + Duration::from_mins(2),
+        );
+
+        assert_eq!(produced, 0);
+        let rows = shared.read().fee_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].fees_id.as_ref(), "tracked");
+        assert_eq!(shared.read().rev(), 1);
+        assert_eq!(*rx.borrow(), 1);
+    }
+
+    #[test]
+    fn handle_fees_message_emits_one_revision_for_all_token_rows() {
+        let wall = SystemTime::now();
+        let payload = signed_fees_payload(2, 0, "fees-id", wall + Duration::from_mins(5));
+        let shared = shared();
+        let (tx, rx) = event_channel(16);
+
+        let produced = handle_fees_message_at(1, &payload, &shared, &tx, wall, Instant::now());
+
+        assert_eq!(produced, 2);
+        assert_eq!(shared.read().fee_rows().len(), 2);
+        assert_eq!(shared.read().rev(), 1);
+        assert_eq!(*rx.borrow(), 1);
     }
 
     #[test]
@@ -976,7 +901,6 @@ mod tests {
         let rows = shared.read().fee_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].fees_id.as_ref(), "tracked");
-        assert!(rows[0].signature_valid);
         assert_eq!(*rx.borrow(), 1);
     }
 
@@ -1005,7 +929,6 @@ mod tests {
             railgun_address: broadcaster.clone(),
             token_address: token,
             fee: U256::from(fee),
-            signature_valid: true,
             fees_id: Arc::from(fees_id),
             fee_expiration,
             available_wallets: 1,
@@ -1024,7 +947,6 @@ mod tests {
             expiration,
             wall,
             monotonic,
-            true,
             vec![row(100, "active", wall, expiration)],
         );
         let pending_wall = wall + Duration::from_secs(1);
@@ -1035,7 +957,6 @@ mod tests {
             pending_expiration,
             pending_wall,
             monotonic + Duration::from_secs(1),
-            true,
             vec![row(200, "pending", pending_wall, pending_expiration)],
         );
 

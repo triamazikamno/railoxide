@@ -150,7 +150,6 @@ pub(in crate::root) fn fee_row(chain_id: u64, token: Address, fees_id: &str) -> 
         railgun_address: Arc::from(RAILGUN_ADDRESS),
         token_address: token,
         fee: uint!(10_U256),
-        signature_valid: true,
         fees_id: Arc::from(fees_id),
         fee_expiration: SystemTime::now() + Duration::from_mins(1),
         available_wallets: 1,

@@ -777,17 +777,6 @@ impl TableDelegate for FeesDelegate {
             }
             4 => render_fee_bonus_cell(row, &self.fee_anchor_lookup).into_any_element(),
             5 => {
-                let (label, color) = if row.signature_valid {
-                    ("OK", rgb(theme::SUCCESS))
-                } else {
-                    ("BAD", rgb(theme::DANGER))
-                };
-                div()
-                    .text_color(color)
-                    .child(SharedString::from(label))
-                    .into_any_element()
-            }
-            6 => {
                 let color = if row.reliability >= 0.9 {
                     rgb(theme::SUCCESS)
                 } else {
@@ -798,7 +787,7 @@ impl TableDelegate for FeesDelegate {
                     .child(SharedString::from(format!("{:.2}", row.reliability)))
                     .into_any_element()
             }
-            7 => {
+            6 => {
                 let age = SystemTime::now()
                     .duration_since(row.last_seen)
                     .unwrap_or_default();
@@ -807,7 +796,7 @@ impl TableDelegate for FeesDelegate {
                     .child(SharedString::from(format_relative_age(age)))
                     .into_any_element()
             }
-            8 => {
+            7 => {
                 let now = SystemTime::now();
                 if let Ok(d) = row.fee_expiration.duration_since(now) {
                     div()
@@ -850,7 +839,6 @@ fn fee_columns(with_preferences: bool) -> Vec<Column> {
         Column::new("bonus", "bonus %")
             .width(px(78.0))
             .movable(false),
-        Column::new("sig", "sig").width(px(40.0)).movable(false),
         Column::new("reliability", "rel")
             .width(px(50.0))
             .movable(false),
@@ -1112,7 +1100,6 @@ mod tests {
             railgun_address: Arc::from(broadcaster),
             token_address: token,
             fee: uint!(0_U256),
-            signature_valid: true,
             fees_id: Arc::from("fid"),
             fee_expiration: SystemTime::now(),
             available_wallets: 1,

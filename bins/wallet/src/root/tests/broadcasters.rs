@@ -142,15 +142,12 @@ fn ethereum_weth_public_broadcaster_count_filters_available_broadcasters() {
     unavailable.available_wallets = 0;
     let mut expired = fee_row(1, weth, "expired");
     expired.fee_expiration = SystemTime::now() - Duration::from_secs(1);
-    let mut invalid_signature = fee_row(1, weth, "invalid-signature");
-    invalid_signature.signature_valid = false;
     let rows = vec![
         fee_row(1, weth, "available-weth"),
         fee_row(42161, weth, "wrong-chain"),
         fee_row(1, other_token, "wrong-token"),
         unavailable,
         expired,
-        invalid_signature,
     ];
 
     assert_eq!(ethereum_weth_public_broadcaster_count(&rows), 1);
