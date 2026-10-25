@@ -16,6 +16,7 @@ waku-relay = { workspace = true }
 
 [dev-dependencies]
 alloy = { workspace = true }
+broadcaster-core = { workspace = true }
 libp2p = { workspace = true }
 reqwest = { workspace = true }
 

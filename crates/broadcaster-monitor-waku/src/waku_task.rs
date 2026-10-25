@@ -266,6 +266,9 @@ async fn run_fees_loop(
     tracing::warn!("fees subscription channel closed");
 }
 
+const MAX_FEE_ANNOUNCEMENT_TOKENS: usize = 256;
+const MAX_FEE_ANNOUNCEMENT_POI_LIST_KEYS: usize = 16;
+
 /// Decode one fees `WakuMessage` payload and emit one row per token fee.
 /// Returns the number of rows produced (for testability).
 pub fn handle_fees_message(
@@ -307,6 +310,20 @@ fn handle_fees_message_at(
             return 0;
         }
     };
+
+    let token_count = body.fees.len();
+    let poi_list_key_count = body.required_poi_list_keys.len();
+    if token_count > MAX_FEE_ANNOUNCEMENT_TOKENS
+        || poi_list_key_count > MAX_FEE_ANNOUNCEMENT_POI_LIST_KEYS
+    {
+        tracing::warn!(
+            chain_id,
+            token_count,
+            poi_list_key_count,
+            "rejected fees payload over count limits"
+        );
+        return 0;
+    }
 
     let railgun_address: Arc<str> = Arc::from(body.railgun_address.as_ref());
     let fees_id: Arc<str> = Arc::from(body.fees_id.as_str());
@@ -468,8 +485,9 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use alloy::primitives::{U256, address};
+    use alloy::primitives::{Address, U256, address};
     use alloy::uint;
+    use broadcaster_core::crypto::railgun;
     use broadcaster_monitor::{event_channel, shared};
     use public_broadcaster_protocol::Body as FeeBody;
 
@@ -854,6 +872,112 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].fees_id.as_ref(), "cached-fees-id");
         assert_eq!(*rx.borrow(), 0);
+    }
+
+    fn signed_fees_payload(
+        token_count: u16,
+        poi_list_key_count: usize,
+        fees_id: &str,
+        fee_expiration: SystemTime,
+    ) -> Vec<u8> {
+        let seed = [7_u8; 32];
+        let fee_expiration = fee_expiration
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("expiration after epoch")
+            .as_millis();
+        let body = FeeBody {
+            fees: (1..=token_count)
+                .map(|i| (Address::left_padding_from(&i.to_be_bytes()), U256::from(i)))
+                .collect(),
+            fee_expiration: u64::try_from(fee_expiration).expect("expiration fits u64"),
+            fees_id: fees_id.to_string(),
+            railgun_address: railgun::Address::try_from_parts(
+                U256::from(1),
+                railgun::derive_viewing_public_key(&seed),
+                None,
+            )
+            .expect("test Railgun address"),
+            available_wallets: 1,
+            version: "8.2.3".to_string(),
+            relay_adapt: address!("0000000000000000000000000000000000000002"),
+            relay_adapt_7702: None,
+            required_poi_list_keys: (0..poi_list_key_count)
+                .map(|i| format!("poi-list-{i}"))
+                .collect(),
+            reliability: 1.0,
+            identifier: None,
+        };
+        let payload = body.into_signed_payload(seed).expect("signed fees payload");
+        serde_json::to_vec(&payload).expect("serialize fees payload")
+    }
+
+    #[test]
+    fn handle_fees_message_accepts_announcement_at_count_limits() {
+        let wall = SystemTime::now();
+        let payload = signed_fees_payload(256, 16, "at-limit", wall + Duration::from_mins(5));
+        let shared = shared();
+        let (tx, rx) = event_channel(16);
+
+        let produced = handle_fees_message_at(1, &payload, &shared, &tx, wall, Instant::now());
+
+        assert_eq!(produced, 256);
+        assert_eq!(shared.read().fee_rows().len(), 256);
+        assert_eq!(*rx.borrow(), 1);
+    }
+
+    #[test]
+    fn handle_fees_message_rejects_announcement_over_count_limits() {
+        let wall = SystemTime::now();
+        for (token_count, poi_list_key_count) in [(257, 16), (256, 17)] {
+            let payload = signed_fees_payload(
+                token_count,
+                poi_list_key_count,
+                "over-limit",
+                wall + Duration::from_mins(5),
+            );
+            let shared = shared();
+            let (tx, rx) = event_channel(16);
+
+            let produced = handle_fees_message_at(1, &payload, &shared, &tx, wall, Instant::now());
+
+            assert_eq!(produced, 0);
+            assert!(shared.read().fee_rows().is_empty());
+            assert_eq!(shared.read().rev(), 0);
+            assert_eq!(*rx.borrow(), 0);
+        }
+    }
+
+    #[test]
+    fn handle_fees_message_over_count_limits_keeps_tracked_publisher_rows() {
+        let wall = SystemTime::now();
+        let monotonic = Instant::now();
+        let shared = shared();
+        let (tx, rx) = event_channel(16);
+        let tracked = signed_fees_payload(1, 1, "tracked", wall + Duration::from_mins(5));
+        assert_eq!(
+            handle_fees_message_at(1, &tracked, &shared, &tx, wall, monotonic),
+            1
+        );
+
+        // Past the tracked generation's expiry, admission alone would apply the replacement.
+        let later_wall = wall + Duration::from_mins(6);
+        let over_limit =
+            signed_fees_payload(257, 1, "over-limit", later_wall + Duration::from_mins(5));
+        let produced = handle_fees_message_at(
+            1,
+            &over_limit,
+            &shared,
+            &tx,
+            later_wall,
+            monotonic + Duration::from_mins(6),
+        );
+
+        assert_eq!(produced, 0);
+        let rows = shared.read().fee_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].fees_id.as_ref(), "tracked");
+        assert!(rows[0].signature_valid);
+        assert_eq!(*rx.borrow(), 1);
     }
 
     #[test]
