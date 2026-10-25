@@ -149,16 +149,16 @@ impl WalletRoot {
         let active_wallet_generation = self.active_wallet_generation;
         self.walletconnect.request_actions.insert(key.clone());
         self.walletconnect.error = None;
-        let http = self.http.clone();
         let control = request.request_control.clone();
+        let operation = request.operation.clone();
         let begin = self.runtime.spawn(async move {
             sender.begin_approval().await.map_err(|_| {
                 Arc::<str>::from("Approval could not start. Review and confirm again.")
             })?;
             if let Some((chain_id, definition, _)) = &mut addition {
-                let verified = if let Some(control) = control {
+                let verified = if let (Some(control), Some(operation)) = (control, operation) {
                     wallet_ops::gateway::policy::verify_proposed_chain(
-                        &http, &control, *chain_id, definition,
+                        &operation, &control, *chain_id, definition,
                     )
                     .await
                 } else {

@@ -428,12 +428,14 @@ impl RpcRead {
             RpcOperation::EthCall { request, block, .. } if request.other.is_empty() => {
                 ReadIdentity::EthCall {
                     chain_id: route.chain_id(),
+                    isolation: route.chain_route().isolation_id(),
                     block: *block,
                     request: Arc::clone(request),
                 }
             }
             RpcOperation::GetBalance { account, block } => ReadIdentity::GetBalance {
                 chain_id: route.chain_id(),
+                isolation: route.chain_route().isolation_id(),
                 block: *block,
                 account: *account,
             },
@@ -606,13 +608,16 @@ pub(super) enum ReadIdentity {
     Individual {
         chain_id: u64,
     },
+    // `isolation` scopes cached results to their isolated route; `None` is the shared route.
     EthCall {
         chain_id: u64,
+        isolation: Option<u64>,
         block: BlockId,
         request: Arc<WithOtherFields<TransactionRequest>>,
     },
     GetBalance {
         chain_id: u64,
+        isolation: Option<u64>,
         block: BlockId,
         account: Address,
     },
@@ -627,22 +632,26 @@ impl Hash for ReadIdentity {
             }
             Self::EthCall {
                 chain_id,
+                isolation,
                 block,
                 request,
             } => {
                 0_u8.hash(state);
                 chain_id.hash(state);
+                isolation.hash(state);
                 BlockKey(*block).hash(state);
                 // Extra-bearing calls receive Individual identities and cannot be reused.
                 request.inner.hash(state);
             }
             Self::GetBalance {
                 chain_id,
+                isolation,
                 block,
                 account,
             } => {
                 1_u8.hash(state);
                 chain_id.hash(state);
+                isolation.hash(state);
                 BlockKey(*block).hash(state);
                 account.hash(state);
             }
@@ -1001,7 +1010,7 @@ impl RpcChainRoute {
         }
     }
     /// Returns a clone whose reads go over `client` and are kept apart from every other route,
-    /// including the result cache. Endpoint verification stays shared with this route.
+    /// with cached results that serve only this route. Endpoint verification stays shared.
     #[must_use]
     pub(crate) fn isolated(&self, client: OperationHttpClient) -> Self {
         let mut route = self.clone();
@@ -1010,9 +1019,6 @@ impl RpcChainRoute {
             client,
         }));
         route
-    }
-    pub(super) const fn is_isolated(&self) -> bool {
-        self.isolation.is_some()
     }
     /// The client for this route's reads sent to `endpoint`. On an isolated route, wallet
     /// endpoints use the isolated client and direct endpoints the shared direct client. Identity
@@ -1027,7 +1033,7 @@ impl RpcChainRoute {
             (transport, _) => clients.get(transport),
         }
     }
-    fn isolation_id(&self) -> Option<u64> {
+    pub(super) fn isolation_id(&self) -> Option<u64> {
         self.isolation.as_ref().map(|isolation| isolation.id)
     }
     #[cfg(test)]
@@ -1163,7 +1169,7 @@ impl ClassRoute {
         self.route.multicall
     }
     /// Returns a clone whose reads go over `client` and are kept apart from every other route,
-    /// including the result cache. Endpoint verification stays shared with this route.
+    /// with cached results that serve only this route. Endpoint verification stays shared.
     #[must_use]
     pub fn isolated(&self, client: OperationHttpClient) -> Self {
         Self {

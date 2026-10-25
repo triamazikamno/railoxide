@@ -637,6 +637,8 @@ pub struct HttpContext {
     arti_state_dir: Option<PathBuf>,
     arti_cache_dir: Option<PathBuf>,
     socks_bridge: Option<Arc<ArtiSocksBridge>>,
+    /// Live operation bridges, moved onto each new Tor session.
+    operation_bridges: Arc<Mutex<Vec<Weak<ArtiSocksBridge>>>>,
     fail_closed: bool,
     /// Opens operation clients in place of [`Self::operation_http_client`]'s own.
     #[cfg(any(test, feature = "test-support"))]
@@ -824,9 +826,24 @@ impl HttpContext {
             .socks_bridge
             .as_ref()
             .ok_or_else(|| eyre!("new Tor session requires the internal SOCKS bridge"))?;
+        // Held across both steps so a concurrently opened operation bridge joins this session.
+        let mut operation_bridges = self.lock_operation_bridges()?;
         let generation = socks_bridge.new_isolated_session()?;
+        operation_bridges.retain(|bridge| bridge.strong_count() > 0);
+        for bridge in operation_bridges.iter().filter_map(Weak::upgrade) {
+            bridge.join_session(generation)?;
+        }
+        drop(operation_bridges);
         self.gateway_pool.reset();
         Ok(generation)
+    }
+
+    fn lock_operation_bridges(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Vec<Weak<ArtiSocksBridge>>>> {
+        self.operation_bridges
+            .lock()
+            .map_err(|_| eyre!("operation Tor bridge list lock is poisoned"))
     }
 
     /// Build an HTTP client for the traffic of one wallet operation, such as one swap.
@@ -838,7 +855,8 @@ impl HttpContext {
     /// none of it shares circuits with this operation. The clients use the same proxy-only
     /// builder as the shared clients, so a failed bridge fails the request rather than
     /// bypassing Tor. Each client's connector holds the bridge, which stops when the last clone
-    /// of either client is dropped.
+    /// of either client is dropped. [`Self::start_new_tor_session`] moves every live bridge onto
+    /// a fresh isolated client.
     ///
     /// Proxy and direct modes can't isolate one operation's traffic. They return the shared
     /// clients and report isolation as unavailable so that callers can disclose it.
@@ -858,10 +876,23 @@ impl HttpContext {
                     .arti_client()
                     .ok_or_else(|| eyre!("Tor client is unavailable"))?;
                 let bridge = Arc::new(
-                    ArtiSocksBridge::start(arti_client.isolated_client())
-                        .await
-                        .wrap_err("start operation Arti SOCKS bridge")?,
+                    ArtiSocksBridge::start(
+                        arti_client.isolated_client(),
+                        self.tor_session_generation(),
+                    )
+                    .await
+                    .wrap_err("start operation Arti SOCKS bridge")?,
                 );
+                {
+                    let mut operation_bridges = self.lock_operation_bridges()?;
+                    // A session started while the bridge opened moves it on at once.
+                    let generation = self.tor_session_generation();
+                    if bridge.session_generation() != generation {
+                        bridge.join_session(generation)?;
+                    }
+                    operation_bridges.retain(|bridge| bridge.strong_count() > 0);
+                    operation_bridges.push(Arc::downgrade(&bridge));
+                }
                 let proxy_url = Url::parse(&format!("socks5h://{}", bridge.local_addr()))
                     .wrap_err("build operation Arti SOCKS proxy URL")?;
                 let builder = || -> Result<reqwest::ClientBuilder> {
@@ -886,7 +917,7 @@ impl HttpContext {
                         .wrap_err("build operation RPC HTTP client")?,
                     isolation: OperationNetworkIsolation::Dedicated,
                     #[cfg(test)]
-                    bridge_addr: Some(bridge.local_addr()),
+                    bridge: Some(Arc::downgrade(&bridge)),
                 })
             }
             WalletNetworkMode::Proxy | WalletNetworkMode::Direct => Ok(OperationHttpClient {
@@ -894,7 +925,7 @@ impl HttpContext {
                 rpc_client: self.rpc_client.clone(),
                 isolation: OperationNetworkIsolation::Unavailable(self.mode),
                 #[cfg(test)]
-                bridge_addr: None,
+                bridge: None,
             }),
         }
     }
@@ -953,6 +984,7 @@ impl HttpContext {
             arti_state_dir: None,
             arti_cache_dir: None,
             socks_bridge: None,
+            operation_bridges: Arc::default(),
             fail_closed: false,
             operation_clients_for_tests: None,
         }
@@ -1002,6 +1034,7 @@ impl HttpContext {
             arti_state_dir: None,
             arti_cache_dir: None,
             socks_bridge: None,
+            operation_bridges: Arc::default(),
             fail_closed: mode != WalletNetworkMode::Direct,
             operation_clients_for_tests: None,
         }
@@ -1039,7 +1072,7 @@ pub struct OperationHttpClient {
     rpc_client: reqwest::Client,
     isolation: OperationNetworkIsolation,
     #[cfg(test)]
-    bridge_addr: Option<SocketAddr>,
+    bridge: Option<Weak<ArtiSocksBridge>>,
 }
 
 impl OperationHttpClient {
@@ -1057,8 +1090,8 @@ impl OperationHttpClient {
     }
 
     #[cfg(test)]
-    pub(crate) const fn bridge_addr(&self) -> Option<SocketAddr> {
-        self.bridge_addr
+    fn bridge(&self) -> Option<Arc<ArtiSocksBridge>> {
+        self.bridge.as_ref().and_then(Weak::upgrade)
     }
 
     /// Uses `client` for both general HTTP and JSON-RPC.
@@ -1070,7 +1103,7 @@ impl OperationHttpClient {
             client,
             isolation,
             #[cfg(test)]
-            bridge_addr: None,
+            bridge: None,
         }
     }
 
@@ -1323,7 +1356,7 @@ async fn build_tor_context(
         ),
     );
     let socks_bridge = Arc::new(
-        ArtiSocksBridge::start(arti_client.clone())
+        ArtiSocksBridge::start(arti_client.clone(), 1)
             .await
             .wrap_err("start internal Arti SOCKS bridge")?,
     );
@@ -1501,6 +1534,7 @@ fn build_reqwest_context(
         arti_state_dir,
         arti_cache_dir,
         socks_bridge,
+        operation_bridges: Arc::default(),
         fail_closed: mode != WalletNetworkMode::Direct,
         #[cfg(any(test, feature = "test-support"))]
         operation_clients_for_tests: None,
@@ -1556,6 +1590,16 @@ struct TorBridgeSession {
     activity: Arc<TorBridgeActivity>,
 }
 
+impl TorBridgeSession {
+    fn isolate(&mut self, generation: u64) {
+        *self = Self {
+            client: self.client.isolated_client(),
+            generation,
+            activity: TorBridgeActivity::new(generation),
+        };
+    }
+}
+
 #[derive(Clone)]
 struct CapturedTorBridgeSession {
     client: WalletTorClient,
@@ -1564,7 +1608,7 @@ struct CapturedTorBridgeSession {
 }
 
 impl ArtiSocksBridge {
-    async fn start(arti_client: WalletTorClient) -> Result<Self> {
+    async fn start(arti_client: WalletTorClient, generation: u64) -> Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .wrap_err("bind internal Arti SOCKS bridge")?;
@@ -1574,8 +1618,8 @@ impl ArtiSocksBridge {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let session = Arc::new(RwLock::new(TorBridgeSession {
             client: arti_client,
-            generation: 1,
-            activity: TorBridgeActivity::new(1),
+            generation,
+            activity: TorBridgeActivity::new(generation),
         }));
         let task = tokio::spawn(run_arti_socks_bridge(
             listener,
@@ -1612,18 +1656,22 @@ impl ArtiSocksBridge {
     }
 
     fn new_isolated_session(&self) -> Result<u64> {
-        let mut session = self
-            .session
-            .write()
-            .map_err(|_| eyre!("active Tor session client lock is poisoned"))?;
+        let mut session = self.write_session()?;
         let generation = session.generation.saturating_add(1);
-        let isolated_client = session.client.isolated_client();
-        *session = TorBridgeSession {
-            client: isolated_client,
-            generation,
-            activity: TorBridgeActivity::new(generation),
-        };
+        session.isolate(generation);
         Ok(generation)
+    }
+
+    /// Moves this bridge onto a fresh isolated client numbered `generation`.
+    fn join_session(&self, generation: u64) -> Result<()> {
+        self.write_session()?.isolate(generation);
+        Ok(())
+    }
+
+    fn write_session(&self) -> Result<std::sync::RwLockWriteGuard<'_, TorBridgeSession>> {
+        self.session
+            .write()
+            .map_err(|_| eyre!("active Tor session client lock is poisoned"))
     }
 
     fn session_generation(&self) -> u64 {
@@ -2609,7 +2657,7 @@ mod tests {
                 .await
                 .expect("create unbootstrapped Arti client");
             let shared_bridge = Arc::new(
-                ArtiSocksBridge::start(arti_client.clone())
+                ArtiSocksBridge::start(arti_client.clone(), 1)
                     .await
                     .expect("start shared Arti SOCKS bridge"),
             );
@@ -2638,14 +2686,41 @@ mod tests {
 
             assert_eq!(first.isolation(), OperationNetworkIsolation::Dedicated);
             assert_eq!(second.isolation(), OperationNetworkIsolation::Dedicated);
-            let first_addr = first.bridge_addr().expect("first operation bridge");
-            let second_addr = second.bridge_addr().expect("second operation bridge");
+            let first_addr = first.bridge().expect("first operation bridge").local_addr();
+            let second_addr = second
+                .bridge()
+                .expect("second operation bridge")
+                .local_addr();
             assert!(first_addr.ip().is_loopback());
             assert_ne!(first_addr, shared_addr);
             assert_ne!(second_addr, shared_addr);
             assert_ne!(first_addr, second_addr);
             // Operation isolation leaves the shared sync, RPC, and broadcaster session alone.
             assert_eq!(context.tor_session_generation(), 1);
+
+            // A new session moves both open operations onto fresh clients of their own.
+            let session = |client: &OperationHttpClient| {
+                ArtiSocksBridge::capture_session(&client.bridge().expect("bridge").session)
+                    .expect("capture operation session")
+            };
+            let before = [session(&first).client, session(&second).client];
+            assert_eq!(context.start_new_tor_session().expect("new session"), 2);
+            let [first_session, second_session] = [session(&first), session(&second)];
+            assert_eq!(first_session.generation, 2);
+            assert_eq!(second_session.generation, 2);
+            let shared_client = context.arti_client().expect("shared client");
+            let clients = [
+                &before[0],
+                &before[1],
+                &first_session.client,
+                &second_session.client,
+            ];
+            for (index, client) in clients.iter().enumerate() {
+                assert!(!Arc::ptr_eq(client, &shared_client));
+                for other in &clients[index + 1..] {
+                    assert!(!Arc::ptr_eq(client, other));
+                }
+            }
 
             // A raw client clone keeps the bridge running after its operation client drops.
             let rpc_client = first.rpc_client().clone();
@@ -2893,7 +2968,7 @@ mod tests {
                 .create_unbootstrapped_async()
                 .await
                 .expect("create unbootstrapped Arti client");
-            let bridge = ArtiSocksBridge::start(arti_client)
+            let bridge = ArtiSocksBridge::start(arti_client, 1)
                 .await
                 .expect("start loopback Arti SOCKS bridge");
             assert!(bridge.local_addr().ip().is_loopback());

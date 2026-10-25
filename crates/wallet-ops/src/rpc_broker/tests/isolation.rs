@@ -90,10 +90,11 @@ async fn isolated_routes_aggregate_apart_over_their_own_clients() {
 }
 
 #[tokio::test]
-async fn isolated_and_shared_reads_share_neither_requests_nor_cached_results() {
+async fn each_route_caches_only_its_own_reads_and_shares_no_requests() {
     let (endpoint, recorded, server) = spawn_recording_rpc_mock(echo_responder()).await;
     let shared = RpcRoute::new(RpcChainRoute::new(1, vec![endpoint]));
     let isolated = RpcRoute::new(shared.chain_route().isolated(tagged_client("isolated")));
+    let other = RpcRoute::new(shared.chain_route().isolated(tagged_client("other")));
     let broker = test_broker(Duration::from_millis(20), 4);
     let submit = |route: &RpcRoute, block| {
         broker.submit(RpcSubmission::new(
@@ -110,23 +111,26 @@ async fn isolated_and_shared_reads_share_neither_requests_nor_cached_results() {
             .map(|(tag, _)| tag.clone())
             .collect::<Vec<_>>()
     };
-    let isolated_tag = Some("isolated".to_owned());
+    let routes = [&shared, &isolated, &other];
+    let route_tags = [None, Some("isolated".to_owned()), Some("other".to_owned())];
 
     // Submitted in one window, the identical reads are not deduplicated.
-    let (isolated_results, shared_results) = tokio::join!(submit(&isolated, 1), submit(&shared, 1));
-    assert!(isolated_results.unwrap()[0].is_ok());
-    assert!(shared_results.unwrap()[0].is_ok());
+    for results in futures_util::future::join_all(routes.map(|route| submit(route, 1))).await {
+        assert!(results.unwrap()[0].is_ok());
+    }
     let mut together = tags();
     together.sort();
-    assert_eq!(together, vec![None, isolated_tag.clone()]);
-    // The shared result cached at block 1 is not served to the isolated route.
-    assert!(submit(&isolated, 1).await.unwrap()[0].is_ok());
-    // The isolated result at block 2 is not cached for the shared route.
-    assert!(submit(&isolated, 2).await.unwrap()[0].is_ok());
-    assert!(submit(&shared, 2).await.unwrap()[0].is_ok());
-    // The shared route's own result is cached.
-    assert!(submit(&shared, 2).await.unwrap()[0].is_ok());
-    assert_eq!(tags()[2..], [isolated_tag.clone(), isolated_tag, None]);
+    assert_eq!(together, route_tags);
+    // Each route's repeated read at block 1 is served from its own cached result.
+    for route in routes {
+        assert!(submit(route, 1).await.unwrap()[0].is_ok());
+    }
+    assert_eq!(tags().len(), 3);
+    // At block 2, no route is served from a result cached by the routes before it.
+    for route in routes {
+        assert!(submit(route, 2).await.unwrap()[0].is_ok());
+    }
+    assert_eq!(tags()[3..], route_tags);
     drop(broker);
     server.abort();
 }

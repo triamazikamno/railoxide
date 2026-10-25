@@ -80,8 +80,9 @@ pub(super) fn proposed_chain(
 /// Called only after the bounded native approval enters its executing state.
 /// Each endpoint must agree; a failed endpoint never leaves a partial definition.
 /// Returns the common Multicall address only when its optional probe succeeds.
+/// Probes go over the approval request's own client, which needs no account grant.
 pub async fn verify_proposed_chain(
-    http: &crate::HttpContext,
+    operation: &crate::OperationHttpClientSlot,
     control: &crate::dapp_request::DappRequestControl,
     chain_id: u64,
     definition: &crate::settings::CustomChainSettings,
@@ -99,11 +100,11 @@ pub async fn verify_proposed_chain(
             Ok(SensitiveUrl::from(url))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    verify_chain_endpoints(http, control, chain_id, endpoints).await
+    verify_chain_endpoints(operation, control, chain_id, endpoints).await
 }
 
 async fn verify_chain_endpoints(
-    http: &crate::HttpContext,
+    operation: &crate::OperationHttpClientSlot,
     control: &crate::dapp_request::DappRequestControl,
     chain_id: u64,
     endpoints: Vec<SensitiveUrl>,
@@ -111,7 +112,14 @@ async fn verify_chain_endpoints(
     if endpoints.is_empty() {
         return Err(RpcBrokerError::NoEndpoint { chain_id });
     }
-    let clients = http.rpc_clients();
+    let client = tokio::select! {
+        biased;
+        () = control.cancelled() => return Err(RpcBrokerError::OriginRejected),
+        client = operation.client() => client.map_err(|_| RpcBrokerError::Transport)?,
+    };
+    let rpc = client.rpc_client();
+    // Proposed endpoints all use the wallet transport.
+    let clients = crate::rpc_broker::RpcClients::new(rpc.clone(), rpc.clone());
     for endpoint in &endpoints {
         control.ensure_current()?;
         let route = crate::RpcChainRoute::new(chain_id, vec![endpoint.clone()])
@@ -123,11 +131,11 @@ async fn verify_chain_endpoints(
         }
         control.ensure_current()?;
     }
-    probe_common_multicall(http, control, chain_id, &endpoints).await
+    probe_common_multicall(rpc, control, chain_id, &endpoints).await
 }
 
 async fn probe_common_multicall(
-    http: &crate::HttpContext,
+    rpc: &reqwest::Client,
     control: &crate::dapp_request::DappRequestControl,
     chain_id: u64,
     endpoints: &[SensitiveUrl],
@@ -138,8 +146,8 @@ async fn probe_common_multicall(
     let probe = async {
         for endpoint in endpoints {
             control.ensure_current()?;
-            let provider = ProviderBuilder::new()
-                .connect_reqwest(http.rpc_client.clone(), endpoint.expose_url().clone());
+            let provider =
+                ProviderBuilder::new().connect_reqwest(rpc.clone(), endpoint.expose_url().clone());
             let result = provider
                 .multicall()
                 .get_chain_id()
@@ -212,6 +220,18 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    /// An approval request's slot holding `rpc`, over a shared context whose client is tagged
+    /// `shared`.
+    fn request_slot(rpc: reqwest::Client) -> crate::OperationHttpClientSlot {
+        crate::OperationHttpClientSlot::for_tests(
+            crate::HttpContext::with_rpc_client_for_tests(
+                crate::rpc_broker::tests::tagged_reqwest_client("shared"),
+                crate::WalletNetworkMode::Direct,
+            ),
+            crate::OperationHttpClient::for_tests(rpc, crate::OperationNetworkIsolation::Dedicated),
+        )
+    }
+
     #[test]
     fn dapp_chain_metadata_cannot_install_native_pricing() {
         let metadata = serde_json::json!([{
@@ -238,9 +258,9 @@ mod tests {
             || Ok(()),
         );
         let active = control.clone();
-        let http = crate::HttpContext::direct_for_tests();
+        let operation = request_slot(reqwest::Client::new());
         let verification = tokio::spawn(async move {
-            verify_chain_endpoints(&http, &active, 123, vec![endpoint.into()]).await
+            verify_chain_endpoints(&operation, &active, 123, vec![endpoint.into()]).await
         });
         let connection = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
             .await
@@ -276,7 +296,7 @@ mod tests {
                     serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result": if mode == "mismatch" && index == 1 {"0x1"} else {"0x20000000000001"}})
                 }), Arc::default(), Arc::default(),
             ).await;
-            let mut http = crate::HttpContext::direct_for_tests();
+            let mut rpc = reqwest::Client::new();
             if mode == "expired" {
                 control.invalidate(&RpcBrokerError::Timeout);
             }
@@ -285,13 +305,13 @@ mod tests {
                 let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = unavailable.local_addr().unwrap();
                 drop(unavailable);
-                http.rpc_client = reqwest::Client::builder()
+                rpc = reqwest::Client::builder()
                     .proxy(reqwest::Proxy::all(format!("http://{address}")).unwrap())
                     .build()
                     .unwrap();
             }
             let result = verify_chain_endpoints(
-                &http,
+                &request_slot(rpc),
                 &control,
                 9_007_199_254_740_993,
                 vec![endpoint.clone().into(), endpoint.into()],
@@ -329,7 +349,7 @@ mod tests {
             let probes = Arc::new(AtomicUsize::new(0));
             let seen = probes.clone();
             let active = control.clone();
-            let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
+            let (endpoint, requests, server) = crate::rpc_broker::tests::spawn_recording_rpc_mock(
                 Arc::new(move |request| {
                     if request["method"] == "eth_chainId" {
                         assert_eq!(seen.load(Ordering::SeqCst), 0);
@@ -365,11 +385,9 @@ mod tests {
                     };
                     serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":result})
                 }),
-                Arc::default(),
-                Arc::default(),
             ).await;
             let result = verify_chain_endpoints(
-                &crate::HttpContext::direct_for_tests(),
+                &request_slot(crate::rpc_broker::tests::tagged_reqwest_client("request")),
                 &control,
                 CHAIN_ID,
                 vec![endpoint.clone().into(), endpoint.into()],
@@ -385,6 +403,15 @@ mod tests {
                 "{mode}"
             );
             assert_eq!(probes.load(Ordering::SeqCst), 2);
+            // Identity checks and probes need no account grant and use only the request's client.
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(route, _)| route.as_deref() == Some("request")),
+                "{mode}"
+            );
             server.abort();
         }
     }
@@ -402,13 +429,8 @@ mod tests {
             );
             let active = control.clone();
             let probe = tokio::spawn(async move {
-                probe_common_multicall(
-                    &crate::HttpContext::direct_for_tests(),
-                    &active,
-                    8453,
-                    &[endpoint.into()],
-                )
-                .await
+                probe_common_multicall(&reqwest::Client::new(), &active, 8453, &[endpoint.into()])
+                    .await
             });
             let connection =
                 tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())

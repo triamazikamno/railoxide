@@ -497,9 +497,7 @@ impl Actor {
             Some(BlockId::Hash(hash)) if hash.require_canonical != Some(true) => Some(0),
             _ => None,
         };
-        // Isolated reads neither use nor fill the cache, which is shared by every route.
         if read.is_cacheable()
-            && !key.route.is_isolated()
             && expected_epoch.is_some()
             && let Some(cached) = self.cache.lookup(&key.identity, expected_epoch)
         {
@@ -845,7 +843,7 @@ impl Actor {
             }
             if let Some(active) = self.active.remove(&key) {
                 let read = active.read;
-                if read.is_cacheable() && result.is_ok() && !key.route.is_isolated() {
+                if read.is_cacheable() && result.is_ok() {
                     let chain_id = key.identity.chain_id();
                     let observed = match read.reuse_block_id() {
                         Some(BlockId::Number(BlockNumberOrTag::Latest)) => self

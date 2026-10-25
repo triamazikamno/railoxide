@@ -3,7 +3,9 @@ use super::admission::{ReadAdmission, ReadAdmissionDecision, ReadAdmissionUpdate
 use super::balance_reads::{LocalBalanceAnswer, permits_balance_shortcut};
 use super::errors::{LocalProviderFailure, ProviderAvailability, ProviderRpcError};
 use super::{GatewayError, GatewayProviderOutcome, GatewayServerMessage, PeerId};
-use crate::{HttpContext, RpcBrokerError, RpcChainRoute, RpcRead, WalletRpcOrigin};
+use crate::{
+    HttpContext, OperationHttpClientSlot, RpcBrokerError, RpcChainRoute, RpcRead, WalletRpcOrigin,
+};
 use crate::{
     RpcOrigin,
     vault::{
@@ -262,6 +264,51 @@ struct ReadOwner {
     /// Selected-chain snapshot for an accountless `eth_chainId` query.
     unconnected_chain: Option<u64>,
 }
+/// One origin's own client and read route, for the context and grant it was opened for.
+#[derive(Clone)]
+struct OriginRoute {
+    http: HttpContext,
+    grant: (String, u64),
+    slot: OperationHttpClientSlot,
+    /// The isolated route and the wallet route it was built from. Every read of the origin
+    /// reuses it, since each `isolated` call starts a new isolation id.
+    route: Arc<std::sync::Mutex<Option<(RpcChainRoute, RpcChainRoute)>>>,
+}
+impl OriginRoute {
+    fn new(http: HttpContext, permission: &GatewayPermission) -> Self {
+        Self {
+            slot: OperationHttpClientSlot::new(http.clone()),
+            http,
+            grant: (permission.public_account_uuid.clone(), permission.chain_id),
+            route: Arc::default(),
+        }
+    }
+    fn serves(&self, http: Option<&HttpContext>, permission: &GatewayPermission) -> bool {
+        same_http(Some(&self.http), http)
+            && self.grant.0 == permission.public_account_uuid
+            && self.grant.1 == permission.chain_id
+    }
+    /// Opens the client on first use, and rebuilds the route from it after a chain edit.
+    async fn route(&self, base: &RpcChainRoute) -> Result<RpcChainRoute, RpcBrokerError> {
+        let client = self
+            .slot
+            .client()
+            .await
+            .map_err(|_| RpcBrokerError::Transport)?;
+        let mut route = self
+            .route
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((built, isolated)) = &*route
+            && built == base
+        {
+            return Ok(isolated.clone());
+        }
+        let isolated = base.isolated(client);
+        *route = Some((base.clone(), isolated.clone()));
+        Ok(isolated)
+    }
+}
 enum ReadWork {
     Accounts,
     Chain,
@@ -358,6 +405,7 @@ pub(super) struct DappProvider {
     gateway_lifetime: Option<watch::Receiver<super::GatewaySnapshot>>,
     admission: ReadAdmission,
     reads: HashMap<u64, PendingRead>,
+    origin_routes: HashMap<RpcOrigin, OriginRoute>,
     pub(super) jobs: JoinSet<ReadCompletion>,
     outbox: Vec<(u64, Delivery)>,
     next_document: u64,
@@ -385,6 +433,7 @@ impl DappProvider {
             gateway_lifetime: None,
             admission: ReadAdmission::new(),
             reads: HashMap::new(),
+            origin_routes: HashMap::new(),
             jobs: JoinSet::new(),
             outbox: Vec::new(),
             next_document: 0,
@@ -405,6 +454,7 @@ impl DappProvider {
         self.ui_peers.retain(|session, _| live(*session));
         self.ui_errors.retain(|session, _| live(*session));
         self.documents.retain(|(session, _), _| live(*session));
+        self.retain_origin_routes();
         self.pending.retain(|pending| live(pending.session));
         self.outbox.retain(|(session, _)| live(*session));
         self.refresh_approvals(Instant::now());
@@ -527,6 +577,22 @@ impl DappProvider {
             .as_ref()
             .and_then(|view| self.store.list_gateway_permissions(view).ok())
             .unwrap_or_default();
+        self.retain_origin_routes();
+    }
+    /// Drops each origin route whose origin has no document left, or whose context or grant
+    /// changed. The origin's next read opens a new one.
+    fn retain_origin_routes(&mut self) {
+        let (documents, permissions) = (&self.documents, &self.permissions);
+        let http = self.wallet.http.as_ref();
+        self.origin_routes.retain(|origin, route| {
+            documents
+                .values()
+                .any(|document| &document.origin == origin)
+                && permissions
+                    .iter()
+                    .find(|permission| &permission.origin == origin)
+                    .is_some_and(|permission| route.serves(http, permission))
+        });
     }
     fn resolve(
         &self,
@@ -667,6 +733,7 @@ impl DappProvider {
     }
     pub(super) fn unregister(&mut self, session: u64, document: &str) {
         self.documents.remove(&(session, document.to_owned()));
+        self.retain_origin_routes();
         self.pending
             .retain(|pending| pending.session != session || pending.document != document);
         self.outbox.retain(|(owner, message)| *owner != session || !matches!(&message.message, GatewayServerMessage::ProviderResponse { document: target, .. } | GatewayServerMessage::ProviderState { document: target, .. } if target == document));
@@ -1043,13 +1110,27 @@ impl DappProvider {
                     .permission
                     .as_ref()
                     .expect("authorized remote read");
-                let route = match &read.response {
-                    ReadResponse::Provider => {
-                        read.owner.wallet.routes[&permission.chain_id].clone()
-                    }
-                    ReadResponse::Native { route, .. } => route.clone(),
-                };
                 let http = read.owner.wallet.http.clone().expect("available context");
+                let (route, origin_route) = match &read.response {
+                    ReadResponse::Provider => {
+                        let current = self
+                            .origin_routes
+                            .get(&read.owner.origin)
+                            .filter(|route| route.serves(Some(&http), permission))
+                            .cloned();
+                        let origin_route = current.unwrap_or_else(|| {
+                            let route = OriginRoute::new(http.clone(), permission);
+                            self.origin_routes
+                                .insert(read.owner.origin.clone(), route.clone());
+                            route
+                        });
+                        (
+                            read.owner.wallet.routes[&permission.chain_id].clone(),
+                            Some(origin_route),
+                        )
+                    }
+                    ReadResponse::Native { route, .. } => (route.clone(), None),
+                };
                 let origin = match &read.response {
                     ReadResponse::Provider => read.owner.origin.clone(),
                     ReadResponse::Native { .. } => WalletRpcOrigin::PublicWallet.into(),
@@ -1070,9 +1151,14 @@ impl DappProvider {
                     });
                 read.phase = ReadPhase::Running;
                 self.jobs.spawn(async move {
-                    let outcome = std::panic::AssertUnwindSafe(super::reads::submit_read(
-                        http, route, origin, rpc, lookup, deadline,
-                    ))
+                    let outcome = std::panic::AssertUnwindSafe(async move {
+                        // Dapp reads never fall back to the shared route.
+                        let route = match origin_route {
+                            Some(origin_route) => origin_route.route(&route).await?,
+                            None => route,
+                        };
+                        super::reads::submit_read(http, route, origin, rpc, lookup, deadline).await
+                    })
                     .catch_unwind()
                     .await
                     .unwrap_or(Err(super::reads::ReadError::Broker(
