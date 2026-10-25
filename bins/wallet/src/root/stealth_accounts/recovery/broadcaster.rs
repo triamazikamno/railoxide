@@ -242,6 +242,10 @@ impl StealthAccountsView {
         let Some(asset) = self.recovery.asset else {
             return;
         };
+        // A form that closed takes no further step.
+        let Some(route) = self.recovery.client.clone() else {
+            return;
+        };
         let Some(root) = self.root.upgrade() else {
             return;
         };
@@ -287,8 +291,9 @@ impl StealthAccountsView {
             let result = runtime
                 .spawn(async move {
                     if let Some(candidate) = candidate {
+                        let client = route.client().await?;
                         owner
-                            .estimate_recovery_fee(operation, asset, &session, candidate)
+                            .estimate_recovery_fee(operation, asset, &session, candidate, &client)
                             .await
                             .map(|estimate| RecoveryEstimate::Broadcaster(Box::new(estimate)))
                     } else {

@@ -407,15 +407,20 @@ struct NetworkFunding {
 pub(super) async fn estimate_network_funding(
     session: &WalletSession,
     candidates: Vec<PublicBroadcasterCandidate>,
+    http: &wallet_ops::HttpContext,
 ) -> NetworkAvailability {
     let Some(owner) = session.executor_owner() else {
+        return NetworkAvailability::Unavailable(NetworkUnavailable::SetupFee);
+    };
+    // One client of its own for the check's offers.
+    let Ok(client) = http.operation_http_client().await else {
         return NetworkAvailability::Unavailable(NetworkUnavailable::SetupFee);
     };
     let mut failed = false;
     for candidate in candidates {
         match tokio::time::timeout(
             Duration::from_secs(15),
-            owner.can_fund_swap_setup(session, candidate),
+            owner.can_fund_swap_setup(session, candidate, &client),
         )
         .await
         {
@@ -499,6 +504,9 @@ impl PrivateSwapsView {
             })
             .map(|network| network.chain_id)
             .collect::<Vec<_>>();
+        let Some(http) = self.http(cx) else {
+            return;
+        };
         for network in networks {
             let Some(inputs) = self.network_funding_inputs(network, cx) else {
                 continue;
@@ -525,9 +533,11 @@ impl PrivateSwapsView {
             let session = Arc::clone(&inputs.session);
             let candidates = inputs.candidates.clone();
             let runtime = self.runtime.clone();
+            let http = http.clone();
             let task = cx.spawn(async move |view, cx| {
-                let work = runtime
-                    .spawn(async move { estimate_network_funding(&session, candidates).await });
+                let work = runtime.spawn(async move {
+                    estimate_network_funding(&session, candidates, &http).await
+                });
                 let _abort = AbortOnDrop(work.abort_handle());
                 let availability = work.await.unwrap_or(NetworkAvailability::Unavailable(
                     NetworkUnavailable::SetupFee,

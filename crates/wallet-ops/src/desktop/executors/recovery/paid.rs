@@ -242,6 +242,7 @@ impl ExecutorOwner {
         asset: ExecutorAsset,
         session: &WalletSession,
         candidate: PublicBroadcasterCandidate,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorRecoveryFeeEstimate> {
         self.ensure_active()?;
         self.require_fee_session(session, PaidExecutionPurpose::Recovery)?;
@@ -264,6 +265,7 @@ impl ExecutorOwner {
                     buffer,
                 )
             },
+            client,
         )
         .await
     }
@@ -278,12 +280,14 @@ impl ExecutorOwner {
         candidate: PublicBroadcasterCandidate,
         inputs: &[Utxo],
         budget_gas: impl FnOnce(u64) -> u64,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorRecoveryFeeEstimate> {
         ExecutorDelivery::PublicBroadcaster(Box::new(candidate.clone())).admit(profile)?;
         let chain = effective_desktop_chain_config(self.chain.chain_id, &self.chain)?;
         let route = chain
             .rpc_route
-            .for_class(crate::RpcTrafficClass::Sensitive)?;
+            .for_class(crate::RpcTrafficClass::Sensitive)?
+            .isolated(client.clone());
         let min_gas_price = self
             .while_active(async {
                 let candidates = acquire_fee_candidates(&self.http, &route, None).await?;

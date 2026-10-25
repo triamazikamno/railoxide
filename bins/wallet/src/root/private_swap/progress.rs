@@ -2986,9 +2986,10 @@ impl PrivateSwapsView {
             cx.notify();
             return;
         };
-        let (Some(owner), Some(session)) = (
+        let (Some(owner), Some(session), Some(http)) = (
             self.private_owner().cloned(),
             self.private_session().cloned(),
+            self.http(cx),
         ) else {
             return;
         };
@@ -2996,7 +2997,11 @@ impl PrivateSwapsView {
             operation,
             SwapJobKind::CancelQuote,
             async move {
-                Box::pin(owner.estimate_swap_cancellation_fee(operation, &session, candidate)).await
+                let client = http.operation_http_client().await?;
+                Box::pin(
+                    owner.estimate_swap_cancellation_fee(operation, &session, candidate, &client),
+                )
+                .await
             },
             move |this, estimate, window, cx| {
                 this.cancel = Some(CancelQuote {

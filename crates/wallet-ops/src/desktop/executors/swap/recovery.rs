@@ -36,6 +36,7 @@ impl ExecutorOwner {
         operation: ExecutorOperationId,
         session: &WalletSession,
         candidate: PublicBroadcasterCandidate,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorRecoveryFeeEstimate> {
         self.ensure_active()?;
         self.require_fee_session(session, PaidExecutionPurpose::Recovery)?;
@@ -55,6 +56,7 @@ impl ExecutorOwner {
                     buffer,
                 )[0]
             },
+            client,
         )
         .await
     }

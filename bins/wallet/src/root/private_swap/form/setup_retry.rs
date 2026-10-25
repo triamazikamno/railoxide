@@ -507,12 +507,16 @@ impl PrivateSwapsView {
         }
         // A new account's fee is estimated as a first setup's is, for no reserved account.
         let account = (!self.retries_with_new_account(operation, side)).then_some(account);
+        let Some(http) = self.http(cx) else {
+            return;
+        };
         self.start_job(
             operation,
             SwapJobKind::SetupQuote,
             // An estimate that fails is told in the retry's dialog, which stays open.
             setup_job_result(async move {
-                Box::pin(owner.estimate_swap_setup_fee(&session, account, candidate)).await
+                let client = http.operation_http_client().await?;
+                Box::pin(owner.estimate_swap_setup_fee(&session, account, candidate, &client)).await
             }),
             move |this, estimate, window, cx| {
                 this.review_setup_retry(operation, side, estimate, waku, window, cx);

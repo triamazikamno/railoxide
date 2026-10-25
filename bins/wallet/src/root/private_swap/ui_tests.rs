@@ -2492,6 +2492,7 @@ fn retired_swap_with_estimate(
             &session,
             None,
             offer.clone(),
+            &operation_client(root, runtime, cx),
         )))
         .unwrap();
     (offer, estimate)
@@ -2921,6 +2922,7 @@ fn a_setup_retry_keeps_the_saved_terms_and_saves_a_raised_fee_limit(cx: &mut Tes
                     &session,
                     Some(operation),
                     offer,
+                    &operation_client(root, runtime, cx),
                 )))
                 .unwrap();
             let waku = idle_waku(root, cx);
@@ -3124,6 +3126,7 @@ fn a_swap_saves_the_fee_token_and_limit_of_its_own_setup(cx: &mut TestAppContext
                     &session,
                     None,
                     offer.clone(),
+                    &operation_client(root, runtime, cx),
                 )))
                 .unwrap();
             open_private_form(root, swaps, &stubs, runtime, cx);
@@ -3190,6 +3193,7 @@ fn a_setup_retry_reviews_the_broadcaster_and_fee_token_its_dialog_holds(cx: &mut
                     &session,
                     Some(operation),
                     offer.clone(),
+                    &operation_client(root, runtime, cx),
                 )))
                 .unwrap();
             let waku = idle_waku(root, cx);
@@ -6687,6 +6691,7 @@ fn private_network_funding_checks_the_setup_fee_against_spendable_notes(cx: &mut
                 Arc::clone(swaps.private_owner().unwrap()),
             )
         });
+        let http = root.read_with(cx, |root, _| root.http.clone());
         let delegate = root.read_with(cx, |root, _| {
             root.effective_chain_configs
                 .get(1)
@@ -6730,7 +6735,8 @@ fn private_network_funding_checks_the_setup_fee_against_spendable_notes(cx: &mut
             assert_eq!(
                 runtime.block_on(buy_picker::estimate_network_funding(
                     &session,
-                    vec![candidate.clone()]
+                    vec![candidate.clone()],
+                    &http,
                 )),
                 expected,
                 "a compatible fee token alone is insufficient",
@@ -6743,7 +6749,8 @@ fn private_network_funding_checks_the_setup_fee_against_spendable_notes(cx: &mut
         assert_eq!(
             runtime.block_on(buy_picker::estimate_network_funding(
                 &session,
-                vec![invalid]
+                vec![invalid],
+                &http,
             )),
             NetworkAvailability::Unavailable(NetworkUnavailable::SetupFee),
             "an unusable offer must not be reported as insufficient funds",
@@ -7354,6 +7361,16 @@ fn setup_offer(
     }
 }
 
+/// The wallet's operation client, as the form opens one for each fee estimate.
+fn operation_client(
+    root: &Entity<WalletRoot>,
+    runtime: &tokio::runtime::Runtime,
+    cx: &gpui::VisualTestContext,
+) -> wallet_ops::OperationHttpClient {
+    let http = root.read_with(cx, |root, _| root.http.clone());
+    runtime.block_on(http.operation_http_client()).unwrap()
+}
+
 /// The two setups of a private Bridge swap report their stages by themselves, and one's end
 /// leaves the other running.
 #[gpui::test]
@@ -7435,13 +7452,25 @@ fn private_bridge_setups_follow_each_account(cx: &mut TestAppContext) {
             owner.plan_swaps_from_note_for_tests(STUB_USDC, U256::from(10).pow(U256::from(20)));
             let origin_offer =
                 setup_offer(root, 1, STUB_USDC, U256::from(10).pow(U256::from(18)), cx);
+            // The estimate's fee reads go over the client it is given.
+            let client = runtime
+                .block_on(tagged_operation_http().operation_http_client())
+                .unwrap();
+            let before_estimate = stubs.request_count();
             let origin_estimate = runtime
                 .block_on(Box::pin(owner.estimate_swap_setup_fee(
                     &session,
                     None,
                     origin_offer.clone(),
+                    &client,
                 )))
                 .unwrap();
+            let routes = stubs.routes_since(before_estimate, "/rpc");
+            assert_eq!(
+                routes.into_iter().flatten().collect::<Vec<_>>(),
+                ["route-0"],
+                "the fee reads use only the estimate's own client"
+            );
             open_bridge_form(root, swaps, &stubs, runtime, cx);
             let polygon = start_polygon_session(root, &stubs, runtime, store, cx);
             let polygon_owner = polygon.executor_owner().unwrap();
@@ -7453,6 +7482,7 @@ fn private_bridge_setups_follow_each_account(cx: &mut TestAppContext) {
                     &polygon,
                     None,
                     destination_offer.clone(),
+                    &operation_client(root, runtime, cx),
                 )))
                 .unwrap();
             let (polygon_store, destination) = reusable_polygon_account(root, cx);
@@ -8411,9 +8441,12 @@ fn retrying_the_destination_setup_keeps_the_source_setups_progress(cx: &mut Test
                 .plan_swaps_from_note_for_tests(STUB_POLYGON_USDT, U256::from(100_000_000));
             let offer = setup_offer(root, 137, STUB_POLYGON_USDT, U256::from(10), cx);
             let estimate = runtime
-                .block_on(Box::pin(
-                    polygon_owner.estimate_swap_setup_fee(&polygon, None, offer),
-                ))
+                .block_on(Box::pin(polygon_owner.estimate_swap_setup_fee(
+                    &polygon,
+                    None,
+                    offer,
+                    &operation_client(root, runtime, cx),
+                )))
                 .unwrap();
             let waku = idle_waku(root, cx);
             cx.update(|window, cx| {
@@ -9121,6 +9154,7 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
                     &session,
                     Some(fresh_source),
                     offer.clone(),
+                    &operation_client(root, runtime, cx),
                 )))
                 .unwrap();
             let orderbook = stub_orderbook(&stubs, runtime);

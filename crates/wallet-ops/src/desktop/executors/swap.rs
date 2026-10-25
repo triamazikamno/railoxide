@@ -1223,8 +1223,12 @@ impl ExecutorOwner {
         &self,
         session: &WalletSession,
         candidate: PublicBroadcasterCandidate,
+        client: &OperationHttpClient,
     ) -> Result<bool> {
-        match self.estimate_swap_setup_fee(session, None, candidate).await {
+        match self
+            .estimate_swap_setup_fee(session, None, candidate, client)
+            .await
+        {
             Ok(_) => Ok(true),
             Err(error)
                 if matches!(
@@ -1247,6 +1251,7 @@ impl ExecutorOwner {
         session: &WalletSession,
         operation: Option<ExecutorOperationId>,
         candidate: PublicBroadcasterCandidate,
+        client: &OperationHttpClient,
     ) -> Result<ExecutorRecoveryFeeEstimate> {
         self.ensure_active()?;
         self.require_fee_session(session, PaidExecutionPurpose::SwapSetup)?;
@@ -1262,6 +1267,7 @@ impl ExecutorOwner {
             candidate,
             &inputs,
             |buffer| setup_gas_budget(self.chain.chain_id, buffer),
+            client,
         )
         .await
     }

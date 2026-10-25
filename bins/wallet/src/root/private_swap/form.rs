@@ -5903,6 +5903,9 @@ impl PrivateSwapsView {
         let Some((session, owner, operation)) = self.setup_estimate_account(side, cx) else {
             return;
         };
+        let Some(http) = self.http(cx) else {
+            return;
+        };
         let runtime = self.runtime.clone();
         let Some(route) = self.active_setup_route_mut(side) else {
             return;
@@ -5917,7 +5920,9 @@ impl PrivateSwapsView {
             cx.background_executor().timer(COST_ESTIMATE_DEBOUNCE).await;
             let result = runtime
                 .spawn(async move {
-                    Box::pin(owner.estimate_swap_setup_fee(&session, operation, candidate)).await
+                    let client = http.operation_http_client().await?;
+                    Box::pin(owner.estimate_swap_setup_fee(&session, operation, candidate, &client))
+                        .await
                 })
                 .await;
             let result = result
