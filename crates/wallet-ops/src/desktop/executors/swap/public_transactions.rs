@@ -33,7 +33,6 @@ use broadcaster_core::contracts::cow_shed::{
 };
 use broadcaster_core::contracts::executor::AcrossPrivateDelivery;
 use broadcaster_core::contracts::shield::build_approve_calldata;
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr as _, eyre};
 use railgun_wallet::tx::RailgunGasModel;
 use tracing::Instrument as _;
@@ -62,11 +61,14 @@ use crate::vault::{
     SwapUseId, SwapUseRecord, SwapUseRole,
 };
 use crate::{
-    DesktopPrivateSpendAuthorization, ExecutorOwner, HardwareTrezorPinMatrixProvider, HttpContext,
-    OperationHttpClient, PublicActionGasFeeSelection, PublicActionProgressStep,
-    PublicActionProgressUpdate, PublicAssetId, query_rpc_pool_for_route,
-    self_broadcast_send_raw_transaction_to_rpc_pool_with_logging,
+    ClassRoute, DesktopPrivateSpendAuthorization, ExecutorOwner, HardwareTrezorPinMatrixProvider,
+    HttpContext, OperationHttpClient, PublicActionGasFeeSelection, PublicActionProgressStep,
+    PublicActionProgressUpdate, PublicAssetId, RpcRead, RpcRoute, RpcSubmission, WalletRpcOrigin,
+    query_rpc_pool_for_route, self_broadcast_send_raw_transaction_to_rpc_pool_with_logging,
 };
+
+/// A read of the chain the swap pays on that no endpoint answered.
+const ORIGIN_UNAVAILABLE: &str = "the network the swap pays on is unavailable";
 
 /// Gas units of a `SpokePool.depositV3` a Public account sends with a private-delivery message.
 /// Fork measurements on chains 1, 56, 137 and 42161 on 2026-10-06 used 84,546 to 101,372 gas.
@@ -840,8 +842,9 @@ impl ExecutorOwner {
         if amount.is_zero() {
             return Err(eyre!("the proxy holds none of the token"));
         }
-        let pool = query_rpc_pool_for_route(&route, &self.http);
-        let proxy_deployed = self.while_active(proxy_deployed(&pool, proxy)).await?;
+        let proxy_deployed = self
+            .while_active(proxy_deployed(&route, &self.http, proxy))
+            .await?;
         let gas_units = if proxy_deployed {
             PUBLIC_PROXY_WITHDRAWAL_GAS_UNITS
         } else {
@@ -1420,25 +1423,20 @@ fn require_approved_gas_cost(plan: &PublicSwapGasPlan, approved: U256) -> Result
     Ok(())
 }
 
-/// The origin chain's head block number, from the first of its endpoints that answers.
+/// The origin chain's head block number, a broker read over the swap's client.
 async fn origin_head(
     origin: &EffectiveChainConfig,
     http: &HttpContext,
     client: &OperationHttpClient,
 ) -> Result<u64> {
-    let pool = query_rpc_pool_for_route(
-        &origin
-            .rpc_route
-            .for_class(crate::RpcTrafficClass::Sensitive)?
-            .isolated(client.clone()),
-        http,
-    );
-    for endpoint in pool.available_providers() {
-        if let Ok(head) = endpoint.provider.get_block_number().await {
-            return Ok(head);
-        }
-    }
-    Err(eyre!("the network the swap pays on is unavailable"))
+    let route = origin
+        .rpc_route
+        .for_class(crate::RpcTrafficClass::Sensitive)?
+        .isolated(client.clone());
+    let head = crate::staking::fetch_latest_block(&route, http, WalletRpcOrigin::PublicWallet)
+        .await
+        .wrap_err(ORIGIN_UNAVAILABLE)?;
+    Ok(head.header.num_hash().number)
 }
 
 /// The identity of the origin chain's block `number`, from the first of its endpoints that
@@ -1449,19 +1447,18 @@ async fn origin_block(
     client: &OperationHttpClient,
     number: u64,
 ) -> Result<BlockNumHash> {
-    let pool = query_rpc_pool_for_route(
-        &origin
-            .rpc_route
-            .for_class(crate::RpcTrafficClass::Sensitive)?
-            .isolated(client.clone()),
-        http,
-    );
-    for endpoint in pool.available_providers() {
-        if let Ok(Some(block)) = endpoint.provider.get_block_by_number(number.into()).await {
-            let identity = block.header.num_hash();
-            if identity.number == number {
-                return Ok(identity);
+    let endpoints =
+        ObservationEndpoints::new(origin, http, crate::RpcTrafficClass::Sensitive, client)?;
+    let mut attempts = endpoints.attempts();
+    while let Some(endpoint) = attempts.next().await {
+        match endpoint.provider.get_block_by_number(number.into()).await {
+            Ok(Some(block)) if block.header.num_hash().number == number => {
+                endpoints.succeeded(&endpoint);
+                return Ok(block.header.num_hash());
             }
+            // An endpoint that hasn't reached the block yet answered all the same.
+            Ok(_) => endpoints.succeeded(&endpoint),
+            Err(error) => endpoints.failed(&endpoint, &eyre::Report::from(error)),
         }
     }
     Err(eyre!(
@@ -1469,15 +1466,36 @@ async fn origin_block(
     ))
 }
 
-/// Whether `proxy` has code on the chain `pool` reads, from the first of its endpoints that
-/// answers.
-pub(super) async fn proxy_deployed(pool: &QueryRpcPool, proxy: Address) -> Result<bool> {
-    for endpoint in pool.available_providers() {
-        if let Ok(code) = endpoint.provider.get_code_at(proxy).await {
-            return Ok(!code.is_empty());
-        }
-    }
-    Err(eyre!("the network the swap pays on is unavailable"))
+/// The code at `account` on the chain `route` reads, a broker read.
+pub(super) async fn code_at(
+    route: &ClassRoute,
+    http: &HttpContext,
+    account: Address,
+) -> Result<Bytes> {
+    let read = async {
+        let code = http
+            .rpc_broker()
+            .submit(RpcSubmission::new(
+                RpcRoute::from(route.clone()),
+                vec![RpcRead::get_code_at(account, BlockId::latest())],
+                WalletRpcOrigin::PublicWallet.into(),
+            ))
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| eyre!("the code read returned nothing"))??;
+        Ok::<_, eyre::Report>(serde_json::from_value(code.into_value())?)
+    };
+    read.await.wrap_err(ORIGIN_UNAVAILABLE)
+}
+
+/// Whether `proxy` has code on the chain `route` reads.
+pub(super) async fn proxy_deployed(
+    route: &ClassRoute,
+    http: &HttpContext,
+    proxy: Address,
+) -> Result<bool> {
+    Ok(!code_at(route, http, proxy).await?.is_empty())
 }
 
 /// Where the step included the transaction it sent, and whether it succeeded.
@@ -1960,5 +1978,52 @@ mod tests {
             public_swap_handoff(&[log], SPOKE_POOL, SOURCE, DESTINATION_CHAIN, &unsigned),
             None
         );
+    }
+
+    // An endpoint that hasn't reached the block answers `null`. The next one serves it, and the
+    // first isn't withdrawn for it.
+    #[tokio::test]
+    async fn the_inclusion_block_is_read_from_an_endpoint_that_has_reached_it() {
+        use serde_json::{Value, json};
+        use std::sync::Arc;
+        let mut block = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+        block.header.inner.number = 50;
+        block.header.hash = B256::repeat_byte(50);
+        let block = serde_json::to_value(block).unwrap();
+        let (lagging, lagging_requests, lagging_task) =
+            crate::rpc_broker::tests::spawn_recording_rpc_mock(Arc::new(
+                |request: Value| json!({"jsonrpc": "2.0", "id": request["id"], "result": null}),
+            ))
+            .await;
+        let (serving, serving_task) = crate::rpc_broker::tests::spawn_rpc_mock(
+            Arc::new(move |request: Value| {
+                json!({"jsonrpc": "2.0", "id": request["id"], "result": block})
+            }),
+            Arc::default(),
+            Arc::default(),
+        )
+        .await;
+        let mut origin = crate::settings::build_effective_chain_configs(
+            &crate::settings::WalletSettings::default(),
+        )
+        .unwrap()
+        .get(1)
+        .cloned()
+        .unwrap();
+        origin.rpc_route = crate::RpcChainRoute::new(1, vec![lagging, serving]);
+        let http = HttpContext::direct_for_tests();
+        for reads in 1..=2 {
+            assert_eq!(
+                origin_block(&origin, &http, OperationHttpClient::direct_for_tests(), 50)
+                    .await
+                    .unwrap(),
+                BlockNumHash::new(50, B256::repeat_byte(50))
+            );
+            // The broker breaks ties in configured order, so the lagging endpoint is asked first
+            // each time.
+            assert_eq!(lagging_requests.lock().unwrap().len(), reads);
+        }
+        lagging_task.abort();
+        serving_task.abort();
     }
 }

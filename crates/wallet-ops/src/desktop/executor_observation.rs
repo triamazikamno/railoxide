@@ -213,19 +213,39 @@ impl ObservationEndpoints {
         }
     }
 
+    /// Each of these endpoints once, for a caller that tries one after another.
+    pub(super) const fn attempts(&self) -> EndpointAttempts<'_> {
+        EndpointAttempts {
+            endpoints: self,
+            tried: BTreeSet::new(),
+            queued: None,
+            deadline: None,
+        }
+    }
+
     pub(super) fn succeeded(&self, provider: &ProviderHandle) {
         self.report(provider, EndpointHealthOutcome::Healthy);
     }
 
-    fn report(&self, provider: &ProviderHandle, outcome: EndpointHealthOutcome) {
+    pub(super) fn report(&self, provider: &ProviderHandle, outcome: EndpointHealthOutcome) {
         self.broker
             .report_endpoint_outcome(self.route.chain_id(), &provider.url, outcome);
     }
 
-    /// Reports a strike to the broker when the endpoint failed rather than the observation:
-    /// a transport or HTTP failure, an unusable response, or an error response
-    /// other than a revert. A chain change doesn't count; other failures are reported neutral.
+    /// Reports the failure to the broker, classified as the broker classifies its own requests.
+    /// A chain change is neutral.
     pub(super) fn failed(&self, provider: &ProviderHandle, error: &eyre::Report) {
+        self.failed_after(provider, error, EndpointHealthOutcome::Healthy);
+    }
+
+    /// [`Self::failed`] for an attempt whose earlier requests had `earlier` as their outcome,
+    /// reported together with the failure as one.
+    pub(super) fn failed_after(
+        &self,
+        provider: &ProviderHandle,
+        error: &eyre::Report,
+        earlier: EndpointHealthOutcome,
+    ) {
         // RPC error text can contain response bodies, addresses, or endpoint credentials.
         let (failure, rpc_code) = match error.downcast_ref::<TransportError>() {
             Some(RpcError::Transport(_)) => ("transport", None),
@@ -242,24 +262,51 @@ impl ObservationEndpoints {
             rpc_code,
             "observation failed"
         );
-        let endpoint_failed =
-            error
-                .downcast_ref::<TransportError>()
-                .is_some_and(|error| match error {
-                    RpcError::Transport(_) | RpcError::NullResp | RpcError::DeserError { .. } => {
-                        true
-                    }
-                    RpcError::ErrorResp(payload) => !payload.message.contains("revert"),
-                    _ => false,
-                });
         self.report(
             provider,
-            if endpoint_failed {
-                EndpointHealthOutcome::Strike
-            } else {
-                EndpointHealthOutcome::Neutral
-            },
+            earlier.combine(EndpointHealthOutcome::for_direct_failure(error)),
         );
+    }
+}
+
+/// The endpoints of [`ObservationEndpoints::providers`], then those admitted later, each at
+/// most once. While one that wasn't tried is still being admitted, the later admissions are
+/// waited for, [`LATE_ADMISSION_WAIT`] in all.
+pub(super) struct EndpointAttempts<'a> {
+    endpoints: &'a ObservationEndpoints,
+    /// By pool index.
+    tried: BTreeSet<usize>,
+    /// `None` before the first endpoint is asked for.
+    queued: Option<std::vec::IntoIter<ProviderHandle>>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl EndpointAttempts<'_> {
+    /// The next endpoint to try, or `None` once there is none.
+    pub(super) async fn next(&mut self) -> Option<ProviderHandle> {
+        if self.queued.is_none() {
+            self.queued = Some(self.endpoints.providers().await.into_iter());
+        }
+        loop {
+            if let Some(queued) = &mut self.queued {
+                for provider in queued.by_ref() {
+                    if self.tried.insert(provider.index) {
+                        return Some(provider);
+                    }
+                }
+            }
+            if self.tried.len() >= self.endpoints.configured_count() {
+                return None;
+            }
+            let until = *self
+                .deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + LATE_ADMISSION_WAIT);
+            let later = self.endpoints.later_providers(&self.tried, until).await;
+            if later.is_empty() {
+                return None;
+            }
+            self.queued = Some(later.into_iter());
+        }
     }
 }
 
@@ -653,7 +700,7 @@ mod tests {
                     json!({
                         "jsonrpc": "2.0",
                         "id": request["id"],
-                        "error": {"code": -32000, "message": "payment required"}
+                        "error": {"code": -32005, "message": "limit exceeded"}
                     })
                 }
             }),

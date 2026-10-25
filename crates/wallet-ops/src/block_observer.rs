@@ -14,7 +14,8 @@ use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool};
 use eyre::{Result, WrapErr as _, eyre};
 
 use crate::public_wallet::{PublicTransactionFamily, PublicTransactionTrackingContext};
-use crate::{RpcBroker, TxReceiptOutput};
+use crate::rpc_broker::EndpointHealthOutcome;
+use crate::{ClassRoute, RpcBroker, TxReceiptOutput};
 
 const MAX_BLOCKS_PER_POLL: u64 = 8;
 
@@ -31,24 +32,26 @@ pub(crate) struct BlockObservation {
     pub(crate) head: Option<(usize, u64)>,
 }
 
+/// Failures carry the poll's outcome for broker health.
 #[derive(Debug)]
 enum ProviderPollFailure {
     Lagging,
-    UnsupportedReceipts,
-    Failed,
+    UnsupportedReceipts(EndpointHealthOutcome),
+    Failed(EndpointHealthOutcome),
 }
 
 #[derive(Debug)]
 enum BlockFetch {
     Missing,
-    Invalid,
+    /// A failed request or an invalid block, with its outcome for broker health.
+    Invalid(EndpointHealthOutcome),
     Valid(BlockIdentity, Vec<B256>),
 }
 
 #[derive(Debug)]
 enum ReceiptFetch {
     Unsupported,
-    Failed,
+    Failed(EndpointHealthOutcome),
     Invalid,
     Valid(TxReceiptOutput),
 }
@@ -67,12 +70,27 @@ pub(crate) struct BlockObserver {
 }
 
 impl BlockObserver {
+    /// `query_rpc_pool` must be built from `route`. The baseline starts on the first admitted
+    /// endpoint the broker reports eligible, or in pool order if the broker can't answer.
     pub(crate) async fn establish(
         query_rpc_pool: Arc<QueryRpcPool>,
         finality_depth: u64,
         rpc_broker: Arc<RpcBroker>,
-        chain_id: u64,
+        route: &ClassRoute,
     ) -> Result<Self> {
+        let providers = query_rpc_pool.available_providers();
+        let active_provider = rpc_broker
+            .endpoint_candidates(route.route(), None)
+            .await
+            .ok()
+            .and_then(|eligible| {
+                eligible.iter().find_map(|endpoint| {
+                    providers
+                        .iter()
+                        .find(|provider| &provider.url == endpoint.expose_url())
+                        .map(|provider| provider.index)
+                })
+            });
         let mut observer = Self {
             query_rpc_pool,
             finality_depth,
@@ -80,13 +98,18 @@ impl BlockObserver {
             registered: HashMap::new(),
             history: VecDeque::new(),
             unsupported_receipts: HashSet::new(),
-            active_provider: None,
+            active_provider,
             rpc_broker,
-            chain_id,
+            chain_id: route.chain_id(),
             tracking: None,
         };
         observer.establish_baseline().await?;
         Ok(observer)
+    }
+
+    fn report(&self, provider: &ProviderHandle, outcome: EndpointHealthOutcome) {
+        self.rpc_broker
+            .report_endpoint_outcome(self.chain_id, &provider.url, outcome);
     }
 
     /// Attach captured ownership after establishing the pre-handoff baseline.
@@ -150,7 +173,17 @@ impl BlockObserver {
         let mut saw_unsupported_receipts = false;
         let mut saw_failed_provider = false;
         for provider in providers {
-            match self.poll_provider(&provider).await {
+            let result = self.poll_provider(&provider).await;
+            // A lagging endpoint answered every request.
+            let outcome = match &result {
+                Ok(_) | Err(ProviderPollFailure::Lagging) => EndpointHealthOutcome::Healthy,
+                Err(
+                    ProviderPollFailure::UnsupportedReceipts(outcome)
+                    | ProviderPollFailure::Failed(outcome),
+                ) => *outcome,
+            };
+            self.report(&provider, outcome);
+            match result {
                 Ok(observation) => {
                     self.active_provider = Some(provider.index);
                     if observation.receipt.is_none()
@@ -169,11 +202,11 @@ impl BlockObserver {
                     return Ok(observation);
                 }
                 Err(ProviderPollFailure::Lagging) => lagging = true,
-                Err(ProviderPollFailure::UnsupportedReceipts) => {
+                Err(ProviderPollFailure::UnsupportedReceipts(_)) => {
                     saw_unsupported_receipts = true;
                     self.unsupported_receipts.insert(provider.index);
                 }
-                Err(ProviderPollFailure::Failed) => {
+                Err(ProviderPollFailure::Failed(_)) => {
                     saw_failed_provider = true;
                     self.query_rpc_pool.mark_bad_provider(&provider);
                     let rpc = crate::http::redact_url_for_display(&provider.url);
@@ -202,12 +235,23 @@ impl BlockObserver {
     }
 
     async fn establish_baseline(&mut self) -> Result<()> {
-        let providers = self.query_rpc_pool.available_providers();
+        let mut providers = self.query_rpc_pool.available_providers();
+        if let Some(active_provider) = self.active_provider {
+            providers.sort_by_key(|provider| usize::from(provider.index != active_provider));
+        }
         if providers.is_empty() {
             return Err(eyre!("privacy-preserving block observation is unavailable"));
         }
         for provider in providers {
-            let Ok(head) = provider.provider.get_block_number().await else {
+            let head = provider.provider.get_block_number().await;
+            self.report(
+                &provider,
+                head.as_ref()
+                    .map_or_else(EndpointHealthOutcome::for_direct_error, |_| {
+                        EndpointHealthOutcome::Healthy
+                    }),
+            );
+            let Ok(head) = head else {
                 self.query_rpc_pool.mark_bad_provider(&provider);
                 let rpc = crate::http::redact_url_for_display(&provider.url);
                 tracing::warn!(%rpc, "block observation baseline failed");
@@ -230,8 +274,11 @@ impl BlockObserver {
             .provider
             .get_block_number()
             .await
-            .map_err(|_| ProviderPollFailure::Failed)?;
+            .map_err(|error| {
+                ProviderPollFailure::Failed(EndpointHealthOutcome::for_direct_error(&error))
+            })?;
 
+        // Valid responses that fail the observer's own checks are neutral.
         if let Some(tip) = self.history.back().copied() {
             match fetch_block(provider, tip.number).await {
                 BlockFetch::Missing if head < tip.number => {
@@ -241,9 +288,10 @@ impl BlockObserver {
                 BlockFetch::Valid(_, _) => {
                     self.rollback_to_common_ancestor(provider).await?;
                 }
-                BlockFetch::Missing | BlockFetch::Invalid => {
-                    return Err(ProviderPollFailure::Failed);
+                BlockFetch::Missing => {
+                    return Err(ProviderPollFailure::Failed(EndpointHealthOutcome::Neutral));
                 }
+                BlockFetch::Invalid(outcome) => return Err(ProviderPollFailure::Failed(outcome)),
             }
         }
 
@@ -256,12 +304,15 @@ impl BlockObserver {
                 .saturating_add(MAX_BLOCKS_PER_POLL.saturating_sub(1)),
         );
         for number in self.next_block..=end {
-            let BlockFetch::Valid(identity, transactions) = fetch_block(provider, number).await
-            else {
-                return Err(ProviderPollFailure::Failed);
+            let (identity, transactions) = match fetch_block(provider, number).await {
+                BlockFetch::Valid(identity, transactions) => (identity, transactions),
+                BlockFetch::Missing => {
+                    return Err(ProviderPollFailure::Failed(EndpointHealthOutcome::Neutral));
+                }
+                BlockFetch::Invalid(outcome) => return Err(ProviderPollFailure::Failed(outcome)),
             };
             if identity.number != number {
-                return Err(ProviderPollFailure::Failed);
+                return Err(ProviderPollFailure::Failed(EndpointHealthOutcome::Strike));
             }
             if self
                 .history
@@ -282,11 +333,14 @@ impl BlockObserver {
                 .filter(|(_, hash)| self.registered.contains_key(hash))
                 .collect::<Vec<_>>();
             if matching_hashes.len() > 1 {
-                return Err(ProviderPollFailure::Failed);
+                return Err(ProviderPollFailure::Failed(EndpointHealthOutcome::Neutral));
             }
             if let Some((transaction_index, tx_hash)) = matching_hashes.first().copied() {
+                // Skipped locally, after this poll's requests succeeded.
                 if self.unsupported_receipts.contains(&provider.index) {
-                    return Err(ProviderPollFailure::UnsupportedReceipts);
+                    return Err(ProviderPollFailure::UnsupportedReceipts(
+                        EndpointHealthOutcome::Healthy,
+                    ));
                 }
                 return match fetch_receipt(provider, identity, &transactions, tx_hash).await {
                     ReceiptFetch::Valid(receipt) => {
@@ -304,9 +358,13 @@ impl BlockObserver {
                             head: self.processed_head(provider.index),
                         })
                     }
-                    ReceiptFetch::Unsupported => Err(ProviderPollFailure::UnsupportedReceipts),
-                    ReceiptFetch::Failed | ReceiptFetch::Invalid => {
-                        Err(ProviderPollFailure::Failed)
+                    // The broker strikes -32601, as for any endpoint-blamed JSON-RPC code.
+                    ReceiptFetch::Unsupported => Err(ProviderPollFailure::UnsupportedReceipts(
+                        EndpointHealthOutcome::Strike,
+                    )),
+                    ReceiptFetch::Failed(outcome) => Err(ProviderPollFailure::Failed(outcome)),
+                    ReceiptFetch::Invalid => {
+                        Err(ProviderPollFailure::Failed(EndpointHealthOutcome::Strike))
                     }
                 };
             }
@@ -328,8 +386,9 @@ impl BlockObserver {
         if let Some(tracking) = &self.tracking {
             tracking.pending();
         }
+        // A reorg beyond retained history is the observer's limit, not the endpoint's failure.
         if self.history.len() < 2 {
-            return Err(ProviderPollFailure::Failed);
+            return Err(ProviderPollFailure::Failed(EndpointHealthOutcome::Neutral));
         }
         for index in (0..self.history.len() - 1).rev() {
             let expected = self.history[index];
@@ -339,13 +398,14 @@ impl BlockObserver {
                     self.next_block = expected.number.saturating_add(1);
                     return Ok(());
                 }
-                BlockFetch::Missing | BlockFetch::Invalid => {
-                    return Err(ProviderPollFailure::Failed);
+                BlockFetch::Missing => {
+                    return Err(ProviderPollFailure::Failed(EndpointHealthOutcome::Neutral));
                 }
+                BlockFetch::Invalid(outcome) => return Err(ProviderPollFailure::Failed(outcome)),
                 BlockFetch::Valid(_, _) => {}
             }
         }
-        Err(ProviderPollFailure::Failed)
+        Err(ProviderPollFailure::Failed(EndpointHealthOutcome::Neutral))
     }
 
     fn record(&mut self, identity: BlockIdentity) {
@@ -462,13 +522,13 @@ async fn fetch_block(provider: &ProviderHandle, number: u64) -> BlockFetch {
     let block = match provider.provider.get_block_by_number(number.into()).await {
         Ok(Some(block)) => block,
         Ok(None) => return BlockFetch::Missing,
-        Err(_) => return BlockFetch::Invalid,
+        Err(error) => return BlockFetch::Invalid(EndpointHealthOutcome::for_direct_error(&error)),
     };
     if block.header().number() != number {
-        return BlockFetch::Invalid;
+        return BlockFetch::Invalid(EndpointHealthOutcome::Strike);
     }
     let BlockTransactions::Hashes(transactions) = block.transactions() else {
-        return BlockFetch::Invalid;
+        return BlockFetch::Invalid(EndpointHealthOutcome::Strike);
     };
     BlockFetch::Valid(
         BlockIdentity {
@@ -495,7 +555,7 @@ async fn fetch_receipt(
     {
         Ok(receipts) => receipts,
         Err(BlockReceiptsError::Unsupported) => return ReceiptFetch::Unsupported,
-        Err(BlockReceiptsError::Failed(_)) => return ReceiptFetch::Failed,
+        Err(BlockReceiptsError::Failed(_, outcome)) => return ReceiptFetch::Failed(outcome),
         Err(BlockReceiptsError::Invalid) => return ReceiptFetch::Invalid,
     };
     let Some(receipt) = receipts
@@ -522,8 +582,9 @@ async fn fetch_receipt(
 pub(crate) enum BlockReceiptsError {
     #[error("method is unsupported (RPC -32601)")]
     Unsupported,
+    /// A redacted reason and the request's outcome for broker health.
     #[error("{0}")]
-    Failed(String),
+    Failed(String, EndpointHealthOutcome),
     #[error("receipts are missing, incomplete, or inconsistent with the block")]
     Invalid,
 }
@@ -569,7 +630,12 @@ pub(crate) async fn fetch_checked_block_receipts(
         {
             return Err(BlockReceiptsError::Unsupported);
         }
-        Err(error) => return Err(BlockReceiptsError::Failed(rpc_failure_reason(&error))),
+        Err(error) => {
+            return Err(BlockReceiptsError::Failed(
+                rpc_failure_reason(&error),
+                EndpointHealthOutcome::for_direct_error(&error),
+            ));
+        }
     };
     let expected = transactions.iter().copied().collect::<HashSet<_>>();
     if expected.len() != transactions.len() || receipts.len() != transactions.len() {
@@ -624,6 +690,21 @@ mod tests {
             |_| {},
         )
         .expect("test broker requires an active Tokio runtime")
+    }
+
+    /// Establishes over a General route of the pool's own endpoints.
+    async fn establish(
+        pool: Arc<QueryRpcPool>,
+        finality_depth: u64,
+        broker: Arc<RpcBroker>,
+    ) -> Result<BlockObserver> {
+        let urls = pool
+            .available_providers()
+            .into_iter()
+            .map(|provider| provider.url)
+            .collect();
+        let route = crate::rpc_broker::tests::general(&RpcChainRoute::new(1, urls));
+        BlockObserver::establish(pool, finality_depth, broker, &route).await
     }
 
     fn spawn_rpc_script<F>(
@@ -806,7 +887,7 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let observer = BlockObserver::establish(Arc::clone(&pool), 2, test_broker(), 1)
+        let observer = establish(Arc::clone(&pool), 2, test_broker())
             .await
             .expect("establish observer baseline");
         let (tracker, context) = crate::public_wallet::test_tracking_context();
@@ -854,9 +935,7 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let (tracker, context) = crate::public_wallet::test_tracking_context();
-        let observer = BlockObserver::establish(test_pool(url), 2, test_broker(), 1)
-            .await
-            .unwrap();
+        let observer = establish(test_pool(url), 2, test_broker()).await.unwrap();
         let mut guard =
             crate::public_wallet::PublicTransactionObservationGuard::new(observer, Some(&context))
                 .unwrap();
@@ -905,15 +984,13 @@ mod tests {
         });
         let pool = test_pool(url);
         let (tracker, context) = crate::public_wallet::test_tracking_context();
-        let observer = BlockObserver::establish(Arc::clone(&pool), 2, test_broker(), 1)
+        let observer = establish(Arc::clone(&pool), 2, test_broker())
             .await
             .unwrap();
         let mut guard = context.admit_observer(observer).unwrap();
         let first = B256::repeat_byte(0x61);
         guard.observer_mut().register(first, 0);
-        let observer = BlockObserver::establish(pool, 2, test_broker(), 1)
-            .await
-            .unwrap();
+        let observer = establish(pool, 2, test_broker()).await.unwrap();
         let mut late = context.admit_observer(observer).unwrap();
         let second = B256::repeat_byte(0x62);
         late.observer_mut().register(second, 0);
@@ -984,7 +1061,7 @@ mod tests {
         assert_eq!(executions.load(Ordering::SeqCst), 1);
 
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(pool, 2, Arc::clone(&broker), 1)
+        let mut observer = establish(pool, 2, Arc::clone(&broker))
             .await
             .expect("establish observer baseline");
         observer.register(tx_hash, 0);
@@ -1035,7 +1112,7 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let observer = BlockObserver::establish(Arc::clone(&pool), 2, test_broker(), 1)
+        let observer = establish(Arc::clone(&pool), 2, test_broker())
             .await
             .expect("establish observer baseline");
         let (tracker, context) = crate::public_wallet::test_tracking_context();
@@ -1099,7 +1176,7 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 2, test_broker(), 1)
+        let mut observer = establish(Arc::clone(&pool), 2, test_broker())
             .await
             .expect("establish observer baseline");
         observer.register(B256::from([0x33; 32]), 0);
@@ -1142,7 +1219,7 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1, test_broker(), 1)
+        let mut observer = establish(Arc::clone(&pool), 1, test_broker())
             .await
             .expect("establish observer baseline");
         observer.register(tx_hash, 0);
@@ -1187,7 +1264,7 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1, test_broker(), 1)
+        let mut observer = establish(Arc::clone(&pool), 1, test_broker())
             .await
             .expect("establish observer baseline");
         observer.register(tx_hash, 0);
@@ -1236,7 +1313,7 @@ mod tests {
         url.set_query(Some("rpc-query-sentinel"));
         url.set_fragment(Some("rpc-fragment-sentinel"));
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1, test_broker(), 1)
+        let mut observer = establish(Arc::clone(&pool), 1, test_broker())
             .await
             .expect("establish observer baseline");
         observer.register(tx_hash, 0);
@@ -1271,7 +1348,7 @@ mod tests {
             ))
         });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1, test_broker(), 1)
+        let mut observer = establish(Arc::clone(&pool), 1, test_broker())
             .await
             .expect("establish observer baseline");
         observer.register(B256::from([0xcc; 32]), 0);
@@ -1293,7 +1370,7 @@ mod tests {
             Duration::ZERO,
             reqwest::Client::new(),
         ));
-        let observer = BlockObserver::establish(Arc::clone(&pool), 1, test_broker(), 1)
+        let observer = establish(Arc::clone(&pool), 1, test_broker())
             .await
             .expect("fail over to healthy baseline provider");
         drop(observer);
@@ -1301,6 +1378,64 @@ mod tests {
         good_task.join().expect("good RPC fixture task");
         assert_no_exact_hash_methods(&bad_requests.try_iter().collect::<Vec<_>>());
         assert_no_exact_hash_methods(&good_requests.try_iter().collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn observer_starts_on_a_broker_eligible_endpoint_and_reports_its_polls() {
+        /// Reports and lookups reach the actor on different channels, so this waits for the
+        /// reports to apply, well inside the shortest withdrawal.
+        async fn candidates_become(broker: &RpcBroker, route: &ClassRoute, expected: &[Url]) {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while broker
+                    .endpoint_candidates(route.route(), None)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|endpoint| endpoint.expose_url().clone())
+                    .ne(expected.iter().cloned())
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the reports applied");
+        }
+        let (withdrawn, withdrawn_requests, withdrawn_task) =
+            spawn_rpc_script(1, |_| Ok(quantity(1)));
+        let heads = AtomicUsize::new(0);
+        let (eligible, _eligible_requests, eligible_task) = spawn_rpc_script(2, move |_| {
+            if heads.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(quantity(1))
+            } else {
+                Err(json!({"code": -32005, "message": "limit exceeded"}))
+            }
+        });
+        let urls = vec![withdrawn.clone(), eligible.clone()];
+        let route = crate::rpc_broker::tests::general(&RpcChainRoute::new(1, urls.clone()));
+        let pool = Arc::new(QueryRpcPool::with_http_client(
+            urls,
+            Duration::ZERO,
+            reqwest::Client::new(),
+        ));
+        let broker = test_broker();
+        broker.report_endpoint_outcome(1, &withdrawn, EndpointHealthOutcome::Strike);
+        candidates_become(&broker, &route, std::slice::from_ref(&eligible)).await;
+
+        // The baseline skips the withdrawn first endpoint.
+        let mut observer =
+            BlockObserver::establish(Arc::clone(&pool), 1, Arc::clone(&broker), &route)
+                .await
+                .expect("establish observer baseline");
+        assert_eq!(observer.active_provider, Some(1));
+        assert!(withdrawn_requests.try_recv().is_err());
+
+        // The failing poll withdraws its endpoint; the lagging fallback answers and is restored.
+        observer.register(B256::repeat_byte(0x71), 0);
+        let observation = observer.poll().await.expect("a lagging fallback");
+        assert_eq!(observation.head, None);
+        candidates_become(&broker, &route, std::slice::from_ref(&withdrawn)).await;
+        withdrawn_task.join().expect("withdrawn RPC fixture task");
+        eligible_task.join().expect("eligible RPC fixture task");
     }
 
     #[tokio::test]
@@ -1347,7 +1482,7 @@ mod tests {
             Duration::from_mins(1),
             reqwest::Client::new(),
         ));
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1, test_broker(), 1)
+        let mut observer = establish(Arc::clone(&pool), 1, test_broker())
             .await
             .expect("establish observer baseline");
         observer.register(tx_hash, 0);
@@ -1402,7 +1537,7 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 3, test_broker(), 1)
+        let mut observer = establish(Arc::clone(&pool), 3, test_broker())
             .await
             .expect("establish observer baseline");
         observer.register(B256::from([0xdd; 32]), 0);
@@ -1457,7 +1592,7 @@ mod tests {
                 method => panic!("unexpected RPC method {method:?}"),
             });
         let pool = test_pool(url);
-        let mut observer = BlockObserver::establish(Arc::clone(&pool), 1, test_broker(), 1)
+        let mut observer = establish(Arc::clone(&pool), 1, test_broker())
             .await
             .expect("establish observer baseline");
         observer.register(B256::from([0xee; 32]), 0);

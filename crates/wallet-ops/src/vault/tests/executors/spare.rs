@@ -1452,6 +1452,134 @@ async fn hardware_restore_checks_64_addresses_on_own_routes_and_keeps_success_af
     }
 }
 
+// Each address is checked on a route of its own, but endpoint health is the broker's: an endpoint
+// that failed one address's check sits out the next address's. A check still reaches an endpoint
+// whose identity check finished only after the admitted one failed.
+#[tokio::test]
+async fn restore_checks_skip_an_endpoint_that_failed_and_reach_one_admitted_late() {
+    let mut block = Block::<alloy::rpc::types::Transaction>::default();
+    block.header.number = 10;
+    block.header.hash = B256::repeat_byte(10);
+    let block = serde_json::to_value(block).unwrap();
+    // It passes its identity check, then fails every other request at the endpoint.
+    let (failing, failing_requests, failing_task) =
+        crate::rpc_broker::tests::spawn_recording_rpc_mock(Arc::new(|request: Value| {
+            if request["method"] == "eth_chainId" {
+                json!({"jsonrpc": "2.0", "id": request["id"], "result": "0x1"})
+            } else {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "error": {"code": -32005, "message": "limit exceeded"}
+                })
+            }
+        }))
+        .await;
+    // It holds every request until released, so its identity check is still pending when the
+    // first check starts.
+    let gate = crate::rpc_broker::tests::RpcMockGate::default();
+    let (serving, serving_task) = crate::rpc_broker::tests::spawn_gated_rpc_mock(
+        Arc::new(move |request: Value| {
+            let result = match request["method"].as_str().unwrap() {
+                "eth_chainId" => json!("0x1"),
+                "eth_getBlockByNumber" => block.clone(),
+                // An empty return: the account is unused.
+                "eth_call" => json!("0x"),
+                method => panic!("unexpected RPC method {method}"),
+            };
+            json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+        }),
+        Arc::default(),
+        Arc::default(),
+        gate.clone(),
+    )
+    .await;
+    let data_requests = move || {
+        failing_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, request)| request["method"] != "eth_chainId")
+            .count()
+    };
+    // The serving endpoint answers once the failing one was sent a check's read.
+    let releaser = {
+        let data_requests = data_requests.clone();
+        tokio::spawn(async move {
+            while data_requests() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            loop {
+                gate.release_response.notify_waiters();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let mut chain =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .get(1)
+            .cloned()
+            .unwrap();
+    chain.finality_depth = 1;
+    chain.rpc_route =
+        crate::RpcChainRoute::new(1, vec![failing, serving]).with_identity_verification();
+    let http = HttpContext::direct_for_tests();
+    let owner =
+        ExecutorOwner::new(0, db.clone(), view.clone(), chain.clone(), http.clone()).unwrap();
+    let authorization = crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
+        TEST_PASSWORD.into(),
+    ));
+
+    let report = owner.discover_range(&authorization, 0..1).await.unwrap();
+    assert_eq!(
+        (report.used(), report.unused(), report.unavailable()),
+        (0, 1, 0)
+    );
+    assert_eq!(data_requests(), 1);
+    // The strike reaches the broker on its advisory channel.
+    let route = chain
+        .rpc_route
+        .for_class(crate::RpcTrafficClass::Sensitive)
+        .unwrap();
+    let serving = &route.endpoints()[1..];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while http
+            .rpc_broker()
+            .endpoint_candidates(route.route(), None)
+            .await
+            .unwrap()
+            != serving
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let report = owner.discover_range(&authorization, 1..2).await.unwrap();
+    assert_eq!(
+        (report.used(), report.unused(), report.unavailable()),
+        (0, 1, 0)
+    );
+    assert_eq!(data_requests(), 1, "the next address's check skips it");
+
+    owner.shutdown().await;
+    for task in [releaser, failing_task, serving_task] {
+        task.abort();
+    }
+    drop(owner);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn background_confirmation_resolves_from_private_sync_without_reading_the_chain() {
     use railgun_wallet::WalletUtxo;

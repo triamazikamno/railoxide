@@ -94,10 +94,14 @@ pub(crate) async fn gas_price_from_candidates_with_policy(
         match buffered_gas_price_with_policy(&provider_handle.provider, numerator, denominator)
             .await
         {
-            Ok(gas_price) => return Ok(gas_price),
+            Ok(gas_price) => {
+                candidates.succeeded(&provider_handle);
+                return Ok(gas_price);
+            }
             Err(error) => {
                 let rpc = http::redact_url_for_display(&provider_handle.url);
                 tracing::warn!(%error, %rpc, "fetch gas price failed");
+                candidates.failed(&provider_handle, &error);
                 candidates.pool().mark_bad_provider(&provider_handle);
                 last_error = Some(error);
             }

@@ -1460,14 +1460,17 @@ async fn exhausted_block_discovery_unlocks_authorized_hash_lookups() {
     let (path, mut provider, view) = fixture();
     authorize(&mut provider, &view, endpoint.clone());
     let http = provider.wallet.http.as_ref().unwrap();
+    let route =
+        crate::rpc_broker::tests::general(&crate::RpcChainRoute::new(1, vec![endpoint.clone()]));
     let pool = Arc::new(QueryRpcPool::with_http_client(
         vec![endpoint],
         Duration::ZERO,
         http.rpc_client.clone(),
     ));
-    let observer = crate::block_observer::BlockObserver::establish(pool, 2, http.rpc_broker(), 1)
-        .await
-        .unwrap();
+    let observer =
+        crate::block_observer::BlockObserver::establish(pool, 2, http.rpc_broker(), &route)
+            .await
+            .unwrap();
     let (tracker, context) = crate::public_wallet::test_tracking_context();
     provider.wallet.public_transaction_tracker = tracker.clone();
     let mut guard = context.admit_observer(observer).unwrap();

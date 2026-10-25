@@ -335,7 +335,7 @@ async fn isolated_block_observation_times_out_and_fails_over() {
 
     let observer = tokio::time::timeout(
         Duration::from_secs(5),
-        BlockObserver::establish(Arc::clone(&pool), 1, http.rpc_broker(), 1),
+        BlockObserver::establish(Arc::clone(&pool), 1, http.rpc_broker(), &route),
     )
     .await
     .expect("the isolated client times out the hung read")

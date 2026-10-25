@@ -325,7 +325,7 @@ pub(super) async fn submit_public_action_step_session(
                 Arc::clone(query_rpc_pool),
                 finality_depth,
                 http.rpc_broker(),
-                chain_id,
+                rpc_route,
             )
             .await?;
             observer = Some(
@@ -881,8 +881,10 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_reads(
         let endpoint = crate::http::redact_url_for_display(&provider_handle.url);
         let started = std::time::Instant::now();
         let mut stage = "fee_resolution";
+        // Gateway candidates report nothing, so a pool provider used for admitted reads isn't
+        // reported either.
         match public_action_preflight(
-            provider_handle,
+            provider_handle.clone(),
             chain_id,
             from,
             base_tx_req.clone(),
@@ -903,7 +905,10 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_reads(
         )
         .await
         {
-            Ok(preflight) => return Ok(preflight),
+            Ok(preflight) => {
+                candidates.succeeded(&provider_handle);
+                return Ok(preflight);
+            }
             Err(error @ PublicActionPreflightError::FeeAuthorizationRequired { .. }) => {
                 return Err(error);
             }
@@ -913,6 +918,7 @@ pub(super) async fn public_action_preflight_from_rpc_pool_with_reads(
                     PublicActionPreflightError::InsufficientShieldFunding(_)
                 );
                 let error = error.into_report();
+                candidates.failed(&provider_handle, &error);
                 if rpc_reads.is_some() {
                     if error
                         .downcast_ref::<crate::rpc_broker::RpcBrokerError>()
@@ -1685,11 +1691,9 @@ mod tests {
         )
         .await;
         let http = HttpContext::direct_for_tests();
-        let pool = crate::query_rpc_pool_for_route(
-            &general(&RpcChainRoute::new(1, vec![endpoint.clone()])),
-            &http,
-        );
-        let mut observer = BlockObserver::establish(pool, 1, http.rpc_broker(), 1)
+        let route = general(&RpcChainRoute::new(1, vec![endpoint.clone()]));
+        let pool = crate::query_rpc_pool_for_route(&route, &http);
+        let mut observer = BlockObserver::establish(pool, 1, http.rpc_broker(), &route)
             .await
             .unwrap()
             .with_tracking(&context);

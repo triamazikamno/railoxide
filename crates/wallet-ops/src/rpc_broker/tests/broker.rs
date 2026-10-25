@@ -1,11 +1,11 @@
-use crate::rpc_broker::actor::{Command, JobExecutor, JobOutput};
+use crate::rpc_broker::actor::{Actor, Command, JobExecutor, JobOutput, RequestEvent};
 use crate::rpc_broker::broker::{
     METADATA_LOOKUP_LIMIT, RpcBroker, SUBMISSION_CAPACITY, default_executor,
 };
 use crate::rpc_broker::identity::CandidateOrder;
 use crate::rpc_broker::model::{
-    DEFAULT_INTERVAL, DEFAULT_MAX_ESTIMATED_GAS, DEFAULT_MAX_IN_FLIGHT, RpcBrokerError,
-    RpcBrokerSpawnError, RpcClients, RpcOrigin, RpcRead, RpcRoute, RpcSubmission,
+    DEFAULT_INTERVAL, DEFAULT_MAX_ESTIMATED_GAS, DEFAULT_MAX_IN_FLIGHT, HEALTH_WITHDRAWAL_BASE,
+    RpcBrokerError, RpcBrokerSpawnError, RpcClients, RpcOrigin, RpcRead, RpcRoute, RpcSubmission,
 };
 use crate::rpc_broker::tests::{data_result, read_calldata, test_origin, test_route};
 use alloy::eips::BlockNumberOrTag;
@@ -555,4 +555,36 @@ async fn a_reported_strike_withdraws_at_once_and_a_healthy_report_restores() {
     candidates_become(&broker, &route, &route.endpoints()[1..]).await;
     broker.report_endpoint_outcome(1, &urls[0], EndpointHealthOutcome::Healthy);
     candidates_become(&broker, &route, route.endpoints()).await;
+
+    // Reports change health only, never the broker's request counts, and a healthy report
+    // keeps the escalation, so the next strike backs off longer.
+    time::pause();
+    let (_tx, rx) = mpsc::channel(1);
+    let mut actor = Actor::new(
+        RpcClients::new(reqwest::Client::new(), reqwest::Client::new()),
+        rx,
+        DEFAULT_INTERVAL,
+        1,
+        default_executor(),
+        |_| {},
+    );
+    let event = |outcome| RequestEvent::new(1, urls[0].clone(), outcome);
+    let mut report = |outcome| {
+        actor.apply_reported_event(&event(outcome));
+        let profile = &actor.profiles[&(1, urls[0].clone())];
+        let cooldown = profile
+            .withdrawn_until
+            .map(|until| until.saturating_duration_since(time::Instant::now()));
+        (profile.request_count, cooldown)
+    };
+    let base = HEALTH_WITHDRAWAL_BASE;
+    assert_eq!(report(EndpointHealthOutcome::Strike), (0, Some(base)));
+    assert_eq!(report(EndpointHealthOutcome::Neutral), (0, Some(base)));
+    time::advance(base).await;
+    assert_eq!(report(EndpointHealthOutcome::Strike), (0, Some(base * 2)));
+    assert_eq!(report(EndpointHealthOutcome::Healthy), (0, None));
+    assert_eq!(report(EndpointHealthOutcome::Strike), (0, Some(base * 4)));
+    // The broker's own requests still count.
+    actor.apply_request_events(&[event(EndpointHealthOutcome::Healthy)]);
+    assert_eq!(actor.profiles[&(1, urls[0].clone())].request_count, 1);
 }

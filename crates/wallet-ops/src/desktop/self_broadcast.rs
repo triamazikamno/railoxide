@@ -4,7 +4,7 @@ use eyre::eyre;
 
 use crate::block_observer::BlockObserver;
 use crate::public_wallet::PublicTransactionObservationGuard;
-use crate::rpc_broker::{RpcBrokerError, RpcCandidates};
+use crate::rpc_broker::{EndpointHealthOutcome, RpcBrokerError, RpcCandidates};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,7 +291,7 @@ pub(super) async fn submit_self_broadcast_plan(
                 Arc::clone(&query_rpc_pool),
                 chain.finality_depth,
                 http.rpc_broker(),
-                chain_id,
+                &sensitive_route,
             )
             .await?;
             observer = Some(PublicTransactionObservationGuard::new(
@@ -659,7 +659,8 @@ pub(super) async fn self_broadcast_replacement_preflight_from_rpc_pool(
             break;
         };
         match self_broadcast_replacement_preflight(
-            &fee_provider.provider,
+            &fee_candidates,
+            &fee_provider,
             provider_handle,
             chain_id,
             from,
@@ -688,7 +689,8 @@ pub(super) async fn self_broadcast_replacement_preflight_from_rpc_pool(
 }
 
 pub(super) async fn self_broadcast_replacement_preflight(
-    fee_provider: &impl Provider,
+    fee_candidates: &RpcCandidates,
+    fee_provider: &ProviderHandle,
     provider_handle: ProviderHandle,
     chain_id: u64,
     from: Address,
@@ -698,7 +700,7 @@ pub(super) async fn self_broadcast_replacement_preflight(
     nonce: u64,
 ) -> Result<SelfBroadcastPreflight> {
     let provider = &provider_handle.provider;
-    let quote = self_broadcast_gas_fee_quote(fee_provider)
+    let quote = self_broadcast_gas_fee_quote(fee_candidates, fee_provider)
         .await
         .wrap_err("fetch self-broadcast gas price")?;
     let SelfBroadcastResolvedGasFee {
@@ -959,12 +961,14 @@ fn launch_ready_fee_samples(
             continue;
         }
         let rpc_reads = rpc_reads.cloned();
+        let candidates = candidates.clone();
         join_set.spawn(async move {
             match rpc_reads {
                 Some((reads, chain_id)) => {
                     self_broadcast_admitted_fee_sample(provider_handle, &reads, chain_id).await
                 }
                 None => Ok(self_broadcast_provider_fee_sample(
+                    &candidates,
                     provider_handle,
                     policy.hard_deadline,
                 )
@@ -1026,11 +1030,26 @@ async fn self_broadcast_admitted_fee_sample(
     ))
 }
 
+/// Reports the sample's requests as one outcome once all have settled; a sample dropped at the
+/// collection cutoff reports nothing.
 pub(super) async fn self_broadcast_provider_fee_sample(
+    candidates: &RpcCandidates,
     provider_handle: ProviderHandle,
     timeout: Duration,
 ) -> SelfBroadcastFeeSample {
-    let provider = provider_handle.provider;
+    fn outcome<T>(
+        result: &std::result::Result<
+            std::result::Result<T, alloy::transports::TransportError>,
+            tokio::time::error::Elapsed,
+        >,
+    ) -> EndpointHealthOutcome {
+        match result {
+            Ok(Ok(_)) => EndpointHealthOutcome::Healthy,
+            Ok(Err(error)) => EndpointHealthOutcome::for_direct_error(error),
+            Err(_) => EndpointHealthOutcome::Strike,
+        }
+    }
+    let provider = &provider_handle.provider;
     let gas_price = tokio::time::timeout(timeout, provider.get_gas_price());
     let max_priority_fee = tokio::time::timeout(timeout, provider.get_max_priority_fee_per_gas());
     let fee_history = tokio::time::timeout(
@@ -1043,6 +1062,12 @@ pub(super) async fn self_broadcast_provider_fee_sample(
     );
     let (gas_price, max_priority_fee, fee_history) =
         tokio::join!(gas_price, max_priority_fee, fee_history);
+    candidates.report(
+        &provider_handle,
+        outcome(&gas_price)
+            .combine(outcome(&max_priority_fee))
+            .combine(outcome(&fee_history)),
+    );
     let url = crate::http::redact_url_for_display(&provider_handle.url);
     let rpc_gas_price = match gas_price {
         Ok(Ok(value)) => Some(value),
@@ -1220,23 +1245,46 @@ pub(crate) async fn self_broadcast_gas_fee_quote_from_candidates_with_reads(
     Err(eyre!("all self-broadcast gas quote RPC attempts failed"))
 }
 
+/// Reports the quote's requests as one outcome, a quote of unusable answers included. A failed
+/// gas price is reported alone, before the other requests are sent.
 pub(super) async fn self_broadcast_gas_fee_quote(
-    provider: &impl Provider,
+    candidates: &RpcCandidates,
+    provider_handle: &ProviderHandle,
 ) -> Result<SelfBroadcastGasFeeQuote> {
-    let rpc_gas_price = provider.get_gas_price().await.wrap_err("fetch gas price")?;
-    let max_priority_fee_per_gas = provider.get_max_priority_fee_per_gas().await.ok();
+    let provider = &provider_handle.provider;
+    let rpc_gas_price = match provider.get_gas_price().await {
+        Ok(gas_price) => gas_price,
+        Err(error) => {
+            candidates.report(
+                provider_handle,
+                EndpointHealthOutcome::for_direct_error(&error),
+            );
+            return Err(error).wrap_err("fetch gas price");
+        }
+    };
+    let max_priority_fee_per_gas = provider.get_max_priority_fee_per_gas().await;
     let fee_history = provider
         .get_fee_history(
             SELF_BROADCAST_FEE_HISTORY_BLOCKS,
             BlockNumberOrTag::Latest,
             &SELF_BROADCAST_FEE_HISTORY_REWARD_PERCENTILES,
         )
-        .await
-        .ok();
+        .await;
+    let outcome = |error: Option<&alloy::transports::TransportError>| {
+        error.map_or(
+            EndpointHealthOutcome::Healthy,
+            EndpointHealthOutcome::for_direct_error,
+        )
+    };
+    candidates.report(
+        provider_handle,
+        outcome(max_priority_fee_per_gas.as_ref().err())
+            .combine(outcome(fee_history.as_ref().err())),
+    );
     let sample = SelfBroadcastFeeSample::from_parts(
         Some(rpc_gas_price),
-        max_priority_fee_per_gas,
-        fee_history,
+        max_priority_fee_per_gas.ok(),
+        fee_history.ok(),
     );
     self_broadcast_quote_from_fee_samples(&[sample])
         .ok_or_else(|| eyre!("self-broadcast gas fee quote returned no usable values"))
@@ -1805,11 +1853,12 @@ pub(crate) fn sponsored_self_broadcast_cancel_grace(block_time: Duration) -> Dur
 /// attempt and is neither persisted nor submitted through normal chain RPCs.
 ///
 /// It observes through `query_rpc_pool`, the pool over the operation's isolated Sensitive route
-/// that prepared and submitted it.
+/// `sensitive_route` that prepared and submitted it.
 pub async fn run_sponsored_self_broadcast_session(
     request: SponsoredSelfBroadcastSessionRequest,
     http: &HttpContext,
     client: &OperationHttpClient,
+    sensitive_route: ClassRoute,
     query_rpc_pool: Arc<QueryRpcPool>,
 ) -> Result<SponsoredSelfBroadcastSessionOutcome> {
     if request.session.chain_id != request.chain_id {
@@ -1859,8 +1908,8 @@ pub async fn run_sponsored_self_broadcast_session(
             .require_railgun()?
             .sponsored_bundle_relays,
         query_rpc_pool,
+        sensitive_route,
         finality_depth: request.effective_chain.finality_depth,
-        chain_id: request.chain_id,
         tx_hash,
         observer: tokio::sync::Mutex::new(None),
         session: &request.session,
@@ -1903,6 +1952,7 @@ pub(super) async fn submit_prepared_sponsored_self_broadcast(
     mut request: DesktopPreparedSponsoredSelfBroadcastRequest,
     http: &HttpContext,
     client: &OperationHttpClient,
+    sensitive_route: ClassRoute,
     query_rpc_pool: Arc<QueryRpcPool>,
 ) -> Result<SponsoredSelfBroadcastSessionOutcome> {
     if request.prepared.chain_id != request.chain_id {
@@ -2075,6 +2125,7 @@ pub(super) async fn submit_prepared_sponsored_self_broadcast(
                 },
                 http,
                 client,
+                sensitive_route,
                 query_rpc_pool,
             )
             .await
@@ -2116,8 +2167,9 @@ struct LiveSponsoredSelfBroadcastBackend<'a> {
     client: &'a OperationHttpClient,
     relays: &'a [SensitiveUrl],
     query_rpc_pool: Arc<QueryRpcPool>,
+    /// The route `query_rpc_pool` was built from.
+    sensitive_route: ClassRoute,
     finality_depth: u64,
-    chain_id: u64,
     tx_hash: FixedBytes<32>,
     observer: tokio::sync::Mutex<Option<PublicTransactionObservationGuard>>,
     session: &'a WalletSession,
@@ -2133,7 +2185,7 @@ impl SponsoredSelfBroadcastBackend for LiveSponsoredSelfBroadcastBackend<'_> {
                 Arc::clone(&self.query_rpc_pool),
                 self.finality_depth,
                 self.http.rpc_broker(),
-                self.chain_id,
+                &self.sensitive_route,
             )
             .await?;
             let mut created =
@@ -2886,6 +2938,148 @@ mod tests {
         for server in stalled_servers {
             server.abort();
         }
+    }
+
+    /// Reports and lookups reach the actor on different channels, so this waits for the
+    /// reports to apply, well inside the shortest withdrawal.
+    async fn snapshots_become(http: &HttpContext, route: &ClassRoute, expected: &[&Url]) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let candidates = RpcCandidates::acquire(http, route, None)
+                    .await
+                    .expect("candidates");
+                let ready = candidates.pool().available_providers();
+                if ready
+                    .iter()
+                    .map(|provider| &provider.url)
+                    .eq(expected.iter().copied())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reports applied");
+    }
+
+    #[tokio::test]
+    async fn timed_out_fee_samples_withdraw_their_endpoint_and_grace_cutoffs_report_nothing() {
+        async fn sample(http: &HttpContext, route: &ClassRoute, grace: Duration) -> usize {
+            let candidates = RpcCandidates::acquire(http, route, None)
+                .await
+                .expect("candidates");
+            let policy = SelfBroadcastFeeQuoteTimeoutPolicy {
+                grace_after_first_usable: grace,
+                hard_deadline: Duration::from_secs(10),
+            };
+            self_broadcast_parallel_fee_samples(&candidates, tokio::time::Instant::now(), policy)
+                .await
+                .expect("candidates were sampled")
+                .len()
+        }
+        let (hanging, hanging_server) = spawn_rpc_mock_with_gate(
+            Arc::new(
+                |request: Value| json!({"jsonrpc": "2.0", "id": request["id"], "result": "0x64"}),
+            ),
+            Arc::default(),
+            Arc::default(),
+            Some(RpcMockGate::default()),
+        )
+        .await;
+        // A usable tip starts the grace period; the fee history error is neutral.
+        let (healthy, healthy_server) = spawn_rpc_mock_with_gate(
+            Arc::new(|request: Value| match request["method"].as_str() {
+                Some("eth_gasPrice" | "eth_maxPriorityFeePerGas") => {
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": "0x64"})
+                }
+                _ => json!({"jsonrpc": "2.0", "id": request["id"],
+                    "error": {"code": -32000, "message": "unavailable"}}),
+            }),
+            Arc::default(),
+            Arc::default(),
+            None,
+        )
+        .await;
+        // Only the operation's client times out a request to the hanging endpoint.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let route = general(&RpcChainRoute::new(
+            FEE_CHAIN_ID,
+            vec![hanging.clone(), healthy.clone()],
+        ))
+        .isolated(crate::http::OperationHttpClient::for_tests(
+            client,
+            crate::http::OperationNetworkIsolation::Dedicated,
+        ));
+        let http = HttpContext::direct_for_tests_with_candidate_order(|_| {});
+
+        // The grace cutoff drops the hanging sample long before its request times out.
+        assert_eq!(sample(&http, &route, Duration::from_millis(20)).await, 1);
+        // Reports apply in order. Had the dropped sample reported a strike, both endpoints
+        // would now be withdrawn, which leaves both eligible.
+        let broker = http.rpc_broker();
+        broker.report_endpoint_outcome(FEE_CHAIN_ID, &healthy, EndpointHealthOutcome::Strike);
+        snapshots_become(&http, &route, &[&hanging]).await;
+        broker.report_endpoint_outcome(FEE_CHAIN_ID, &healthy, EndpointHealthOutcome::Healthy);
+        snapshots_become(&http, &route, &[&hanging, &healthy]).await;
+
+        // With a longer grace period the hanging requests time out, and the next quote's
+        // snapshot leaves that endpoint out.
+        sample(&http, &route, Duration::from_secs(5)).await;
+        snapshots_become(&http, &route, &[&healthy]).await;
+        hanging_server.abort();
+        healthy_server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_optional_replacement_fee_request_withdraws_its_endpoint() {
+        // The gas price alone makes a quote; the rate-limited fee history is still a strike.
+        let (failing, failing_server) = spawn_rpc_mock_with_gate(
+            Arc::new(|request: Value| match request["method"].as_str() {
+                Some("eth_gasPrice" | "eth_maxPriorityFeePerGas") => {
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": "0x64"})
+                }
+                _ => json!({"jsonrpc": "2.0", "id": request["id"],
+                    "error": {"code": -32005, "message": "limit exceeded"}}),
+            }),
+            Arc::default(),
+            Arc::default(),
+            None,
+        )
+        .await;
+        let (other, other_server) = spawn_rpc_mock_with_gate(
+            Arc::new(
+                |request: Value| json!({"jsonrpc": "2.0", "id": request["id"], "result": "0x64"}),
+            ),
+            Arc::default(),
+            Arc::default(),
+            None,
+        )
+        .await;
+        let route = general(&RpcChainRoute::new(
+            FEE_CHAIN_ID,
+            vec![failing.clone(), other.clone()],
+        ));
+        let http = HttpContext::direct_for_tests_with_candidate_order(|_| {});
+        let candidates = RpcCandidates::acquire(&http, &route, None)
+            .await
+            .expect("candidates");
+        let provider = candidates
+            .pool()
+            .available_providers()
+            .into_iter()
+            .find(|provider| provider.url == failing)
+            .expect("the failing endpoint is a candidate");
+
+        self_broadcast_gas_fee_quote(&candidates, &provider)
+            .await
+            .expect("the gas price makes a quote");
+        snapshots_become(&http, &route, &[&other]).await;
+        failing_server.abort();
+        other_server.abort();
     }
 
     #[test]

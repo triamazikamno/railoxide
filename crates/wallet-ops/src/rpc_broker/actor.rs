@@ -1,18 +1,23 @@
 use super::cache::ReadCache;
 use super::capacity::{CapacityLedger, JobControl, JobResources, JobSlots, SlotKind, SlotRequest};
+use super::execution::remote_failure;
 use super::identity::CandidateOrder;
 use super::model::RpcResult;
 use super::model::{
-    JsonRpcFailurePolicy, RpcBrokerError, RpcChainRoute, RpcClients, RpcOrigin, RpcRead, RpcRoute,
-    RpcSubmission,
+    JsonRpcFailurePolicy, RpcBrokerError, RpcChainRoute, RpcClients, RpcOrigin, RpcRead,
+    RpcRemoteError, RpcRoute, RpcSubmission,
 };
 use super::profile::EndpointProfile;
 use super::resolution::{ActiveWork, ReadReply, WaiterPolicy, WaiterState, WorkItem, WorkKey};
 use super::scheduler::{Claim, ExecutionJob, ReadyScheduler, RouteLoad};
 use super::warmup::{self, WarmupPass, WarmupRequest};
 use alloy::eips::{BlockId, BlockNumberOrTag};
+use alloy::rpc::json_rpc::ErrorPayload;
+use alloy::serde::WithOtherFields;
+use alloy::transports::{RpcError, TransportError};
 use futures_util::future::BoxFuture;
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -58,7 +63,41 @@ impl EndpointHealthOutcome {
         }
     }
 
-    pub(super) const fn combine(self, other: Self) -> Self {
+    /// The outcome the broker would give a request that a caller sent to an endpoint itself and
+    /// that failed with `error`. Request errors on the caller's side are neutral.
+    pub(crate) fn for_direct_error(error: &TransportError) -> Self {
+        match error {
+            RpcError::ErrorResp(payload) => {
+                let remote = RpcRemoteError::from(WithOtherFields::new(ErrorPayload {
+                    code: payload.code,
+                    message: payload.message.clone(),
+                    data: payload.try_data_as::<Value>().and_then(Result::ok),
+                }));
+                Self::for_result::<()>(&Err(remote_failure(remote, true)))
+            }
+            RpcError::Transport(_) | RpcError::NullResp | RpcError::DeserError { .. } => {
+                Self::Strike
+            }
+            RpcError::SerError(_)
+            | RpcError::UnsupportedFeature(_)
+            | RpcError::LocalUsageError(_) => Self::Neutral,
+        }
+    }
+
+    /// [`Self::for_direct_error`] for a caller's failure. A per-request timeout the caller
+    /// imposed (`tokio::time::error::Elapsed`) is a strike; the caller's own checks, such as a
+    /// chain mismatch, are neutral.
+    pub(crate) fn for_direct_failure(error: &eyre::Report) -> Self {
+        if let Some(error) = error.downcast_ref::<TransportError>() {
+            Self::for_direct_error(error)
+        } else if error.downcast_ref::<time::error::Elapsed>().is_some() {
+            Self::Strike
+        } else {
+            Self::Neutral
+        }
+    }
+
+    pub(crate) const fn combine(self, other: Self) -> Self {
         match (self, other) {
             (Self::Strike, _) | (_, Self::Strike) => Self::Strike,
             (Self::Neutral, _) | (_, Self::Neutral) => Self::Neutral,
@@ -861,18 +900,18 @@ impl Actor {
     }
     /// A caller's own request runs up to its full timeout, so three strikes in the health window
     /// can't accumulate: a strike withdraws at once, as in warmup. Success clears an active
-    /// withdrawal but keeps its level, so repeated failures back off longer.
-    fn apply_reported_event(&mut self, event: &RequestEvent) {
+    /// withdrawal but keeps its level, so repeated failures back off longer. Reports aren't
+    /// counted as the broker's physical requests.
+    pub(super) fn apply_reported_event(&mut self, event: &RequestEvent) {
         let now = Instant::now();
         if event.health_outcome != EndpointHealthOutcome::Healthy {
-            self.apply_request_event(event, now, true);
+            self.apply_health_outcome(event, now, true);
             return;
         }
         let profile = self
             .profiles
             .entry((event.chain_id, event.endpoint.clone()))
             .or_default();
-        profile.request_count = profile.request_count.saturating_add(1);
         if profile.withdrawn_until.take().is_some() {
             tracing::debug!(
                 chain_id = event.chain_id,
@@ -882,10 +921,17 @@ impl Actor {
         }
     }
     fn apply_request_event(&mut self, event: &RequestEvent, now: Instant, warmup: bool) {
+        let profile = self
+            .profiles
+            .entry((event.chain_id, event.endpoint.clone()))
+            .or_default();
+        profile.request_count = profile.request_count.saturating_add(1);
+        self.apply_health_outcome(event, now, warmup);
+    }
+    fn apply_health_outcome(&mut self, event: &RequestEvent, now: Instant, warmup: bool) {
         let receiving_endpoint = crate::http::redact_url_for_display(&event.endpoint);
         let key = (event.chain_id, event.endpoint.clone());
         let profile = self.profiles.entry(key).or_default();
-        profile.request_count = profile.request_count.saturating_add(1);
         match event.health_outcome {
             EndpointHealthOutcome::Strike => {
                 let withdrawn = if warmup {

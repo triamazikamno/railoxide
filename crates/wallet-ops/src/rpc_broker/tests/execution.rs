@@ -2275,3 +2275,52 @@ async fn verified_routes_reuse_identity_and_never_read_from_wrong_chain_endpoint
     bad_server.abort();
     good_server.abort();
 }
+
+#[tokio::test]
+async fn a_direct_request_failure_gets_the_brokers_health_outcome() {
+    use crate::rpc_broker::actor::EndpointHealthOutcome::{Healthy, Neutral, Strike};
+    use alloy::transports::{RpcError, TransportErrorKind};
+    for (error, expected) in [
+        // A revert counts only with revert data.
+        (
+            json!({"code": 3, "message": "execution reverted", "data": "0xdeadbeef"}),
+            Healthy,
+        ),
+        (
+            json!({"code": -32000, "message": "execution reverted", "data": "0xdeadbeef"}),
+            Healthy,
+        ),
+        (
+            json!({"code": -32000, "message": "execution reverted"}),
+            Neutral,
+        ),
+        // Endpoint-blamed codes strike even with revert data; other codes are neutral.
+        (
+            json!({"code": -32603, "message": "execution reverted", "data": "0xdeadbeef"}),
+            Strike,
+        ),
+        (json!({"code": -32005, "message": "limit exceeded"}), Strike),
+        (json!({"code": -32042, "message": "unknown"}), Neutral),
+    ] {
+        let wire = json!({"id": 1, "error": error.clone()});
+        let brokered = EndpointHealthOutcome::for_result(&parse_rpc_result(&wire, true));
+        let payload: ErrorPayload = serde_json::from_str(&error.to_string()).unwrap();
+        let direct = EndpointHealthOutcome::for_direct_error(&RpcError::ErrorResp(payload));
+        assert_eq!((brokered, direct), (expected, expected), "{error}");
+    }
+
+    // A caller's per-request timeout strikes; its own checks, such as the chain, don't.
+    let elapsed = time::timeout(Duration::ZERO, std::future::pending::<()>())
+        .await
+        .unwrap_err();
+    for (error, expected) in [
+        (eyre::Report::from(elapsed), Strike),
+        (
+            TransportErrorKind::custom_str("connection refused").into(),
+            Strike,
+        ),
+        (eyre::eyre!("chain mismatch"), Neutral),
+    ] {
+        assert_eq!(EndpointHealthOutcome::for_direct_failure(&error), expected);
+    }
+}

@@ -347,7 +347,7 @@ pub async fn submit_walletconnect_send_transaction(
                         pools.observe.clone(),
                         chain.finality_depth,
                         http.rpc_broker(),
-                        request.chain_id,
+                        &pools.route,
                     )
                     .await?;
                     Some(context.admit_observer(observer)?)

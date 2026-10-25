@@ -1437,29 +1437,34 @@ pub(super) fn parse_rpc_result(
         return Err(RpcBrokerError::InvalidResponse);
     }
     if let Some(payload) = response.error {
-        let remote = RpcRemoteError::from(payload);
-        let data = remote
-            .expose_data()
-            .and_then(Value::as_str)
-            .and_then(|raw| raw.parse::<Bytes>().ok());
-        let has_revert_marker = remote
-            .expose_message()
-            .to_ascii_lowercase()
-            .contains("revert");
-        if preserve_revert
-            && let Some(data) = data
-            && (remote.code() == 3 || (remote.code() == -32000 && has_revert_marker))
-        {
-            return Err(RpcBrokerError::InnerRevert(RpcRevert::from_individual(
-                data, remote,
-            )));
-        }
-        return Err(RpcBrokerError::Remote(remote));
+        return Err(remote_failure(
+            RpcRemoteError::from(payload),
+            preserve_revert,
+        ));
     }
     value
         .get("result")
         .cloned()
         .ok_or(RpcBrokerError::InvalidResponse)
+}
+/// The broker's error for a JSON-RPC error response. A revert needs revert data and either code 3
+/// or -32000 with a revert message.
+pub(super) fn remote_failure(remote: RpcRemoteError, preserve_revert: bool) -> RpcBrokerError {
+    let data = remote
+        .expose_data()
+        .and_then(Value::as_str)
+        .and_then(|raw| raw.parse::<Bytes>().ok());
+    let has_revert_marker = remote
+        .expose_message()
+        .to_ascii_lowercase()
+        .contains("revert");
+    if preserve_revert
+        && let Some(data) = data
+        && (remote.code() == 3 || (remote.code() == -32000 && has_revert_marker))
+    {
+        return RpcBrokerError::InnerRevert(RpcRevert::from_individual(data, remote));
+    }
+    RpcBrokerError::Remote(remote)
 }
 pub(super) fn decode_hex_value(value: &Value) -> Result<Bytes, RpcBrokerError> {
     value

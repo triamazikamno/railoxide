@@ -13,6 +13,7 @@ use rand::RngExt as _;
 use rand::seq::SliceRandom as _;
 
 use super::ExecutorOwner;
+use crate::desktop::executor_discovery::WRONG_CHAIN;
 use crate::settings::ExecutorProfile;
 use crate::vault::ExecutorUseObservation;
 use crate::{DesktopPrivateSpendAuthorization, WalletSession};
@@ -170,25 +171,29 @@ impl ExecutorOwner {
     /// leaves the address unavailable.
     async fn check_use(&self, address: Address) -> Result<ExecutorUseObservation> {
         let client = self.http.operation_http_client().await?;
-        let pool = self
-            .chain
-            .rpc_route
-            .for_class(crate::RpcTrafficClass::Sensitive)?
-            .isolated(client)
-            .query_rpc_pool(&self.http.rpc_clients(), Duration::from_secs(30));
-        for provider in pool.available_providers() {
-            // Validate the chain before disclosing the address.
-            if provider.provider.get_chain_id().await.ok() != Some(self.chain.chain_id) {
-                continue;
+        // Health is the broker's, so an endpoint this check finds failing sits out the next.
+        let endpoints = self.observation_endpoints(&client)?;
+        let mut attempts = endpoints.attempts();
+        while let Some(provider) = attempts.next().await {
+            let head = async {
+                // Validate the chain before disclosing the address.
+                if provider.provider.get_chain_id().await? != self.chain.chain_id {
+                    return Err(eyre!(WRONG_CHAIN));
+                }
+                provider
+                    .provider
+                    .get_block_by_number(BlockNumberOrTag::Latest)
+                    .await?
+                    .ok_or_else(|| eyre!("latest executor block is unavailable"))
             }
-            let Ok(Some(head)) = provider
-                .provider
-                .get_block_by_number(BlockNumberOrTag::Latest)
-                .await
-            else {
-                continue;
+            .await;
+            let block = match head {
+                Ok(head) => head.header.num_hash(),
+                Err(error) => {
+                    endpoints.failed(&provider, &error);
+                    continue;
+                }
             };
-            let block = head.header.num_hash();
             // A failed or reverted call ends this check.
             let output = provider
                 .provider
@@ -198,7 +203,18 @@ impl ExecutorOwner {
                         .input(RelayAdapt7702::nonceCall {}.abi_encode().into()),
                 )
                 .block(BlockId::hash_canonical(block.hash))
-                .await?;
+                .await
+                .map_err(eyre::Report::from);
+            let output = match output {
+                Ok(output) => {
+                    endpoints.succeeded(&provider);
+                    output
+                }
+                Err(error) => {
+                    endpoints.failed(&provider, &error);
+                    return Err(error);
+                }
+            };
             let checked_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
             // Calls to undelegated EOAs succeed with empty bytes.
             // A delegated getter returning zero is still evidence of use.

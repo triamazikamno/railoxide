@@ -203,6 +203,13 @@ impl RpcRead {
     }
 
     #[must_use]
+    pub(crate) const fn get_code_at(account: Address, block: BlockId) -> Self {
+        Self {
+            operation: RpcOperation::GetCode(account, block),
+        }
+    }
+
+    #[must_use]
     pub(crate) const fn get_block_by_number(block: BlockNumberOrTag, full: bool) -> Self {
         Self {
             operation: RpcOperation::GetBlockByNumber(block, full),

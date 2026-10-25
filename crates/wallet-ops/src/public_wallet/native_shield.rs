@@ -525,8 +525,14 @@ async fn estimate_native_shield_gas(
     let mut last_error = None;
     while let Some(provider) = candidates.next_untried(&mut tried).await {
         match estimate_delegated_gas(&provider.provider, request).await {
-            Ok(estimate) => return Ok(estimate),
-            Err(error) => last_error = Some(error),
+            Ok(estimate) => {
+                candidates.succeeded(&provider);
+                return Ok(estimate);
+            }
+            Err(error) => {
+                candidates.failed(&provider, &error);
+                last_error = Some(error);
+            }
         }
     }
     Err(last_error.map_or_else(

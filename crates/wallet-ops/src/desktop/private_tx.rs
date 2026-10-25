@@ -2145,9 +2145,10 @@ pub async fn submit_prepared_desktop_sponsored_self_broadcast(
     http: &HttpContext,
     client: &OperationHttpClient,
 ) -> Result<SponsoredSelfBroadcastSessionOutcome> {
-    let (_, query_rpc_pool) =
+    let (sensitive_route, query_rpc_pool) =
         sponsored_sensitive_route(request.chain_id, &request.effective_chain, http, client)?;
-    submit_prepared_sponsored_self_broadcast(request, http, client, query_rpc_pool).await
+    submit_prepared_sponsored_self_broadcast(request, http, client, sensitive_route, query_rpc_pool)
+        .await
 }
 
 pub async fn submit_desktop_sponsored_send_self_broadcast(
@@ -2203,6 +2204,7 @@ pub async fn submit_desktop_sponsored_send_self_broadcast(
         },
         http,
         client,
+        sensitive_route,
         query_rpc_pool,
     )
     .await?;
@@ -2265,6 +2267,7 @@ pub async fn submit_desktop_sponsored_unshield_self_broadcast(
         },
         http,
         client,
+        sensitive_route,
         query_rpc_pool,
     )
     .await?;

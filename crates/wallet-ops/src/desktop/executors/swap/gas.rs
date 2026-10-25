@@ -6,7 +6,7 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall as _;
 use eyre::{Result, eyre};
 
-use crate::rpc_broker::RpcCandidates;
+use crate::rpc_broker::{EndpointHealthOutcome, RpcCandidates};
 use crate::settings::EffectiveChainGasSettings;
 
 alloy::sol! {
@@ -43,6 +43,13 @@ pub(super) async fn hook_data_cost_from_candidates(
                         .input(ArbGasInfo::getL1BaseFeeEstimateCall {}.abi_encode().into()),
                 )
                 .await;
+            // Undecodable data is still a successful request, as for a broker `eth_call`.
+            match &response {
+                Ok(_) => candidates.succeeded(&handle),
+                Err(error) => {
+                    candidates.report(&handle, EndpointHealthOutcome::for_direct_error(error));
+                }
+            }
             if let Some(price) = response.ok().and_then(|bytes| {
                 ArbGasInfo::getL1BaseFeeEstimateCall::abi_decode_returns(&bytes).ok()
             }) {

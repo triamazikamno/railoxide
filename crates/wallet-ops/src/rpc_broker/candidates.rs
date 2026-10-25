@@ -2,11 +2,13 @@
 //!
 //! One broker lookup captures the route's health-eligible endpoints. Identity progress then
 //! changes readiness locally, without contacting the actor; a health refresh is another
-//! acquisition. Neither the lookup nor requests through the pool touch broker request counts,
-//! health or permits.
+//! acquisition. Neither the lookup nor requests through the pool touch broker request counts or
+//! permits; callers report each direct request's outcome to the broker's health.
 
 use super::identity::{MAX_IDENTITY_PROBES, ProbeRunner};
-use super::{ClassRoute, RpcBrokerError, RpcChainRoute, RpcClients};
+use super::{
+    ClassRoute, EndpointHealthOutcome, RpcBroker, RpcBrokerError, RpcChainRoute, RpcClients,
+};
 use crate::HttpContext;
 use crate::desktop::DEFAULT_QUERY_RPC_COOLDOWN;
 use broadcaster_core::query_rpc_pool::{ProviderHandle, QueryRpcPool, RpcAdmission};
@@ -28,6 +30,9 @@ struct Inner {
     /// Bumped after each admission change and closed when discovery ends.
     progress: watch::Receiver<()>,
     discovery: Option<AbortHandle>,
+    /// The broker and chain that direct requests report to; `None` for gateway reads, whose
+    /// broker execution records health itself.
+    health: Option<(Arc<RpcBroker>, u64)>,
 }
 
 impl Drop for Inner {
@@ -85,6 +90,7 @@ impl RpcCandidates {
             pool,
             progress: receiver,
             discovery,
+            health: Some((http.rpc_broker(), route.chain_id())),
         })))
     }
 
@@ -106,7 +112,26 @@ impl RpcCandidates {
             pool: Arc::new(snapshot_pool(http, route, &snapshot)),
             progress,
             discovery: None,
+            health: None,
         })))
+    }
+
+    /// Reports the outcome of a request the caller sent to `provider` itself, without waiting.
+    /// Gateway candidates report nothing, so a read is never counted twice. A request dropped
+    /// at a cutoff must not be reported.
+    pub(crate) fn report(&self, provider: &ProviderHandle, outcome: EndpointHealthOutcome) {
+        if let Some((broker, chain_id)) = &self.0.health {
+            broker.report_endpoint_outcome(*chain_id, &provider.url, outcome);
+        }
+    }
+
+    pub(crate) fn succeeded(&self, provider: &ProviderHandle) {
+        self.report(provider, EndpointHealthOutcome::Healthy);
+    }
+
+    /// Classifies `error` as the broker would; failures of the caller's own checks are neutral.
+    pub(crate) fn failed(&self, provider: &ProviderHandle, error: &eyre::Report) {
+        self.report(provider, EndpointHealthOutcome::for_direct_failure(error));
     }
 
     /// Ready providers are the admitted ones. Identity progress only admits endpoints, so it

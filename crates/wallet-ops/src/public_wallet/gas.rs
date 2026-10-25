@@ -16,7 +16,7 @@ use super::types::{
     PublicAdvancedTransactionEstimateRequest, PublicAdvancedTransactionSimulationError,
     PublicAssetId, PublicShieldTransactionProfile, PublicTransactionIntent,
 };
-use crate::rpc_broker::RpcCandidates;
+use crate::rpc_broker::{EndpointHealthOutcome, RpcCandidates};
 use crate::settings::EffectiveChainConfig;
 use crate::walletconnect::WalletConnectDecodedCallKind;
 use crate::{
@@ -739,8 +739,13 @@ async fn estimate_public_advanced_transaction_with_fee_core(
                 .provider
                 .estimate_gas(tx_req.clone())
                 .await
+                .inspect(|_| candidates.succeeded(&provider_handle))
                 .map_err(|error| {
                     tracing::warn!(%error, "advanced public transaction gas estimate failed");
+                    candidates.report(
+                        &provider_handle,
+                        EndpointHealthOutcome::for_direct_error(&error),
+                    );
                     classify_provider_failure(&error)
                 }),
         };
@@ -1207,7 +1212,14 @@ async fn observed_public_base_fee(
                     .map_err(eyre::Report::new),
             }
         };
-        match tokio::time::timeout(std::time::Duration::from_secs(15), observation).await {
+        let observation =
+            tokio::time::timeout(std::time::Duration::from_secs(15), observation).await;
+        match &observation {
+            Ok(Ok(_)) => candidates.succeeded(&provider),
+            Ok(Err(error)) => candidates.failed(&provider, error),
+            Err(_) => candidates.report(&provider, EndpointHealthOutcome::Strike),
+        }
+        match observation {
             Ok(Ok(Some(block))) => return Ok(block.header.base_fee_per_gas.map(u128::from)),
             Ok(Err(error))
                 if error
@@ -1261,8 +1273,12 @@ pub(super) async fn public_action_gas_fee_quote_bundle_from_candidates_with_prof
     while let Some(provider_handle) = candidates.next_untried(&mut tried).await {
         match railway_gas_fee_quote_from_provider(&provider_handle.provider, chain_id, asset).await
         {
-            Ok(quote) => return Ok(quote),
-            Err(_) => {
+            Ok(quote) => {
+                candidates.succeeded(&provider_handle);
+                return Ok(quote);
+            }
+            Err(error) => {
+                candidates.failed(&provider_handle, &error);
                 tracing::debug!("Railway gas fee quote provider attempt failed");
             }
         }

@@ -118,13 +118,20 @@ pub(super) enum Execution {
     OutOfGas,
 }
 
-/// `eth_call` at the latest block. An error response that reports an execution outcome is a
-/// revert or a gas shortfall; any other error is returned.
+/// `eth_call` at the latest block, read as [`execution`].
 pub(super) async fn execute(
     provider: &DynProvider,
     call: TransactionRequest,
 ) -> Result<Execution, TransportError> {
-    let Err(error) = provider.call(call).latest().await else {
+    execution(provider.call(call).latest().await)
+}
+
+/// An `eth_call` result. An error response that reports an execution outcome is a revert or a
+/// gas shortfall; any other error is returned.
+pub(super) fn execution(
+    result: Result<Bytes, TransportError>,
+) -> Result<Execution, TransportError> {
+    let Err(error) = result else {
         return Ok(Execution::Succeeded);
     };
     let Some(response) = error.as_error_resp() else {

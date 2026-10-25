@@ -16,7 +16,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::dyn_abi::{Resolver, TypedData};
 use alloy::primitives::{Address, B256, Bytes, U256, keccak256};
-use alloy::providers::Provider as _;
 use alloy::sol_types::{Eip712Domain, SolCall as _, SolStruct};
 use broadcaster_core::contracts::across::private_delivery_message;
 use broadcaster_core::contracts::cow::{
@@ -30,7 +29,6 @@ use broadcaster_core::contracts::cow_shed::{
 use broadcaster_core::contracts::executor::AcrossPrivateDelivery;
 use broadcaster_core::contracts::swap_math::SWAP_MATH_RUNTIME_CODE_HASH;
 use broadcaster_core::contracts::weiroll::BalanceDeposit;
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, eyre};
 use railgun_wallet::tx::GasEstimateMode;
 use serde_json::{Value, json};
@@ -49,7 +47,7 @@ use super::order::{
 use super::public_permit::{PublicSwapApprovalPlan, permit_pre_hook, placeholder_permit_pre_hook};
 use super::public_source::PublicSwapDeliveryQuote;
 use super::public_transactions::{
-    AuthorizedPublicSwapSource, ClaimedPublicSwap, PublicSwapGasPlan, proxy_deployed,
+    AuthorizedPublicSwapSource, ClaimedPublicSwap, PublicSwapGasPlan, code_at, proxy_deployed,
     public_swap_gas_plan, require_public_swap_source,
 };
 use crate::bridge::{AcrossClient, PublicBridgeDestination, PublicBridgePath, PublicSellAsset};
@@ -59,9 +57,7 @@ use crate::cow::{
     quote_protocol_fee,
 };
 use crate::desktop::executor_observation::trace_step;
-use crate::desktop::{
-    acquire_fee_candidates, gas_price_from_candidates_with_policy, query_rpc_pool_for_route,
-};
+use crate::desktop::{acquire_fee_candidates, gas_price_from_candidates_with_policy};
 use crate::public_wallet::{VaultedPublicSigner, query_erc20_balance, sign_public_swap_typed_data};
 use crate::settings::{EffectiveChainConfig, EffectiveTokenRegistry, PublicSwapProfile};
 use crate::vault::{
@@ -70,7 +66,10 @@ use crate::vault::{
     PublicSwapOrder, PublicSwapPath, SwapApprovedAccount, SwapApprovedBounds, SwapSetupFeeLimit,
     SwapSubmission, SwapSubmissionStatus, SwapUseId,
 };
-use crate::{ExecutorOwner, OperationHttpClient, TokenAnchorRateCache, check_quote_against_anchor};
+use crate::{
+    ClassRoute, ExecutorOwner, HttpContext, OperationHttpClient, TokenAnchorRateCache,
+    check_quote_against_anchor,
+};
 
 const ORDER_DATA_TOO_LARGE: &str = "the swap's order data is too large for CoW's orderbook";
 pub(super) const NO_PUBLIC_SWAPS: &str = "swaps aren't available from this network";
@@ -90,15 +89,9 @@ pub enum PublicSwapUnavailable {
     OrdersNotEnabled { chain_id: u64 },
 }
 
-/// Whether the code at `math` on the chain `pool` reads is the wallet's math contract, from the
-/// first of its endpoints that answers.
-async fn swap_math_deployed(pool: &QueryRpcPool, math: Address) -> Result<bool> {
-    for endpoint in pool.available_providers() {
-        if let Ok(code) = endpoint.provider.get_code_at(math).await {
-            return Ok(keccak256(&code) == SWAP_MATH_RUNTIME_CODE_HASH);
-        }
-    }
-    Err(eyre!("the network the swap pays on is unavailable"))
+/// Whether the code at `math` on the chain `route` reads is the wallet's math contract.
+async fn swap_math_deployed(route: &ClassRoute, http: &HttpContext, math: Address) -> Result<bool> {
+    Ok(keccak256(code_at(route, http, math).await?) == SWAP_MATH_RUNTIME_CODE_HASH)
 }
 
 /// What a review of a swap paid from a Public account needs. Nothing in it names the
@@ -891,14 +884,11 @@ impl ExecutorOwner {
             return Ok(false);
         };
         // Asked within a Public account's swap, so it shares the swap's class and route.
-        let pool = query_rpc_pool_for_route(
-            &origin
-                .rpc_route
-                .for_class(crate::RpcTrafficClass::Sensitive)?
-                .isolated(client.clone()),
-            &self.http,
-        );
-        self.while_active(swap_math_deployed(&pool, profile.math()))
+        let route = origin
+            .rpc_route
+            .for_class(crate::RpcTrafficClass::Sensitive)?
+            .isolated(client.clone());
+        self.while_active(swap_math_deployed(&route, &self.http, profile.math()))
             .await
     }
 
@@ -1054,9 +1044,8 @@ impl ExecutorOwner {
                     .rpc_route
                     .for_class(crate::RpcTrafficClass::Sensitive)?
                     .isolated(client.clone());
-                let pool = query_rpc_pool_for_route(&route, &self.http);
                 // The first batch of an account deploys its proxy, which costs the hook more.
-                let deployed = proxy_deployed(&pool, proxy).await?;
+                let deployed = proxy_deployed(&route, &self.http, proxy).await?;
                 // A permit travels in the order as a pre-hook, so the plan is read before the
                 // order is priced: the limit prices that hook's gas too.
                 let plan = self

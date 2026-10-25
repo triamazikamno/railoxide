@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use alloy::eips::BlockId;
 use alloy::primitives::ruint::UintTryFrom;
 use alloy::primitives::{Address, U256, Uint};
@@ -14,8 +12,9 @@ use zeroize::Zeroizing;
 
 use super::{ExecutorDelivery, ExecutorOwner};
 use crate::desktop::executor_discovery::{
-    ExecutorErc721, executor_delegation, inspect_recovery_executor,
+    ExecutorErc721, WRONG_CHAIN, executor_delegation, inspect_recovery_executor,
 };
+use crate::desktop::executor_observation::ObservationEndpoints;
 use crate::public_wallet::{PublicErc20, public_native_action_gas_units_with_buffer};
 use crate::settings::ExecutorProfile;
 use crate::vault::{ExecutorOperationId, ExecutorRecord, SwapUseId};
@@ -565,36 +564,38 @@ pub(super) async fn recovery_allowance(
         }
         .abi_encode()
     };
-    let pool = chain
-        .rpc_route
-        .for_class(crate::RpcTrafficClass::Sensitive)?
-        .isolated(client.clone())
-        .query_rpc_pool(&http.rpc_clients(), Duration::from_secs(30));
-    for endpoint in pool.available_providers() {
+    let endpoints =
+        ObservationEndpoints::new(chain, http, crate::RpcTrafficClass::Sensitive, client)?;
+    let mut attempts = endpoints.attempts();
+    while let Some(endpoint) = attempts.next().await {
         let provider = &endpoint.provider;
-        if provider.get_chain_id().await.ok() != Some(chain.chain_id) {
-            continue;
-        }
-        let request = TransactionRequest::default()
-            .to(token.tokenAddress)
-            .input(data.clone().into());
-        let Ok(result) = provider
-            .call(request)
-            .block(BlockId::hash_canonical(inspection.block().hash))
-            .await
-        else {
-            continue;
-        };
-        if token.tokenType == 0 {
-            if let Ok(allowance) = PublicErc20::allowanceCall::abi_decode_returns(&result) {
-                return Ok(allowance);
+        let read = async {
+            if provider.get_chain_id().await? != chain.chain_id {
+                return Err(eyre!(WRONG_CHAIN));
             }
-        } else if let Ok(approved) = ExecutorErc721::getApprovedCall::abi_decode_returns(&result) {
-            return Ok(if approved == railgun {
+            let request = TransactionRequest::default()
+                .to(token.tokenAddress)
+                .input(data.clone().into());
+            let result = provider
+                .call(request)
+                .block(BlockId::hash_canonical(inspection.block().hash))
+                .await?;
+            let allowance = if token.tokenType == 0 {
+                PublicErc20::allowanceCall::abi_decode_returns(&result)?
+            } else if ExecutorErc721::getApprovedCall::abi_decode_returns(&result)? == railgun {
                 U256::ONE
             } else {
                 U256::ZERO
-            });
+            };
+            Ok::<_, eyre::Report>(allowance)
+        }
+        .await;
+        match read {
+            Ok(allowance) => {
+                endpoints.succeeded(&endpoint);
+                return Ok(allowance);
+            }
+            Err(error) => endpoints.failed(&endpoint, &error),
         }
     }
     Err(eyre!(

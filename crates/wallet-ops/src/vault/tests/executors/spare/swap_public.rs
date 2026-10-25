@@ -3921,6 +3921,69 @@ async fn held_public_order_proceeds_are_withdrawn_to_the_public_account_through_
             .encode_log_data(),
         )];
     }
+    // The math and proxy reads are the broker's, over the swap's own client. A first endpoint
+    // that fails them is withdrawn at its third strike, so the review's proxy read skips it.
+    let (failing, failing_requests, failing_task) =
+        crate::rpc_broker::tests::spawn_recording_rpc_mock(Arc::new(|request: Value| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "error": {"code": -32005, "message": "limit exceeded"}
+            })
+        }))
+        .await;
+    let mut failing_first = payment.origin.clone();
+    failing_first.rpc_route = crate::RpcChainRoute::new(
+        DESTINATION_CHAIN,
+        vec![
+            failing,
+            payment.origin.rpc_route.configured_endpoints()[0]
+                .expose_url()
+                .clone(),
+        ],
+    );
+    let client = OperationHttpClient::for_tests(
+        crate::rpc_broker::tests::tagged_reqwest_client("swap"),
+        OperationNetworkIsolation::Dedicated,
+    );
+    for _ in 0..2 {
+        assert!(
+            owner
+                .public_swap_orders_available(&failing_first, &client)
+                .await
+                .unwrap()
+        );
+    }
+    let failing_review = owner
+        .review_public_swap_withdrawal(
+            payment.operation,
+            payment.id,
+            &failing_first,
+            100,
+            1,
+            &client,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (failing_review.amount, failing_review.proxy_deployed),
+        (paid, false)
+    );
+    assert_eq!(
+        failing_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(route, request)| (route.clone(), request["method"].clone()))
+            .collect::<Vec<_>>(),
+        [
+            (Some("swap".to_owned()), json!("eth_getCode")),
+            (Some("swap".to_owned()), json!("eth_getCode")),
+            // The balance read's strike withdraws it before the proxy read.
+            (Some("swap".to_owned()), json!("eth_call")),
+        ]
+    );
+    failing_task.abort();
     let review = owner
         .review_public_swap_withdrawal(
             payment.operation,

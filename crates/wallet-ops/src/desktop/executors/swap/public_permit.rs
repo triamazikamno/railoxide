@@ -13,23 +13,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::MutexGuard;
 
 use alloy::primitives::{Address, B256, Bytes, Signature, U256};
+use alloy::providers::Provider as _;
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::{Eip712Domain, SolCall as _, SolStruct as _};
 use broadcaster_core::contracts::cow::{AppDataHook, OrderUid};
 use broadcaster_core::contracts::erc20_permit::{IERC20Permit, Permit, permit_calldata};
-use broadcaster_core::query_rpc_pool::QueryRpcPool;
 use eyre::{Result, WrapErr as _, eyre};
 use serde_json::{Value, json};
 
 use super::observation::SwapSettlement;
 use super::public_order::{NO_PUBLIC_SWAPS, typed_data};
-use super::simulation::{Execution, execute};
+use super::simulation::{Execution, execution};
+use crate::desktop::executor_observation::ObservationEndpoints;
 use crate::public_wallet::{PublicErc20, VaultedPublicSigner, sign_public_swap_typed_data};
+use crate::rpc_broker::EndpointHealthOutcome;
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{ExecutorOperationId, PublicSwapPermit, PublicSwapRecord, SwapUseId};
 use crate::{
     ExecutorOwner, OperationHttpClient, RpcBrokerError, RpcRoute, RpcTrafficClass, WalletRpcOrigin,
-    query_rpc_pool_for_route,
 };
 
 const ALLOWANCE_READ: &str = "read the Public account's allowance for the swap";
@@ -360,10 +361,25 @@ pub(super) fn placeholder_permit_pre_hook(gas_limit: u64) -> AppDataHook {
 }
 
 /// Whether `call`, a signed `permit`, executes at the latest block, from the first endpoint of
-/// `pool` that says so. An endpoint's own error says nothing of the permit.
-async fn permit_executes(pool: &QueryRpcPool, call: &TransactionRequest) -> Result<bool> {
-    for endpoint in pool.available_providers() {
-        match execute(&endpoint.provider, call.clone()).await {
+/// `endpoints` that says so. An endpoint's own error says nothing of the permit. The endpoint's
+/// health is the call's raw response's: an error response that reports a revert or running out
+/// of gas is classified as any other.
+async fn permit_executes(
+    endpoints: &ObservationEndpoints,
+    call: &TransactionRequest,
+) -> Result<bool> {
+    let mut attempts = endpoints.attempts();
+    while let Some(endpoint) = attempts.next().await {
+        let result = endpoint.provider.call(call.clone()).latest().await;
+        endpoints.report(
+            &endpoint,
+            result
+                .as_ref()
+                .map_or_else(EndpointHealthOutcome::for_direct_error, |_| {
+                    EndpointHealthOutcome::Healthy
+                }),
+        );
+        match execution(result) {
             Ok(Execution::Succeeded) => return Ok(true),
             Ok(Execution::Reverted(_)) => return Ok(false),
             Ok(Execution::OutOfGas) | Err(_) => {}
@@ -550,17 +566,15 @@ impl ExecutorOwner {
                 hash_fallback_confirmed,
             ))
             .await?;
-        let pool = query_rpc_pool_for_route(
-            &origin
-                .rpc_route
-                .for_class(RpcTrafficClass::Sensitive)?
-                .isolated(client.clone()),
-            &self.http,
-        );
+        let endpoints =
+            ObservationEndpoints::new(origin, &self.http, RpcTrafficClass::Sensitive, client)?;
         let call = TransactionRequest::default()
             .to(token)
             .input(permit_calldata(&permit, &signature).into());
-        if !self.while_active(permit_executes(&pool, &call)).await? {
+        if !self
+            .while_active(permit_executes(&endpoints, &call))
+            .await?
+        {
             let key = (origin.chain_id, token);
             let detection = self.redetect_permit(origin, token, owner, client).await;
             let mut support = self.permit_support()?;
@@ -1053,5 +1067,73 @@ mod tests {
             estimate(&permit) - estimate(&PublicSwapApprovalPlan::None),
             U256::from(PUBLIC_PERMIT_HOOK_GAS) * U256::from(5)
         );
+    }
+
+    // An internal error that reports the revert still says the permit doesn't execute, and is
+    // still a strike against the endpoint that sent it.
+    #[tokio::test]
+    async fn a_permit_reverted_under_an_internal_error_withdraws_its_endpoint() {
+        use std::sync::Arc;
+
+        let (failing, failing_server) = crate::rpc_broker::tests::spawn_rpc_mock(
+            Arc::new(|request: Value| match request["method"].as_str() {
+                Some("eth_chainId") => {
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": "0x1"})
+                }
+                _ => json!({"jsonrpc": "2.0", "id": request["id"], "error":
+                    {"code": -32603, "message": "execution reverted", "data": "0x"}}),
+            }),
+            Arc::default(),
+            Arc::default(),
+        )
+        .await;
+        // Another chain's endpoint is never admitted, so the permit is called on the first.
+        let (other, other_server) = crate::rpc_broker::tests::spawn_rpc_mock(
+            Arc::new(
+                |request: Value| json!({"jsonrpc": "2.0", "id": request["id"], "result": "0x2"}),
+            ),
+            Arc::default(),
+            Arc::default(),
+        )
+        .await;
+        let mut chain = crate::settings::build_effective_chain_configs(
+            &crate::settings::WalletSettings::default(),
+        )
+        .unwrap()
+        .get(1)
+        .cloned()
+        .unwrap();
+        chain.rpc_route =
+            crate::RpcChainRoute::new(1, vec![failing, other]).with_identity_verification();
+        let client = OperationHttpClient::for_tests(
+            reqwest::Client::new(),
+            crate::OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Direct),
+        );
+        let http = crate::HttpContext::direct_for_tests();
+        let endpoints =
+            ObservationEndpoints::new(&chain, &http, RpcTrafficClass::Sensitive, &client).unwrap();
+        let call = TransactionRequest::default().to(TOKEN);
+        assert!(!permit_executes(&endpoints, &call).await.unwrap());
+
+        // The strike reaches the broker on its advisory channel.
+        let route = chain
+            .rpc_route
+            .for_class(RpcTrafficClass::Sensitive)
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while http
+                .rpc_broker()
+                .endpoint_candidates(route.route(), None)
+                .await
+                .unwrap()
+                != route.endpoints()[1..]
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        failing_server.abort();
+        other_server.abort();
     }
 }

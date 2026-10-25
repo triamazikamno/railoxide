@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
-use std::time::Duration;
 
 use alloy::eips::eip7702::constants::EIP7702_DELEGATION_DESIGNATOR;
 use alloy::eips::{BlockId, BlockNumHash, BlockNumberOrTag};
@@ -9,13 +8,15 @@ use alloy::primitives::{Address, Bytes, U256};
 use alloy::providers::{DynProvider, Provider};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
+use alloy::transports::TransportResult;
 use broadcaster_core::contracts::executor::EXECUTION_NONCE_STORAGE_SLOT;
 use broadcaster_core::contracts::railgun::RelayAdapt7702;
 use eyre::{Result, eyre};
 use futures_util::future::{join, join_all, join3};
 
-use crate::desktop::executor_observation::trace_step;
+use crate::desktop::executor_observation::{ObservationEndpoints, trace_step};
 use crate::public_wallet::PublicErc20;
+use crate::rpc_broker::EndpointHealthOutcome;
 use crate::settings::{EffectiveChainConfig, ExecutorProfile};
 use crate::{HttpContext, OperationHttpClient};
 
@@ -31,6 +32,21 @@ alloy::sol! {
 }
 
 pub use crate::vault::ExecutorAsset;
+
+/// A failed chain check, which is the caller's own check and not the endpoint's failure.
+pub(super) const WRONG_CHAIN: &str = "the RPC endpoint serves another chain";
+
+/// A read's value, `None` when it is unavailable, and the endpoint health outcome of the
+/// requests it sent.
+type Read<T> = (Option<T>, EndpointHealthOutcome);
+
+/// An answered request is healthy, whatever the caller makes of its value.
+fn answered<T>(result: TransportResult<T>) -> Read<T> {
+    match result {
+        Ok(value) => (Some(value), EndpointHealthOutcome::Healthy),
+        Err(error) => (None, EndpointHealthOutcome::for_direct_error(&error)),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutorActivity {
@@ -131,32 +147,42 @@ async fn inspect_executor_state(
     assets: &[ExecutorAsset],
     recovery: bool,
 ) -> Result<ExecutorInspection> {
-    let pool = chain
-        .rpc_route
-        .for_class(crate::RpcTrafficClass::Sensitive)?
-        .isolated(client.clone())
-        .query_rpc_pool(&http.rpc_clients(), Duration::from_secs(30));
-    for provider in pool.available_providers() {
-        // Avoid leaking the selected address to an endpoint serving a different chain.
-        if provider.provider.get_chain_id().await.ok() != Some(chain.chain_id) {
-            continue;
+    let endpoints =
+        ObservationEndpoints::new(chain, http, crate::RpcTrafficClass::Sensitive, client)?;
+    let mut attempts = endpoints.attempts();
+    while let Some(provider) = attempts.next().await {
+        let head = async {
+            // Avoid leaking the selected address to an endpoint serving a different chain.
+            if provider.provider.get_chain_id().await? != chain.chain_id {
+                return Err(eyre!(WRONG_CHAIN));
+            }
+            provider
+                .provider
+                .get_block_by_number(BlockNumberOrTag::Latest)
+                .await?
+                .ok_or_else(|| eyre!("latest executor block is unavailable"))
         }
-        let Ok(Some(head)) = provider
-            .provider
-            .get_block_by_number(BlockNumberOrTag::Latest)
-            .await
-        else {
-            continue;
+        .await;
+        let head = match head {
+            Ok(head) => head,
+            Err(error) => {
+                endpoints.failed(&provider, &error);
+                continue;
+            }
         };
-        return Ok(inspect_at(
+        let (inspection, outcome, ()) = inspect_at_with(
             &provider.provider,
             chain,
             address,
             assets,
             head.header.num_hash(),
             recovery,
+            std::future::ready(()),
         )
-        .await);
+        .await;
+        // Partial results are still returned, without trying another endpoint.
+        endpoints.report(&provider, outcome);
+        return Ok(inspection);
     }
     Err(eyre!("executor chain state is unavailable"))
 }
@@ -173,6 +199,7 @@ pub(super) async fn inspect_recovery_executor(
     inspect_executor_state(chain, http, client, address, assets, true).await
 }
 
+#[cfg(test)]
 pub(super) async fn inspect_at(
     provider: &DynProvider,
     chain: &EffectiveChainConfig,
@@ -195,7 +222,8 @@ pub(super) async fn inspect_at(
 }
 
 /// Runs `alongside` with the execution nonce read, after the account, code and
-/// balance reads. The lazy future sends none of its requests before then.
+/// balance reads. The lazy future sends none of its requests before then. The outcome
+/// combines every inspection request's, not `alongside`'s.
 async fn inspect_at_with<T>(
     provider: &DynProvider,
     chain: &EffectiveChainConfig,
@@ -204,7 +232,7 @@ async fn inspect_at_with<T>(
     block: BlockNumHash,
     recovery: bool,
     alongside: impl Future<Output = T>,
-) -> (ExecutorInspection, T) {
+) -> (ExecutorInspection, EndpointHealthOutcome, T) {
     let block_id = BlockId::hash_canonical(block.hash);
     // Native first, each asset once: requests keep the sequential read order.
     let mut seen = BTreeSet::new();
@@ -212,25 +240,33 @@ async fn inspect_at_with<T>(
         .chain(assets.iter().copied())
         .filter(|asset| seen.insert(*asset))
         .collect();
-    let (account_nonce, code, asset_balances) = join3(
+    let ((account_nonce, account_outcome), (code, code_outcome), asset_balances) = join3(
         async {
-            provider
-                .get_transaction_count(address)
-                .block_id(block_id)
-                .await
-                .ok()
+            answered(
+                provider
+                    .get_transaction_count(address)
+                    .block_id(block_id)
+                    .await,
+            )
         },
-        async { provider.get_code_at(address).block_id(block_id).await.ok() },
+        async { answered(provider.get_code_at(address).block_id(block_id).await) },
         join_all(
             assets
                 .iter()
-                .map(|asset| asset_balance(provider, address, *asset, block_id)),
+                .map(|asset| read_asset_balance(provider, address, *asset, block_id)),
         ),
     )
     .await;
-    let balances = assets.into_iter().zip(asset_balances).collect();
-    let (execution_nonce, alongside) = join(
-        execution_nonce_with_code(
+    let outcome = asset_balances.iter().fold(
+        account_outcome.combine(code_outcome),
+        |outcome, (_, balance)| outcome.combine(*balance),
+    );
+    let balances = assets
+        .into_iter()
+        .zip(asset_balances.into_iter().map(|(balance, _)| balance))
+        .collect();
+    let ((execution_nonce, nonce_outcome), alongside) = join(
+        read_execution_nonce(
             provider,
             chain,
             address,
@@ -251,6 +287,7 @@ async fn inspect_at_with<T>(
             execution_nonce,
             balances,
         },
+        outcome.combine(nonce_outcome),
         alongside,
     )
 }
@@ -261,8 +298,19 @@ pub(super) async fn asset_balance(
     asset: ExecutorAsset,
     block_id: BlockId,
 ) -> Option<U256> {
+    read_asset_balance(provider, address, asset, block_id)
+        .await
+        .0
+}
+
+async fn read_asset_balance(
+    provider: &DynProvider,
+    address: Address,
+    asset: ExecutorAsset,
+    block_id: BlockId,
+) -> Read<U256> {
     match asset {
-        ExecutorAsset::Native => provider.get_balance(address).block_id(block_id).await.ok(),
+        ExecutorAsset::Native => answered(provider.get_balance(address).block_id(block_id).await),
         ExecutorAsset::Erc20(token) => {
             call(
                 provider,
@@ -275,14 +323,19 @@ pub(super) async fn asset_balance(
         ExecutorAsset::Erc721 {
             collection,
             token_id,
-        } => call(
-            provider,
-            collection,
-            ExecutorErc721::ownerOfCall { tokenId: token_id },
-            block_id,
-        )
-        .await
-        .map(|owner| U256::from(u8::from(owner == address))),
+        } => {
+            let (owner, outcome) = call(
+                provider,
+                collection,
+                ExecutorErc721::ownerOfCall { tokenId: token_id },
+                block_id,
+            )
+            .await;
+            (
+                owner.map(|owner| U256::from(u8::from(owner == address))),
+                outcome,
+            )
+        }
     }
 }
 
@@ -294,13 +347,24 @@ pub(super) async fn execution_nonce_at(
     address: Address,
     block: BlockNumHash,
 ) -> Option<U256> {
-    let block_id = BlockId::hash_canonical(block.hash);
-    let code = provider
-        .get_code_at(address)
-        .block_id(block_id)
+    read_execution_nonce_at(provider, chain, address, block)
         .await
-        .ok()?;
-    execution_nonce_with_code(provider, chain, address, block_id, Some(&code), false).await
+        .0
+}
+
+async fn read_execution_nonce_at(
+    provider: &DynProvider,
+    chain: &EffectiveChainConfig,
+    address: Address,
+    block: BlockNumHash,
+) -> Read<U256> {
+    let block_id = BlockId::hash_canonical(block.hash);
+    match provider.get_code_at(address).block_id(block_id).await {
+        Ok(code) => {
+            read_execution_nonce(provider, chain, address, block_id, Some(&code), false).await
+        }
+        Err(error) => (None, EndpointHealthOutcome::for_direct_error(&error)),
+    }
 }
 
 pub(super) async fn execution_nonce_with_code(
@@ -311,6 +375,21 @@ pub(super) async fn execution_nonce_with_code(
     code: Option<&[u8]>,
     recovery: bool,
 ) -> Option<U256> {
+    read_execution_nonce(provider, chain, address, block_id, code, recovery)
+        .await
+        .0
+}
+
+/// Without an accepted nonce layout for `code`, or without `code`, sends nothing: the nonce is
+/// `None` and the outcome healthy.
+async fn read_execution_nonce(
+    provider: &DynProvider,
+    chain: &EffectiveChainConfig,
+    address: Address,
+    block_id: BlockId,
+    code: Option<&[u8]>,
+    recovery: bool,
+) -> Read<U256> {
     // Ordinary inspection never interprets the storage of a delegate of another capability.
     // Recovery explicitly installs this supported profile and must preserve its stored nonce.
     let profile = chain.railgun.as_ref().and_then(|railgun| {
@@ -320,16 +399,17 @@ pub(super) async fn execution_nonce_with_code(
         (Some(_), Some(code))
             if code.is_empty() || recovery && executor_delegation(code).is_some() =>
         {
-            provider
-                .get_storage_at(address, EXECUTION_NONCE_STORAGE_SLOT)
-                .block_id(block_id)
-                .await
-                .ok()
+            answered(
+                provider
+                    .get_storage_at(address, EXECUTION_NONCE_STORAGE_SLOT)
+                    .block_id(block_id)
+                    .await,
+            )
         }
         (Some(profile), Some(code)) if matches_executor_delegation(code, profile) => {
             call(provider, address, RelayAdapt7702::nonceCall {}, block_id).await
         }
-        _ => None,
+        _ => (None, EndpointHealthOutcome::Healthy),
     }
 }
 
@@ -404,134 +484,155 @@ async fn inspect_signing_state(
     ExecutorInspection,
     Option<crate::vault::ExecutorNonceObservation>,
 )> {
-    let pool = chain
-        .rpc_route
-        .for_class(crate::RpcTrafficClass::Sensitive)?
-        .isolated(client.clone())
-        .query_rpc_pool(&http.rpc_clients(), Duration::from_secs(30));
-    for endpoint in pool.available_providers() {
+    let endpoints =
+        ObservationEndpoints::new(chain, http, crate::RpcTrafficClass::Sensitive, client)?;
+    let mut attempts = endpoints.attempts();
+    while let Some(endpoint) = attempts.next().await {
         let provider = &endpoint.provider;
-        // The head read carries no address. Address reads wait for the chain check.
-        let Ok(head) = trace_step("inspection_chain_head", async {
-            match join(provider.get_chain_id(), async {
-                provider.get_block_by_number(BlockNumberOrTag::Latest).await
-            })
-            .await
-            {
-                (Ok(chain_id), Ok(Some(head))) if chain_id == chain.chain_id => {
-                    Ok(head.header.num_hash())
+        // The outcome of the inspection's requests, once they were answered or failed.
+        let mut inspected = EndpointHealthOutcome::Healthy;
+        // A rejection of the state the inspection answered reports `inspected` alone.
+        let mut rejected = false;
+        // `Err` moves on to the next endpoint. `Ok` is this endpoint's answer, a refusal included.
+        let answer = async {
+            // The head read carries no address. Address reads wait for the chain check.
+            let head = trace_step("inspection_chain_head", async {
+                let (chain_id, head) = join(provider.get_chain_id(), async {
+                    provider.get_block_by_number(BlockNumberOrTag::Latest).await
+                })
+                .await;
+                if chain_id? != chain.chain_id {
+                    return Err(eyre!(WRONG_CHAIN));
                 }
-                _ => Err(()),
-            }
-        })
-        .await
-        else {
-            continue;
-        };
-        let confirmed_number = head.number.saturating_sub(chain.finality_depth);
-        let Ok(Some(confirmed)) = trace_step("inspection_confirmed_block", async {
-            provider.get_block_by_number(confirmed_number.into()).await
-        })
-        .await
-        else {
-            continue;
-        };
-        let confirmed = confirmed.header.num_hash();
-        let confirmed_nonce = async {
-            if confirmed == head {
-                None
-            } else if recovery {
-                // The reviewed target layout persists across delegation changes, including
-                // at the older block. Its runtime need not be installed at that block.
-                Some(
-                    provider
-                        .get_storage_at(address, EXECUTION_NONCE_STORAGE_SLOT)
-                        .block_id(BlockId::hash_canonical(confirmed.hash))
-                        .await
-                        .ok(),
+                Ok::<_, eyre::Report>(
+                    head?
+                        .ok_or_else(|| eyre!("latest executor block is unavailable"))?
+                        .header
+                        .num_hash(),
                 )
-            } else {
-                Some(execution_nonce_at(provider, chain, address, confirmed).await)
-            }
-        };
-        // The confirmed nonce read starts after the tip account reads, so a stalled
-        // tip code read never issues a second code read.
-        let Ok((current, confirmed_nonce)) = trace_step("inspection_state", async {
-            Ok::<_, Infallible>(
-                inspect_at_with(
-                    provider,
-                    chain,
-                    address,
-                    assets,
-                    head,
-                    recovery,
-                    confirmed_nonce,
+            })
+            .await?;
+            let confirmed_number = head.number.saturating_sub(chain.finality_depth);
+            let confirmed = trace_step("inspection_confirmed_block", async {
+                provider.get_block_by_number(confirmed_number.into()).await
+            })
+            .await?
+            .ok_or_else(|| eyre!("confirmed executor block is unavailable"))?
+            .header
+            .num_hash();
+            let confirmed_nonce = async {
+                if confirmed == head {
+                    return (None, EndpointHealthOutcome::Healthy);
+                }
+                let (nonce, outcome) = if recovery {
+                    // The reviewed target layout persists across delegation changes, including
+                    // at the older block. Its runtime need not be installed at that block.
+                    answered(
+                        provider
+                            .get_storage_at(address, EXECUTION_NONCE_STORAGE_SLOT)
+                            .block_id(BlockId::hash_canonical(confirmed.hash))
+                            .await,
+                    )
+                } else {
+                    read_execution_nonce_at(provider, chain, address, confirmed).await
+                };
+                (Some(nonce), outcome)
+            };
+            // The confirmed nonce read starts after the tip account reads, so a stalled
+            // tip code read never issues a second code read.
+            let Ok((current, outcome, confirmed_nonce)) = trace_step("inspection_state", async {
+                Ok::<_, Infallible>(
+                    inspect_at_with(
+                        provider,
+                        chain,
+                        address,
+                        assets,
+                        head,
+                        recovery,
+                        confirmed_nonce,
+                    )
+                    .await,
                 )
-                .await,
-            )
-        })
+            })
+            .await;
+            let (confirmed_nonce, confirmed_outcome) = confirmed_nonce;
+            inspected = outcome.combine(confirmed_outcome);
+            if current.account_nonce().is_none()
+                || current.code().is_none()
+                || current.balances().values().any(Option::is_none)
+                || require_execution_nonce && current.execution_nonce().is_none()
+            {
+                rejected = true;
+                return Err(eyre!("executor signing state is incomplete"));
+            }
+            let nonce = confirmed_nonce.unwrap_or_else(|| current.execution_nonce());
+            if require_execution_nonce && nonce.is_none() {
+                rejected = true;
+                return Err(eyre!("confirmed executor execution nonce is unavailable"));
+            }
+            if current.execution_nonce() != nonce {
+                return Ok(Err(eyre!(
+                    "executor execution nonce is awaiting confirmation"
+                )));
+            }
+            // After every state read, so a transaction sent meanwhile still blocks signing, and
+            // before the head recheck, which must be the last read.
+            let pending_nonce = provider.get_transaction_count(address).pending().await?;
+            if current
+                .account_nonce()
+                .is_some_and(|nonce| nonce != pending_nonce)
+            {
+                return Ok(Err(eyre!(
+                    "executor account has an unconfirmed transaction or authorization"
+                )));
+            }
+            let canonical = trace_step("inspection_canonical_recheck", async {
+                provider.get_block_by_number(head.number.into()).await
+            })
+            .await?
+            .ok_or_else(|| eyre!("executor head block is unavailable"))?;
+            if canonical.header.num_hash() != head {
+                return Err(eyre!("executor head block changed during inspection"));
+            }
+            Ok::<_, eyre::Report>(Ok((
+                current,
+                nonce.map(|nonce| crate::vault::ExecutorNonceObservation::new(confirmed, nonce)),
+            )))
+        }
         .await;
-        if current.account_nonce().is_none()
-            || current.code().is_none()
-            || current.balances().values().any(Option::is_none)
-            || require_execution_nonce && current.execution_nonce().is_none()
-        {
-            continue;
+        match answer {
+            Ok(answer) => {
+                endpoints.report(&endpoint, inspected);
+                return answer;
+            }
+            Err(_) if rejected => endpoints.report(&endpoint, inspected),
+            Err(error) => endpoints.failed_after(&endpoint, &error, inspected),
         }
-        let nonce = confirmed_nonce.unwrap_or_else(|| current.execution_nonce());
-        if require_execution_nonce && nonce.is_none() {
-            continue;
-        }
-        if current.execution_nonce() != nonce {
-            return Err(eyre!("executor execution nonce is awaiting confirmation"));
-        }
-        // After every state read, so a transaction sent meanwhile still blocks signing, and
-        // before the head recheck, which must be the last read.
-        let Ok(pending_nonce) = provider.get_transaction_count(address).pending().await else {
-            continue;
-        };
-        if current
-            .account_nonce()
-            .is_some_and(|nonce| nonce != pending_nonce)
-        {
-            return Err(eyre!(
-                "executor account has an unconfirmed transaction or authorization"
-            ));
-        }
-        let Ok(Some(canonical)) = trace_step("inspection_canonical_recheck", async {
-            provider.get_block_by_number(head.number.into()).await
-        })
-        .await
-        else {
-            continue;
-        };
-        if canonical.header.num_hash() != head {
-            continue;
-        }
-        return Ok((
-            current,
-            nonce.map(|nonce| crate::vault::ExecutorNonceObservation::new(confirmed, nonce)),
-        ));
     }
     Err(eyre!("executor signing state is unavailable"))
 }
 
+/// A return value that doesn't decode is `None`, yet the call was answered.
 async fn call<C: SolCall>(
     provider: &DynProvider,
     to: Address,
     call: C,
     block: BlockId,
-) -> Option<C::Return> {
-    let bytes = provider
-        .call(
-            TransactionRequest::default()
-                .to(to)
-                .input(call.abi_encode().into()),
-        )
-        .block(block)
-        .await
-        .ok()?;
-    C::abi_decode_returns(&bytes).ok()
+) -> Read<C::Return> {
+    let (bytes, outcome) = answered(
+        provider
+            .call(
+                TransactionRequest::default()
+                    .to(to)
+                    .input(call.abi_encode().into()),
+            )
+            .block(block)
+            .await,
+    );
+    (
+        bytes.and_then(|bytes| C::abi_decode_returns(&bytes).ok()),
+        outcome,
+    )
 }
 
 pub(super) fn executor_delegation(code: &[u8]) -> Option<Address> {
@@ -552,6 +653,7 @@ mod tests {
     use alloy::primitives::B256;
     use alloy::providers::ProviderBuilder;
     use alloy::transports::mock::Asserter;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn executor_inspection_uses_the_context_proxy_and_checks_chain_before_address_reads() {
@@ -681,6 +783,92 @@ mod tests {
         assert_eq!(with_nft.activity(), ExecutorActivity::PreviouslyUsed);
         assert!(with_nft.has_incomplete_reads());
         assert_eq!(with_nft.balances()[&nft], Some(U256::from(1)));
+    }
+
+    #[tokio::test]
+    async fn a_failed_inspection_read_withdraws_its_endpoint_and_keeps_the_partial_result() {
+        use serde_json::{Value, json};
+        use std::sync::Arc;
+
+        let mut chain = build_effective_chain_configs(&WalletSettings::default())
+            .unwrap()
+            .get(1)
+            .cloned()
+            .unwrap();
+        let mut block = alloy::rpc::types::Block::<alloy::rpc::types::Transaction>::default();
+        block.header.inner.number = 50;
+        block.header.hash = B256::repeat_byte(50);
+        // Passes the chain and head checks, then rate-limits the balance read.
+        let (failing, failing_server) = crate::rpc_broker::tests::spawn_rpc_mock(
+            Arc::new(move |request: Value| {
+                let result = match request["method"].as_str().unwrap() {
+                    "eth_chainId" => json!("0x1"),
+                    "eth_getBlockByNumber" => serde_json::to_value(&block).unwrap(),
+                    "eth_getTransactionCount" => json!("0x0"),
+                    "eth_getCode" => json!("0x"),
+                    "eth_getStorageAt" => json!(B256::ZERO),
+                    _ => {
+                        return json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "error": {"code": -32005, "message": "limit exceeded"}
+                        });
+                    }
+                };
+                json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+            }),
+            Arc::default(),
+            Arc::default(),
+        )
+        .await;
+        // Another chain's endpoint, if tried first, fails the inspection's own chain check,
+        // which is neutral and leaves it eligible.
+        let (other, other_server) = crate::rpc_broker::tests::spawn_rpc_mock(
+            Arc::new(
+                |request: Value| json!({"jsonrpc": "2.0", "id": request["id"], "result": "0x2"}),
+            ),
+            Arc::default(),
+            Arc::default(),
+        )
+        .await;
+        chain.rpc_route = crate::RpcChainRoute::new(1, vec![failing, other]);
+        let client = OperationHttpClient::for_tests(
+            reqwest::Client::new(),
+            crate::OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Direct),
+        );
+        let http = HttpContext::direct_for_tests();
+        let inspection = inspect_executor(
+            &chain,
+            &http,
+            &client,
+            Address::repeat_byte(1),
+            &[ExecutorAsset::Native],
+        )
+        .await
+        .unwrap();
+        assert_eq!(inspection.account_nonce(), Some(0));
+        assert_eq!(inspection.balances()[&ExecutorAsset::Native], None);
+
+        // The strike reaches the broker on its advisory channel.
+        let route = chain
+            .rpc_route
+            .for_class(crate::RpcTrafficClass::Sensitive)
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while http
+                .rpc_broker()
+                .endpoint_candidates(route.route(), None)
+                .await
+                .unwrap()
+                != route.endpoints()[1..]
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        failing_server.abort();
+        other_server.abort();
     }
 
     #[tokio::test]
