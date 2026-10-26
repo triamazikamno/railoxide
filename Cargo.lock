@@ -1824,9 +1824,9 @@ checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
 
 [[package]]
 name = "async-trait"
-version = "0.1.91"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae36dc4177970ef04fde5178d3e2429882def40e57a451f919c098f72baa6cec"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2020,9 +2020,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.17.3"
+version = "1.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00bdb5da18dac48ca2cc7cd4a98e533e8635a58e2361d13a1a4ee3888e0d72f1"
+checksum = "faac5829c2b74c28f830747e7818ccfb684261b5f48a1118b1e2a13d36dfab13"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -2030,9 +2030,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.43.0"
+version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43103168cc76fe62678a375e722fc9cb3a0146159ac5828bc4f0dfd755c2224c"
+checksum = "f1622d8446a2d4b2ce0c7eefc73dd43a99779028d5ee5c2dd8073a658ba8a2bc"
 dependencies = [
  "cc",
  "cmake",
@@ -2446,7 +2446,7 @@ dependencies = [
 [[package]]
 name = "broadcaster-core"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=67a0ba2b2860cd5f7e683dfe38f64dffe56aa005#67a0ba2b2860cd5f7e683dfe38f64dffe56aa005"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=595d42682cf1f71af8c49bde84cfcf1039f7b8c3#595d42682cf1f71af8c49bde84cfcf1039f7b8c3"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -3672,9 +3672,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-bigint"
-version = "0.7.5"
+version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a52aa3fcda4e6302a9f48734f234d35d4721b96f8fe07d073f07ce9df4f0271"
+checksum = "9c035cb64cba03dad2fb921f3e218785e8cf9a41790da5eb3a1400f62fa2be11"
 dependencies = [
  "cpubits",
  "ctutils",
@@ -3729,9 +3729,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "fe3e9d21d39e6f39ff46e03d5b621424f88ee23d8a1672c6bfc9ccc7f2da4f6a"
 dependencies = [
  "cmov",
  "subtle",
@@ -4450,7 +4450,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d65aa39b3a5c1c9c1b745c9a019234bb7a21b77abcb4f4d266d706e2d577d65"
 dependencies = [
  "base16ct 1.0.0",
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.10",
  "crypto-common 0.2.2",
  "digest 0.11.3",
  "ff 0.14.0",
@@ -6593,9 +6593,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.15"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -8340,7 +8340,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 [[package]]
 name = "local-db"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=67a0ba2b2860cd5f7e683dfe38f64dffe56aa005#67a0ba2b2860cd5f7e683dfe38f64dffe56aa005"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=595d42682cf1f71af8c49bde84cfcf1039f7b8c3#595d42682cf1f71af8c49bde84cfcf1039f7b8c3"
 dependencies = [
  "alloy",
  "broadcaster-core",
@@ -8721,7 +8721,7 @@ dependencies = [
 [[package]]
 name = "merkletree"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=67a0ba2b2860cd5f7e683dfe38f64dffe56aa005#67a0ba2b2860cd5f7e683dfe38f64dffe56aa005"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=595d42682cf1f71af8c49bde84cfcf1039f7b8c3#595d42682cf1f71af8c49bde84cfcf1039f7b8c3"
 dependencies = [
  "alloy",
  "alloy-rpc-types-eth",
@@ -10318,7 +10318,7 @@ dependencies = [
 [[package]]
 name = "poi"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=67a0ba2b2860cd5f7e683dfe38f64dffe56aa005#67a0ba2b2860cd5f7e683dfe38f64dffe56aa005"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=595d42682cf1f71af8c49bde84cfcf1039f7b8c3#595d42682cf1f71af8c49bde84cfcf1039f7b8c3"
 dependencies = [
  "alloy",
  "broadcaster-core",
@@ -10484,7 +10484,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c555a6e4eb7d4e158fcb028c835c3b8642206ddc279b5c6b202ef9a8bdb592f4"
 dependencies = [
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.10",
  "crypto-common 0.2.2",
  "ff 0.14.0",
  "rand_core 0.10.1",
@@ -10852,7 +10852,7 @@ dependencies = [
 [[package]]
 name = "public-broadcaster-protocol"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=67a0ba2b2860cd5f7e683dfe38f64dffe56aa005#67a0ba2b2860cd5f7e683dfe38f64dffe56aa005"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=595d42682cf1f71af8c49bde84cfcf1039f7b8c3#595d42682cf1f71af8c49bde84cfcf1039f7b8c3"
 dependencies = [
  "alloy",
  "broadcaster-core",
@@ -10993,9 +10993,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.16"
+version = "0.11.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
+checksum = "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -11059,7 +11059,7 @@ checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
 [[package]]
 name = "railgun-indexed-artifacts"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=67a0ba2b2860cd5f7e683dfe38f64dffe56aa005#67a0ba2b2860cd5f7e683dfe38f64dffe56aa005"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=595d42682cf1f71af8c49bde84cfcf1039f7b8c3#595d42682cf1f71af8c49bde84cfcf1039f7b8c3"
 dependencies = [
  "alloy-primitives",
  "ed25519-dalek 3.0.0",
@@ -11081,7 +11081,7 @@ dependencies = [
 [[package]]
 name = "railgun-wallet"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=67a0ba2b2860cd5f7e683dfe38f64dffe56aa005#67a0ba2b2860cd5f7e683dfe38f64dffe56aa005"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=595d42682cf1f71af8c49bde84cfcf1039f7b8c3#595d42682cf1f71af8c49bde84cfcf1039f7b8c3"
 dependencies = [
  "alloy",
  "alloy-rpc-types-eth",
@@ -11683,7 +11683,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4a459cddafb3fe76b31fd8f1108007566c40301feb64dc7b54656eb7388172b"
 dependencies = [
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.10",
  "hmac 0.13.0",
 ]
 
@@ -12119,9 +12119,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -12192,9 +12192,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -13479,7 +13479,7 @@ dependencies = [
 [[package]]
 name = "sync-service"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=67a0ba2b2860cd5f7e683dfe38f64dffe56aa005#67a0ba2b2860cd5f7e683dfe38f64dffe56aa005"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=595d42682cf1f71af8c49bde84cfcf1039f7b8c3#595d42682cf1f71af8c49bde84cfcf1039f7b8c3"
 dependencies = [
  "alloy",
  "alloy-provider",
@@ -15281,7 +15281,7 @@ dependencies = [
 [[package]]
 name = "trustless-artifacts"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=67a0ba2b2860cd5f7e683dfe38f64dffe56aa005#67a0ba2b2860cd5f7e683dfe38f64dffe56aa005"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=595d42682cf1f71af8c49bde84cfcf1039f7b8c3#595d42682cf1f71af8c49bde84cfcf1039f7b8c3"
 dependencies = [
  "blake2b_simd",
  "bytes",
@@ -15771,7 +15771,7 @@ checksum = "317211a0dc0ceedd78fb2ca9a44aed3d7b9b26f81870d485c07122b4350673b7"
 [[package]]
 name = "waku"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=67a0ba2b2860cd5f7e683dfe38f64dffe56aa005#67a0ba2b2860cd5f7e683dfe38f64dffe56aa005"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=595d42682cf1f71af8c49bde84cfcf1039f7b8c3#595d42682cf1f71af8c49bde84cfcf1039f7b8c3"
 dependencies = [
  "ahash",
  "alloy-rlp",
@@ -15808,13 +15808,14 @@ dependencies = [
 [[package]]
 name = "waku-relay"
 version = "0.1.0"
-source = "git+https://github.com/triamazikamno/railgun-rust?rev=67a0ba2b2860cd5f7e683dfe38f64dffe56aa005#67a0ba2b2860cd5f7e683dfe38f64dffe56aa005"
+source = "git+https://github.com/triamazikamno/railgun-rust?rev=595d42682cf1f71af8c49bde84cfcf1039f7b8c3#595d42682cf1f71af8c49bde84cfcf1039f7b8c3"
 dependencies = [
  "alloy",
  "base64 0.22.1",
  "lru 0.18.2",
  "reqwest",
  "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -16422,9 +16423,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -16435,14 +16436,14 @@ version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
 dependencies = [
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]
