@@ -71,6 +71,15 @@ pub struct GatewayInstallBundle {
     pub version: &'static str,
 }
 
+impl GatewayInstallBundle {
+    /// Lowercase hex SHA-256 of the served `zip`, as `sha256sum` prints it, or `None` without a bundle.
+    #[must_use]
+    pub fn zip_sha256(&self) -> Option<String> {
+        use sha2::{Digest as _, Sha256};
+        (!self.zip.is_empty()).then(|| alloy::hex::encode(Sha256::digest(self.zip)))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
@@ -751,6 +760,19 @@ impl GatewayHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zip_sha256_matches_os_tools() {
+        assert_eq!(GatewayInstallBundle::default().zip_sha256(), None);
+        let bundle = GatewayInstallBundle {
+            zip: b"abc",
+            version: "0.1.0",
+        };
+        assert_eq!(
+            bundle.zip_sha256().as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+    }
 
     #[test]
     fn only_a_parsable_older_report_offers_an_update() {

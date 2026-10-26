@@ -9,7 +9,9 @@ For a manual Cargo build, run `scripts/build-browser-extension` first and set
 1. Open **Browser pairing** in the desktop sidebar and turn on **Enable browser gateway**.
 2. Choose **Install extension…** under **Paired browsers**.
 3. Open the address the dialog shows in the browser you want to pair, on this machine or on another one that can reach the listener.
-4. Follow the page: download the zip, extract it, and load the folder through the browser's extension page.
+4. Download the zip from the page.
+5. Before extracting it, run the check command for that machine's system from the desktop install dialog, in the folder that holds the file. The command carries the expected SHA-256 and prints `OK` (Linux, macOS) or `True` (Windows PowerShell) when the file matches; otherwise delete the file. The page and the zip travel over plain HTTP, so anyone who can replace the zip can also rewrite the page and what its copy buttons copy. Take the hash and the command only from the desktop app.
+6. Follow the page to extract the zip and load the folder through the browser's extension page.
 
 ## Build and load
 

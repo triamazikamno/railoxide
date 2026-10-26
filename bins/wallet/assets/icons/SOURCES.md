@@ -1,5 +1,8 @@
 # Icon Sources
 
+- `linux-logo.svg`, `apple-logo.svg`, `windows-logo.svg`: Phosphor Icons `linux-logo`, `apple-logo` and `windows-logo`, regular weight, unchanged from [`@phosphor-icons/core` 2.1.1](https://cdn.jsdelivr.net/npm/@phosphor-icons/core@2.1.1/assets/regular/), MIT License, vendored as [phosphor-icons-LICENSE.txt](phosphor-icons-LICENSE.txt). Used only to identify the operating system a download check command is for.
+  SHA-256: `98d671ac52a3f495a3047b117fa7ad19fb210c701efffdba41cf618b0f4ef3d7`, `eda34697a0e75fec1732b55ae97b75868615696993a4fa8fff6029cd63498ff8`, `7fbc3e77c1f1cc05cc15edb074b5f3360e2d8a30253b8826a290c0b62e10f62f`.
+
 - `square.svg`: Lucide `square`, ISC License, https://lucide.dev/icons/square
 - `square-asterisk.svg`: Lucide `square-asterisk`, ISC License, https://lucide.dev/icons/square-asterisk
 - `key-round.svg`: Lucide `key-round`, ISC License, https://lucide.dev/icons/key-round

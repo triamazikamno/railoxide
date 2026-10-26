@@ -63,6 +63,9 @@ const SPARKLES_ICON_PATH: &str = "railgun/icons/sparkles.svg";
 const REFRESH_CW_OFF_ICON_PATH: &str = "railgun/icons/refresh-cw-off.svg";
 const NETWORK_ICON_PATH: &str = "railgun/icons/network.svg";
 const PIN_ICON_PATH: &str = "railgun/icons/pin.svg";
+pub(crate) const LINUX_LOGO_ICON_PATH: &str = "railgun/icons/linux-logo.svg";
+pub(crate) const APPLE_LOGO_ICON_PATH: &str = "railgun/icons/apple-logo.svg";
+pub(crate) const WINDOWS_LOGO_ICON_PATH: &str = "railgun/icons/windows-logo.svg";
 const UI_ASSET_PREFIX: &str = "ui/";
 const RAILGUN_UI_ASSET_PREFIX: &str = "railgun-ui/";
 
@@ -115,6 +118,9 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     REFRESH_CW_OFF_ICON_PATH,
     NETWORK_ICON_PATH,
     PIN_ICON_PATH,
+    LINUX_LOGO_ICON_PATH,
+    APPLE_LOGO_ICON_PATH,
+    WINDOWS_LOGO_ICON_PATH,
 ];
 
 const LOGO_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/logo.svg");
@@ -173,6 +179,9 @@ const SPARKLES_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/sparkles.svg"
 const REFRESH_CW_OFF_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/refresh-cw-off.svg");
 const NETWORK_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/network.svg");
 const PIN_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/pin.svg");
+const LINUX_LOGO_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/linux-logo.svg");
+const APPLE_LOGO_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/apple-logo.svg");
+const WINDOWS_LOGO_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/windows-logo.svg");
 
 pub(crate) struct WalletAssets;
 
@@ -478,6 +487,9 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         REFRESH_CW_OFF_ICON_PATH => Some(REFRESH_CW_OFF_ICON_BYTES),
         NETWORK_ICON_PATH => Some(NETWORK_ICON_BYTES),
         PIN_ICON_PATH => Some(PIN_ICON_BYTES),
+        LINUX_LOGO_ICON_PATH => Some(LINUX_LOGO_ICON_BYTES),
+        APPLE_LOGO_ICON_PATH => Some(APPLE_LOGO_ICON_BYTES),
+        WINDOWS_LOGO_ICON_PATH => Some(WINDOWS_LOGO_ICON_BYTES),
         _ => None,
     }
 }

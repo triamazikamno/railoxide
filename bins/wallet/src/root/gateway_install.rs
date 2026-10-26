@@ -4,18 +4,19 @@ use std::rc::{Rc, Weak};
 
 use gpui::{
     App, Context, FocusHandle, IntoElement, ParentElement, SharedString, Styled, Window, div,
-    prelude::FluentBuilder as _, rems,
+    prelude::FluentBuilder as _, rems, rgb,
 };
 use gpui_component::{
     Icon, Sizable as _, WindowExt,
-    button::ButtonVariants as _,
+    button::{ButtonGroup, ButtonVariants as _},
     clipboard::Clipboard,
     dialog::{Cancel, Confirm, DialogFooter},
 };
-use ui::controls::{app_button, app_muted_text, app_strong_text, app_text};
-use ui::theme::APP_MONO_FONT_FAMILY;
+use ui::controls::{app_button, app_muted_text, app_segment_button, app_strong_text, app_text};
+use ui::theme::{self, APP_MONO_FONT_FAMILY};
 
 use super::listener::local_ipv4_addresses;
+use crate::assets::{APPLE_LOGO_ICON_PATH, LINUX_LOGO_ICON_PATH, WINDOWS_LOGO_ICON_PATH};
 use crate::root::WalletRoot;
 
 pub(super) struct GatewayInstallDialog {
@@ -23,6 +24,56 @@ pub(super) struct GatewayInstallDialog {
     lease: Weak<()>,
     listener: SocketAddr,
     interfaces: Option<Result<Vec<(IpAddr, String)>, ()>>,
+    check_os: CheckOs,
+}
+
+/// The system the download is checked on, which may differ from the desktop's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckOs {
+    Linux,
+    MacOs,
+    Windows,
+}
+
+impl CheckOs {
+    const ALL: [Self; 3] = [Self::Linux, Self::MacOs, Self::Windows];
+
+    const fn desktop() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Linux
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Linux => "Linux",
+            Self::MacOs => "macOS",
+            Self::Windows => "Windows",
+        }
+    }
+
+    const fn icon(self) -> &'static str {
+        match self {
+            Self::Linux => LINUX_LOGO_ICON_PATH,
+            Self::MacOs => APPLE_LOGO_ICON_PATH,
+            Self::Windows => WINDOWS_LOGO_ICON_PATH,
+        }
+    }
+
+    /// A command that checks the download against `hex` and prints `OK` or `True` on a match.
+    /// It comes from this window because an attacker who rewrites the HTTP page also controls
+    /// what its copy buttons copy.
+    fn command(self, hex: &str) -> String {
+        match self {
+            Self::Linux => format!("echo '{hex}  RailOxide-Extension.zip' | sha256sum -c"),
+            Self::MacOs => format!("echo '{hex}  RailOxide-Extension.zip' | shasum -a 256 -c"),
+            Self::Windows => format!("(Get-FileHash RailOxide-Extension.zip).Hash -eq '{hex}'"),
+        }
+    }
 }
 
 impl GatewayInstallDialog {
@@ -63,6 +114,23 @@ pub(super) fn install_addresses(
     addresses
 }
 
+/// A labelled monospace value that wraps instead of truncating, so every character stays visible.
+fn copy_row(label: &'static str, value: SharedString, copy: Clipboard) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .min_w_0()
+        .child(app_muted_text(label).flex_none().w(rems(6.0)))
+        .child(
+            app_text(value)
+                .flex_1()
+                .min_w_0()
+                .font_family(APP_MONO_FONT_FAMILY),
+        )
+        .child(copy)
+}
+
 impl WalletRoot {
     pub(super) fn open_gateway_install_dialog(
         &mut self,
@@ -79,6 +147,15 @@ impl WalletRoot {
         let lease = Rc::new(());
         let identity = Rc::downgrade(&lease);
         let root = cx.entity();
+        let download_sha256 = super::install_bundle().zip_sha256().map(|hex| {
+            let grouped = hex
+                .as_bytes()
+                .chunks(8)
+                .map(|group| String::from_utf8_lossy(group))
+                .collect::<Vec<_>>()
+                .join(" ");
+            (hex, SharedString::from(grouped))
+        });
         window.open_dialog(cx, move |dialog, window, cx| {
             // Only the active dialog builder owns a strong lease. Programmatic closes
             // can bypass on_close, so opening a browser also checks the lease and focus.
@@ -128,6 +205,95 @@ impl WalletRoot {
                 })
                 .when(enumeration_failed, |this| {
                     this.child(app_muted_text("Could not list local addresses."))
+                })
+                .when_some(download_sha256.as_ref(), |this, (hex, grouped)| {
+                    let selected = state.check_os;
+                    let command = SharedString::from(selected.command(hex));
+                    let switches = CheckOs::ALL.map(|os| {
+                        let root = root.clone();
+                        let identity = identity.clone();
+                        app_segment_button(
+                            SharedString::from(format!("gateway-install-check-{}", os.label())),
+                            os.label(),
+                            os == selected,
+                            false,
+                            None,
+                        )
+                        .icon(Icon::empty().path(os.icon()).small())
+                        .flex_1()
+                        .min_w_0()
+                        .on_click(move |_, _, cx| {
+                            root.update(cx, |root, cx| {
+                                if let Some(state) = root
+                                    .gateway
+                                    .install_dialog
+                                    .as_mut()
+                                    .filter(|state| state.lease.ptr_eq(&identity))
+                                {
+                                    state.check_os = os;
+                                    cx.notify();
+                                }
+                            });
+                        })
+                    });
+                    this.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .mt_2()
+                            .pt_4()
+                            .border_t_1()
+                            .border_color(rgb(theme::BORDER_SUBTLE))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(app_strong_text("Check the download"))
+                                    .child(app_muted_text(
+                                        "Before extracting the zip, run this where you saved it. It prints OK or True if the file is genuine.",
+                                    )),
+                            )
+                            .child(
+                                ButtonGroup::new("gateway-install-check-os")
+                                    .outline()
+                                    .compact()
+                                    .w_full()
+                                    .children(switches),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_start()
+                                    .gap_2()
+                                    .min_w_0()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(theme::BORDER_SUBTLE))
+                                    .bg(rgb(theme::SETTINGS_INPUT_SURFACE))
+                                    .child(
+                                        app_text(command.clone())
+                                            .flex_1()
+                                            .min_w_0()
+                                            .font_family(APP_MONO_FONT_FAMILY),
+                                    )
+                                    .child(
+                                        Clipboard::new("gateway-install-copy-check")
+                                            .value(command)
+                                            .tooltip("Copy command"),
+                                    ),
+                            )
+                            .child(copy_row(
+                                "SHA-256",
+                                grouped.clone(),
+                                Clipboard::new("gateway-install-copy-sha256")
+                                    .value(SharedString::from(hex.clone()))
+                                    .tooltip("Copy SHA-256"),
+                            )),
+                    )
                 });
             let open_root = root.clone();
             let open_identity = identity.clone();
@@ -192,6 +358,7 @@ impl WalletRoot {
             lease: identity.clone(),
             listener,
             interfaces: None,
+            check_os: CheckOs::desktop(),
         });
         if listener.ip().is_unspecified() {
             let interfaces = cx

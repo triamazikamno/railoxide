@@ -414,6 +414,12 @@ mod tests {
         assert!(page.contains(&default.to_string()));
         assert!(page.contains("9.9.9"));
         assert!(page.contains(r#"class="local bundled""#));
+        // An attacker who replaces the zip rewrites the page and its copy buttons too, so the
+        // hash and the commands that check it come only from the desktop dialog.
+        assert!(!page.contains(&BUNDLE.zip_sha256().unwrap()));
+        for tool in ["sha256sum", "shasum", "certutil", "Get-FileHash"] {
+            assert!(!page.contains(tool));
+        }
 
         // On loopback the socket decides both the mode and the address, whatever the header says.
         for header in [Some("localhost:43110"), Some("evil\"><b>"), None] {

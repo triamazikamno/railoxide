@@ -36,8 +36,7 @@
   .step .c { grid-column:2; display:flex; flex-direction:column; gap:8px; font-size:13px; line-height:19px; }
   .step .c p { color:var(--text-muted); }
   .step .c ol { padding-left:18px; color:var(--text); display:flex; flex-direction:column; gap:4px; }
-  .step .c ol li span.aside { color:var(--text-muted); }
-  .code {
+  .step .c ol li span.aside { color:var(--text-muted); }  .code {
     font-family:Menlo,Consolas,"DejaVu Sans Mono",monospace; font-size:12px;
     background:var(--input-surface); border:1px solid var(--border-subtle); border-radius:4px; padding:1px 6px;
   }
@@ -114,7 +113,13 @@
       <p class="unbundled-only">This build has no extension bundle. Run <span class="code">scripts/build-browser-extension</span> and rebuild the desktop app.</p>
     </div></div>
 
-  <div class="step"><span class="n">2</span><h3>Extract</h3>
+  <div class="step"><span class="n">2</span><h3>Verify</h3>
+    <div class="c">
+      <p>Before you extract the zip, run the check command for this computer’s system from the desktop app’s install dialog, in the folder that holds the file. If it does not report a match, delete the file.</p>
+      <p>Whoever could replace the file could also rewrite this page, so this page offers no hash or command to check it with. Use only the ones in the desktop app.</p>
+    </div></div>
+
+  <div class="step"><span class="n">3</span><h3>Extract</h3>
     <div class="c">
       <div class="osgrid">
         <div><b>macOS</b>Double-click the zip.</div>
@@ -124,7 +129,7 @@
       <p>You get a folder named <span class="code">RailOxide-Extension</span>.</p>
     </div></div>
 
-  <div class="step"><span class="n">3</span><h3>Load it in the browser</h3>
+  <div class="step"><span class="n">4</span><h3>Load it in the browser</h3>
     <div class="c">
       <div class="browsers">
         <input type="radio" name="browser" id="tab-brave" checked>
@@ -156,7 +161,7 @@
       </div>
     </div></div>
 
-  <div class="step"><span class="n">4</span><h3>Connect</h3>
+  <div class="step"><span class="n">5</span><h3>Connect</h3>
     <div class="c connect-local">
       <p>Open the extension. It connects to this computer automatically.</p>
       <p>Create a pairing in the desktop app and enter the code.</p>
@@ -173,7 +178,7 @@
     </div></div>
 
   <div class="step"><span class="n" style="border-color:transparent"></span><h3>Updating</h3>
-    <div class="c"><p>Download again, extract over the same folder, then click <b>Reload</b> on the extension card.</p></div></div>
+    <div class="c"><p>Download again, verify it, extract over the same folder, then click <b>Reload</b> on the extension card.</p></div></div>
 
   <section class="step" id="graphics-troubleshooting">
     <span class="n" style="border-color:transparent" aria-hidden="true"></span><h3>Graphics startup fails in a Linux VM</h3>
