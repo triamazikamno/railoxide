@@ -108,12 +108,14 @@ jobs:
         id: sccache
         shell: bash
         env:
-          BUILD_INPUTS_HASH: ${{ hashFiles('Cargo.lock', 'Cargo.toml', 'bins/wallet/packaging/flatpak/**', 'scripts/build-wallet-flatpak', '.github/workflows/flatpak-ci.yml', '.github/workflows/flatpak-release.yml') }}
+          # sccache checks dependency sources and compiler inputs per compilation.
+          # Share snapshots across application version and dependency updates.
+          CACHE_CONFIG_HASH: ${{ hashFiles('bins/wallet/packaging/flatpak/rust-toolchain.yml', 'bins/wallet/packaging/flatpak/sccache.yml', 'bins/wallet/packaging/flatpak/rustc-cache') }}
         run: |
           set -euo pipefail
           sdk_commit="$(flatpak info --arch=${{ matrix.arch }} --show-commit org.freedesktop.Sdk//25.08)"
           [[ "$sdk_commit" =~ ^[0-9a-f]{64}$ ]]
-          printf 'prefix=flatpak-sccache-%s-%s-%s-\n' '${{ matrix.arch }}' "$sdk_commit" "$BUILD_INPUTS_HASH" >>"$GITHUB_OUTPUT"
+          printf 'prefix=flatpak-sccache-%s-%s-%s-\n' '${{ matrix.arch }}' "$sdk_commit" "$CACHE_CONFIG_HASH" >>"$GITHUB_OUTPUT"
 
       - name: Restore sccache
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
