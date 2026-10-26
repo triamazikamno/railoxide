@@ -1751,7 +1751,7 @@ async fn swap_fork_external_settlement_pays_the_receiver_and_completes_on_the_tr
         wallet.pair = (buy, SwapDelivery::External { receiver });
         let swap = wallet.swap(&fork).await;
         assert_eq!(swap.order.receiver, receiver);
-        assert!(swap.hooks.post.is_empty());
+        assert_eq!(swap.hooks.post, [] as [AppDataHook; 0]);
         let before = balance_of(&fork, buy, receiver).await;
 
         let receipt = fork
@@ -3027,7 +3027,7 @@ async fn swap_fork_one_cancellation_invalidates_both_overlapping_orders() {
             SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Cancellation)
         );
     }
-    assert!(record.swap().unwrap().fundings().is_empty());
+    assert_eq!(record.swap().unwrap().fundings(), [] as [SwapFunding; 0]);
     assert_eq!(
         record.payload_state(issued.payload_hash()),
         Some(ExecutorPayloadState::Resolved)
@@ -3424,7 +3424,7 @@ async fn swap_fork_retry_settlement_deposits_an_expired_attempts_across_terms() 
             assert_eq!(*credited + *fee, left);
             Some((*credited, Some(*fee)))
         } else {
-            assert!(shields.is_empty());
+            assert_eq!(shields, [] as [(U256, U256); 0]);
             None
         };
         assert_eq!(
@@ -3870,7 +3870,7 @@ async fn swap_fork_spoke_pool_rejects_a_deposit_past_its_quote_age() {
         .await;
     assert_eq!(continuing().await, vec![swap.uid]);
     fork.mine(1).await;
-    assert!(continuing().await.is_empty());
+    assert_eq!(continuing().await, [] as [OrderUid; 0]);
     wallet.finish().await;
 }
 
@@ -4909,7 +4909,10 @@ async fn swap_fork_private_across_fill_with_a_failed_shield_is_held_by_the_desti
         (balance(account).await, balance(railgun).await),
         (output, shielded_before)
     );
-    assert!(shields_of(&filled, railgun, DESTINATION_TOKEN).is_empty());
+    assert_eq!(
+        shields_of(&filled, railgun, DESTINATION_TOKEN),
+        [] as [(U256, U256); 0]
+    );
     assert_eq!(execution_nonce(&destination_fork, account).await, taken);
 
     let block = BlockNumHash::new(filled.block_number.unwrap(), filled.block_hash.unwrap());
@@ -6121,13 +6124,11 @@ async fn swap_fork_public_deposit_is_filled_and_shielded_on_the_destination_chai
             },
         )
         .await;
-    assert!(native.plan.approval_gas_limits.is_empty());
+    assert_eq!(native.plan.approval_gas_limits, [] as [u64; 0]);
     approve(&native).await.unwrap();
-    assert!(
-        public_swap_record(&wallet, &native)
-            .0
-            .transactions()
-            .is_empty()
+    assert_eq!(
+        public_swap_record(&wallet, &native).0.transactions(),
+        [] as [PublicSwapTransaction; 0]
     );
     let signed = wallet
         .sign_public_delivery(
@@ -6285,7 +6286,7 @@ async fn place_public_order(
         .unwrap()
         .metadata
         .hooks;
-    assert!(hooks.pre.is_empty());
+    assert_eq!(hooks.pre, [] as [AppDataHook; 0]);
     let [hook] = hooks.post.as_slice() else {
         panic!("the order has one post-hook");
     };
@@ -7059,7 +7060,7 @@ async fn public_permit_order_scenario(route: PermitOrigin) {
         "the review plans a permit for USDC's short allowance"
     );
     let plan = review.gas_plan().clone();
-    assert!(plan.approval_gas_limits.is_empty());
+    assert_eq!(plan.approval_gas_limits, [] as [u64; 0]);
     assert_eq!(
         (plan.deposit_gas_limit, plan.max_gas_cost),
         (None, U256::ZERO)
@@ -7125,11 +7126,9 @@ async fn public_permit_order_scenario(route: PermitOrigin) {
         .await
         .unwrap();
     assert_eq!(outcome, PublicSwapApprovalsOutcome::Ready);
-    assert!(
-        public_swap_record(&wallet, &swap)
-            .0
-            .transactions()
-            .is_empty()
+    assert_eq!(
+        public_swap_record(&wallet, &swap).0.transactions(),
+        [] as [PublicSwapTransaction; 0]
     );
 
     // The order signs the permit under the account's current nonce until the order's

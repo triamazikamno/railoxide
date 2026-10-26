@@ -927,7 +927,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
         .into_iter()
         .find(|record| record.operation() == operation)
         .unwrap();
-    assert!(released.reserved_inputs().is_empty());
+    assert_eq!(released.reserved_inputs(), [] as [ExecutorInputIdentity; 0]);
     let other = ExecutorOperationId::random().unwrap();
     // The reservation takes the prefetched spare, which already has its address.
     let other_address = store
@@ -4520,7 +4520,10 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
                 error.to_string().contains("destination network"),
                 "{error:#}"
             );
-            assert!(destination_record().issued().is_empty());
+            assert_eq!(
+                destination_record().issued(),
+                [] as [IssuedExecutorPayload; 0]
+            );
         }
 
         // A new account's setup is confirmed now. An existing account keeps the one it had.
@@ -4552,11 +4555,9 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
         }
         // A completed destination setup still belongs to its origin swap, even before any
         // shield has been issued. It must not be offered or previewed for an unrelated swap.
-        assert!(
-            destination_owner
-                .swap_account_candidates()
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            destination_owner.swap_account_candidates().unwrap(),
+            [] as [crate::SwapAccountCandidate; 0]
         );
         assert!(
             destination_owner

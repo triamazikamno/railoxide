@@ -559,13 +559,19 @@ fn waku_doh_settings_display_presets_until_customized() {
     let mut direct = settings.clone();
     direct.network.mode = NetworkModeSetting::Direct;
     assert_eq!(display_waku_doh_endpoint(&direct), DEFAULT_DOH_ENDPOINT);
-    assert!(display_waku_doh_fallback_endpoints(&direct).is_empty());
+    assert_eq!(
+        display_waku_doh_fallback_endpoints(&direct),
+        [] as [String; 0]
+    );
 
     let mut proxy = settings.clone();
     proxy.network.mode = NetworkModeSetting::Proxy;
     proxy.network.proxy_url = Some("socks5h://127.0.0.1:9050".to_string());
     assert_eq!(display_waku_doh_endpoint(&proxy), DEFAULT_DOH_ENDPOINT);
-    assert!(display_waku_doh_fallback_endpoints(&proxy).is_empty());
+    assert_eq!(
+        display_waku_doh_fallback_endpoints(&proxy),
+        [] as [String; 0]
+    );
 
     let mut custom = settings;
     custom.waku.doh_endpoint = Some("https://doh.example.invalid/dns-query".to_string());
@@ -585,7 +591,10 @@ fn waku_doh_fallback_mutations_materialize_presets() {
 
     remove_waku_doh_fallback_endpoint(&mut settings, 0);
     assert_eq!(settings.waku.doh_fallback_endpoints, Some(Vec::new()));
-    assert!(display_waku_doh_fallback_endpoints(&settings).is_empty());
+    assert_eq!(
+        display_waku_doh_fallback_endpoints(&settings),
+        [] as [String; 0]
+    );
 
     add_waku_doh_fallback_endpoint(&mut settings, " https://fallback.example/dns-query ");
     assert_eq!(
@@ -612,7 +621,7 @@ fn waku_dns_enr_tree_settings_display_presets_until_customized() {
 
     remove_waku_dns_enr_tree(&mut settings, 0);
     assert_eq!(settings.waku.dns_enr_trees, Some(Vec::new()));
-    assert!(display_waku_dns_enr_trees(&settings).is_empty());
+    assert_eq!(display_waku_dns_enr_trees(&settings), [] as [String; 0]);
 
     add_waku_dns_enr_tree(&mut settings, " enrtree://custom@example.invalid ");
     assert_eq!(
@@ -652,7 +661,10 @@ fn waku_peer_mutations_keep_lists_separate_and_preserve_opt_out() {
 
     remove_waku_peer(&mut settings, WakuPeerList::Backup, 0);
     assert_eq!(settings.waku.backup_peers, Some(Vec::new()));
-    assert!(WakuPeerList::Backup.peers(&settings).is_empty());
+    assert_eq!(
+        WakuPeerList::Backup.peers(&settings),
+        [] as [wallet_ops::settings::WakuDirectPeerSetting; 0]
+    );
     assert_eq!(WakuPeerList::Direct.peers(&settings), vec![direct]);
 }
 
@@ -775,7 +787,10 @@ fn price_anchor_settings_display_includes_built_in_defaults() {
             rate: "1000000000000000000".to_string(),
         }
     );
-    assert!(settings.tokens.price_anchors.is_empty());
+    assert_eq!(
+        settings.tokens.price_anchors,
+        [] as [TokenPriceAnchorOverride; 0]
+    );
 }
 
 #[test]
@@ -1019,7 +1034,10 @@ fn price_anchor_add_dialog_values_create_override_without_mutating_settings() {
     })
     .expect("valid add price anchor dialog values");
 
-    assert!(settings.tokens.price_anchors.is_empty());
+    assert_eq!(
+        settings.tokens.price_anchors,
+        [] as [TokenPriceAnchorOverride; 0]
+    );
     assert_eq!(anchor.key.chain_id, 42161);
     assert_eq!(
         anchor.key.token_address,

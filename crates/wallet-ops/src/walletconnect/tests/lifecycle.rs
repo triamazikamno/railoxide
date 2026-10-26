@@ -22,7 +22,10 @@ fn relay_lifecycle_pauses_without_unsubscribing_and_terminal_unsubscribes() {
     lifecycle.add_subscribed_topic("session-topic", "sub-1", true);
 
     assert!(lifecycle.local_processing_active());
-    assert!(lifecycle.pause_for_lock_or_shutdown().is_empty());
+    assert_eq!(
+        lifecycle.pause_for_lock_or_shutdown(),
+        [] as [WalletConnectRelayRpc; 0]
+    );
     assert!(!lifecycle.local_processing_active());
 
     lifecycle.resume_after_unlock();

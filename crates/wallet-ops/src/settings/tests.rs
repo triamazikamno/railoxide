@@ -1618,12 +1618,9 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
     assert!(ethereum.has_sponsorship_prerequisites());
     for chain_id in [56, 137, 42161] {
         let chain = configs.get(chain_id).expect("supported chain config");
-        assert!(
-            chain
-                .require_railgun()
-                .unwrap()
-                .sponsored_bundle_relays
-                .is_empty()
+        assert_eq!(
+            chain.require_railgun().unwrap().sponsored_bundle_relays,
+            [] as [super::SensitiveUrl; 0]
         );
         assert_eq!(chain.require_railgun().unwrap().coinbase_payer, None);
         assert!(!chain.has_sponsorship_prerequisites());
@@ -1836,14 +1833,14 @@ fn effective_chain_rpc_route_validates_chain_identities() {
 fn sponsored_relay_overrides_preserve_order_and_explicit_empty_disables() {
     let mut settings = WalletSettings::default();
     let inherited = build_effective_chain_configs(&settings).expect("inherited sponsored relays");
-    assert!(
-        !inherited
+    assert_ne!(
+        inherited
             .get(1)
             .expect("ethereum config")
             .require_railgun()
             .unwrap()
-            .sponsored_bundle_relays
-            .is_empty()
+            .sponsored_bundle_relays,
+        [] as [super::SensitiveUrl; 0]
     );
     settings
         .chains
@@ -1886,14 +1883,14 @@ fn sponsored_relay_overrides_preserve_order_and_explicit_empty_disables() {
         .railgun
         .sponsored_bundle_relays = Some(Vec::new());
     let disabled = build_effective_chain_configs(&settings).expect("disabled sponsored relays");
-    assert!(
+    assert_eq!(
         disabled
             .get(1)
             .expect("ethereum config")
             .require_railgun()
             .unwrap()
-            .sponsored_bundle_relays
-            .is_empty()
+            .sponsored_bundle_relays,
+        [] as [super::SensitiveUrl; 0]
     );
 }
 
@@ -3567,7 +3564,10 @@ fn released_v6_overrides_migrate_without_losing_repairable_or_unrelated_settings
     assert_eq!(private.coinbase_payer, super::default_coinbase_payer(1));
     assert_eq!(private.sync.block_range, 2_000);
     assert!(private.sync.quick_sync_endpoint.is_none());
-    assert!(private.sponsored_bundle_relays.is_empty());
+    assert_eq!(
+        private.sponsored_bundle_relays,
+        [] as [super::SensitiveUrl; 0]
+    );
     assert_eq!(
         configs.get(1).unwrap().rpc_route.multicall(),
         Some(Address::repeat_byte(2))

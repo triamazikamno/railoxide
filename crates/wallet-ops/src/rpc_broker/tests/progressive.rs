@@ -678,7 +678,7 @@ async fn parked_jobs_wake_when_a_route_clone_verifies_an_endpoint() {
     let mut served = healthy.reads();
     served.sort();
     assert_eq!(served, ["eth_blockNumber", "eth_gasPrice"]);
-    assert!(stalled_endpoint.reads().is_empty());
+    assert_eq!(stalled_endpoint.reads(), [] as [String; 0]);
     release_stalled_jobs(&stall, stalled).await;
     drop(broker);
     failing.server.abort();
@@ -778,7 +778,7 @@ async fn queued_reads_start_when_their_own_route_verifies_outside_the_broker() {
     time::sleep(SETTLE).await;
     assert!(!first.is_finished());
     assert!(!second.is_finished());
-    assert!(healthy.reads().is_empty());
+    assert_eq!(healthy.reads(), [] as [String; 0]);
 
     // Verified outside the broker, as sync admission does, and only in the second cache.
     warm_identity(&second_route, &healthy.url).await;
@@ -857,7 +857,7 @@ async fn parked_read_keeps_its_dispatched_failure_when_the_caller_expires() {
         "unexpected parked result: {result:?}"
     );
     assert_eq!(failing.reads(), [Shape::Individual.method()]);
-    assert!(pending.reads().is_empty());
+    assert_eq!(pending.reads(), [] as [String; 0]);
     drop(tx);
     time::timeout(BOUND, actor)
         .await

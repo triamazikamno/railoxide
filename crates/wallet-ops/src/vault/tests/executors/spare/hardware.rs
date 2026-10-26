@@ -180,7 +180,7 @@ async fn hardware_executor_allocation_issuance_and_public_signing_require_scoped
                 .await
                 .is_err()
         );
-        assert!(store.records().unwrap().is_empty());
+        assert_eq!(store.records().unwrap(), [] as [ExecutorRecord; 0]);
         assert!(rpc.state.requests.lock().unwrap().is_empty());
         assert!(
             owner
@@ -227,7 +227,7 @@ async fn hardware_executor_allocation_issuance_and_public_signing_require_scoped
                 .await
                 .is_err()
         );
-        assert!(store.records().unwrap().is_empty());
+        assert_eq!(store.records().unwrap(), [] as [ExecutorRecord; 0]);
         let prepared = owner
             .prepare_operation(
                 operation,
@@ -669,7 +669,7 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
     );
     assert_eq!(owner.records().unwrap()[0].issued().len(), 1);
     let routes = rpc.state.routes.lock().unwrap()[restored..].to_vec();
-    assert!(!routes.is_empty());
+    assert_ne!(routes, [] as [Option<String>; 0]);
     assert!(
         routes
             .iter()
@@ -825,7 +825,7 @@ async fn one_hardware_derivation_authorizes_both_setups_of_a_private_bridge_swap
                 .await
                 .is_err()
         );
-        assert!(owner.records().unwrap().is_empty());
+        assert_eq!(owner.records().unwrap(), [] as [ExecutorRecord; 0]);
     }
 
     let prepared = prepare_swap_pair(

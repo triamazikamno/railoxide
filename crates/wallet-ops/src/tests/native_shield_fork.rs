@@ -372,7 +372,10 @@ async fn native_shield_completes(
         panic!("one issued payload");
     };
     assert_eq!(payload.purpose(), ExecutorPayloadPurpose::Operation);
-    assert!(payload.context().inputs().is_empty());
+    assert_eq!(
+        payload.context().inputs(),
+        [] as [crate::vault::ExecutorInputIdentity; 0]
+    );
     assert_eq!(payload.transaction_hashes(), [hash]);
     let value = shielded(
         &fork.receipt(hash).await,

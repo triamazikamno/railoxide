@@ -114,11 +114,11 @@ fn wallet_metadata_flows_auto_create_initial_public_account() {
     let legacy_session = store
         .load_view_session(TEST_PASSWORD, legacy_wallet_id)
         .expect("legacy view session");
-    assert!(
+    assert_eq!(
         store
             .list_active_public_accounts_for_session(&legacy_session)
-            .expect("legacy public accounts")
-            .is_empty()
+            .expect("legacy public accounts"),
+        [] as [PublicAccountMetadata; 0]
     );
 
     drop(store);
@@ -1036,10 +1036,10 @@ fn permanent_wallet_delete_purges_wallet_scoped_records_and_guards_last_active()
             "expected {key} to be deleted"
         );
     }
-    assert!(
+    assert_eq!(
         db.list_wallet_utxos(&second_cache_key)
-            .expect("list deleted atomic cache rows")
-            .is_empty()
+            .expect("list deleted atomic cache rows"),
+        [] as [local_db::WalletUtxoRecord; 0]
     );
     assert!(
         db.get_wallet_meta(&second_cache_key)
@@ -1061,13 +1061,13 @@ fn permanent_wallet_delete_purges_wallet_scoped_records_and_guards_last_active()
             .expect("list deleted output recoveries")
             .is_empty()
     );
-    assert!(
+    assert_eq!(
         db.list_opaque_wallet_private_rows(
             &second_namespace,
             WalletPrivateRecordKind::SenderTransactionCandidate,
         )
-        .expect("list deleted sender candidates")
-        .is_empty()
+        .expect("list deleted sender candidates"),
+        [] as [OpaqueWalletPrivateRow; 0]
     );
     assert_eq!(
         db.list_opaque_wallet_private_rows(

@@ -2944,14 +2944,14 @@ mod tests {
             uint!(3_000_00000000_U256),
         );
 
-        assert!(
+        assert_eq!(
             anchor_rates_from_sources_with_inputs(
                 1,
                 &runtime_sources(ARB_PER_ETH_ANCHOR_SOURCE),
                 &answers,
                 &TwapFetchedInputs::default(),
-            )
-            .is_empty()
+            ),
+            [] as [U256; 0]
         );
     }
 

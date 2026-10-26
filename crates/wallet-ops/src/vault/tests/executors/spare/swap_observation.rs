@@ -1296,7 +1296,7 @@ async fn reusing_an_account_for_another_pair_does_not_credit_the_old_tokens_shie
         .swap_order_preview(fixture.operation, true, None)
         .unwrap();
     assert!(preview.is_reused());
-    assert!(fixture.chain.lock().unwrap().rpc_methods.is_empty());
+    assert_eq!(fixture.chain.lock().unwrap().rpc_methods, [] as [String; 0]);
     // The ended order isn't settled history, so admission reconciles it before judging.
     let selected = fixture
         .owner
@@ -2100,7 +2100,10 @@ async fn an_approved_or_restricted_setup_is_not_offered_for_another_swap() {
             Some(SwapAccountRefusal::RecoveryOnly),
         ]
     );
-    assert!(fixture.owner.swap_account_candidates().unwrap().is_empty());
+    assert_eq!(
+        fixture.owner.swap_account_candidates().unwrap(),
+        [] as [crate::SwapAccountCandidate; 0]
+    );
     fixture.finish().await;
 }
 
@@ -2688,7 +2691,7 @@ async fn stealth_account_reads_use_only_the_account_client() {
         crate::OperationNetworkIsolation::Dedicated,
     );
     let only_account = |routes: &[Option<String>]| {
-        assert!(!routes.is_empty());
+        assert_ne!(routes, [] as [Option<String>; 0]);
         assert!(
             routes
                 .iter()
@@ -2792,7 +2795,10 @@ async fn expired_pre_hook_releases_inputs_at_finality_and_stays_released_after_r
         !fixture.reserved(&retained),
         "finalized release survives restart"
     );
-    assert!(restarted.input_locks(&[sell_note(3)]).unwrap().is_empty());
+    assert_eq!(
+        restarted.input_locks(&[sell_note(3)]).unwrap(),
+        [] as [crate::ExecutorInputLock; 0]
+    );
     assert_eq!(fixture.chain.lock().unwrap().rpc_methods.len(), requests);
     restarted.shutdown().await;
     fixture.finish().await;
@@ -2824,7 +2830,10 @@ async fn checking_an_expired_orders_lock_observes_the_order_and_frees_its_notes(
         state(&fixture.record(), 0),
         SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired)
     );
-    assert!(fixture.owner.input_locks(&notes).unwrap().is_empty());
+    assert_eq!(
+        fixture.owner.input_locks(&notes).unwrap(),
+        [] as [crate::ExecutorInputLock; 0]
+    );
     fixture.finish().await;
 }
 
@@ -3434,7 +3443,7 @@ async fn shared_proof_effects_record_one_funding_and_name_neither_pre_hook() {
         chain.nullifiers_spent = None;
     }
     let reopened = fixture.observe(38, 30).await;
-    assert!(reopened.swap().unwrap().fundings().is_empty());
+    assert_eq!(reopened.swap().unwrap().fundings(), [] as [SwapFunding; 0]);
     assert_eq!(order_states(&reopened), vec![SwapOrderState::Open; 2]);
     assert!(fixture.reserved(&reopened));
     fixture.finish().await;
@@ -4035,7 +4044,7 @@ fn settlement_logs(fixture: &Fixture, attempt: u8, valid_to: u64) -> Vec<(Addres
 }
 
 fn assert_block_only_requests(requests: &[Value], block: BlockNumHash) {
-    assert!(!requests.is_empty());
+    assert_ne!(requests, [] as [Value; 0]);
     for request in requests {
         match request["method"].as_str().unwrap() {
             "eth_chainId" | "eth_blockNumber" => {
@@ -4294,7 +4303,7 @@ async fn settlement_receipts_confirm_at_safety_depth_without_account_queries() {
         )
         .await
         .unwrap();
-    assert!(fixture.chain.lock().unwrap().rpc_requests.is_empty());
+    assert_eq!(fixture.chain.lock().unwrap().rpc_requests, [] as [Value; 0]);
     // Reuse after restart keeps completed order evidence local. A fresh current nonce
     // must clear both old hooks, but we need not attribute their historical execution.
     let restarted = restarted_owner(&fixture);
@@ -4353,7 +4362,7 @@ async fn settlement_receipts_confirm_at_safety_depth_without_account_queries() {
     assert_eq!(fixture.record().swap(), checked.swap());
     {
         let chain = fixture.chain.lock().unwrap();
-        assert!(!chain.rpc_requests.is_empty());
+        assert_ne!(chain.rpc_requests, [] as [Value; 0]);
         for request in &chain.rpc_requests {
             match request["method"].as_str().unwrap() {
                 "eth_chainId" | "eth_blockNumber" | "eth_getCode" => {}
@@ -4996,7 +5005,7 @@ async fn continuing_approvals_read_the_quote_age_from_one_finalized_block() {
     // A retry at the old post-hook's nonce passes it, which needs no evidence.
     fixture.chain.lock().unwrap().rpc_requests.clear();
     assert_eq!(continuing(2).await, None);
-    assert!(fixture.chain.lock().unwrap().rpc_requests.is_empty());
+    assert_eq!(fixture.chain.lock().unwrap().rpc_requests, [] as [Value; 0]);
     fixture.finish().await;
 }
 
@@ -5204,7 +5213,7 @@ async fn a_retrys_settlement_hands_off_with_the_expired_attempts_across_deposit(
                     )
                     .await
                     .unwrap();
-                assert!(fixture.chain.lock().unwrap().rpc_requests.is_empty());
+                assert_eq!(fixture.chain.lock().unwrap().rpc_requests, [] as [Value; 0]);
                 assert_eq!(fixture.record(), record);
                 // Check status once the nonce passed both hooks. The executor holds the buy
                 // amount again, which alone would read as an undelivered trade.
@@ -6281,7 +6290,7 @@ async fn across_delivery_is_verified_from_finalized_destination_receipts() {
         let outcome = if expired {
             // The destination chain isn't read.
             assert_eq!(first, Some(SwapBridgeOutcome::Refunding));
-            assert!(destination.lock().unwrap().rpc_requests.is_empty());
+            assert_eq!(destination.lock().unwrap().rpc_requests, [] as [Value; 0]);
             first
         } else {
             // The fill's block isn't final at head 30.
@@ -7045,7 +7054,7 @@ async fn an_explicit_check_of_an_across_report_verifies_it_or_finds_its_refund()
             Some(known)
         );
         assert_eq!(lookups.lock().unwrap().len(), 1);
-        assert!(destination.lock().unwrap().rpc_requests.is_empty());
+        assert_eq!(destination.lock().unwrap().rpc_requests, [] as [Value; 0]);
         match scenario {
             0 => {
                 let payment = Transfer {

@@ -351,7 +351,7 @@ mod tests {
             loopback(default_port()),
         );
         assert_eq!(status(&head), "HTTP/1.1 200 OK");
-        assert!(body(&head).is_empty());
+        assert_eq!(body(&head), [] as [u8; 0]);
         // HEAD must still announce the length the matching GET would send.
         let length = format!("Content-Length: {}", body(&page).len());
         assert!(String::from_utf8_lossy(&head).contains(&length));

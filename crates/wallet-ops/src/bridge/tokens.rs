@@ -502,8 +502,9 @@ mod tests {
             one_click("arb", "USDC", Some(ARB_USDC)),
             one_click("linea", "ETH", None),
         ];
-        assert!(
-            near_destination_tokens(&tokens, &arbitrum, &linea, ARB_WETH, &registry).is_empty()
+        assert_eq!(
+            near_destination_tokens(&tokens, &arbitrum, &linea, ARB_WETH, &registry),
+            [] as [BridgeDestination; 0]
         );
     }
 }

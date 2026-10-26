@@ -2719,7 +2719,7 @@ impl PrivateSwapsView {
                 seen,
                 transaction,
             } => SwapBridgeReported::Delivered {
-                amount: amount_out.map(&shown),
+                amount: amount_out.map(shown),
                 shield: match seen {
                     None => SwapShieldSeen::Looking,
                     Some(SwapDeliverySeen::Shielded { amount }) => SwapShieldSeen::Detected(shown(
@@ -4580,17 +4580,15 @@ mod tests {
         let within = |at: Instant, from: Instant| (from + secs(9)..=from + secs(15)).contains(&at);
         let start = Instant::now();
         let mut schedule = SwapSchedule::with_interval(swap_poll_interval, start);
-        assert!(
-            schedule
-                .poll_due(vec!['a'], |swap| *swap, start + secs(5))
-                .is_empty()
+        assert_eq!(
+            schedule.poll_due(vec!['a'], |swap| *swap, start + secs(5)),
+            [] as [char; 0]
         );
         assert!(within(schedule.due[&'a'], start));
         let later = start + secs(8);
-        assert!(
-            schedule
-                .poll_due(vec!['a', 'b'], |swap| *swap, later)
-                .is_empty()
+        assert_eq!(
+            schedule.poll_due(vec!['a', 'b'], |swap| *swap, later),
+            [] as [char; 0]
         );
         assert!(within(schedule.due[&'b'], later));
 

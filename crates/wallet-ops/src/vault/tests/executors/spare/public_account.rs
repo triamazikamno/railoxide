@@ -82,7 +82,10 @@ async fn registration_rejects_prepared_executor_retry_and_shutdown_cancels_publi
             .await
             .is_err()
     );
-    assert!(owner.records().unwrap()[0].issued().is_empty());
+    assert_eq!(
+        owner.records().unwrap()[0].issued(),
+        [] as [IssuedExecutorPayload; 0]
+    );
     let signer = admitted_public_signer(
         &vault,
         &view,

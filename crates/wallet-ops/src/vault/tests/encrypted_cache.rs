@@ -972,8 +972,14 @@ fn shipped_plaintext_poi_rows_migrate_before_reads_and_restart_idempotently() {
     drop(cache_store);
     drop(store);
     drop(db);
-    assert!(raw_wallet_private_rows(&db_path, PENDING_OUTPUT_CONTEXT_V1).is_empty());
-    assert!(raw_wallet_private_rows(&db_path, OUTPUT_POI_RECOVERY_V1).is_empty());
+    assert_eq!(
+        raw_wallet_private_rows(&db_path, PENDING_OUTPUT_CONTEXT_V1),
+        [] as [(Vec<u8>, Vec<u8>); 0]
+    );
+    assert_eq!(
+        raw_wallet_private_rows(&db_path, OUTPUT_POI_RECOVERY_V1),
+        [] as [(Vec<u8>, Vec<u8>); 0]
+    );
     let pending_rows = raw_wallet_private_rows(&db_path, PENDING_OUTPUT_CONTEXT_V2);
     let recovery_rows = raw_wallet_private_rows(&db_path, OUTPUT_POI_RECOVERY_V2);
     assert_eq!(pending_rows.len(), 1);
@@ -1112,13 +1118,13 @@ fn canonical_recovery_wins_over_authenticated_legacy_duplicate() {
         .expect("list canonical rows"),
         vec![canonical_row]
     );
-    assert!(
+    assert_eq!(
         db.list_opaque_wallet_private_rows(
             &legacy_namespace,
             WalletPrivateRecordKind::OutputPoiRecovery,
         )
-        .expect("list consumed legacy rows")
-        .is_empty()
+        .expect("list consumed legacy rows"),
+        [] as [OpaqueWalletPrivateRow; 0]
     );
     assert_eq!(
         db.wallet_private_canonicalization_version(&canonical_namespace)

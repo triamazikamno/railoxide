@@ -93,12 +93,7 @@ fn relay_client_auth_reuses_client_id_for_same_identity() {
 
     assert_eq!(first.client_id, second.client_id);
     assert!(first.client_id.starts_with("did:key:z"));
-    assert!(
-        !first
-            .bearer_token(WALLETCONNECT_RELAY_URL, 60)
-            .unwrap()
-            .is_empty()
-    );
+    assert_ne!(first.bearer_token(WALLETCONNECT_RELAY_URL, 60).unwrap(), "");
 }
 
 #[test]
@@ -114,7 +109,7 @@ fn relay_client_auth_secret_debug_output_is_redacted_and_zeroizable() {
     auth.zeroize();
 
     assert_eq!(auth.signing_key, [0u8; 32]);
-    assert!(auth.client_id.is_empty());
+    assert_eq!(auth.client_id, "");
 }
 
 #[test]

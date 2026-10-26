@@ -187,7 +187,7 @@ async fn executor_discovery_restores_unknown_high_indices_without_lowering_the_a
     assert_eq!(restored[0].operation(), identities[0].0);
     assert_eq!(restored[0].delegate(), earlier);
     assert_eq!(restored[0].restored_at(), restored_at);
-    assert!(restored[0].assets().is_empty());
+    assert_eq!(restored[0].assets(), [] as [ExecutorAsset; 0]);
     let authorization = crate::DesktopPrivateSpendAuthorization::VaultPassword(Zeroizing::new(
         TEST_PASSWORD.into(),
     ));
@@ -509,7 +509,7 @@ async fn executor_payload_handoff_is_durable_and_does_not_duplicate_on_retry() {
     let settled = store
         .record_synced(operation, None, advanced.block().number)
         .unwrap();
-    assert!(settled.reserved_inputs().is_empty());
+    assert_eq!(settled.reserved_inputs(), [] as [ExecutorInputIdentity; 0]);
     let cold_owner = crate::ExecutorOwner::new(
         0,
         db.clone(),
@@ -684,7 +684,7 @@ async fn notes_at_a_resolved_nonce_stay_reserved_until_private_sync_settles_it()
     // Private sync reaches block 20. Its spent status is now the only record of those notes.
     let settled = synced(20);
     assert_eq!(settled.settled_nonce(), Some(U256::ONE));
-    assert!(settled.reserved_inputs().is_empty());
+    assert_eq!(settled.reserved_inputs(), [] as [ExecutorInputIdentity; 0]);
     assert_eq!(own_candidates(&settled), [3, 4, 5]);
     // A reset of private sync leaves the settled nonce settled.
     assert_eq!(synced(0), settled);
@@ -698,7 +698,10 @@ async fn notes_at_a_resolved_nonce_stay_reserved_until_private_sync_settles_it()
     assert_eq!(own_candidates(&reset), [3, 4]);
     let rescanned = synced(30);
     assert_eq!(rescanned.settled_nonce(), Some(U256::from(2)));
-    assert!(rescanned.reserved_inputs().is_empty());
+    assert_eq!(
+        rescanned.reserved_inputs(),
+        [] as [ExecutorInputIdentity; 0]
+    );
 
     // A read that shows nonce 1 unconsumed again lowers the settled nonce with the watermark.
     read(31, 1);
@@ -1016,11 +1019,9 @@ async fn released_executor_inputs_stay_spendable_until_a_later_payload_reserves_
             .len(),
         1
     );
-    assert!(
-        restarted
-            .input_locks(std::slice::from_ref(&input))
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        restarted.input_locks(std::slice::from_ref(&input)).unwrap(),
+        [] as [crate::ExecutorInputLock; 0]
     );
     drop(restarted);
 
@@ -1189,7 +1190,7 @@ fn executor_records_authenticate_identity_and_wallet_deletion_blocks_stale_write
         1
     );
     vault.delete_wallet_for_session(&view, &wallet_id).unwrap();
-    assert!(store.records().unwrap().is_empty());
+    assert_eq!(store.records().unwrap(), [] as [ExecutorRecord; 0]);
     assert!(matches!(
         store.reserve(
             ExecutorOperationId::random().unwrap(),

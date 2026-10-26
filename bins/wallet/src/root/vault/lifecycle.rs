@@ -1491,8 +1491,8 @@ mod tests {
         assert!(view_session.is_none());
         assert!(selected_wallet_id.is_none());
         assert!(revealed.is_none());
-        assert!(metadata.is_empty());
+        assert_eq!(metadata, [] as [WalletMetadataBundle; 0]);
         assert!(options.is_empty());
-        assert!(accounts.is_empty());
+        assert_eq!(accounts, [] as [PublicAccountMetadata; 0]);
     }
 }

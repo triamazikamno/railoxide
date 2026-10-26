@@ -167,7 +167,7 @@ fn sponsorship_summary_requires_fresh_explicit_review_without_warning_notes() {
         SelfBroadcastFundingMode::PrivateSponsorship,
     );
 
-    assert!(summary.warnings_for_test().is_empty());
+    assert_eq!(summary.warnings_for_test(), [] as [String; 0]);
     assert!(!spend_authorization_can_use_cached_password(&summary));
 }
 

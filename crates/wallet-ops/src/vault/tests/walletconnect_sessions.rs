@@ -81,11 +81,11 @@ fn walletconnect_sessions_persist_after_unlock_and_reuse_relay_identity() {
     store
         .delete_walletconnect_session(&session.session_uuid)
         .expect("delete session");
-    assert!(
+    assert_eq!(
         store
             .list_walletconnect_sessions(&unlocked_again)
-            .expect("list after delete")
-            .is_empty()
+            .expect("list after delete"),
+        [] as [WalletConnectSessionRecord; 0]
     );
 
     drop(store);

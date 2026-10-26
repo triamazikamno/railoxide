@@ -544,7 +544,7 @@ mod tests {
             cfg.peer_connection_timeout,
             Some(Duration::from_secs(DEFAULT_PEER_CONNECTION_TIMEOUT_SECS))
         );
-        assert!(cfg.direct_peers.is_empty());
+        assert_eq!(cfg.direct_peers, [] as [AdditionalPeer; 0]);
         assert!(cfg.dns_enr_trees.is_none());
     }
 
@@ -725,7 +725,7 @@ mod tests {
         let (tx, _rx) = event_channel(16);
         let produced = handle_fees_message(1, b"not-json", &shared, &tx);
         assert_eq!(produced, 0);
-        assert!(shared.read().fee_rows().is_empty());
+        assert_eq!(shared.read().fee_rows(), [] as [FeeRow; 0]);
     }
 
     fn signed_fees_payload(
@@ -784,7 +784,7 @@ mod tests {
         let produced = handle_fees_message_at(1, &payload, &shared, &tx, wall, Instant::now());
 
         assert_eq!(produced, 0);
-        assert!(shared.read().fee_rows().is_empty());
+        assert_eq!(shared.read().fee_rows(), [] as [FeeRow; 0]);
         assert_eq!(shared.read().rev(), 0);
         assert_eq!(*rx.borrow(), 0);
     }
@@ -866,7 +866,7 @@ mod tests {
             let produced = handle_fees_message_at(1, &payload, &shared, &tx, wall, Instant::now());
 
             assert_eq!(produced, 0);
-            assert!(shared.read().fee_rows().is_empty());
+            assert_eq!(shared.read().fee_rows(), [] as [FeeRow; 0]);
             assert_eq!(shared.read().rev(), 0);
             assert_eq!(*rx.borrow(), 0);
         }

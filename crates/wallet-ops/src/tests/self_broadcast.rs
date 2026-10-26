@@ -336,7 +336,10 @@ fn direct_self_broadcast_estimates_private_send_and_unshield_costs() {
 
     assert!(!send.gas_cost.expected_cost.is_zero());
     assert!(send.gas_cost.maximum_cost > send.gas_cost.expected_cost);
-    assert!(send.protocol_fees.is_empty());
+    assert_eq!(
+        send.protocol_fees,
+        [] as [crate::DesktopSelfBroadcastProtocolFee; 0]
+    );
     assert_eq!(
         unshield.protocol_fees.as_slice(),
         &[crate::DesktopSelfBroadcastProtocolFee {

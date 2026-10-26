@@ -1643,7 +1643,7 @@ fn a_public_order_pays_its_proxy_and_runs_the_signed_batch_as_its_only_hook() {
     );
     assert_eq!(app_data.hash, keccak256(app_data.document.as_bytes()));
     let document: AppData = serde_json::from_str(&app_data.document).unwrap();
-    assert!(document.metadata.hooks.pre.is_empty());
+    assert_eq!(document.metadata.hooks.pre, [] as [AppDataHook; 0]);
     let [post] = document.metadata.hooks.post.as_slice() else {
         panic!("the order has one post-hook");
     };

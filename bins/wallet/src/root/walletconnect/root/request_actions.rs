@@ -2628,7 +2628,7 @@ mod tests {
         );
         risks.clear();
         append_walletconnect_simulation_risk("request-key", Some(&other_request), &mut risks);
-        assert!(risks.is_empty());
+        assert_eq!(risks, [] as [WalletConnectRisk; 0]);
 
         let unavailable = fee_state(
             "request-key",
@@ -2637,6 +2637,6 @@ mod tests {
         );
         risks.clear();
         append_walletconnect_simulation_risk("request-key", Some(&unavailable), &mut risks);
-        assert!(risks.is_empty());
+        assert_eq!(risks, [] as [WalletConnectRisk; 0]);
     }
 }

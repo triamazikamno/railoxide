@@ -533,7 +533,7 @@ impl TorBridgeActivity {
     fn finish_active_stream(&self) {
         let _ = self
             .active_streams
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 count.checked_sub(1)
             });
         self.touch();
@@ -1822,7 +1822,7 @@ impl TorConnectingGuard {
 
 impl Drop for TorConnectingGuard {
     fn drop(&mut self) {
-        let _ = self.activity.connecting_streams.fetch_update(
+        let _ = self.activity.connecting_streams.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |count| count.checked_sub(1),
@@ -2094,7 +2094,10 @@ mod tests {
         let start = Instant::now();
         let mut tracker = TorRuntimeHealthTracker::new(7);
         record_observation(&mut tracker, 8, true, start, Duration::from_millis(10));
-        assert!(tracker.observations(start).is_empty());
+        assert_eq!(
+            tracker.observations(start),
+            [] as [TorConnectionObservation; 0]
+        );
 
         for index in 0..65 {
             let at = start + Duration::from_secs(index);
@@ -2299,7 +2302,10 @@ mod tests {
         );
         let stale_at = start + Duration::from_secs(200);
         assert_eq!(tracker.health(stale_at), TorRuntimeHealth::Ready);
-        assert!(tracker.observations(stale_at).is_empty());
+        assert_eq!(
+            tracker.observations(stale_at),
+            [] as [TorConnectionObservation; 0]
+        );
 
         for index in 0..3 {
             let at = stale_at + Duration::from_secs(index);
@@ -2328,7 +2334,10 @@ mod tests {
         let retained = tracker.observations(after_expiry);
         assert_eq!(retained.len(), 2);
         assert_eq!(tracker.health(after_expiry), TorRuntimeHealth::Slow);
-        assert!(!tracker.observations(after_expiry).is_empty());
+        assert_ne!(
+            tracker.observations(after_expiry),
+            [] as [TorConnectionObservation; 0]
+        );
 
         let first_fresh_success = after_expiry;
         record_observation(

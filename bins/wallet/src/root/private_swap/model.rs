@@ -3664,7 +3664,10 @@ pub(super) mod tests {
         // Each ordinary attempt has its own pre-hook nonce; a speed-up keeps the open order's.
         let funding = |nonce: u64| Some((swap_use, U256::from(nonce)));
         // An order-less record has no ranges; it is one swap without orders.
-        assert!(swap_order_ranges(std::iter::empty()).is_empty());
+        assert_eq!(
+            swap_order_ranges(std::iter::empty()),
+            [] as [std::ops::Range<usize>; 0]
+        );
         assert_eq!(
             swap_order_ranges([
                 // Expired, then retried with the same pair: one swap.

@@ -1538,7 +1538,7 @@ async fn swap_pair_sets_up_only_its_new_accounts() {
                     setup.require_broadcaster(own).unwrap();
                     assert!(setup.require_broadcaster(other).is_err());
                     assert!(saved.swap_use(use_id).unwrap().is_fresh());
-                    assert!(saved.issued().is_empty());
+                    assert_eq!(saved.issued(), [] as [IssuedExecutorPayload; 0]);
                 }
                 SwapPairSide::Existing { executor, .. } => {
                     assert_eq!(*executor, address);

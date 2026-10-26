@@ -497,7 +497,7 @@ mod tests {
         ));
         assert!(old.same_authority(&wallet));
         assert!(!old.same_state(&wallet));
-        assert!(wallet.network_view.as_ref().unwrap().detail.is_empty());
+        assert_eq!(wallet.network_view.as_ref().unwrap().detail, "");
         provider.update_wallet(wallet.clone(), 1);
         for (session, view) in [(1, "popup"), (2, "panel")] {
             let _ = provider.network_command(

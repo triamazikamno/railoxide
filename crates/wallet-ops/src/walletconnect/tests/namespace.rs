@@ -71,8 +71,8 @@ fn empty_proposal_approves_default_eip155_namespace() {
             "eip155:137:0x1111111111111111111111111111111111111111",
         ]
     );
-    assert!(approved.methods.is_empty());
-    assert!(approved.events.is_empty());
+    assert_eq!(approved.methods, [] as [String; 0]);
+    assert_eq!(approved.events, [] as [String; 0]);
 }
 
 #[test]
@@ -123,8 +123,8 @@ fn empty_required_namespace_is_approved() {
         approved.accounts,
         vec!["eip155:1:0x1111111111111111111111111111111111111111"]
     );
-    assert!(approved.methods.is_empty());
-    assert!(approved.events.is_empty());
+    assert_eq!(approved.methods, [] as [String; 0]);
+    assert_eq!(approved.events, [] as [String; 0]);
 }
 
 #[test]
@@ -304,7 +304,10 @@ fn hardware_account_auto_includes_optional_typed_data_with_capability() {
         optional.methods,
         vec!["eth_signTypedData", "eth_signTypedData_v4"]
     );
-    assert!(negotiated.excluded_optional.is_empty());
+    assert_eq!(
+        negotiated.excluded_optional,
+        [] as [crate::WalletConnectUnsupportedNamespaceItem; 0]
+    );
 }
 
 #[test]

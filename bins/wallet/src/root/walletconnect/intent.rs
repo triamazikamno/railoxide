@@ -2217,7 +2217,7 @@ mod tests {
                 ..
             }] if *address == account
         ));
-        assert!(intent.risks.is_empty());
+        assert_eq!(intent.risks, [] as [WalletConnectRisk; 0]);
     }
 
     #[test]
@@ -2255,7 +2255,7 @@ mod tests {
             None,
             selected,
         );
-        assert!(equal_source.is_empty());
+        assert_eq!(equal_source, [] as [WalletConnectRisk; 0]);
         let foreign_source = token_operation_risks(
             &WalletConnectDecodedCallKind::Erc20TransferFrom {
                 from: foreign,

@@ -252,7 +252,7 @@ async fn root_replacement_barrier_waits_for_both_workers_before_clearing_monitor
         .await
         .expect("root replacement cleanup succeeds");
     assert_eq!(report.stopped_startup_tasks, 2);
-    assert!(monitor_state.read().fee_rows().is_empty());
+    assert_eq!(monitor_state.read().fee_rows(), [] as [FeeRow; 0]);
 
     monitor_state.write().upsert_fee(fee_row(
         3,
@@ -326,7 +326,7 @@ async fn worker_error_epilogue_publishes_quiescence_and_preserves_error() {
         .await
         .expect("root replacement cleanup succeeds");
     assert_eq!(report.stopped_startup_tasks, 1);
-    assert!(monitor_state.read().fee_rows().is_empty());
+    assert_eq!(monitor_state.read().fee_rows(), [] as [FeeRow; 0]);
 }
 
 #[tokio::test]
@@ -363,7 +363,7 @@ async fn panicking_worker_releases_waku_quiescence_and_clears_monitor() {
         .await
         .expect("root replacement cleanup succeeds after panic");
     assert_eq!(report, WalletSyncLifecycleCleanupReport::default());
-    assert!(monitor_state.read().fee_rows().is_empty());
+    assert_eq!(monitor_state.read().fee_rows(), [] as [FeeRow; 0]);
 }
 
 #[tokio::test]
@@ -417,7 +417,7 @@ async fn root_replacement_barrier_rejects_closed_waku_quiescence_latch() {
         .await
         .expect_err("closed Waku latch must reject root replacement");
     assert!(error.contains("before quiescence was established"));
-    assert!(monitor_state.read().fee_rows().is_empty());
+    assert_eq!(monitor_state.read().fee_rows(), [] as [FeeRow; 0]);
 }
 
 #[tokio::test]
@@ -449,7 +449,7 @@ async fn root_replacement_barrier_preserves_sync_cleanup_failure_after_waku_quie
         .await
         .expect_err("sync cleanup failure must reject root replacement");
     assert!(error.contains("wallet sync cleanup failed during root replacement"));
-    assert!(monitor_state.read().fee_rows().is_empty());
+    assert_eq!(monitor_state.read().fee_rows(), [] as [FeeRow; 0]);
 }
 
 #[test]
@@ -479,8 +479,11 @@ fn stop_removes_access_signals_workers_and_clears_monitor_state() {
     assert!(runtime.is_none());
     assert!(*worker_shutdown_rx.borrow());
     assert!(weak_client.upgrade().is_none());
-    assert!(monitor_state.read().fee_rows().is_empty());
-    assert!(monitor_state.read().peer_rows().is_empty());
+    assert_eq!(monitor_state.read().fee_rows(), [] as [FeeRow; 0]);
+    assert_eq!(
+        monitor_state.read().peer_rows(),
+        [] as [broadcaster_monitor::PeerRow; 0]
+    );
     assert_eq!(
         monitor_state.read().peer_summary(),
         broadcaster_monitor::PeerSummary::default()
@@ -540,7 +543,7 @@ fn worker_error_after_stop_allows_a_fresh_runtime_generation() {
         WakuWorkerCompletionAction::FinalizedStop { restart: true }
     );
     assert!(stopping_generation.is_none());
-    assert!(monitor_state.read().fee_rows().is_empty());
+    assert_eq!(monitor_state.read().fee_rows(), [] as [FeeRow; 0]);
     assert!(*event_rx.borrow() > initial_rev);
     assert!(should_start_waku_runtime(
         true,

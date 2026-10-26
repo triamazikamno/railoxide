@@ -160,7 +160,7 @@ fn connect_is_owned_by_session_and_web_origin_and_revocation_is_origin_local() {
         1,
         now,
     );
-    assert!(messages(&mut provider).is_empty());
+    assert_eq!(messages(&mut provider), [] as [(u64, Value); 0]);
     assert!(
         provider
             .store
@@ -238,11 +238,12 @@ fn connect_is_owned_by_session_and_web_origin_and_revocation_is_origin_local() {
             "eth_requestAccounts",
             now,
         );
-        assert!(
-            !snapshot(&pending)["pending_connects"]
+        assert_ne!(
+            snapshot(&pending)["pending_connects"]
                 .as_array()
                 .unwrap()
-                .is_empty()
+                .as_slice(),
+            [] as [Value; 0]
         );
     }
     let other_generation = provider.documents[&(1, "other".to_owned())].generation;
@@ -358,7 +359,10 @@ fn scoped_grant_pauses_on_wallet_change_global_grant_survives_and_lock_purges() 
     let locked = messages(&mut provider);
     assert!(provider.wallet.view.is_none());
     assert!(provider.permissions().is_empty());
-    assert!(provider.wallet.public_accounts.is_empty());
+    assert_eq!(
+        provider.wallet.public_accounts,
+        [] as [PublicAccountMetadata; 0]
+    );
     let ui = prompt(&locked);
     assert_eq!(ui["needs_unlock"], true);
     assert_eq!(ui["accounts"], json!([]));
@@ -1013,7 +1017,10 @@ async fn accepted_reads_drain_after_lock_revoke_and_document_retirement_without_
             let (endpoint, started, release, server) = held_rpc(remote_error).await;
             let (peer, permission) = authorize(&mut provider, &view, endpoint);
             let now = Instant::now();
-            assert!(request(&mut provider, 1, "doc", "delayed", "eth_blockNumber", now).is_empty());
+            assert_eq!(
+                request(&mut provider, 1, "doc", "delayed", "eth_blockNumber", now),
+                [] as [(u64, Value); 0]
+            );
             tokio::time::timeout(Duration::from_secs(5), started.notified())
                 .await
                 .unwrap();
@@ -1077,7 +1084,7 @@ async fn accepted_reads_drain_after_lock_revoke_and_document_retirement_without_
             release.notify_one();
             let completion = provider.jobs.join_next().await.unwrap().unwrap();
             provider.complete_read(completion);
-            assert!(messages(&mut provider).is_empty());
+            assert_eq!(messages(&mut provider), [] as [(u64, Value); 0]);
             assert!(!provider.reads.contains_key(&id));
             assert!(matches!(
                 provider
@@ -1707,7 +1714,7 @@ async fn included_lookup_drains_after_owner_invalidation_without_delivering_old_
         "synthetic-lookup-payload"
     );
     provider.complete_read(completion);
-    assert!(messages(&mut provider).is_empty());
+    assert_eq!(messages(&mut provider), [] as [(u64, Value); 0]);
     assert!(!provider.reads.contains_key(&id));
     server.await.unwrap();
     drop(family);
@@ -3873,7 +3880,7 @@ async fn unsealed_remote_outcomes_revalidate_live_authority_before_actor_update(
             let (path, mut provider, view) = fixture();
             let (endpoint, started, release, server) = held_rpc(remote_error).await;
             authorize(&mut provider, &view, endpoint);
-            assert!(
+            assert_eq!(
                 request(
                     &mut provider,
                     1,
@@ -3881,8 +3888,8 @@ async fn unsealed_remote_outcomes_revalidate_live_authority_before_actor_update(
                     "held",
                     "eth_blockNumber",
                     Instant::now()
-                )
-                .is_empty()
+                ),
+                [] as [(u64, Value); 0]
             );
             started.notified().await;
             release.notify_one();
@@ -4500,7 +4507,7 @@ async fn each_origin_reads_over_its_own_client_while_it_keeps_a_document_and_its
     assert_eq!(together, ["op-0", "op-1"]);
     // The origin's other document is answered from the origin's own cached result.
     origin_reads(&mut provider, "eth_call", &[(2, block_call("0x5"))]).await;
-    assert!(sent().is_empty());
+    assert_eq!(sent(), [] as [String; 0]);
     origin_reads(&mut provider, "eth_call", &[(1, block_call("0x6"))]).await;
     let [own] = <[String; 1]>::try_from(sent()).unwrap();
     origin_reads(&mut provider, "eth_call", &[(2, block_call("0x7"))]).await;

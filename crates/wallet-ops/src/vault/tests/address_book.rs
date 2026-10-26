@@ -55,17 +55,17 @@ fn address_books_persist_encrypted_and_load_without_spend_unlock() {
     let private_address = railgun_recipient_for_derivation(7);
     let public_address = "0x1111111111111111111111111111111111111111";
 
-    assert!(
+    assert_eq!(
         store
             .list_private_address_book_entries_for_session(&view_session)
-            .expect("empty private address book")
-            .is_empty()
+            .expect("empty private address book"),
+        [] as [PrivateAddressBookEntry; 0]
     );
-    assert!(
+    assert_eq!(
         store
             .list_public_address_book_entries_for_session(&view_session)
-            .expect("empty public address book")
-            .is_empty()
+            .expect("empty public address book"),
+        [] as [PublicAddressBookEntry; 0]
     );
 
     let private_entry = store

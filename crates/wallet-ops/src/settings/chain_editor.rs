@@ -1064,9 +1064,9 @@ mod tests {
         let snapshot = chain_editor_snapshot(&next, Some(u64::MAX)).unwrap();
         let draft = snapshot.draft.unwrap();
         assert_eq!(draft.chain_id, "18446744073709551615");
-        assert!(!draft.value(ChainField::FinalityDepth).is_empty());
-        assert!(!draft.value(ChainField::GasLimitBuffer).is_empty());
-        assert!(draft.value(ChainField::MulticallContract).is_empty());
+        assert_ne!(draft.value(ChainField::FinalityDepth), "");
+        assert_ne!(draft.value(ChainField::GasLimitBuffer), "");
+        assert_eq!(draft.value(ChainField::MulticallContract), "");
         assert_eq!(save_draft(&next, draft), next);
         assert!(
             build_effective_chain_configs(&next)

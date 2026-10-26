@@ -435,7 +435,7 @@ fn public_list_keyboard_selection_menus_and_preferences(cx: &mut TestAppContext)
     cx.run_until_parked();
     root.read_with(cx, |root, _| {
         let (active, inactive) = root.public_list_accounts();
-        assert!(active.is_empty());
+        assert_eq!(active, [] as [PublicAccountMetadata; 0]);
         assert_eq!(inactive.len(), 1);
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));

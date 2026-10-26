@@ -204,7 +204,7 @@ async fn a_failed_destination_setup_leaves_the_public_account_untouched() {
             .downcast_ref::<ExecutorStoreError>(),
         Some(ExecutorStoreError::PublicSwapSourceShared)
     ));
-    assert!(store.records().unwrap().is_empty());
+    assert_eq!(store.records().unwrap(), [] as [ExecutorRecord; 0]);
 
     // The claim reserves the account, and its preparation derives it and binds its address
     // into the approval.
@@ -313,9 +313,9 @@ async fn a_failed_destination_setup_leaves_the_public_account_untouched() {
     let after = saved(&store, operation, id);
     assert_eq!(after.swap, claimed.swap);
     assert!(after.swap.path().is_none());
-    assert!(after.swap.transactions().is_empty());
+    assert_eq!(after.swap.transactions(), [] as [PublicSwapTransaction; 0]);
     assert!(after.swap.bridge().is_none());
-    assert!(after.shields.is_empty());
+    assert_eq!(after.shields, [] as [B256; 0]);
 
     // The retry prepares the same account for the same use.
     let SwapPairSide::Setup(retried) = owner
@@ -594,12 +594,15 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
         (executor, U256::from(1_000))
     );
     assert!(stopped.swap.path().is_none());
-    assert!(stopped.swap.transactions().is_empty());
+    assert_eq!(
+        stopped.swap.transactions(),
+        [] as [PublicSwapTransaction; 0]
+    );
     assert!(stopped.swap.bridge().is_none());
 
     // The real quote replaces the optimistic preview, without changing the persisted
     // approval. The user must explicitly accept these corrected terms before another sign.
-    assert!(!review.gas_plan().approval_gas_limits.is_empty());
+    assert_ne!(review.gas_plan().approval_gas_limits, [] as [u64; 0]);
     // The Public account has now paid its approval. Re-review must retain only the deposit
     // gas while using the actual Across quote, at the original fee rates.
     rpc.state
@@ -617,7 +620,7 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
         )
         .await
         .unwrap();
-    assert!(corrected.gas_plan().approval_gas_limits.is_empty());
+    assert_eq!(corrected.gas_plan().approval_gas_limits, [] as [u64; 0]);
     assert_eq!(
         corrected.gas_plan().deposit_gas_limit,
         review.gas_plan().deposit_gas_limit
@@ -954,7 +957,7 @@ async fn a_public_orders_short_signing_time_quote_within_the_cushion_raises_its_
         .await
         .unwrap();
     assert_eq!(review.buy_amount(), Some(U256::from(1_010)));
-    assert!(!review.gas_plan().approval_gas_limits.is_empty());
+    assert_ne!(review.gas_plan().approval_gas_limits, [] as [u64; 0]);
     let saved_approval = saved(&store, operation, id).swap.approval().clone();
     rpc.state
         .calls
@@ -971,7 +974,7 @@ async fn a_public_orders_short_signing_time_quote_within_the_cushion_raises_its_
         )
         .await
         .unwrap();
-    assert!(corrected.gas_plan().approval_gas_limits.is_empty());
+    assert_eq!(corrected.gas_plan().approval_gas_limits, [] as [u64; 0]);
     assert_eq!(corrected.gas_plan().deposit_gas_limit, None);
     assert_eq!(corrected.gas_plan().max_gas_cost, U256::ZERO);
     assert_eq!(
@@ -1168,8 +1171,8 @@ async fn a_restart_between_setup_and_approval_resumes_the_public_swap_unsigned()
     let after = saved(&store, operation, id);
     assert_eq!(after.swap, before.swap);
     assert!(after.swap.path().is_none());
-    assert!(after.swap.transactions().is_empty());
-    assert!(after.shields.is_empty());
+    assert_eq!(after.swap.transactions(), [] as [PublicSwapTransaction; 0]);
+    assert_eq!(after.shields, [] as [B256; 0]);
 
     server.abort();
     restarted.shutdown().await;
@@ -2285,8 +2288,14 @@ async fn a_public_swap_approves_then_deposits_with_its_path_recorded_first() {
         payment.approve(&owner).await.unwrap(),
         PublicSwapApprovalsOutcome::ReviewRequired { transactions: true }
     );
-    assert!(payment.chain.lock().unwrap().broadcasts.is_empty());
-    assert!(payment.saved().swap.transactions().is_empty());
+    assert_eq!(
+        payment.chain.lock().unwrap().broadcasts,
+        [] as [(B256, TxEnvelope); 0]
+    );
+    assert_eq!(
+        payment.saved().swap.transactions(),
+        [] as [PublicSwapTransaction; 0]
+    );
     assert_eq!(payment.saved().swap.approval(), &approval);
 
     payment.chain.lock().unwrap().allowance = U256::ZERO;
@@ -2424,7 +2433,10 @@ async fn a_public_swap_approves_then_deposits_with_its_path_recorded_first() {
 async fn a_native_public_swap_deposits_its_amount_as_value_without_an_approval() {
     let (payment, owner) = PublicPayment::start(Address::ZERO, U256::ZERO).await;
     payment.approve(&owner).await.unwrap();
-    assert!(payment.chain.lock().unwrap().broadcasts.is_empty());
+    assert_eq!(
+        payment.chain.lock().unwrap().broadcasts,
+        [] as [(B256, TxEnvelope); 0]
+    );
     assert!(matches!(
         payment.deposit(&owner).await.unwrap(),
         PublicSwapTransactionOutcome::Included { .. }
@@ -2438,7 +2450,10 @@ async fn a_native_public_swap_deposits_its_amount_as_value_without_an_approval()
         (deposit.to(), deposit.value()),
         (Some(payment.spoke_pool), payment.sell_amount)
     );
-    assert!(payment.chain.lock().unwrap().allowance_reads.is_empty());
+    assert_eq!(
+        payment.chain.lock().unwrap().allowance_reads,
+        [] as [(Address, Address, Address); 0]
+    );
     let recorded = payment.saved().swap;
     assert!(matches!(
         recorded.transactions(),
@@ -2764,7 +2779,7 @@ async fn a_deposit_no_rpc_took_is_resent_unchanged_after_a_restart() {
     };
     let signed = {
         let chain = payment.chain.lock().unwrap();
-        assert!(chain.broadcasts.is_empty());
+        assert_eq!(chain.broadcasts, [] as [(B256, TxEnvelope); 0]);
         let [signed] = chain.sent.as_slice() else {
             panic!("the deposit was sent once");
         };
@@ -3251,7 +3266,10 @@ async fn a_public_order_is_recorded_with_its_signed_batch_before_it_is_submitted
     let document = body["appData"].as_str().unwrap();
     assert_eq!(keccak256(document), sent.appData);
     let app_data: AppData = serde_json::from_str(document).unwrap();
-    assert!(app_data.metadata.hooks.pre.is_empty());
+    assert_eq!(
+        app_data.metadata.hooks.pre,
+        [] as [broadcaster_core::contracts::cow::AppDataHook; 0]
+    );
     let [hook] = app_data.metadata.hooks.post.as_slice() else {
         panic!("the order has one post-hook");
     };
@@ -3312,8 +3330,11 @@ async fn a_public_order_is_recorded_with_its_signed_batch_before_it_is_submitted
     {
         let chain = payment.chain.lock().unwrap();
         assert_eq!(chain.balance_reads, [(DESTINATION_TOKEN, proxy)]);
-        assert!(chain.allowance_reads.is_empty());
-        assert!(chain.broadcasts.is_empty());
+        assert_eq!(
+            chain.allowance_reads,
+            [] as [(Address, Address, Address); 0]
+        );
+        assert_eq!(chain.broadcasts, [] as [(B256, TxEnvelope); 0]);
     }
 
     // The same request again finds the accepted order and neither signs nor sends anything.
@@ -3472,7 +3493,10 @@ async fn a_public_order_for_other_terms_than_approved_is_refused_unsigned() {
         assert!(error.to_string().contains("review the swap again"));
     }
     assert!(payment.saved().swap.path().is_none());
-    assert!(payment.chain.lock().unwrap().balance_reads.is_empty());
+    assert_eq!(
+        payment.chain.lock().unwrap().balance_reads,
+        [] as [(Address, Address); 0]
+    );
     assert!(requests.lock().unwrap().is_empty());
 
     orderbook_task.abort();
@@ -3548,7 +3572,10 @@ async fn an_order_is_refused_until_the_math_contract_is_deployed_on_its_chain() 
     }
     // Nothing was read of the proxy, signed, recorded or sent.
     assert!(payment.saved().swap.path().is_none());
-    assert!(payment.chain.lock().unwrap().balance_reads.is_empty());
+    assert_eq!(
+        payment.chain.lock().unwrap().balance_reads,
+        [] as [(Address, Address); 0]
+    );
     assert!(requests.lock().unwrap().is_empty());
 
     payment.chain.lock().unwrap().math_code = swap_math_runtime_code();
@@ -4205,7 +4232,7 @@ async fn held_public_order_proceeds_are_withdrawn_to_the_public_account_through_
     let finished = payment.observe(&owner, &orderbook).await;
     assert!(finished.observations().deposit_ruled_out.is_some());
     assert!(finished.is_finished(true, u64::from(payment.valid_to) + 1));
-    assert!(payment.to_track(&owner).is_empty());
+    assert_eq!(payment.to_track(&owner), [] as [SwapUseId; 0]);
     assert_eq!(payment.log_queries(), withdrawal_queries + 1);
     payment.store.claim_public_swap(competing()).unwrap();
 
@@ -4751,7 +4778,7 @@ async fn a_withdrawal_whose_receipt_was_never_seen_is_found_by_its_transfer() {
             .filter(|request| request["method"] == "eth_getLogs")
             .map(|request| &request["params"][0])
             .collect();
-        assert!(!queries.is_empty());
+        assert_ne!(queries, [] as [&Value; 0]);
         for filter in queries {
             let tokens: Vec<Address> = match &filter["address"] {
                 Value::Array(_) => serde_json::from_value(filter["address"].clone()).unwrap(),
@@ -5028,7 +5055,10 @@ async fn a_public_swaps_fill_without_its_shield_is_held_on_the_destination() {
             .destination_balance,
         None
     );
-    assert!(balance_reads(&payment.delivery_chain.lock().unwrap().rpc_requests).is_empty());
+    assert_eq!(
+        balance_reads(&payment.delivery_chain.lock().unwrap().rpc_requests),
+        [] as [Value; 0]
+    );
     let explicit = || PublicSwapTracking {
         origin: &payment.origin,
         across: &across,
@@ -5233,7 +5263,7 @@ async fn a_refunding_public_swaps_refund_to_its_public_account_is_verified_on_th
     }
     // The caller refreshes the Public account's balances when a refund is returned, once.
     assert_eq!(refund().await.unwrap(), None);
-    assert!(payment.to_track(&owner).is_empty());
+    assert_eq!(payment.to_track(&owner), [] as [SwapUseId; 0]);
 
     // The destination account's shield stays signed, and keeps the account from another swap.
     let refunded = payment.saved();
@@ -5405,7 +5435,7 @@ async fn a_public_swap_resumes_from_its_destination_chains_owner_alone() {
             transaction_hash,
         })
     );
-    assert!(payment.to_track(&restarted).is_empty());
+    assert_eq!(payment.to_track(&restarted), [] as [SwapUseId; 0]);
 
     across_task.abort();
     payment.finish(restarted).await;
@@ -5475,7 +5505,7 @@ async fn a_public_order_resumes_from_its_destination_chains_owner_alone() {
             transaction_hash,
         })
     );
-    assert!(payment.to_track(&restarted).is_empty());
+    assert_eq!(payment.to_track(&restarted), [] as [SwapUseId; 0]);
     // An accepted order isn't sent again.
     assert_eq!(requests.lock().unwrap().len(), 2);
 
@@ -5539,7 +5569,10 @@ async fn permit_reads_travel_with_the_allowance_read_and_are_kept_for_the_sessio
             transactions: false
         }
     );
-    assert!(payment.chain.lock().unwrap().broadcasts.is_empty());
+    assert_eq!(
+        payment.chain.lock().unwrap().broadcasts,
+        [] as [(B256, TxEnvelope); 0]
+    );
     assert_eq!(payment.saved().swap.approval(), &approval);
     token_reads_served(&payment);
 
@@ -5657,7 +5690,7 @@ async fn a_public_order_carries_a_signed_permit_in_place_of_an_approval() {
     {
         let chain = payment.chain.lock().unwrap();
         assert_eq!(chain.simulated, std::slice::from_ref(&hook.call_data));
-        assert!(chain.broadcasts.is_empty());
+        assert_eq!(chain.broadcasts, [] as [(B256, TxEnvelope); 0]);
     }
 
     orderbook_task.abort();
@@ -5686,7 +5719,10 @@ async fn a_permit_that_reverts_on_its_token_stops_the_order_before_it_is_recorde
         payment.approve(&owner).await.unwrap(),
         PublicSwapApprovalsOutcome::ReviewRequired { transactions: true }
     );
-    assert!(payment.chain.lock().unwrap().broadcasts.is_empty());
+    assert_eq!(
+        payment.chain.lock().unwrap().broadcasts,
+        [] as [(B256, TxEnvelope); 0]
+    );
     assert_eq!(payment.saved().swap.approval(), &approval);
 
     orderbook_task.abort();
@@ -5846,7 +5882,7 @@ async fn a_permit_review_corrected_to_a_covered_allowance_binds_no_permit_hook()
         .await
         .unwrap();
     assert!(!corrected.approval_plan().signs_permit());
-    assert!(corrected.approval_plan().transactions().is_empty());
+    assert_eq!(corrected.approval_plan().transactions(), [] as [U256; 0]);
     let corrected = approval(&corrected);
     assert_eq!(corrected.bounds.pre_hook_gas_limit, 0);
 
@@ -5860,7 +5896,7 @@ async fn a_permit_review_corrected_to_a_covered_allowance_binds_no_permit_hook()
             transactions: false
         }
     );
-    assert!(payment.chain.lock().unwrap().simulated.is_empty());
+    assert_eq!(payment.chain.lock().unwrap().simulated, [] as [Bytes; 0]);
 
     for task in [across_task, orderbook_task] {
         task.abort();
@@ -5938,7 +5974,7 @@ async fn a_restart_resends_a_permit_order_with_its_recorded_permit() {
     assert_eq!(at_resend.as_ref(), Some(&order));
     let app_data: AppData = serde_json::from_str(resent["appData"].as_str().unwrap()).unwrap();
     assert_eq!(app_data.metadata.hooks.pre.len(), 1);
-    assert!(token_reads_served(&payment).is_empty());
+    assert_eq!(token_reads_served(&payment), [] as [usize; 0]);
     assert_eq!(payment.chain.lock().unwrap().simulated.len(), 1);
 
     orderbook_task.abort();

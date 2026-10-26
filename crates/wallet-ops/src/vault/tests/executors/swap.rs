@@ -749,7 +749,10 @@ fn an_order_on_an_included_setup_takes_the_next_nonces_and_spends_other_notes() 
         // releases its note, and the setup stays pending and can be sent again with it.
         expire_attempt(&store, operation, uid, observed);
         let expired = record_of(&store, operation);
-        assert!(expired.swap_reserved_inputs().is_empty());
+        assert_eq!(
+            expired.swap_reserved_inputs(),
+            [] as [ExecutorInputIdentity; 0]
+        );
         assert_eq!(expired.reserved_inputs(), vec![setup_fee.clone()]);
         assert_eq!(
             expired.payload_state(B256::repeat_byte(3)),
@@ -1801,7 +1804,7 @@ fn bridge_swap_attempts_hand_off_and_admit_the_next_only_once_delivered() {
     let refunding = store
         .record_swap_bridge_outcome(operation, order.uid(), SwapBridgeOutcome::Refunding)
         .unwrap();
-    assert!(tracked(&refunding).is_empty());
+    assert_eq!(tracked(&refunding), [] as [OrderUid; 0]);
     for replacement in [
         SwapBridgeOutcome::NeedsAttention,
         SwapBridgeOutcome::DeliveredReported {
@@ -1819,7 +1822,7 @@ fn bridge_swap_attempts_hand_off_and_admit_the_next_only_once_delivered() {
         .record_swap_bridge_outcome(operation, order.uid(), verified(9_900))
         .unwrap();
     assert!(delivered.swap().unwrap().admits_attempt());
-    assert!(tracked(&delivered).is_empty());
+    assert_eq!(tracked(&delivered), [] as [OrderUid; 0]);
     // A final outcome stays, and the delivery doesn't turn back into a refund; recording it
     // again changes nothing.
     assert!(matches!(
@@ -1952,7 +1955,7 @@ fn bridge_swap_attempts_hand_off_and_admit_the_next_only_once_delivered() {
         .unwrap();
     assert!(!attention.swap().unwrap().admits_attempt());
     // Needs attention waits for an explicit status check.
-    assert!(tracked(&attention).is_empty());
+    assert_eq!(tracked(&attention), [] as [OrderUid; 0]);
 
     // Both providers' terms and outcomes survive the store's encoding and a restart.
     drop(store);
@@ -2733,10 +2736,9 @@ fn continuing_across_approvals_follow_the_nonce_and_the_quote_age() {
         }),
         SwapDelivery::Reshield,
     ] {
-        assert!(
-            swap_continuing_approvals(&record, first, other, Some(U256::ONE), None)
-                .approvals()
-                .is_empty()
+        assert_eq!(
+            swap_continuing_approvals(&record, first, other, Some(U256::ONE), None).approvals(),
+            [] as [crate::SwapContinuingApproval; 0]
         );
     }
 
@@ -6403,7 +6405,7 @@ fn a_public_account_has_one_open_swap_per_bought_and_sold_token_on_a_chain() {
         Err(ExecutorStoreError::PublicSwapSourceShared)
     ));
     // A refused claim allocates nothing, and neither does the read-only check.
-    assert!(other_store.records().unwrap().is_empty());
+    assert_eq!(other_store.records().unwrap(), [] as [ExecutorRecord; 0]);
     // Swaps of other tokens run beside the order.
     other_store
         .claim_public_swap(claim(9, 8, true, 500))

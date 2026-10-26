@@ -8147,7 +8147,10 @@ mod tests {
             vec!["a", "b", "g"]
         );
         assert!(!choices.iter().any(|choice| choice.uuid == "i"));
-        assert!(participant_choices(&accounts, &selected, Some("wallet"), "missing").is_empty());
+        assert_eq!(
+            participant_choices(&accounts, &selected, Some("wallet"), "missing"),
+            [] as [ParticipantChoice; 0]
+        );
         assert_eq!(
             participant_choices(&accounts, &BTreeSet::new(), Some("wallet"), "alice").len(),
             0
@@ -8664,7 +8667,7 @@ mod tests {
         }
         assert_eq!(power(&state, &called, actor), Some(U256::from(1)));
         assert!(state.row(&proposal(&acted), &actor).is_none());
-        assert!(state.unloaded(&proposal(&acted)).is_empty());
+        assert_eq!(state.unloaded(&proposal(&acted)), [] as [Address; 0]);
 
         // A later action on the contract retires an earlier action's read still outstanding, and
         // so does the end of the wallet session.
@@ -9736,11 +9739,9 @@ mod tests {
             let shown = root.proposals.selected_proposal().unwrap();
             assert_eq!(shown.voting_snapshot_interval, U256::ZERO);
             assert_eq!(row_states(root, shown), ["not loaded", "ready", "ready"]);
-            assert!(
-                root.governance
-                    .proposal_participation
-                    .unloaded(shown)
-                    .is_empty()
+            assert_eq!(
+                root.governance.proposal_participation.unloaded(shown),
+                [] as [Address; 0]
             );
         });
 

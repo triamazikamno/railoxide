@@ -1349,14 +1349,14 @@ fn public_balance_helpers_ignore_stale_chain_snapshot() {
         )
         .is_some(),
     );
-    assert!(
+    assert_eq!(
         public_account_visible_balances_for_chain(
             Some(&snapshot),
             56,
             "public-account",
             PublicAccountStatus::Active,
-        )
-        .is_empty(),
+        ),
+        [] as [PublicBalanceEntry; 0],
     );
     assert!(
         public_balance_entry_for_chain(
@@ -1368,14 +1368,14 @@ fn public_balance_helpers_ignore_stale_chain_snapshot() {
         )
         .is_none(),
     );
-    assert!(
+    assert_eq!(
         public_account_visible_balances_for_chain(
             Some(&snapshot),
             1,
             "public-account",
             PublicAccountStatus::Inactive,
-        )
-        .is_empty(),
+        ),
+        [] as [PublicBalanceEntry; 0],
     );
 }
 

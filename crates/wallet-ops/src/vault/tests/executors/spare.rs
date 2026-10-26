@@ -441,7 +441,7 @@ async fn executor_inspection_is_user_initiated_and_reused_until_handoff() {
             .await
             .is_err()
     );
-    assert!(store.records().unwrap().is_empty());
+    assert_eq!(store.records().unwrap(), [] as [ExecutorRecord; 0]);
     assert!(rpc.state.requests.lock().unwrap().is_empty());
     let first = owner
         .prepare_operation(
@@ -1440,7 +1440,7 @@ async fn hardware_restore_checks_64_addresses_on_own_routes_and_keeps_success_af
                 after.use_check().observation()
             );
             assert!(after.use_check().is_unavailable());
-            assert!(after.assets().is_empty());
+            assert_eq!(after.assets(), [] as [ExecutorAsset; 0]);
             assert_eq!(before.operation(), after.operation());
         }
         restarted.shutdown().await;
@@ -1707,7 +1707,7 @@ async fn background_confirmation_resolves_from_private_sync_without_reading_the_
     );
     assert_eq!(resolved.settled_nonce(), Some(U256::from(4)));
     assert_eq!(resolved.nonce_observation(), pending.nonce_observation());
-    assert!(resolved.reserved_inputs().is_empty());
+    assert_eq!(resolved.reserved_inputs(), [] as [ExecutorInputIdentity; 0]);
     assert!(rpc.state.requests.lock().unwrap().is_empty());
     owner.shutdown().await;
     drop(owner);
@@ -1899,8 +1899,8 @@ async fn native_shield_issues_a_delegated_operation_without_inputs_and_records_i
         payload.purpose(),
         crate::vault::ExecutorPayloadPurpose::Operation
     );
-    assert!(payload.context().inputs().is_empty());
-    assert!(payload.transaction_hashes().is_empty());
+    assert_eq!(payload.context().inputs(), [] as [ExecutorInputIdentity; 0]);
+    assert_eq!(payload.transaction_hashes(), [] as [B256; 0]);
 
     let sent = B256::repeat_byte(9);
     let mut handoff = owner.native_shield_handoff(&issued).unwrap();

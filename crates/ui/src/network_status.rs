@@ -970,7 +970,7 @@ mod tests {
                 first.read(cx).intents.last(),
                 Some(&NetworkStatusIntent::QuitAndReset)
             );
-            assert!(second.read(cx).intents.is_empty());
+            assert_eq!(second.read(cx).intents, [] as [NetworkStatusIntent; 0]);
         });
         for kind in [NetworkStatusKind::Proxy, NetworkStatusKind::Direct] {
             first.update(cx, |probe, cx| {

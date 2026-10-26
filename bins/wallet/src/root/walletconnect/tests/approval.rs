@@ -142,7 +142,7 @@ async fn approval_post_persist_relay_error_removes_session() {
     else {
         panic!("expected pre-persist execute command");
     };
-    assert!(steps.is_empty());
+    assert_eq!(steps, [] as [WalletConnectRelayStep; 0]);
     assert!(
         response_tx
             .send(Ok(WalletConnectRelayOutput::default()))

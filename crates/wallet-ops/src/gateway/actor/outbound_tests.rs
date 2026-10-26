@@ -454,7 +454,7 @@ async fn unsealed_state_accounts_and_approval_labels_are_discarded_on_lock() {
             },
             reader
         );
-        assert!(!messages.is_empty());
+        assert_ne!(messages, [] as [Value; 0]);
         for message in messages {
             if authority_only {
                 assert_eq!(message["type"], "provider_response");

@@ -3269,7 +3269,7 @@ mod tests {
         .expect("zero-delta send request");
 
         assert_eq!(request.private_sends.len(), 1);
-        assert!(request.public_unshields.is_empty());
+        assert_eq!(request.public_unshields, [] as [CompositeUnshieldLeg; 0]);
         assert!(request.relay_actions.is_none());
         assert_eq!(request.adapter, None);
     }

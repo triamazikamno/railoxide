@@ -59,17 +59,14 @@ impl EffectiveChainRegistry {
             .ok_or_else(|| eyre!("chain {chain_id} is not configured"))
     }
 
-    #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&u64, &EffectiveChainConfig)> {
         self.chains.iter()
     }
 
-    #[must_use]
     pub fn values(&self) -> impl ExactSizeIterator<Item = &EffectiveChainConfig> {
         self.chains.values()
     }
 
-    #[must_use]
     pub fn keys(&self) -> impl ExactSizeIterator<Item = &u64> {
         self.chains.keys()
     }
@@ -102,7 +99,6 @@ impl EffectiveChainRegistry {
             .sum()
     }
 
-    #[must_use]
     pub fn into_values(self) -> impl ExactSizeIterator<Item = EffectiveChainConfig> {
         self.chains.into_values()
     }

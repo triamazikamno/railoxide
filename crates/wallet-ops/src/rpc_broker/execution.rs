@@ -856,7 +856,7 @@ impl ReductionAttempt {
 
     fn consume(&self) -> Result<(), RpcBrokerError> {
         self.budget
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Acquire,
                 |current| (current < MAX_REDUCTION_ATTEMPTS_PER_ENDPOINT).then_some(current + 1),

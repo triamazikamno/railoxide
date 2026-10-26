@@ -1685,7 +1685,10 @@ fn stale_setup_read_is_dropped_and_a_failed_read_records_its_error(cx: &mut Test
                         .wrap_err("checking setup");
                     let mut stale = result(Err(error));
                     stale[0].destination = destination;
-                    assert!(swaps.apply_observations(stale, window, cx).is_empty());
+                    assert_eq!(
+                        swaps.apply_observations(stale, window, cx),
+                        [] as [ExecutorOperationId; 0]
+                    );
                     assert!(swaps.tracking.get(&operation).is_none_or(|tracking| {
                         tracking.error.is_none()
                             && tracking.setup.is_none()
@@ -4853,7 +4856,10 @@ fn expired_order_can_be_checked_and_hidden_without_releasing_inputs(cx: &mut Tes
             )
             .unwrap();
         let reserved = executors.records().unwrap()[0].reserved_inputs();
-        assert!(!reserved.is_empty());
+        assert_ne!(
+            reserved,
+            [] as [wallet_ops::vault::ExecutorInputIdentity; 0]
+        );
         cx.update(|window, cx| {
             swaps.update(cx, |swaps, cx| {
                 swaps.reload_records();
@@ -10633,7 +10639,10 @@ fn competing_orders_follow_the_one_that_traded(cx: &mut TestAppContext, original
                     [(original, true), (speed_up, true)],
                     "both competing orders are followed"
                 );
-                assert!(located(swaps, cx).is_empty());
+                assert_eq!(
+                    located(swaps, cx),
+                    [] as [(Option<(OrderUid, u64)>, Option<std::ops::Range<u64>>); 0]
+                );
                 swaps.apply_order_hints(
                     vec![
                         report(winner, CowOrderStatusHint::Fulfilled, Some(confirmed)),
@@ -10773,8 +10782,11 @@ fn competing_orders_follow_the_one_that_traded(cx: &mut TestAppContext, original
             );
             assert_eq!(attempt_rows(swaps, cx), expected_rows);
             assert!(!swaps.has_shown_swaps(), "a completed swap leaves the card");
-            assert!(asked(swaps, cx).is_empty());
-            assert!(located(swaps, cx).is_empty());
+            assert_eq!(asked(swaps, cx), [] as [(OrderUid, bool); 0]);
+            assert_eq!(
+                located(swaps, cx),
+                [] as [(Option<(OrderUid, u64)>, Option<std::ops::Range<u64>>); 0]
+            );
         };
         cx.update(|window, cx| {
             swaps.update(cx, |swaps, cx| {
@@ -17004,7 +17016,7 @@ fn changed_public_delivery_keeps_the_corrected_review_until_the_draft_changes(
                 true,
                 cx,
             );
-            assert!(corrected.gas_plan().approval_gas_limits.is_empty());
+            assert_eq!(corrected.gas_plan().approval_gas_limits, [] as [u64; 0]);
             assert!(corrected.gas_plan().max_gas_cost < original_gas_maximum);
             let corrected_minimum = corrected.bridge().received_minimum();
             assert!(corrected_minimum < original_minimum);

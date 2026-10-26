@@ -1009,7 +1009,7 @@ mod tests {
         };
         for free in [plan(200, None), plan(0, Some(&permit))] {
             let gas = gas(&free);
-            assert!(gas.approval_gas_limits.is_empty());
+            assert_eq!(gas.approval_gas_limits, [] as [u64; 0]);
             assert_eq!(gas.max_gas_cost, U256::ZERO);
         }
         assert_eq!(gas(&plan(100, None)).approval_gas_limits.len(), 2);

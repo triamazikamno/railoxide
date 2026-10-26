@@ -351,7 +351,7 @@ mod tests {
         let TrezorSignRequest::Eip1559(request) = request else {
             panic!("expected EIP-1559 request")
         };
-        assert!(request.to.is_empty());
+        assert_eq!(request.to, "");
         assert_eq!(request.data, input);
         assert_eq!(request.value, vec![7]);
     }

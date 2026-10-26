@@ -566,7 +566,10 @@ fn hardware_wallet_recipient_source_uses_stored_receive_address() {
     inactive_metadata.status = WalletStatus::Inactive;
     let inactive_source = hardware_wallet_recipient_source_from_metadata(&inactive_metadata)
         .expect("inactive hardware recipient source");
-    assert!(private_send_recipient_options(std::slice::from_ref(&inactive_source), &[]).is_empty());
+    assert_eq!(
+        private_send_recipient_options(std::slice::from_ref(&inactive_source), &[]),
+        [] as [RecipientOption; 0]
+    );
 
     let mut missing_address_metadata = metadata;
     missing_address_metadata
@@ -622,7 +625,10 @@ fn recipient_combobox_helpers_filter_validate_and_move_selection() {
             "0x2222222222222222222222222222222222222222"
         ]
     );
-    assert!(filtered_recipient_options(&options, "carol").is_empty());
+    assert_eq!(
+        filtered_recipient_options(&options, "carol"),
+        [] as [RecipientOption; 0]
+    );
     assert!(recipient_query_is_valid(
         DeliveryFormKind::Unshield,
         "0x1111111111111111111111111111111111111111"

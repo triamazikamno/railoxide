@@ -727,7 +727,7 @@ mod tests {
             result,
             Err(RpcBrokerError::NoEndpoint { chain_id: CHAIN_ID })
         ));
-        assert!(available(&pool).is_empty());
+        assert_eq!(available(&pool), [] as [usize; 0]);
         wrong_server.abort();
     }
 

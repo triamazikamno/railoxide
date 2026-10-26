@@ -250,7 +250,7 @@ mod tests {
         sender
             .send(TransactionGenerationStage::PublishingToBroadcaster)
             .unwrap();
-        assert!(details(&progress).is_empty());
+        assert_eq!(details(&progress), [] as [String; 0]);
     }
 
     #[test]

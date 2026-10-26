@@ -95,7 +95,7 @@ fn expired_request_keys_skip_unexpired_and_in_flight_requests() {
     let expired =
         expired_walletconnect_request_keys(&pending_requests, &request_actions, 1_700_000_011);
 
-    assert!(expired.is_empty());
+    assert_eq!(expired, [] as [String; 0]);
 
     let expired =
         expired_walletconnect_request_keys(&pending_requests, &request_actions, 1_700_000_021);

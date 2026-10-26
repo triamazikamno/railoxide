@@ -1462,10 +1462,10 @@ fn permanent_wallet_delete_purges_hardware_private_chain_cache_records() {
             "expected {key} to be deleted"
         );
     }
-    assert!(
+    assert_eq!(
         db.list_wallet_utxos(&wallet_cache_key)
-            .expect("list deleted hardware cache")
-            .is_empty()
+            .expect("list deleted hardware cache"),
+        [] as [local_db::WalletUtxoRecord; 0]
     );
 
     drop(store);

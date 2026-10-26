@@ -725,13 +725,12 @@ mod tests {
         );
         assert_eq!(state.rev(), 1);
         assert_eq!(state.fee_rows()[0].fees_id.as_ref(), "first");
-        assert!(
-            state
-                .promote_due_fee_announcements(
-                    monotonic + Duration::from_secs(39),
-                    wall + Duration::from_secs(39),
-                )
-                .is_empty()
+        assert_eq!(
+            state.promote_due_fee_announcements(
+                monotonic + Duration::from_secs(39),
+                wall + Duration::from_secs(39),
+            ),
+            [] as [u64; 0]
         );
         assert_eq!(
             state.promote_due_fee_announcements(
@@ -1102,13 +1101,12 @@ mod tests {
             expiration + Duration::from_secs(49),
         );
         assert_eq!(state.rev(), 1);
-        assert!(
-            state
-                .promote_due_fee_announcements(
-                    monotonic + Duration::from_secs(50),
-                    wall + Duration::from_secs(50),
-                )
-                .is_empty()
+        assert_eq!(
+            state.promote_due_fee_announcements(
+                monotonic + Duration::from_secs(50),
+                wall + Duration::from_secs(50),
+            ),
+            [] as [u64; 0]
         );
         assert_eq!(
             state.promote_due_fee_announcements(
@@ -1117,7 +1115,7 @@ mod tests {
             ),
             vec![2]
         );
-        assert!(state.fee_rows().is_empty());
+        assert_eq!(state.fee_rows(), [] as [FeeRow; 0]);
     }
 
     #[test]

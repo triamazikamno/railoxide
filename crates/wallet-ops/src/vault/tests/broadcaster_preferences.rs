@@ -12,8 +12,8 @@ fn broadcaster_preferences_default_empty_persist_and_reload() {
     let empty = store
         .list_broadcaster_preferences_for_session(&view_session)
         .expect("empty broadcaster preferences");
-    assert!(empty.favorites.is_empty());
-    assert!(empty.banned.is_empty());
+    assert_eq!(empty.favorites, [] as [BroadcasterPreferenceEntry; 0]);
+    assert_eq!(empty.banned, [] as [BroadcasterPreferenceEntry; 0]);
 
     let favorite = store
         .add_favorite_broadcaster_for_session(&view_session, &favorite_address)
@@ -66,7 +66,7 @@ fn broadcaster_preferences_validate_dedupe_remove_and_exclude() {
         .list_broadcaster_preferences_for_session(&view_session)
         .expect("preferences after duplicate");
     assert_eq!(preferences.favorites, vec![favorite]);
-    assert!(preferences.banned.is_empty());
+    assert_eq!(preferences.banned, [] as [BroadcasterPreferenceEntry; 0]);
 
     let banned = store
         .add_banned_broadcaster_for_session(&view_session, &address)
@@ -74,7 +74,7 @@ fn broadcaster_preferences_validate_dedupe_remove_and_exclude() {
     let preferences = store
         .list_broadcaster_preferences_for_session(&view_session)
         .expect("preferences after ban");
-    assert!(preferences.favorites.is_empty());
+    assert_eq!(preferences.favorites, [] as [BroadcasterPreferenceEntry; 0]);
     assert_eq!(preferences.banned, vec![banned.clone()]);
 
     assert_eq!(
@@ -133,7 +133,7 @@ fn broadcaster_preferences_banned_wins_and_invalid_persisted_entries_are_ignored
         .list_broadcaster_preferences_for_session(&view_session)
         .expect("list inconsistent preferences");
 
-    assert!(preferences.favorites.is_empty());
+    assert_eq!(preferences.favorites, [] as [BroadcasterPreferenceEntry; 0]);
     assert_eq!(preferences.banned, vec![entry]);
 
     drop(store);

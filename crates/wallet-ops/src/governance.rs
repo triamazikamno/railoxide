@@ -1774,7 +1774,7 @@ mod tests {
         assert!(!page[0].executed);
         assert_eq!(page[1].proposer, Address::from([0; 20]));
         assert_eq!(page[1].proposal_document, "cid-0");
-        assert!(page[1].actions.is_empty());
+        assert_eq!(page[1].actions, [] as [GovernanceProposalAction; 0]);
         assert!(page[1].executed);
         assert_eq!(page[2].contract_version, GovernanceContractVersion::V1);
         assert_eq!(page[2].index, U256::from(1));

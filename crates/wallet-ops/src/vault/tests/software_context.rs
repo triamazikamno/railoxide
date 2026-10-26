@@ -423,10 +423,10 @@ fn whole_profile_delete_removes_child_records_and_keeps_an_outside_wallet() {
                 "expected {key} to be deleted"
             );
         }
-        assert!(
+        assert_eq!(
             db.list_wallet_utxos(cache_key)
-                .expect("list deleted wallet cache rows")
-                .is_empty()
+                .expect("list deleted wallet cache rows"),
+            [] as [local_db::WalletUtxoRecord; 0]
         );
         assert!(
             db.get_wallet_meta(cache_key)
@@ -434,13 +434,13 @@ fn whole_profile_delete_removes_child_records_and_keeps_an_outside_wallet() {
                 .is_none()
         );
         let namespace = WalletPrivateNamespaceId::new(1, (*cache_key).clone());
-        assert!(
+        assert_eq!(
             db.list_opaque_wallet_private_rows(
                 &namespace,
                 WalletPrivateRecordKind::SenderTransactionCandidate,
             )
-            .expect("list deleted private rows")
-            .is_empty()
+            .expect("list deleted private rows"),
+            [] as [OpaqueWalletPrivateRow; 0]
         );
     }
     assert!(
