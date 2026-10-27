@@ -1914,87 +1914,22 @@ fn public_broadcaster_response_decodes_tx_hash() {
     );
 }
 
-#[test]
-fn public_broadcaster_republish_loop_retries_until_dropped() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .expect("build runtime");
-
-    runtime.block_on(async {
-        let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut republish = Box::pin(public_broadcaster_republish_loop(
-            Duration::from_millis(10),
-            move |attempt| {
-                let attempt_tx = attempt_tx.clone();
-                async move {
-                    attempt_tx.send(attempt).expect("record attempt");
-                    Ok(())
-                }
-            },
-        ));
-
-        let mut attempts = Vec::new();
-        while attempts.len() < 2 {
-            tokio::select! {
-                () = &mut republish => unreachable!("the republish loop ends only when dropped"),
-                attempt = attempt_rx.recv() => attempts.push(attempt.expect("retry attempt")),
-            }
-        }
-        drop(republish);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        assert_eq!(attempts, [2, 3]);
-        assert!(attempt_rx.try_recv().is_err());
-    });
-}
-
-#[test]
-fn public_broadcaster_republish_loop_dropped_before_first_retry_publishes_nothing() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .expect("build runtime");
-
-    runtime.block_on(async {
-        let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut republish = Box::pin(public_broadcaster_republish_loop(
-            Duration::from_millis(50),
-            move |attempt| {
-                let attempt_tx = attempt_tx.clone();
-                async move {
-                    attempt_tx.send(attempt).expect("record attempt");
-                    Ok(())
-                }
-            },
-        ));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), &mut republish)
-                .await
-                .is_err()
-        );
-        drop(republish);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        assert!(attempt_rx.try_recv().is_err());
-    });
-}
-
 /// Submissions on fake submission nodes, which report what they were built from and did.
 mod submission_nodes {
     use super::*;
     use crate::desktop::{
-        SubmissionNode, SubmissionNodeSpec, submit_public_broadcaster_transaction,
+        SubmissionNode, SubmissionNodeSpec, SubmissionRouteHealth,
+        submit_public_broadcaster_transaction,
     };
     use crate::http::{OperationHttpClient, OperationNetworkIsolation};
     use crate::rpc_broker::tests::{spawn_recording_rpc_mock, tagged_reqwest_client};
     use crate::{
-        HttpContext, PublicBroadcasterWaku, SubmissionNodeScope, WalletNetworkMode,
-        WalletTorClientProvider,
+        HttpContext, PublicBroadcasterWaku, SubmissionNodeScope, SubmissionRouteProgress,
+        SubmissionRouteSender, SubmissionRouteState, WalletNetworkMode, WalletTorClientProvider,
     };
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicUsize;
-    use tokio::sync::mpsc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use tokio::sync::{mpsc, watch};
     use tokio::time::Instant;
     use waku::proto::WakuMessage;
     use waku_relay::client::{
@@ -2011,9 +1946,28 @@ mod submission_nodes {
         Dropped(usize),
     }
 
+    /// The route of a harness's nodes, which a test drops and restores.
+    struct FakeRoute {
+        /// Connected peers. The route is ready while there are any.
+        peers: watch::Sender<usize>,
+        refreshes: AtomicUsize,
+        /// Publications fail, after they are reported, while set.
+        failing: AtomicBool,
+    }
+
+    impl FakeRoute {
+        fn set_peers(&self, peers: usize) {
+            self.peers.send_replace(peers);
+        }
+
+        fn refreshes(&self) -> usize {
+            self.refreshes.load(Ordering::SeqCst)
+        }
+    }
+
     struct FakeNode {
         index: usize,
-        ready: bool,
+        route: Arc<FakeRoute>,
         /// Every publication after the first never completes.
         hang_republish: bool,
         publications: AtomicUsize,
@@ -2036,8 +1990,27 @@ mod submission_nodes {
             "/waku/2/rs/5/1"
         }
 
-        async fn wait_ready(&self, _bound: Duration) -> eyre::Result<()> {
-            if self.ready {
+        fn route_health(&self) -> SubmissionRouteHealth {
+            let peers = *self.route.peers.borrow();
+            SubmissionRouteHealth {
+                peers,
+                lightpush: peers > 0,
+                filter: peers > 0,
+            }
+        }
+
+        fn refresh_route(&self) -> bool {
+            self.route.refreshes.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+
+        async fn wait_ready(&self, bound: Duration) -> eyre::Result<()> {
+            let mut peers = self.route.peers.subscribe();
+            let connected = matches!(
+                tokio::time::timeout(bound, peers.wait_for(|count| *count > 0)).await,
+                Ok(Ok(_))
+            );
+            if connected {
                 Ok(())
             } else {
                 Err(eyre::eyre!("no peer connected"))
@@ -2064,6 +2037,9 @@ mod submission_nodes {
             if self.hang_republish && self.publications.fetch_add(1, Ordering::SeqCst) > 0 {
                 std::future::pending::<()>().await;
             }
+            if self.route.failing.load(Ordering::SeqCst) {
+                return Err(eyre::eyre!("publish failed"));
+            }
             Ok(())
         }
 
@@ -2078,6 +2054,9 @@ mod submission_nodes {
         scope: SubmissionNodeScope,
         specs: Arc<Mutex<Vec<SubmissionNodeSpec>>>,
         events: mpsc::UnboundedReceiver<NodeEvent>,
+        route: Arc<FakeRoute>,
+        /// The route watch of every spawned submission.
+        route_tx: SubmissionRouteSender,
     }
 
     /// Submissions seeded from `root`, with fake nodes numbered in build order.
@@ -2091,14 +2070,20 @@ mod submission_nodes {
         let scope = SubmissionNodeScope::new();
         let specs = Arc::new(Mutex::new(Vec::new()));
         let (events_tx, events) = mpsc::unbounded_channel();
+        let route = Arc::new(FakeRoute {
+            peers: watch::Sender::new(if ready { 3 } else { 0 }),
+            refreshes: AtomicUsize::new(0),
+            failing: AtomicBool::new(false),
+        });
         let built = Arc::clone(&specs);
+        let node_route = Arc::clone(&route);
         let waku = PublicBroadcasterWaku::new(root, config, http, scope.clone())
             .with_node_factory_for_tests(move |spec| {
                 let mut built = built.lock().unwrap();
                 built.push(spec);
                 let node: Box<dyn SubmissionNode> = Box::new(FakeNode {
                     index: built.len() - 1,
-                    ready,
+                    route: Arc::clone(&node_route),
                     hang_republish,
                     publications: AtomicUsize::new(0),
                     events: events_tx.clone(),
@@ -2110,6 +2095,8 @@ mod submission_nodes {
             scope,
             specs,
             events,
+            route,
+            route_tx: watch::Sender::new(SubmissionRouteProgress::default()),
         }
     }
 
@@ -2140,17 +2127,18 @@ mod submission_nodes {
     }
 
     /// Tor-mode networking whose every operation client is new, carries `x-route: submission`,
-    /// and has its own Tor provider, recorded in `opened`.
-    fn tor_http(opened: Arc<Mutex<Vec<WalletTorClientProvider>>>) -> HttpContext {
+    /// and has its own Tor provider. Each is recorded in `opened`.
+    fn tor_http(opened: Arc<Mutex<Vec<OperationHttpClient>>>) -> HttpContext {
         HttpContext::with_rpc_client_for_tests(reqwest::Client::new(), WalletNetworkMode::Tor)
             .with_operation_clients_for_tests(move || {
                 let provider: WalletTorClientProvider = Arc::new(|| None);
-                opened.lock().unwrap().push(Arc::clone(&provider));
-                Ok(OperationHttpClient::for_tests(
+                let operation = OperationHttpClient::for_tests(
                     tagged_reqwest_client("submission"),
                     OperationNetworkIsolation::Dedicated,
                 )
-                .with_tor_client_provider_for_tests(provider))
+                .with_tor_client_provider_for_tests(provider);
+                opened.lock().unwrap().push(operation.clone());
+                Ok(operation)
             })
     }
 
@@ -2158,6 +2146,15 @@ mod submission_nodes {
         waku: &PublicBroadcasterWaku,
         broadcaster: &PublicBroadcasterCandidate,
         timeout: Duration,
+    ) -> eyre::Result<PublicBroadcasterResultKind> {
+        submit_watched(waku, broadcaster, timeout, None).await
+    }
+
+    async fn submit_watched(
+        waku: &PublicBroadcasterWaku,
+        broadcaster: &PublicBroadcasterCandidate,
+        timeout: Duration,
+        route_tx: Option<SubmissionRouteSender>,
     ) -> eyre::Result<PublicBroadcasterResultKind> {
         submit_public_broadcaster_transaction(
             waku,
@@ -2168,19 +2165,24 @@ mod submission_nodes {
             broadcaster,
             1_000_000_000,
             None,
+            route_tx,
             timeout,
             REPUBLISH_INTERVAL,
         )
         .await
     }
 
+    /// A submission that reports its route on the harness's watch.
     fn spawn_submission(
         harness: &Harness,
         broadcaster: &PublicBroadcasterCandidate,
         timeout: Duration,
     ) -> tokio::task::JoinHandle<eyre::Result<PublicBroadcasterResultKind>> {
         let (waku, broadcaster) = (harness.waku.clone(), broadcaster.clone());
-        tokio::spawn(async move { submit(&waku, &broadcaster, timeout).await })
+        let route_tx = harness.route_tx.clone();
+        tokio::spawn(
+            async move { submit_watched(&waku, &broadcaster, timeout, Some(route_tx)).await },
+        )
     }
 
     async fn next_event(events: &mut mpsc::UnboundedReceiver<NodeEvent>) -> NodeEvent {
@@ -2237,12 +2239,15 @@ mod submission_nodes {
             let opened = opened.lock().unwrap();
             let specs = harness.specs.lock().unwrap();
             assert_eq!((opened.len(), specs.len()), (2, 2));
-            assert!(!Arc::ptr_eq(&opened[0], &opened[1]));
-            for (spec, provider) in specs.iter().zip(opened.iter()) {
+            assert!(!Arc::ptr_eq(
+                &opened[0].tor_client_provider().unwrap(),
+                &opened[1].tor_client_provider().unwrap()
+            ));
+            for (spec, operation) in specs.iter().zip(opened.iter()) {
                 assert_eq!(spec.network.mode, RelayNetworkMode::Tor);
                 assert!(Arc::ptr_eq(
                     spec.network.tor_client.as_ref().unwrap(),
-                    provider
+                    &operation.tor_client_provider().unwrap()
                 ));
             }
         }
@@ -2478,6 +2483,11 @@ mod submission_nodes {
 
             submission.abort();
             assert!(submission.await.unwrap_err().is_cancelled());
+            // Closed at once, while the node is still retiring.
+            assert_eq!(
+                harness.route_tx.borrow().state,
+                SubmissionRouteState::Closed
+            );
             let aborted = Instant::now();
             if close_scope {
                 harness.scope.close();
@@ -2549,5 +2559,289 @@ mod submission_nodes {
         assert!(error.to_string().contains("locked"));
         assert_eq!(harness.specs.lock().unwrap().len(), 1);
         assert!(harness.events.try_recv().is_err());
+    }
+
+    fn route_progress(
+        state: SubmissionRouteState,
+        peers: usize,
+        recoveries_used: u32,
+        publishes: u32,
+    ) -> SubmissionRouteProgress {
+        SubmissionRouteProgress {
+            state,
+            peers,
+            recoveries_used,
+            publishes,
+        }
+    }
+
+    /// The node keeps its identity: no second node is built, and node 0 publishes throughout.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_route_is_recovered_on_new_circuits_and_its_response_accepted() {
+        let opened = Arc::default();
+        let mut harness = build_harness(
+            disabled_root(),
+            ClientConfig::default(),
+            tor_http(Arc::clone(&opened)),
+            true,
+            false,
+        );
+        let (broadcaster, viewing) = sample_public_broadcaster_candidate(11);
+        let started = Instant::now();
+        let at = |millis| started + Duration::from_millis(millis);
+        let submission = spawn_submission(&harness, &broadcaster, Duration::from_mins(2));
+        let NodeEvent::Subscribed(0, responses) = next_event(&mut harness.events).await else {
+            panic!("the node subscribes before publishing");
+        };
+        let NodeEvent::Published(0, request) = next_event(&mut harness.events).await else {
+            panic!("the node publishes the request");
+        };
+        assert_eq!(
+            *harness.route_tx.borrow(),
+            route_progress(SubmissionRouteState::Ready, 3, 0, 1)
+        );
+
+        // Lost from the first poll, at 1 s, so the grace ends at 11 s.
+        harness.route.set_peers(0);
+        tokio::time::sleep_until(at(10_500)).await;
+        assert_eq!(harness.route.refreshes(), 0);
+        tokio::time::sleep_until(at(11_500)).await;
+        let reisolations = opened.lock().unwrap()[0].reisolations_for_tests();
+        assert_eq!((reisolations, harness.route.refreshes()), (1, 1));
+        assert_eq!(
+            *harness.route_tx.borrow(),
+            route_progress(SubmissionRouteState::Reconnecting, 0, 1, 1)
+        );
+        // Nothing went out while the route was down, though a republish was due at 5 s.
+        assert!(harness.events.try_recv().is_err());
+
+        harness.route.set_peers(2);
+        let NodeEvent::Published(0, republished) = next_event(&mut harness.events).await else {
+            panic!("the recovered node republishes");
+        };
+        assert_eq!(republished, request);
+        assert!((at(11_500)..at(12_000)).contains(&Instant::now()));
+        assert_eq!(
+            *harness.route_tx.borrow(),
+            route_progress(SubmissionRouteState::Ready, 2, 1, 2)
+        );
+
+        responses
+            .send(tx_hash_response(&viewing, &request))
+            .await
+            .unwrap();
+        assert_eq!(
+            submission.await.unwrap().unwrap(),
+            PublicBroadcasterResultKind::Submitted {
+                tx_hash: TxHash::repeat_byte(3).to_string(),
+            }
+        );
+        // Closed with its counts kept.
+        assert_eq!(
+            *harness.route_tx.borrow(),
+            route_progress(SubmissionRouteState::Closed, 2, 1, 2)
+        );
+        assert_eq!(harness.specs.lock().unwrap().len(), 1);
+    }
+
+    /// A republish left pending by the route's loss doesn't hold off the recovered route's
+    /// resend.
+    #[tokio::test(start_paused = true)]
+    async fn a_recovered_route_resends_at_once_past_a_pending_publish() {
+        let mut harness = build_harness(
+            disabled_root(),
+            ClientConfig::default(),
+            tor_http(Arc::default()),
+            true,
+            true,
+        );
+        let (broadcaster, viewing) = sample_public_broadcaster_candidate(11);
+        let started = Instant::now();
+        let at = |millis| started + Duration::from_millis(millis);
+        let submission = spawn_submission(&harness, &broadcaster, Duration::from_mins(2));
+        let NodeEvent::Subscribed(0, responses) = next_event(&mut harness.events).await else {
+            panic!("the node subscribes before publishing");
+        };
+        let NodeEvent::Published(0, request) = next_event(&mut harness.events).await else {
+            panic!("the node publishes the request");
+        };
+        // The republish at 5 s never completes. The route is lost from the poll at 6 s, so
+        // recovery starts at 16 s.
+        assert!(matches!(
+            next_event(&mut harness.events).await,
+            NodeEvent::Published(0, _)
+        ));
+        harness.route.set_peers(0);
+        tokio::time::sleep_until(at(16_500)).await;
+        assert_eq!(harness.route.refreshes(), 1);
+
+        harness.route.set_peers(2);
+        let NodeEvent::Published(0, resent) = next_event(&mut harness.events).await else {
+            panic!("the recovered node resends");
+        };
+        assert_eq!(resent, request);
+        assert!((at(16_500)..at(17_500)).contains(&Instant::now()));
+        assert_eq!(harness.route_tx.borrow().publishes, 3);
+
+        responses
+            .send(tx_hash_response(&viewing, &request))
+            .await
+            .unwrap();
+        assert_eq!(
+            submission.await.unwrap().unwrap(),
+            PublicBroadcasterResultKind::Submitted {
+                tx_hash: TxHash::repeat_byte(3).to_string(),
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_short_drop_recovers_nothing_and_publishes_count_only_on_a_ready_route() {
+        let opened = Arc::default();
+        let mut harness = build_harness(
+            disabled_root(),
+            ClientConfig::default(),
+            tor_http(Arc::clone(&opened)),
+            true,
+            false,
+        );
+        let (broadcaster, _) = sample_public_broadcaster_candidate(11);
+        let started = Instant::now();
+        let at = |millis| started + Duration::from_millis(millis);
+        let submission = spawn_submission(&harness, &broadcaster, Duration::from_mins(2));
+        let NodeEvent::Subscribed(0, _responses) = next_event(&mut harness.events).await else {
+            panic!("the node subscribes before publishing");
+        };
+        assert!(matches!(
+            next_event(&mut harness.events).await,
+            NodeEvent::Published(0, _)
+        ));
+
+        // Down for the polls at 1 to 10 s, 9 s apart: short of the grace.
+        harness.route.set_peers(0);
+        tokio::time::sleep_until(at(10_500)).await;
+        assert_eq!(harness.route_tx.borrow().publishes, 1);
+        harness.route.set_peers(3);
+        // The republish due at 5 s goes out at the first ready poll, and the next one fails.
+        assert!(matches!(
+            next_event(&mut harness.events).await,
+            NodeEvent::Published(0, _)
+        ));
+        assert_eq!(Instant::now(), at(11_000));
+        harness.route.failing.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            next_event(&mut harness.events).await,
+            NodeEvent::Published(0, _)
+        ));
+        assert_eq!(Instant::now(), at(16_000));
+        tokio::time::sleep_until(at(16_500)).await;
+
+        assert_eq!(harness.route_tx.borrow().publishes, 3);
+        let reisolations = opened.lock().unwrap()[0].reisolations_for_tests();
+        assert_eq!((reisolations, harness.route.refreshes()), (0, 0));
+        submission.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn route_recovery_stops_at_its_limit_and_the_submission_times_out_on_time() {
+        const TIMEOUT: Duration = Duration::from_secs(100);
+        let opened = Arc::default();
+        let mut harness = build_harness(
+            disabled_root(),
+            ClientConfig::default(),
+            tor_http(Arc::clone(&opened)),
+            true,
+            false,
+        );
+        let (broadcaster, _) = sample_public_broadcaster_candidate(11);
+        let started = Instant::now();
+        let at = |millis| started + Duration::from_millis(millis);
+        let submission = spawn_submission(&harness, &broadcaster, TIMEOUT);
+        let NodeEvent::Subscribed(0, _responses) = next_event(&mut harness.events).await else {
+            panic!("the node subscribes before publishing");
+        };
+        assert!(matches!(
+            next_event(&mut harness.events).await,
+            NodeEvent::Published(0, _)
+        ));
+
+        // The first recovery starts at 11 s and waits out its 30 s; the second follows at once.
+        harness.route.set_peers(0);
+        tokio::time::sleep_until(at(40_500)).await;
+        assert_eq!(harness.route.refreshes(), 1);
+        tokio::time::sleep_until(at(41_500)).await;
+        assert_eq!(harness.route.refreshes(), 2);
+        harness.route.set_peers(3);
+        assert!(matches!(
+            next_event(&mut harness.events).await,
+            NodeEvent::Published(0, _)
+        ));
+
+        // Lost again, with no recovery left.
+        harness.route.set_peers(0);
+        tokio::time::sleep_until(at(99_500)).await;
+        let reisolations = opened.lock().unwrap()[0].reisolations_for_tests();
+        assert_eq!((reisolations, harness.route.refreshes()), (2, 2));
+        assert_eq!(
+            *harness.route_tx.borrow(),
+            route_progress(SubmissionRouteState::Reconnecting, 0, 2, 2)
+        );
+        assert_eq!(
+            submission.await.unwrap().unwrap(),
+            PublicBroadcasterResultKind::TimedOut
+        );
+        assert!((at(100_000)..at(100_500)).contains(&Instant::now()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_direct_mode_route_reconnects_on_its_own_without_recovery() {
+        let opened: Arc<Mutex<Vec<OperationHttpClient>>> = Arc::default();
+        let recorded = Arc::clone(&opened);
+        let http = HttpContext::with_rpc_client_for_tests(
+            reqwest::Client::new(),
+            WalletNetworkMode::Direct,
+        )
+        .with_operation_clients_for_tests(move || {
+            let operation = OperationHttpClient::for_tests(
+                reqwest::Client::new(),
+                OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct),
+            );
+            recorded.lock().unwrap().push(operation.clone());
+            Ok(operation)
+        });
+        let mut harness =
+            build_harness(disabled_root(), ClientConfig::default(), http, true, false);
+        let (broadcaster, _) = sample_public_broadcaster_candidate(11);
+        let started = Instant::now();
+        let submission = spawn_submission(&harness, &broadcaster, Duration::from_mins(2));
+        let NodeEvent::Subscribed(0, _responses) = next_event(&mut harness.events).await else {
+            panic!("the node subscribes before publishing");
+        };
+        assert!(matches!(
+            next_event(&mut harness.events).await,
+            NodeEvent::Published(0, _)
+        ));
+
+        // Well past the grace.
+        harness.route.set_peers(0);
+        tokio::time::sleep_until(started + Duration::from_millis(20_500)).await;
+        assert_eq!(
+            *harness.route_tx.borrow(),
+            route_progress(SubmissionRouteState::Reconnecting, 0, 0, 1)
+        );
+        let reisolations = opened.lock().unwrap()[0].reisolations_for_tests();
+        assert_eq!((reisolations, harness.route.refreshes()), (0, 0));
+
+        // The next poll finds the node ready and sends the overdue republish.
+        harness.route.set_peers(2);
+        assert!(matches!(
+            next_event(&mut harness.events).await,
+            NodeEvent::Published(0, _)
+        ));
+        assert_eq!(
+            *harness.route_tx.borrow(),
+            route_progress(SubmissionRouteState::Ready, 2, 0, 2)
+        );
+        submission.abort();
     }
 }

@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wallet_ops::{
-    PublicBroadcasterResultKind, SponsoredSelfBroadcastSessionOutcome, TransactionGenerationStage,
+    PublicBroadcasterResultKind, SponsoredSelfBroadcastSessionOutcome, SubmissionRouteProgress,
+    SubmissionRouteState, TransactionGenerationStage,
 };
 
 use super::types::{
@@ -16,6 +17,7 @@ use crate::root::public_action::{
     ProgressDialogCloseBehavior, ProgressFooterAction, PublicActionStepStatus,
     progress_dialog_close_behavior, progress_footer_action,
 };
+use crate::root::submission_route::SubmissionRouteCard;
 use crate::root::{DeliveryFormKind, UnshieldAssetKey};
 
 pub(in crate::root) fn private_broadcaster_progress_steps()
@@ -176,7 +178,7 @@ pub(in crate::root) fn private_broadcaster_progress_footer_action(
     progress: &PrivateBroadcasterProgressState,
 ) -> ProgressFooterAction {
     progress_footer_action(
-        private_broadcaster_progress_stop_available(progress, Instant::now()),
+        private_broadcaster_progress_stop_available(progress),
         private_broadcaster_progress_is_terminal(progress),
     )
 }
@@ -214,17 +216,36 @@ pub(super) fn private_self_broadcast_requires_attention(
 
 pub(super) fn private_broadcaster_progress_stop_available(
     progress: &PrivateBroadcasterProgressState,
-    now: Instant,
 ) -> bool {
-    progress.stop_available || public_broadcaster_waiting_can_stop(progress, now)
+    progress.stop_available || public_broadcaster_waiting_can_stop(progress)
 }
 
 pub(super) fn public_broadcaster_waiting_can_stop(
     progress: &PrivateBroadcasterProgressState,
-    now: Instant,
 ) -> bool {
-    public_broadcaster_resend_count(progress, now)
+    public_broadcaster_resend_count(progress)
         .is_some_and(|count| count >= PUBLIC_BROADCASTER_STOP_RESEND_THRESHOLD)
+}
+
+/// The route card of a public broadcaster submission's progress: its one route, which closed
+/// once the submission ended, at whatever stage. `None` for a self-broadcast, which has none.
+pub(in crate::root) fn private_broadcaster_route_card(
+    progress: &PrivateBroadcasterProgressState,
+) -> Option<SubmissionRouteCard> {
+    if progress.flow != PrivateSubmissionProgressFlow::PublicBroadcaster {
+        return None;
+    }
+    let route = progress
+        .route
+        .as_ref()
+        .map_or_else(SubmissionRouteProgress::default, |route| *route.borrow());
+    Some(SubmissionRouteCard {
+        isolated: progress.route_isolated,
+        // The job's end also covers a failure before delivery, which leaves no route.
+        ended: private_broadcaster_progress_is_terminal(progress)
+            || route.state == SubmissionRouteState::Closed,
+        routes: vec![(None, route)],
+    })
 }
 
 pub(in crate::root) fn private_broadcaster_progress_is_terminal(
@@ -391,7 +412,7 @@ pub(in crate::root) fn finish_private_broadcaster_progress_steps(
         }
         PublicBroadcasterResultKind::TimedOut => fail_private_broadcaster_progress_steps(
             steps,
-            "No decryptable broadcaster response arrived before the timeout.",
+            "No broadcaster response arrived before the timeout. The request may still be submitted, so check history first. Submitting again sends it from a new identity.",
         ),
     }
 }
@@ -514,67 +535,50 @@ pub(in crate::root) fn public_broadcaster_wait_status_detail(
     progress: &PrivateBroadcasterProgressState,
     now: Instant,
 ) -> Option<String> {
-    if progress.flow != PrivateSubmissionProgressFlow::PublicBroadcaster {
-        return None;
-    }
-    broadcaster_wait_detail(
+    Some(broadcaster_wait_detail(
+        public_broadcaster_resend_count(progress)?,
         progress.public_broadcaster_wait_started_at?,
-        progress.public_broadcaster_republish_interval?,
         progress.public_broadcaster_response_timeout,
         now,
-    )
-}
-
-/// What a wait for a broadcaster's answer that began at `started_at` says at `now`: how often
-/// the request was re-sent, once each `republish_interval`, and the time left before
-/// `timeout`, when the wait has one. `None` for a request that isn't re-sent.
-pub(in crate::root) fn broadcaster_wait_detail(
-    started_at: Instant,
-    republish_interval: Duration,
-    timeout: Option<Duration>,
-    now: Instant,
-) -> Option<String> {
-    let resend_count = broadcaster_resend_count(started_at, republish_interval, now)?;
-    let elapsed = now.saturating_duration_since(started_at);
-    if resend_count == 0 {
-        return Some("Waiting for broadcaster response".to_string());
-    }
-    let Some(timeout) = timeout else {
-        return Some(format!("Still waiting - re-sent {resend_count}x"));
-    };
-    Some(format!(
-        "Still waiting - re-sent {resend_count}x - {} left",
-        format_public_broadcaster_wait_remaining(timeout.saturating_sub(elapsed))
     ))
 }
 
-fn public_broadcaster_resend_count(
-    progress: &PrivateBroadcasterProgressState,
+/// What a wait for a broadcaster's answer that began at `started_at` says at `now`: how often
+/// the request was re-sent, `resend_count`, and the time left before `timeout`, when the wait
+/// has one.
+pub(in crate::root) fn broadcaster_wait_detail(
+    resend_count: u32,
+    started_at: Instant,
+    timeout: Option<Duration>,
     now: Instant,
-) -> Option<usize> {
-    if progress.flow != PrivateSubmissionProgressFlow::PublicBroadcaster {
-        return None;
+) -> String {
+    if resend_count == 0 {
+        return "Waiting for broadcaster response".to_string();
     }
-    broadcaster_resend_count(
-        progress.public_broadcaster_wait_started_at?,
-        progress.public_broadcaster_republish_interval?,
-        now,
+    let Some(timeout) = timeout else {
+        return format!("Still waiting - re-sent {resend_count}x");
+    };
+    let elapsed = now.saturating_duration_since(started_at);
+    format!(
+        "Still waiting - re-sent {resend_count}x - {} left",
+        format_public_broadcaster_wait_remaining(timeout.saturating_sub(elapsed))
     )
 }
 
-/// How often a request published at `started_at` was re-sent by `now`, once each
-/// `republish_interval`. `None` for a request that isn't re-sent.
-pub(in crate::root) fn broadcaster_resend_count(
-    started_at: Instant,
-    republish_interval: Duration,
-    now: Instant,
-) -> Option<usize> {
-    if republish_interval.is_zero() {
+/// How often a public broadcaster submission re-sent its request: each publish its route
+/// reports after the first. `None` without a route.
+fn public_broadcaster_resend_count(progress: &PrivateBroadcasterProgressState) -> Option<u32> {
+    if progress.flow != PrivateSubmissionProgressFlow::PublicBroadcaster {
         return None;
     }
-    let elapsed = now.saturating_duration_since(started_at);
-    let count = elapsed.as_nanos() / republish_interval.as_nanos();
-    Some(count.min(usize::MAX as u128) as usize)
+    Some(
+        progress
+            .route
+            .as_ref()?
+            .borrow()
+            .publishes
+            .saturating_sub(1),
+    )
 }
 
 pub(in crate::root) fn format_public_broadcaster_wait_remaining(duration: Duration) -> String {

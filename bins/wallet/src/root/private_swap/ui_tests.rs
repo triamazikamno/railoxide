@@ -2084,7 +2084,7 @@ fn swap_detail_shows_the_setup_until_its_account_is_ready(cx: &mut TestAppContex
         assert!(waiting.contains(&retry.center()));
 
         // This session sends it again.
-        let stages = swaps.update(cx, |swaps, cx| {
+        let (stages, _routes) = swaps.update(cx, |swaps, cx| {
             swaps.job = Some(SwapJob {
                 operation,
                 kind: SwapJobKind::Setup,
@@ -2155,9 +2155,10 @@ fn a_setup_waiting_for_five_resends_offers_its_retry(cx: &mut TestAppContext) {
         executors
             .record_swap_approval(operation, SwapUseId::first(operation), test_approval())
             .unwrap();
-        let waiting_since = Rc::new(Cell::new(None));
-        let waited = |secs| Instant::now().checked_sub(Duration::from_secs(secs));
-        let _stages = cx.update(|window, cx| {
+        let waiting_since = Rc::new(Cell::new(
+            Instant::now().checked_sub(Duration::from_secs(26)),
+        ));
+        let (_stages, routes) = cx.update(|window, cx| {
             swaps.update(cx, |swaps, cx| {
                 swaps.reload_records();
                 swaps.job = Some(SwapJob {
@@ -2169,22 +2170,25 @@ fn a_setup_waiting_for_five_resends_offers_its_retry(cx: &mut TestAppContext) {
                 let (stages, receiver) = tokio::sync::watch::channel(
                     TransactionGenerationStage::WaitingForBroadcasterResponse,
                 );
+                let (routes, route) =
+                    tokio::sync::watch::channel(wallet_ops::SubmissionRouteProgress::default());
                 let tracking = swaps.tracking.entry(operation).or_default();
                 tracking.auto_place = true;
                 *tracking.setup_progress_mut(SetupSide::Origin) = Some(
-                    SetupProgress::running(receiver, None).waiting_since(Rc::clone(&waiting_since)),
+                    SetupProgress::running(receiver, route, None)
+                        .waiting_since(Rc::clone(&waiting_since)),
                 );
-                stages
+                (stages, routes)
             })
         });
 
         // Re-sent twice: the setup still waits, with no retry.
-        waiting_since.set(waited(12));
+        routes.send_modify(|route| route.publishes = 3);
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("swap-setup-retry-origin").is_none());
 
         // Re-sent five times: its row offers the retry, while its job runs.
-        waiting_since.set(waited(26));
+        routes.send_modify(|route| route.publishes = 6);
         cx.update(|window, cx| window.draw(cx).clear(cx));
         let retry = cx.debug_bounds("swap-setup-retry-origin").unwrap();
         cx.simulate_click(retry.center(), gpui::Modifiers::none());
@@ -2232,7 +2236,7 @@ fn a_replaced_account_keeps_the_swap_and_its_open_detail(cx: &mut TestAppContext
             .unwrap()
             .started_at();
         // This session sends the setup, and the swap's detail shows it.
-        let (stages, (replacements, _following)) = cx.update(|window, cx| {
+        let ((stages, _routes), (replacements, _following)) = cx.update(|window, cx| {
             swaps.update(cx, |swaps, cx| {
                 swaps.reload_records();
                 swaps.job = Some(SwapJob {
@@ -2802,6 +2806,7 @@ fn a_setup_failure_is_told_on_its_stage_or_as_the_swaps_error(cx: &mut TestAppCo
                     // The setup reported its first stage before its job failed.
                     swaps
                         .start_setup_progress(operation, SetupSide::Origin, cx)
+                        .0
                         .send(TransactionGenerationStage::SelectingPrivateNotes)
                         .unwrap();
                 }
@@ -7389,12 +7394,13 @@ fn setup_progress_of_each_side_advances_and_ends_by_itself(cx: &mut TestAppConte
     use crate::root::public_action::PublicActionStepStatus::Pending;
 
     with_swap_view(cx, |_, swaps, _, operation, _, cx| {
-        let (origin, destination) = swaps.update(cx, |swaps, cx| {
-            (
-                swaps.start_setup_progress(operation, SetupSide::Origin, cx),
-                swaps.start_setup_progress(operation, SetupSide::Destination, cx),
-            )
-        });
+        let ((origin, _origin_route), (destination, _destination_route)) =
+            swaps.update(cx, |swaps, cx| {
+                (
+                    swaps.start_setup_progress(operation, SetupSide::Origin, cx),
+                    swaps.start_setup_progress(operation, SetupSide::Destination, cx),
+                )
+            });
         let running = |side, cx: &mut gpui::VisualTestContext| {
             swaps.read_with(cx, |swaps, _| {
                 let progress = swaps.tracking[&operation].setup_progress(side).unwrap();

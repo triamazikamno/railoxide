@@ -606,9 +606,10 @@ impl WalletRoot {
 
         let self_broadcast_requires_device_approval =
             self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived);
+        let mut route_tx = None;
         match delivery_mode {
             DeliveryMode::PublicBroadcaster => {
-                self.start_private_broadcaster_progress(
+                route_tx = Some(self.start_private_broadcaster_progress(
                     DeliveryFormKind::Send,
                     key,
                     generation_id,
@@ -617,8 +618,8 @@ impl WalletRoot {
                     recipient.clone(),
                     cost_estimate.clone(),
                     self.public_broadcaster_response_timeout,
-                    self.public_broadcaster_republish_interval,
-                );
+                    cx,
+                ));
             }
             DeliveryMode::SelfBroadcast => {
                 let signer =
@@ -726,6 +727,7 @@ impl WalletRoot {
                     response_timeout: self.public_broadcaster_response_timeout,
                     republish_interval: self.public_broadcaster_republish_interval,
                     progress_tx: Some(progress_tx),
+                    route_tx,
                 };
                 self.spawn_public_transaction_submission(chain_id, async move {
                     Box::pin(submit_desktop_send_public_broadcaster(request, &http))
@@ -1652,9 +1654,10 @@ impl WalletRoot {
 
         let self_broadcast_requires_device_approval =
             self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived);
+        let mut route_tx = None;
         match delivery_mode {
             DeliveryMode::PublicBroadcaster => {
-                self.start_private_broadcaster_progress(
+                route_tx = Some(self.start_private_broadcaster_progress(
                     DeliveryFormKind::Unshield,
                     key,
                     generation_id,
@@ -1663,8 +1666,8 @@ impl WalletRoot {
                     recipient.to_checksum(None),
                     cost_estimate.clone(),
                     self.public_broadcaster_response_timeout,
-                    self.public_broadcaster_republish_interval,
-                );
+                    cx,
+                ));
             }
             DeliveryMode::SelfBroadcast => {
                 let signer =
@@ -1793,6 +1796,7 @@ impl WalletRoot {
                     response_timeout: self.public_broadcaster_response_timeout,
                     republish_interval: self.public_broadcaster_republish_interval,
                     progress_tx: Some(progress_tx),
+                    route_tx,
                 };
                 self.spawn_public_transaction_submission(chain_id, async move {
                     Box::pin(submit_desktop_unshield_public_broadcaster(request, &http))

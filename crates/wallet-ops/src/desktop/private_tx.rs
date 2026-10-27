@@ -2741,6 +2741,7 @@ pub async fn submit_desktop_unshield_public_broadcaster(
     let timeout = request.response_timeout;
     let republish_interval = request.republish_interval;
     let progress_tx = request.progress_tx.clone();
+    let route_tx = request.route_tx.clone();
     let session = Arc::clone(&request.session);
     let prepared = Box::pin(prepare_desktop_unshield_public_broadcaster(request, http)).await?;
     let pending_spent_inputs = prepared.plan.input_utxos();
@@ -2782,6 +2783,7 @@ pub async fn submit_desktop_unshield_public_broadcaster(
         prepared.uses_relay_adapt,
         prepared.native_top_up,
         progress_tx,
+        route_tx,
         timeout,
         republish_interval,
     )
@@ -2805,6 +2807,7 @@ pub async fn submit_desktop_send_public_broadcaster(
     let timeout = request.response_timeout;
     let republish_interval = request.republish_interval;
     let progress_tx = request.progress_tx.clone();
+    let route_tx = request.route_tx.clone();
     let session = Arc::clone(&request.session);
     let prepared = prepare_desktop_send_public_broadcaster(request, http).await?;
     let pending_spent_inputs = prepared
@@ -2843,6 +2846,7 @@ pub async fn submit_desktop_send_public_broadcaster(
         prepared.uses_relay_adapt,
         prepared.native_top_up,
         progress_tx,
+        route_tx,
         timeout,
         republish_interval,
     )

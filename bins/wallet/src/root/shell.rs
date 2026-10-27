@@ -54,6 +54,7 @@ use super::chain_load::{
 use super::private_assets::{
     format_private_asset_rows_from_snapshot, should_show_pending_poi_amount,
 };
+use super::submission_route::{presence_status_color, status_presence_dot, status_presence_text};
 use super::ui_helpers::format_binary_bytes;
 use super::utxo::{
     blocked_shield_rescue_display_rows, ppoi_workflow_status_detail, ppoi_workflow_status_title,
@@ -1353,26 +1354,6 @@ pub(super) const fn ppoi_retry_completion_is_current(
     current_wallet_generation == retry_wallet_generation && session_is_current
 }
 
-fn status_presence_text(label: impl Into<SharedString>, status: PresenceStatus) -> gpui::Div {
-    div()
-        .h(px(24.0))
-        .min_w_0()
-        .px_1()
-        .flex()
-        .items_center()
-        .gap_1()
-        .text_color(rgb(theme::TEXT))
-        .child(status_presence_dot(status))
-        .child(
-            div()
-                .min_w_0()
-                .truncate()
-                .text_size(px(12.0))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .child(label.into()),
-        )
-}
-
 fn render_balances_status_hover_target(
     root: &Entity<WalletRoot>,
     id: &'static str,
@@ -2444,47 +2425,6 @@ fn ppoi_attention_detail(counts: WalletStatusCounts) -> String {
         items.push(count_label(recovery_attention, "PPOI output needing retry"));
     }
     format!("Review {}", items.join(" and "))
-}
-
-fn status_presence_dot(status: PresenceStatus) -> gpui::Div {
-    if status == PresenceStatus::Healthy {
-        return healthy_presence_dot();
-    }
-    div()
-        .size(px(7.0))
-        .rounded_full()
-        .bg(rgb(presence_status_color(status)))
-}
-
-fn healthy_presence_dot() -> gpui::Div {
-    const SLOT_SIZE: f32 = 15.0;
-
-    div()
-        .relative()
-        .size(px(SLOT_SIZE))
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
-            div()
-                .absolute()
-                .top(px(3.0))
-                .left(px(3.0))
-                .size(px(9.0))
-                .rounded_full()
-                .bg(rgb_with_alpha(theme::SUCCESS, 0.38))
-                .opacity(0.52),
-        )
-        .child(div().size(px(6.0)).rounded_full().bg(rgb(theme::SUCCESS)))
-}
-
-const fn presence_status_color(status: PresenceStatus) -> u32 {
-    match status {
-        PresenceStatus::Healthy => theme::SUCCESS,
-        PresenceStatus::Active => theme::WARNING,
-        PresenceStatus::Error => theme::DANGER,
-        PresenceStatus::Unknown => theme::TEXT_MUTED,
-    }
 }
 
 fn now_epoch_secs() -> u64 {

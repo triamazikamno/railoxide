@@ -2,10 +2,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{Pixels, px};
+use tokio::sync::watch;
 use wallet_ops::{
     DesktopSelfBroadcastResult, PublicBroadcasterCostEstimate, PublicBroadcasterSubmissionResult,
     SelfBroadcastAttemptInfo, SelfBroadcastCommandSender, SponsoredSelfBroadcastCommandSender,
-    SponsoredSelfBroadcastSessionOutcome, TransactionGenerationStage,
+    SponsoredSelfBroadcastSessionOutcome, SubmissionRouteProgress, TransactionGenerationStage,
 };
 
 use crate::assets::WalletIconSource;
@@ -39,7 +40,7 @@ pub(super) const SELF_BROADCAST_UNSHIELD_PROGRESS_STAGES: [TransactionGeneration
 ];
 
 pub(in crate::root) const SELF_BROADCAST_GAS_RETRY_DIALOG_WIDTH: Pixels = px(460.0);
-pub(super) const PUBLIC_BROADCASTER_STOP_RESEND_THRESHOLD: usize = 2;
+pub(super) const PUBLIC_BROADCASTER_STOP_RESEND_THRESHOLD: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::root) enum PrivateSubmissionProgressFlow {
@@ -90,8 +91,13 @@ pub(in crate::root) struct PrivateBroadcasterProgressState {
     pub(in crate::root) self_broadcast_current_gas_fee: Option<(u128, u128)>,
     pub(in crate::root) self_broadcast_action_error: Option<Arc<str>>,
     pub(in crate::root) public_broadcaster_response_timeout: Option<Duration>,
-    pub(in crate::root) public_broadcaster_republish_interval: Option<Duration>,
     pub(in crate::root) public_broadcaster_wait_started_at: Option<Instant>,
+    /// The public broadcaster submission's route, as its delivery reports it. A self-broadcast
+    /// has none.
+    pub(in crate::root) route: Option<watch::Receiver<SubmissionRouteProgress>>,
+    /// Whether the submission runs on routes of its own: the network mode at its start wasn't
+    /// Direct.
+    pub(in crate::root) route_isolated: bool,
     pub(in crate::root) task_abort_handle: Option<tokio::task::AbortHandle>,
     pub(in crate::root) stop_available: bool,
     pub(in crate::root) stopped: bool,

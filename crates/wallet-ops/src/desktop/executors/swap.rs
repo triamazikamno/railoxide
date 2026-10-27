@@ -20,6 +20,7 @@ use crate::desktop::executor_observation::{
     ExecutorAccountRead, ObservationEndpoints, read_executor_account,
     read_executor_account_at_latest, trace_step,
 };
+use crate::desktop::{ClosingSubmissionRoute, update_submission_route};
 use crate::settings::{ExecutorProfile, SwapTokenEligibility};
 use crate::vault::{
     BridgeDelivery, ClaimedSwapPair, ExecutorNonceObservation, ExecutorOperationId,
@@ -30,8 +31,8 @@ use crate::vault::{
 };
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorAsset, HardwareExecutorAction, OperationHttpClient,
-    PublicBroadcasterCandidate, PublicBroadcasterWaku, TransactionGenerationProgressSender,
-    WalletSession,
+    PublicBroadcasterCandidate, PublicBroadcasterWaku, SubmissionRouteSender, SubmissionRouteState,
+    TransactionGenerationProgressSender, WalletSession,
 };
 
 mod admission;
@@ -166,6 +167,7 @@ pub struct SwapSetupRequest<A = DesktopPrivateSpendAuthorization> {
     pub waku: PublicBroadcasterWaku,
     pub verify_proof: bool,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
+    pub route_tx: Option<SubmissionRouteSender>,
     pub response_timeout: Duration,
     pub republish_interval: Duration,
     /// The swap's route, for the setup's fee, signing and estimate reads.
@@ -1745,6 +1747,12 @@ impl ExecutorOwner {
         prepared: &PreparedExecutorOperation,
         request: SwapSetupRequest<A>,
     ) -> Result<ExecutorPaidRecoveryOutcome> {
+        // Closes the route on a failure before delivery too. Preparing reopens a route an
+        // earlier attempt closed.
+        let _closing = ClosingSubmissionRoute(request.route_tx.clone());
+        update_submission_route(request.route_tx.as_ref(), |route| {
+            route.state = SubmissionRouteState::Preparing;
+        });
         self.while_active(Box::pin(self.submit_swap_setup_active(prepared, request)))
             .await
     }
@@ -1790,6 +1798,7 @@ impl ExecutorOwner {
             &request.waku,
             request.verify_proof,
             request.progress_tx.as_ref(),
+            request.route_tx.as_ref(),
             request.response_timeout,
             request.republish_interval,
             &request.client,

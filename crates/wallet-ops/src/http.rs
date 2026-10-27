@@ -912,8 +912,9 @@ impl HttpContext {
                         .wrap_err("build operation RPC HTTP client")?,
                     isolation: OperationNetworkIsolation::Dedicated,
                     tor_client: Some(ArtiSocksBridge::session_client_provider(&bridge.session)),
-                    #[cfg(test)]
                     bridge: Some(Arc::downgrade(&bridge)),
+                    #[cfg(test)]
+                    reisolations: Arc::default(),
                 })
             }
             WalletNetworkMode::Proxy | WalletNetworkMode::Direct => Ok(OperationHttpClient {
@@ -921,8 +922,9 @@ impl HttpContext {
                 rpc_client: self.rpc_client.clone(),
                 isolation: OperationNetworkIsolation::Unavailable(self.mode),
                 tor_client: None,
-                #[cfg(test)]
                 bridge: None,
+                #[cfg(test)]
+                reisolations: Arc::default(),
             }),
         }
     }
@@ -1070,8 +1072,10 @@ pub struct OperationHttpClient {
     isolation: OperationNetworkIsolation,
     /// The operation bridge's current Tor client, for libp2p dials on the same isolation.
     tor_client: Option<WalletTorClientProvider>,
-    #[cfg(test)]
     bridge: Option<Weak<ArtiSocksBridge>>,
+    /// Shared by clones, so tests can see that a clone was re-isolated.
+    #[cfg(test)]
+    reisolations: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl OperationHttpClient {
@@ -1095,6 +1099,22 @@ impl OperationHttpClient {
         self.tor_client.clone()
     }
 
+    /// Gives the operation's own Tor bridge new circuits in the current session; a later
+    /// [`HttpContext::start_new_tor_session`] still moves it on. Without a bridge it does nothing.
+    pub fn reisolate(&self) -> Result<()> {
+        #[cfg(test)]
+        self.reisolations.fetch_add(1, Ordering::SeqCst);
+        if let Some(bridge) = self.bridge.as_ref().and_then(Weak::upgrade) {
+            bridge.reisolate()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reisolations_for_tests(&self) -> usize {
+        self.reisolations.load(Ordering::SeqCst)
+    }
+
     #[cfg(test)]
     fn bridge(&self) -> Option<Arc<ArtiSocksBridge>> {
         self.bridge.as_ref().and_then(Weak::upgrade)
@@ -1109,8 +1129,9 @@ impl OperationHttpClient {
             client,
             isolation,
             tor_client: None,
-            #[cfg(test)]
             bridge: None,
+            #[cfg(test)]
+            reisolations: Arc::default(),
         }
     }
 
@@ -1695,6 +1716,14 @@ impl ArtiSocksBridge {
     /// Moves this bridge onto a fresh isolated client numbered `generation`.
     fn join_session(&self, generation: u64) -> Result<()> {
         self.write_session()?.isolate(generation);
+        Ok(())
+    }
+
+    /// Moves this bridge onto a fresh isolated client in its current session.
+    fn reisolate(&self) -> Result<()> {
+        let mut session = self.write_session()?;
+        let generation = session.generation;
+        session.isolate(generation);
         Ok(())
     }
 
@@ -2760,6 +2789,19 @@ mod tests {
                     assert!(!Arc::ptr_eq(client, other));
                 }
             }
+
+            // Re-isolation gives one operation new circuits in the same session.
+            let provider = first.tor_client_provider().expect("first provider");
+            first.reisolate().expect("reisolate first operation");
+            let reisolated = provider().expect("reisolated client");
+            assert!(!Arc::ptr_eq(&reisolated, &first_session.client));
+            assert_eq!(session(&first).generation, 2);
+            assert!(Arc::ptr_eq(
+                &session(&second).client,
+                &second_session.client
+            ));
+            assert_eq!(context.start_new_tor_session().expect("new session"), 3);
+            assert_eq!(session(&first).generation, 3);
 
             // A raw client clone keeps the bridge running after its operation client drops.
             let rpc_client = first.rpc_client().clone();

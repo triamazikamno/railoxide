@@ -10,14 +10,21 @@ use tokio::sync::{mpsc, watch};
 use waku::proto::WakuMessage;
 use waku_relay::client::Client as WakuClient;
 
-use crate::{HttpContext, WalletNetworkMode};
+use crate::{HttpContext, OperationHttpClient, WalletNetworkMode};
 use waku_relay::client::{ClientConfig, RelayNetworkConfig, RelayNetworkMode};
 
 /// The most seeds, and the most peers, of one submission node.
 const SUBMISSION_NODE_MAX_PEERS: usize = 3;
 /// Bound for a fresh node to reach a `LightPush` peer and a filter peer. Over Tor its new
 /// isolation has to build circuits before the first connection, which can take tens of seconds.
-const SUBMISSION_NODE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const SUBMISSION_NODE_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often a waiting submission reads its node's route.
+pub(crate) const SUBMISSION_ROUTE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a route must stay not ready before the wallet recovers it, so that a peer that
+/// drops and redials on its own triggers nothing.
+pub(crate) const SUBMISSION_ROUTE_LOSS_GRACE: Duration = Duration::from_secs(10);
+/// The most route recoveries of one submission.
+pub const SUBMISSION_ROUTE_RECOVERY_LIMIT: u32 = 2;
 const SUBMISSION_NODE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Ends a wallet root's submission nodes. A closed scope builds no node and ends every
@@ -56,11 +63,29 @@ impl SubmissionNodeScope {
     }
 }
 
+/// A submission node's connected peers, and whether any of them serves `LightPush` and filter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SubmissionRouteHealth {
+    pub(crate) peers: usize,
+    pub(crate) lightpush: bool,
+    pub(crate) filter: bool,
+}
+
+impl SubmissionRouteHealth {
+    /// The node can publish and receive responses.
+    pub(crate) const fn ready(self) -> bool {
+        self.lightpush && self.filter
+    }
+}
+
 /// The Waku operations a submission runs on its node.
 #[async_trait::async_trait]
 pub(crate) trait SubmissionNode: Send + Sync {
     fn local_peer_id(&self) -> Option<waku::PeerId>;
     fn pubsub_path(&self) -> &str;
+    fn route_health(&self) -> SubmissionRouteHealth;
+    /// Drops the node's connections and redials. `false` when the node can't, outside Tor.
+    fn refresh_route(&self) -> bool;
     async fn wait_ready(&self, bound: Duration) -> Result<()>;
     async fn subscribe(&self, content_topics: Vec<String>) -> Result<mpsc::Receiver<WakuMessage>>;
     async fn publish(&self, content_topic: &str, payload: &[u8]) -> Result<()>;
@@ -75,6 +100,20 @@ impl SubmissionNode for WakuClient {
 
     fn pubsub_path(&self) -> &str {
         Self::pubsub_path(self)
+    }
+
+    fn route_health(&self) -> SubmissionRouteHealth {
+        let mut health = SubmissionRouteHealth::default();
+        for peer in self.peer_snapshots().iter().filter(|peer| peer.connected) {
+            health.peers += 1;
+            health.lightpush |= peer.supports_lightpush_v3;
+            health.filter |= peer.supports_filter;
+        }
+        health
+    }
+
+    fn refresh_route(&self) -> bool {
+        self.refresh_network_session()
     }
 
     async fn wait_ready(&self, bound: Duration) -> Result<()> {
@@ -148,9 +187,11 @@ impl PublicBroadcasterWaku {
     /// Builds a node for one submission and waits until it can publish and receive responses.
     ///
     /// The node has a fresh identity, up to three seeds sampled from the root's snapshot, and
-    /// one operation client for its Tor dials, DNS discovery and nwaku requests. It publishes
-    /// nothing.
-    pub(crate) async fn start_node(&self) -> Result<Box<dyn SubmissionNode>> {
+    /// one operation client for its Tor dials, DNS discovery and nwaku requests, returned with
+    /// it so that the submission can re-isolate its route. It publishes nothing.
+    pub(crate) async fn start_node(
+        &self,
+    ) -> Result<(Box<dyn SubmissionNode>, OperationHttpClient)> {
         let network_mode = self.http.network_mode();
         if network_mode == WalletNetworkMode::Proxy {
             return Err(waku_unavailable("Proxy mode disables Waku"));
@@ -212,7 +253,7 @@ impl PublicBroadcasterWaku {
         node.wait_ready(SUBMISSION_NODE_READY_TIMEOUT)
             .await
             .wrap_err("Waku delivery network is unavailable: no broadcaster peer connected")?;
-        Ok(node)
+        Ok((node, operation))
     }
 
     #[cfg_attr(
@@ -230,13 +271,13 @@ impl PublicBroadcasterWaku {
     }
 
     /// Keeps `node` connected, without publishing, for a random 10 to 60 seconds so that its
-    /// lifetime doesn't end at its response, then shuts it down. A closed scope ends the
-    /// delay at once.
-    pub(crate) fn retire(&self, node: Box<dyn SubmissionNode>) {
+    /// lifetime doesn't end at its response, then shuts it down and drops its `operation`
+    /// client. A closed scope ends the delay at once.
+    pub(crate) fn retire(&self, node: Box<dyn SubmissionNode>, operation: OperationHttpClient) {
         // A dropped submission retires its node from `Drop`, which can run off the runtime or
         // while unwinding. There, dropping the node signals its shutdown without blocking.
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            drop(node);
+            drop((node, operation));
             return;
         };
         let scope = self.scope.clone();
@@ -249,6 +290,7 @@ impl PublicBroadcasterWaku {
             if let Err(error) = node.shutdown(SUBMISSION_NODE_SHUTDOWN_TIMEOUT).await {
                 tracing::debug!(%error, "public broadcaster submission node shutdown did not complete");
             }
+            drop(operation);
         });
     }
 }

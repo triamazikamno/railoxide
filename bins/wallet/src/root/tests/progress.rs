@@ -2,8 +2,8 @@ use super::*;
 use crate::root::private_broadcaster::{
     cancel_private_broadcaster_progress, gateway_self_broadcast_result,
     private_broadcaster_progress_dialog_close_behavior, private_broadcaster_progress_is_terminal,
-    request_sponsored_session_cancel, spawn_sponsored_abort_watchdog,
-    sponsored_stop_uses_session_command,
+    private_broadcaster_route_card, request_sponsored_session_cancel,
+    spawn_sponsored_abort_watchdog, sponsored_stop_uses_session_command,
 };
 use crate::root::public_action::{
     PublicActionGasRetryKind, public_action_discard_attempt_available,
@@ -915,15 +915,35 @@ fn private_public_broadcaster_stop_footer_follows_publication_boundary() {
     );
 }
 
+/// A public broadcaster progress whose route reports `publishes` publishes, and the sender
+/// that reports more.
+fn progress_with_publishes(
+    key: UnshieldAssetKey,
+    publishes: u32,
+) -> (
+    PrivateBroadcasterProgressState,
+    tokio::sync::watch::Sender<wallet_ops::SubmissionRouteProgress>,
+) {
+    let mut progress =
+        private_progress_state(PrivateSubmissionProgressFlow::PublicBroadcaster, key);
+    let (route, receiver) = tokio::sync::watch::channel(wallet_ops::SubmissionRouteProgress {
+        publishes,
+        ..wallet_ops::SubmissionRouteProgress::default()
+    });
+    progress.route = Some(receiver);
+    (progress, route)
+}
+
+/// Stop waiting follows the re-sends the route made, not the time since the first publish: a
+/// route that reconnected through more than two republish intervals re-sent nothing then.
 #[test]
 fn private_public_broadcaster_stop_footer_reopens_after_two_re_sends() {
     let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
-    let mut progress =
-        private_progress_state(PrivateSubmissionProgressFlow::PublicBroadcaster, key);
+    let (mut progress, route) = progress_with_publishes(key, 2);
     progress.stop_available = false;
     progress.public_broadcaster_wait_started_at = Some(
         std::time::Instant::now()
-            .checked_sub(Duration::from_secs(6))
+            .checked_sub(Duration::from_secs(20))
             .expect("started before now"),
     );
 
@@ -932,11 +952,7 @@ fn private_public_broadcaster_stop_footer_reopens_after_two_re_sends() {
         ProgressFooterAction::Close,
     );
 
-    progress.public_broadcaster_wait_started_at = Some(
-        std::time::Instant::now()
-            .checked_sub(Duration::from_secs(11))
-            .expect("started before now"),
-    );
+    route.send_modify(|route| route.publishes = 3);
 
     assert_eq!(
         private_broadcaster_progress_footer_action(&progress),
@@ -947,8 +963,7 @@ fn private_public_broadcaster_stop_footer_reopens_after_two_re_sends() {
 #[test]
 fn public_broadcaster_wait_status_detail_is_concise() {
     let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
-    let mut progress =
-        private_progress_state(PrivateSubmissionProgressFlow::PublicBroadcaster, key);
+    let (mut progress, route) = progress_with_publishes(key, 1);
     let now = std::time::Instant::now();
 
     progress.public_broadcaster_wait_started_at = Some(now);
@@ -957,24 +972,63 @@ fn public_broadcaster_wait_status_detail_is_concise() {
         Some("Waiting for broadcaster response".to_string()),
     );
 
+    // 12 s in, two republish intervals passed, and a reconnect let one re-send through. The
+    // time left still counts from the wait's start.
     progress.public_broadcaster_wait_started_at = Some(
-        now.checked_sub(Duration::from_secs(10))
+        now.checked_sub(Duration::from_secs(12))
             .expect("started before now"),
     );
+    route.send_modify(|route| route.publishes = 2);
     assert_eq!(
         public_broadcaster_wait_status_detail(&progress, now),
-        Some("Still waiting - re-sent 2x - 1:50 left".to_string()),
+        Some("Still waiting - re-sent 1x - 1:48 left".to_string()),
     );
 
     progress.public_broadcaster_response_timeout = None;
     assert_eq!(
         public_broadcaster_wait_status_detail(&progress, now),
-        Some("Still waiting - re-sent 2x".to_string()),
+        Some("Still waiting - re-sent 1x".to_string()),
     );
     assert_eq!(
         format_public_broadcaster_wait_remaining(Duration::from_secs(3661)),
         "1:01:01",
     );
+}
+
+/// A job that ends while it proves, by a failure or Stop, closed its route although its
+/// delivery never started to report one.
+#[test]
+fn a_job_ended_before_delivery_shows_its_route_closed() {
+    let key = UnshieldAssetKey::new(1, Address::from([0x11; 20]));
+    let proving = || {
+        let mut progress =
+            private_progress_state(PrivateSubmissionProgressFlow::PublicBroadcaster, key);
+        apply_private_broadcaster_progress_stage(
+            &mut progress.steps,
+            TransactionGenerationStage::ProvingTransaction,
+        );
+        progress
+    };
+    let label = |progress: &PrivateBroadcasterProgressState| {
+        private_broadcaster_route_card(progress)
+            .expect("a public broadcaster submission has a route")
+            .indicator()
+            .label
+    };
+    assert_eq!(label(&proving()), "Isolated route");
+
+    let mut failed = proving();
+    fail_private_broadcaster_progress_steps_at_stage(
+        &mut failed.steps,
+        TransactionGenerationStage::ProvingTransaction,
+        "The proof could not be generated.",
+    );
+    assert_eq!(label(&failed), "Route closed");
+
+    let mut stopped = proving();
+    stopped.stopped = true;
+    mark_private_broadcaster_active_step_stopped(&mut stopped.steps);
+    assert_eq!(label(&stopped), "Route closed");
 }
 
 #[test]
@@ -1023,8 +1077,9 @@ fn closed_private_broadcaster_progress_exposes_active_stage() {
         self_broadcast_current_gas_fee: None,
         self_broadcast_action_error: None,
         public_broadcaster_response_timeout: Some(Duration::from_mins(2)),
-        public_broadcaster_republish_interval: Some(Duration::from_secs(5)),
         public_broadcaster_wait_started_at: None,
+        route: None,
+        route_isolated: true,
         task_abort_handle: None,
         stop_available: true,
         stopped: false,

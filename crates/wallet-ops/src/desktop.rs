@@ -61,9 +61,13 @@ pub use prover_cache::*;
 #[cfg(test)]
 pub(crate) use public_broadcaster::random_eligible_public_broadcasters;
 pub use public_broadcaster::*;
-pub use public_broadcaster_node::{PublicBroadcasterWaku, SubmissionNodeScope};
+pub use public_broadcaster_node::{
+    PublicBroadcasterWaku, SUBMISSION_ROUTE_RECOVERY_LIMIT, SubmissionNodeScope,
+};
 #[cfg(test)]
-pub(crate) use public_broadcaster_node::{SubmissionNode, SubmissionNodeSpec};
+pub(crate) use public_broadcaster_node::{
+    SubmissionNode, SubmissionNodeSpec, SubmissionRouteHealth,
+};
 pub(crate) use public_broadcaster_submit::*;
 pub use requests::*;
 pub use self_broadcast::SelfBroadcastResolvedGasFee;

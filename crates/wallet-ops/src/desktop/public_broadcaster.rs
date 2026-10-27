@@ -171,6 +171,7 @@ pub struct DesktopUnshieldPublicBroadcasterRequest {
     pub response_timeout: Duration,
     pub republish_interval: Duration,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
+    pub route_tx: Option<SubmissionRouteSender>,
 }
 
 pub struct DesktopSendPublicBroadcasterRequest {
@@ -197,6 +198,7 @@ pub struct DesktopSendPublicBroadcasterRequest {
     pub response_timeout: Duration,
     pub republish_interval: Duration,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
+    pub route_tx: Option<SubmissionRouteSender>,
 }
 
 pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {

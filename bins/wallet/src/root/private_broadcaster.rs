@@ -2,13 +2,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+    AnyElement, App, AppContext, Context, Entity, InteractiveElement, IntoElement, ParentElement,
     Pixels, SharedString, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder as _, px, rems, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable, WindowExt, button::ButtonVariants, tooltip::Tooltip,
 };
+use tokio::sync::watch;
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text};
 use ui::theme;
@@ -16,8 +17,9 @@ use wallet_ops::{
     DesktopSelfBroadcastResult, PublicBroadcasterCostEstimate, PublicBroadcasterResultKind,
     PublicBroadcasterSubmissionResult, SelfBroadcastAttemptInfo, SelfBroadcastCommand,
     SelfBroadcastCommandKind, SelfBroadcastCommandSender, SelfBroadcastGasFeeSelection,
-    SponsoredSelfBroadcastCommand, SponsoredSelfBroadcastSessionOutcome,
-    TransactionGenerationStage, self_broadcast_replacement_bumped_fee,
+    SponsoredSelfBroadcastCommand, SponsoredSelfBroadcastSessionOutcome, SubmissionRouteProgress,
+    SubmissionRouteSender, TransactionGenerationStage, WalletNetworkMode,
+    self_broadcast_replacement_bumped_fee,
 };
 
 use super::gas_fee::{GasRetryInputs, format_gwei};
@@ -33,6 +35,7 @@ use super::public_broadcaster_cost::{
 };
 use super::spend_authorization::spend_authorization_recipient_display;
 use super::submission_progress::{SubmissionProgressStep, render_submission_progress_stepper};
+use super::submission_route::{SubmissionRouteCard, render_submission_route_indicator};
 use super::utxo::short_hash;
 use super::{
     DeliveryFormKind, PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH, UnshieldAssetKey, WalletRoot,
@@ -51,6 +54,8 @@ pub(super) use gateway::{gateway_self_broadcast_result, gateway_self_broadcast_s
 mod progress;
 mod types;
 
+pub(in crate::root) use progress::broadcaster_wait_detail;
+pub(super) use progress::private_broadcaster_route_card;
 pub(super) use progress::{
     apply_private_broadcaster_progress_stage, end_private_broadcaster_progress_steps,
     ensure_self_broadcast_unshield_progress_stage,
@@ -65,7 +70,6 @@ pub(super) use progress::{
     private_submission_discard_attempt_available, self_broadcast_progress_steps,
     self_broadcast_step_retry_kind, sponsored_stop_uses_session_command,
 };
-pub(in crate::root) use progress::{broadcaster_resend_count, broadcaster_wait_detail};
 use progress::{
     ensure_private_broadcaster_progress_stage, private_broadcaster_progress_stop_available,
     private_broadcaster_retry_button_id, private_broadcaster_step_detail,
@@ -254,6 +258,8 @@ impl WalletRoot {
         }
     }
 
+    /// Start the progress of a public broadcaster submission, and return the sender its
+    /// delivery reports the submission's route through.
     pub(super) fn start_private_broadcaster_progress(
         &mut self,
         kind: DeliveryFormKind,
@@ -264,8 +270,19 @@ impl WalletRoot {
         recipient: String,
         estimate: Option<PublicBroadcasterCostEstimate>,
         response_timeout: Duration,
-        republish_interval: Duration,
-    ) {
+        cx: &Context<'_, Self>,
+    ) -> SubmissionRouteSender {
+        // The route's chip and the re-sends it counts are redrawn as its delivery reports them.
+        let (route_tx, mut route) = watch::channel(SubmissionRouteProgress::default());
+        let route_rx = route.clone();
+        cx.spawn(async move |this, cx| {
+            while route.changed().await.is_ok() {
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         let asset_label = Arc::<str>::from(asset_label);
         let dialog_open = self
             .private_broadcaster_progress
@@ -306,8 +323,9 @@ impl WalletRoot {
             self_broadcast_current_gas_fee: None,
             self_broadcast_action_error: None,
             public_broadcaster_response_timeout: Some(response_timeout),
-            public_broadcaster_republish_interval: Some(republish_interval),
             public_broadcaster_wait_started_at: None,
+            route: Some(route_rx),
+            route_isolated: self.http.network_mode() != WalletNetworkMode::Direct,
             task_abort_handle: None,
             stop_available: true,
             stopped: false,
@@ -315,6 +333,7 @@ impl WalletRoot {
             dialog_open,
             stage_seen: false,
         });
+        route_tx
     }
 
     pub(super) fn start_private_self_broadcast_progress(
@@ -371,8 +390,9 @@ impl WalletRoot {
             self_broadcast_current_gas_fee: current_gas_fee,
             self_broadcast_action_error: None,
             public_broadcaster_response_timeout: None,
-            public_broadcaster_republish_interval: None,
             public_broadcaster_wait_started_at: None,
+            route: None,
+            route_isolated: false,
             task_abort_handle: None,
             stop_available: true,
             stopped: false,
@@ -409,16 +429,44 @@ impl WalletRoot {
         window.open_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
+            // A public broadcaster submission's route chip ends the title, which truncates
+            // before it.
+            let route = root
+                .read(cx)
+                .private_broadcaster_progress
+                .as_ref()
+                .and_then(private_broadcaster_route_card)
+                .map(|card| {
+                    render_submission_route_indicator(
+                        delivery_element_id(key, kind, "progress-route"),
+                        &card,
+                        &root,
+                        private_broadcaster_root_route_card,
+                    )
+                });
             dialog
                 .w(dialog_width)
                 .max_h(dialog_max_height)
-                .title(private_action_title_row(
-                    private_submission_dialog_title_action(flow, kind),
-                    asset_label.as_ref(),
-                    icon_path.clone(),
-                    None,
-                    false,
-                ))
+                .title(
+                    div()
+                        .w(content_width)
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            private_action_title_row(
+                                private_submission_dialog_title_action(flow, kind),
+                                asset_label.as_ref(),
+                                icon_path.clone(),
+                                None,
+                                false,
+                            )
+                            .flex_1()
+                            .min_w_0()
+                            .truncate(),
+                        )
+                        .children(route),
+                )
                 .on_close(move |_event, window, cx| {
                     close_root.update(cx, |root, cx| {
                         let matches_progress = root
@@ -1187,8 +1235,7 @@ impl WalletRoot {
                 .into_any_element(),
             );
         }
-        let can_ban = public_broadcaster_waiting_can_stop(progress, Instant::now())
-            && !progress.stop_available;
+        let can_ban = public_broadcaster_waiting_can_stop(progress) && !progress.stop_available;
         if !can_ban {
             return None;
         }
@@ -1484,16 +1531,15 @@ fn render_private_broadcaster_progress_footer(
     root: Entity<WalletRoot>,
     progress: &PrivateBroadcasterProgressState,
 ) -> gpui::Div {
-    let now = Instant::now();
     let action = progress_footer_action(
-        private_broadcaster_progress_stop_available(progress, now),
+        private_broadcaster_progress_stop_available(progress),
         private_broadcaster_progress_is_terminal(progress),
     );
     if matches!(action, ProgressFooterAction::Stop) {
         use ui::private_submission::OperationControl;
         let control = if progress.sponsored_funding {
             OperationControl::StopRetries
-        } else if public_broadcaster_waiting_can_stop(progress, now) && !progress.stop_available {
+        } else if public_broadcaster_waiting_can_stop(progress) && !progress.stop_available {
             OperationControl::StopWaiting
         } else {
             OperationControl::Stop
@@ -1510,7 +1556,7 @@ fn render_private_broadcaster_progress_footer(
     let (id_suffix, label) = match action {
         ProgressFooterAction::Stop => (
             "progress-stop",
-            if public_broadcaster_waiting_can_stop(progress, now) && !progress.stop_available {
+            if public_broadcaster_waiting_can_stop(progress) && !progress.stop_available {
                 "Stop waiting"
             } else if progress.sponsored_funding {
                 "Stop retries"
@@ -1635,6 +1681,17 @@ fn render_self_broadcast_step_action(
     Some(action.into_any_element())
 }
 
+/// The route card of the root's private submission progress, which the progress dialog's route
+/// chip shows on hover.
+fn private_broadcaster_root_route_card(
+    root: &WalletRoot,
+    _cx: &App,
+) -> Option<SubmissionRouteCard> {
+    root.private_broadcaster_progress
+        .as_ref()
+        .and_then(private_broadcaster_route_card)
+}
+
 pub(super) fn render_private_broadcaster_status_notice(
     root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
@@ -1654,7 +1711,7 @@ pub(super) fn render_private_broadcaster_status_notice(
         ),
         PublicBroadcasterResultKind::TimedOut => (
             "Public broadcaster timed out",
-            "Open the broadcaster status dialog for the timeout details.",
+            "Check history before submitting again. A new submission is sent from a new identity.",
             theme::WARNING,
         ),
     };

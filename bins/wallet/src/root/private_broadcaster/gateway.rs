@@ -92,9 +92,8 @@ impl WalletRoot {
             == ProgressFooterAction::Stop
             && progress.stop_available;
         projection.stop_retries = projection.stop && progress.sponsored_funding;
-        projection.stop_waiting = !terminal
-            && !progress.stop_available
-            && public_broadcaster_waiting_can_stop(progress, Instant::now());
+        projection.stop_waiting =
+            !terminal && !progress.stop_available && public_broadcaster_waiting_can_stop(progress);
         let address = public_broadcaster_progress_address(progress);
         projection.ban = projection.stop_waiting
             && address.is_some_and(|address| !self.is_banned_broadcaster(address));

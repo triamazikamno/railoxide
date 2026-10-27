@@ -4993,6 +4993,7 @@ async fn prepare_public_destination(
                             .ok_or_else(|| eyre::eyre!("The broadcaster network isn't ready."))?,
                         verify_proof: true,
                         progress_tx: None,
+                        route_tx: None,
                         response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
                         republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
                         client: command.client.clone(),

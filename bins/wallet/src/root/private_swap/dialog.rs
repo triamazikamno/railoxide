@@ -24,20 +24,23 @@ use ui::controls::{
 };
 use ui::theme;
 use wallet_ops::{
-    SwapOrderState, is_swap_record,
+    SwapOrderState, WalletNetworkMode, is_swap_record,
     vault::{BridgeProvider, ExecutorOperationId, ExecutorRecord, SwapDelivery, SwapOrderRecord},
 };
 
+use super::form::SetupSide;
 use super::model::{
     RecordSwap, SwapAttempts, SwapIdentity, SwapLabels, SwapOrderGroup, SwapStage,
     bridge_sent_amount, provider_name, record_swaps, swap_delivery, swap_order_group,
     swap_order_status, swap_private_minimum,
 };
+use super::setup_progress::setup_route_card;
 use super::{PrivateSwapsView, local_date_time_label, swap_tokens};
 use crate::assets::{
     ACROSS_LOGOMARK_PATH, COW_DAO_LIGHT_PATH, COW_PROTOCOL_LOGO_LIGHT_PATH, LIST_ICON_PATH,
     NEAR_SYMBOL_WHITE_PATH, WalletIconSource,
 };
+use crate::root::submission_route::{SubmissionRouteCard, render_submission_route_indicator};
 use crate::root::{dialog_max_height, secondary_dialog_content_width};
 
 /// One column for the form's panels, narrower than Send and Unshield.
@@ -834,6 +837,46 @@ impl PrivateSwapsView {
                 row.child(Self::render_disclaimer_button(cx))
                     .child(self.render_orders_button(cx))
             })
+            .children(self.dialog_route_card(cx).map(|card| {
+                render_submission_route_indicator(
+                    "swap-dialog-route",
+                    &card,
+                    &cx.entity(),
+                    Self::dialog_route_card,
+                )
+            }))
+    }
+
+    /// The route card of the setups the shown swap's running setup job sends, each under the
+    /// network its heading names. `None` while no setup job of that swap runs: a swap outlives
+    /// its setups, and its later traffic shows no route.
+    fn dialog_route_card(&self, cx: &App) -> Option<SubmissionRouteCard> {
+        let Some(SwapDialogView::Detail(operation)) =
+            self.dialog.as_ref().map(|dialog| dialog.view)
+        else {
+            return None;
+        };
+        if !self.submitting_setup(operation) {
+            return None;
+        }
+        let tracking = self.tracking.get(&operation)?;
+        let isolated =
+            self.root.upgrade()?.read(cx).http.network_mode() != WalletNetworkMode::Direct;
+        let networks = self
+            .labels(self.record(operation)?, cx)
+            .bridge
+            .and_then(|bridge| bridge.private)
+            .map(|private| private.setups.map(|setup| setup.network));
+        let network = |index: usize| networks.as_ref().map(|networks| networks[index].clone());
+        setup_route_card(
+            isolated,
+            [
+                (network(0), tracking.setup_progress(SetupSide::Origin)),
+                (network(1), tracking.setup_progress(SetupSide::Destination)),
+            ]
+            .into_iter()
+            .filter_map(|(network, setup)| Some((network, setup?))),
+        )
     }
 
     /// My orders, labeled with the count of open swaps.

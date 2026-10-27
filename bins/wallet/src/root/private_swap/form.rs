@@ -2511,6 +2511,13 @@ impl PrivateSwapsView {
         if !self.session_is_current(cx) || self.busy() {
             return;
         }
+        // Debug UI fixture: a `setup:` mode shows its private swap instead.
+        #[cfg(debug_assertions)]
+        if super::ui_fixture::setup_swap_token(sell).is_some()
+            && self.open_ui_fixture_swap(window, cx)
+        {
+            return;
+        }
         self.open_form(
             None,
             sell,
@@ -6310,12 +6317,14 @@ impl PrivateSwapsView {
             .entry(operation)
             .or_default()
             .clear_setup_progress();
-        let progress = approval
+        let (progress, route_tx) = approval
             .origin
             .is_some()
-            .then(|| self.start_setup_progress(operation, SetupSide::Origin, cx));
-        let destination_progress = sends_destination
-            .then(|| self.start_setup_progress(operation, SetupSide::Destination, cx));
+            .then(|| self.start_setup_progress(operation, SetupSide::Origin, cx))
+            .unzip();
+        let (destination_progress, destination_route_tx) = sends_destination
+            .then(|| self.start_setup_progress(operation, SetupSide::Destination, cx))
+            .unzip();
         let bounds = &approval.approval.bounds;
         // An existing account's swap has no order yet for its progress to show, so its draft
         // stands in until the order is placed, and reopens the form with these terms.
@@ -6559,6 +6568,7 @@ impl PrivateSwapsView {
                         waku: waku.clone(),
                         verify_proof: true,
                         progress_tx: progress,
+                        route_tx,
                         response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
                         republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
                         client: client.clone(),
@@ -6573,6 +6583,7 @@ impl PrivateSwapsView {
                                     waku: waku.clone(),
                                     verify_proof: true,
                                     progress_tx: destination_progress,
+                                    route_tx: destination_route_tx,
                                     response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
                                     republish_interval: SWAP_BROADCASTER_REPUBLISH_INTERVAL,
                                     client: client.clone(),
@@ -6584,6 +6595,12 @@ impl PrivateSwapsView {
                             .await
                         }
                         (_, failed) => {
+                            // No setup call closes the destination's route here.
+                            if let Some(route_tx) = &destination_route_tx {
+                                route_tx.send_modify(|route| {
+                                    route.state = wallet_ops::SubmissionRouteState::Closed;
+                                });
+                            }
                             let (origin, _) = Box::pin(
                                 accounts.submit_setups((&mut prepared, origin_request), None),
                             )
@@ -6788,17 +6805,23 @@ impl PrivateSwapsView {
     }
 
     /// Start a new attempt's progress for `side` of the swap `operation` in place of what an
-    /// earlier attempt left, and return the sender its setup reports its stages through. The
-    /// view redraws on each stage.
+    /// earlier attempt left, and return the senders its setup reports its stages and its
+    /// route through. The view redraws on each stage and each change of the route.
     fn start_setup_progress(
         &mut self,
         operation: ExecutorOperationId,
         side: SetupSide,
         cx: &Context<'_, Self>,
-    ) -> tokio::sync::watch::Sender<TransactionGenerationStage> {
+    ) -> (
+        tokio::sync::watch::Sender<TransactionGenerationStage>,
+        wallet_ops::SubmissionRouteSender,
+    ) {
         let (progress, receiver) =
             tokio::sync::watch::channel(TransactionGenerationStage::SelectingPrivateNotes);
+        let (route, route_receiver) =
+            tokio::sync::watch::channel(wallet_ops::SubmissionRouteProgress::default());
         let mut changes = receiver.clone();
+        let mut route_changes = route_receiver.clone();
         let waiting_since = Rc::new(Cell::new(None));
         let waiting = Rc::clone(&waiting_since);
         // While a broadcaster's answer is awaited, its re-sends and time left are redrawn each
@@ -6815,8 +6838,15 @@ impl PrivateSwapsView {
                     if changes.has_changed().is_err() {
                         break;
                     }
-                } else if changes.changed().await.is_err() {
-                    break;
+                } else {
+                    // A closed route watch leaves the stage watch alone to wake the view.
+                    let changed = tokio::select! {
+                        changed = changes.changed() => changed,
+                        Ok(()) = route_changes.changed() => Ok(()),
+                    };
+                    if changed.is_err() {
+                        break;
+                    }
                 }
                 if view.update(cx, |_, cx| cx.notify()).is_err() {
                     break;
@@ -6824,9 +6854,11 @@ impl PrivateSwapsView {
             }
         });
         let tracking = self.tracking.entry(operation).or_default();
-        *tracking.setup_progress_mut(side) =
-            Some(SetupProgress::running(receiver, Some(watch)).waiting_since(waiting_since));
-        progress
+        *tracking.setup_progress_mut(side) = Some(
+            SetupProgress::running(receiver, route_receiver, Some(watch))
+                .waiting_since(waiting_since),
+        );
+        (progress, route)
     }
 
     /// End the progress of `side`'s setup with its job's result: a broadcaster's answer, or

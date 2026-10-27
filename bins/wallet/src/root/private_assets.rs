@@ -788,7 +788,14 @@ impl WalletRoot {
             .is_some();
         let send_asset = assets
             .iter()
-            .find_map(|asset| build_send_asset(snapshot, asset));
+            .find_map(|asset| build_send_asset(snapshot, asset))
+            .or_else(|| {
+                let wrapped_native = self
+                    .effective_chain_configs
+                    .get(self.selected_chain)?
+                    .wrapped_native_token?;
+                super::private_swap::ui_fixture_send_asset(self.selected_chain, wrapped_native)
+            });
         let unshield_asset = assets
             .iter()
             .find_map(|asset| build_unshield_asset(snapshot, asset))
@@ -806,6 +813,11 @@ impl WalletRoot {
             .private_swaps_view()
             .filter(|view| view.read(cx).has_shown_swaps())
             .map(gpui::IntoElement::into_any_element);
+        let fixture_swap_token = self
+            .effective_chain_configs
+            .get(self.selected_chain)
+            .and_then(|chain| chain.wrapped_native_token)
+            .and_then(super::private_swap::ui_fixture_setup_swap_token);
         let swap_entry = swap_profile.as_ref().map(|profile| {
             assets
                 .iter()
@@ -816,6 +828,7 @@ impl WalletRoot {
                     .then_some(asset.token)
                     .flatten()
                 })
+                .or(fixture_swap_token)
                 .filter(|_| actions_available)
                 .ok_or(if actions_available {
                     "No private token can be swapped"
@@ -823,11 +836,13 @@ impl WalletRoot {
                     "Available after wallet session starts"
                 })
         });
-        // The `unshield` UI fixture offers a stand-in asset without private funds.
-        let total_balance = total_balance.or_else(|| {
-            (assets.is_empty() && unshield_asset.is_some()).then(|| "$0.00".to_owned())
-        });
-        if assets.is_empty() && unshield_asset.is_none() {
+        // The `unshield`, `broadcaster-progress:` and `setup:` UI fixtures offer a stand-in
+        // asset without private funds.
+        let stand_in =
+            unshield_asset.is_some() || send_asset.is_some() || fixture_swap_token.is_some();
+        let total_balance =
+            total_balance.or_else(|| (assets.is_empty() && stand_in).then(|| "$0.00".to_owned()));
+        if assets.is_empty() && !stand_in {
             let message = if syncing {
                 loading_summary(progress)
             } else {

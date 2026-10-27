@@ -1,7 +1,8 @@
 //! A debug-only fixture for looking at the Public account swap screens, at a private swap's
 //! retry review, failed quote, speed-up, split outcome, reported fill, setup progress and
 //! cancelled preparation, at the Stealth accounts inspector, at the refund dialog of a blocked
-//! Shield and at the rows of the UTXO table: it opens them on a scratch wallet without private
+//! Shield, at a private Send's broadcaster progress and at the rows of the UTXO table: it opens
+//! them on a scratch wallet without private
 //! funds and holds a chosen state on screen. It is compiled only with `debug_assertions`, and
 //! does nothing unless `RAILOXIDE_UI_FIXTURE` is set.
 //!
@@ -143,12 +144,17 @@
 //!   leaves the card, as any does.
 //! - `setup:<state>` opens the swap dialog, in place of a Public account's form, on the detail
 //!   of a synthesized swap that sells 0.05 WETH for USDC and sets up a new stealth account,
-//!   on Ethereum with its private session started. Its review is approved and it has no order
+//!   on Ethereum with its private session started. The Private tab's Swap opens it too, and is
+//!   offered there without private funds. Its review is approved and it has no order
 //!   yet. `running` holds the setup at its proof, with a setup job that never answers.
-//!   `waiting` holds it at the broadcaster's answer, 27 seconds after it was published, where
-//!   the stage tells the re-sends and the time left as of the mode's start; they don't advance.
-//!   Past five re-sends the row offers Retry setup…, which stops the wait and opens the retry
-//!   dialog.
+//!   `waiting` holds it at the broadcaster's answer, 27 seconds after it was published, over a
+//!   ready route with 3 peers that published the request 6 times, where the stage tells the
+//!   re-sends and the time left as of the mode's start; they don't advance. Past five re-sends
+//!   the row offers Retry setup…, which stops the wait and opens the retry dialog.
+//!   `reconnecting` is that wait while its route reconnects, with 1 of its reconnects used and
+//!   3 publishes, so the row tells 2 re-sends and offers no retry.
+//!   While a setup job runs, the dialog's title shows its route's chip, whose hover card tells
+//!   the route's state, peers and reconnects. The routes are synthesized and never change.
 //!   `failed` is a setup that failed at its fee estimate, before anything was published.
 //!   `broadcaster-error` and `timeout` are a published setup that a broadcaster refused, or
 //!   that no broadcaster answered. `restart` is a setup that was sent and isn't confirmed, as
@@ -175,7 +181,12 @@
 //!   Approving the review takes the vault password and ends in an error on the detail.
 //!   `setup:two-accounts` is that swap delivered by Across to the private balance on Arbitrum
 //!   One, with a new stealth account on each network: the setup on Ethereum was submitted
-//!   and waits for its confirmation, and the one on Arbitrum One is at its POI proofs.
+//!   and waits for its confirmation, and the one on Arbitrum One is at its POI proofs, where
+//!   its route is still being prepared, so in built-in Tor the chip reads Isolated route
+//!   without a peer count.
+//!   `setup:two-waiting` is that swap with both setups waiting for their broadcasters' answers
+//!   as `waiting` does, over ready routes with 3 peers on Ethereum and 2 on Arbitrum One: the
+//!   chip counts 5 peers, and its hover card lists each network's route.
 //!   `setup:destination-failed` is that swap once its setup on Ethereum is confirmed and a
 //!   broadcaster refused the one on Arbitrum One.
 //!   No private note shows a setup included, so a confirmation never counts blocks. Copy
@@ -241,6 +252,20 @@
 //!   the shared control shows it in progress for as long as the wallet runs. `waku-failed`
 //!   ends it at once as if the new session had started and the broadcaster network couldn't
 //!   restart. Neither stops Waku or changes the Tor session.
+//! - `broadcaster-progress:<state>` lets the Private tab's Send offer a stand-in 1.0 of the
+//!   network's wrapped native token, with its icon, when the wallet holds nothing it can send.
+//!   The network's private session must be started. Send then opens the "Send via
+//!   broadcaster" progress dialog of a synthesized submission in place of the form, with the
+//!   wallet's own address as the recipient, held at the response wait: `ready` waits over a
+//!   ready route with 3 peers that published the request 4 times and used no reconnect, 17
+//!   seconds after the wait began, so the step tells 3 re-sends and the time left as of the
+//!   mode's start, and the footer offers Stop waiting. `reconnecting` waits while the route
+//!   reconnects, with 1 reconnect used and 3 publishes. `timeout` is that wait ended without
+//!   an answer, after both reconnects: the step shows the timed-out message and the chip
+//!   reads Route closed. `direct` is `ready` in direct network mode, where the chip reads Not
+//!   isolated, whatever the wallet's network mode is. The route's chip and its hover card show
+//!   the synthesized route, which never changes. Stop waiting marks the wait stopped, and
+//!   Close closes the dialog. No job runs, nothing is proved or sent, and no record is written.
 //!
 //! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
@@ -251,8 +276,8 @@
 //! `setup:fee-token` or `setup:retired` mode holds the broadcaster network's client, as any
 //! setup's review does, and publishes nothing on it.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use alloy::eips::BlockNumHash;
@@ -278,7 +303,8 @@ use wallet_ops::vault::{
 use wallet_ops::{
     BlockedShieldRescueBlocker, BlockedShieldRescueInfo, BlockedShieldRescueUtxoId,
     ExecutorRecoveryFeeEstimate, OperationNetworkIsolation, PairAnchorRate,
-    PublicBroadcasterResultKind, SwapBridgeReport, SwapContinuingApproval, SwapDeliverySeen,
+    PublicBroadcasterResultKind, SUBMISSION_ROUTE_RECOVERY_LIMIT, SubmissionRouteProgress,
+    SubmissionRouteSender, SwapBridgeReport, SwapContinuingApproval, SwapDeliverySeen,
     SwapHandoffHint, SwapQuoteAnchor, SwapQuoteDiagnostics, SwapReview, SwapReviewChange,
     SwapSettlementHint, SwapSpeedUpRefusal, TransactionGenerationStage, UtxoPpoiState,
 };
@@ -290,6 +316,9 @@ use super::setup_progress::SetupProgress;
 use super::{PrivateSwapsView, SwapEarlyHint, SwapJob, SwapJobKind, SwapOrderHint, now_unix};
 use crate::assets::WalletIconSource;
 use crate::root::WalletRoot;
+use crate::root::private_broadcaster::{
+    apply_private_broadcaster_progress_stage, finish_private_broadcaster_progress_steps_at_stage,
+};
 use crate::root::utxo::{BlockedShieldRefundDialogState, UtxoDisplayRow, UtxoFinalityContext};
 
 const VARIABLE: &str = "RAILOXIDE_UI_FIXTURE";
@@ -327,6 +356,20 @@ enum Mode {
     SetupUnderOrder(SetupUnderOrder),
     Reported(Reported),
     Cancelled(Cancelled),
+    BroadcasterProgress(BroadcasterProgress),
+}
+
+/// Where a `broadcaster-progress:` mode holds its synthesized Send via broadcaster.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BroadcasterProgress {
+    /// Waiting for the broadcaster's answer over a ready route.
+    Ready,
+    /// Waiting while the route reconnects.
+    Reconnecting,
+    /// The wait ended without an answer.
+    Timeout,
+    /// Waiting in direct network mode, with no route of its own.
+    Direct,
 }
 
 /// What a `cancelled:` mode holds of stealth account #5 once the fresh source preparation that
@@ -374,6 +417,8 @@ enum Setup {
     Running,
     /// Published, and waiting for a broadcaster's answer for 27 seconds.
     Waiting,
+    /// Waiting as `Waiting` does while its route reconnects.
+    Reconnecting,
     /// The setup failed before it was published.
     Failed,
     BroadcasterError,
@@ -389,6 +434,9 @@ enum Setup {
     FeeToken,
     /// A private Bridge swap whose two new accounts are each at another point of their setup.
     TwoAccounts,
+    /// A private Bridge swap whose two new accounts' setups both wait for a broadcaster's
+    /// answer.
+    TwoWaiting,
     /// A private Bridge swap whose own setup is confirmed and whose destination setup a
     /// broadcaster refused.
     DestinationFailed,
@@ -494,6 +542,15 @@ fn parse(value: &str) -> Option<Mode> {
     if value == "unshield" {
         return Some(Mode::Unshield);
     }
+    if let Some(state) = value.strip_prefix("broadcaster-progress:") {
+        return Some(Mode::BroadcasterProgress(match state {
+            "ready" => BroadcasterProgress::Ready,
+            "reconnecting" => BroadcasterProgress::Reconnecting,
+            "timeout" => BroadcasterProgress::Timeout,
+            "direct" => BroadcasterProgress::Direct,
+            _ => return None,
+        }));
+    }
     if let Some(state) = value.strip_prefix("rotation:") {
         return Some(Mode::Rotation {
             waku_failed: match state {
@@ -557,6 +614,8 @@ fn parse(value: &str) -> Option<Mode> {
             "replaced" => Setup::Replaced,
             "fee-token" => Setup::FeeToken,
             "two-accounts" => Setup::TwoAccounts,
+            "two-waiting" => Setup::TwoWaiting,
+            "reconnecting" => Setup::Reconnecting,
             "destination-failed" => Setup::DestinationFailed,
             _ => return None,
         }));
@@ -1826,19 +1885,39 @@ fn staged_cancelled(
 }
 
 /// This session's stages of a setup whose job is at `stage`, or ended there with `result`.
+/// A running one's route is where a job's route starts.
 fn staged_setup_progress(
     stage: TransactionGenerationStage,
     result: Option<Result<&PublicBroadcasterResultKind, String>>,
+) -> SetupProgress {
+    let mut progress = running_setup_progress(stage, SubmissionRouteProgress::default());
+    if let Some(result) = result {
+        progress.finish(result);
+    }
+    progress
+}
+
+/// This session's stages of a setup whose job is at `stage`, with its route at `route`.
+fn running_setup_progress(
+    stage: TransactionGenerationStage,
+    route: SubmissionRouteProgress,
 ) -> SetupProgress {
     let (sender, receiver) =
         tokio::sync::watch::channel(TransactionGenerationStage::SelectingPrivateNotes);
     // The job reported the stage it is at, as a real one does from its first stage on.
     let _ = sender.send(stage);
-    let mut progress = SetupProgress::running(receiver, None);
-    if let Some(result) = result {
-        progress.finish(result);
-    }
-    progress
+    let (route_sender, route) = tokio::sync::watch::channel(route);
+    hold_route(route_sender);
+    SetupProgress::running(receiver, route, None)
+}
+
+/// Keep a mode's route sender for as long as the wallet runs, as a running job keeps its own,
+/// so the route never reads as closed.
+fn hold_route(sender: SubmissionRouteSender) {
+    static HELD: Mutex<Vec<SubmissionRouteSender>> = Mutex::new(Vec::new());
+    HELD.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(sender);
 }
 
 impl PrivateSwapsView {
@@ -1880,6 +1959,7 @@ impl PrivateSwapsView {
             EstimatingBroadcasterFee, GeneratingPoiProofs, ProvingTransaction,
             WaitingForBroadcasterResponse,
         };
+        use wallet_ops::SubmissionRouteState::{Ready, Reconnecting};
         // A confirmed setup is recorded for the network's accepted delegate.
         let delegate = self.root.upgrade().and_then(|root| {
             let chains = &root.read(cx).effective_chain_configs;
@@ -1890,7 +1970,10 @@ impl PrivateSwapsView {
                     .delegate(),
             )
         });
-        let bridged = matches!(setup, Setup::TwoAccounts | Setup::DestinationFailed);
+        let bridged = matches!(
+            setup,
+            Setup::TwoAccounts | Setup::TwoWaiting | Setup::DestinationFailed
+        );
         let delivery = bridged.then_some(PRIVATE_DELIVERY);
         let operation = ExecutorOperationId::random().ok();
         let destination_operation = ExecutorOperationId::random().ok();
@@ -1900,6 +1983,8 @@ impl PrivateSwapsView {
             let (origin, destination) = match setup {
                 Setup::Running
                 | Setup::Waiting
+                | Setup::Reconnecting
+                | Setup::TwoWaiting
                 | Setup::Failed
                 | Setup::Retired
                 | Setup::Replaced
@@ -1980,6 +2065,14 @@ impl PrivateSwapsView {
         };
         // What the setup job ended with. A failure its stages show isn't the swap's error too.
         let failed = "Fixture: the setup fee is above the limit approved with the swap.";
+        // A setup that waits for a broadcaster's answer over `route`, published 27 seconds ago.
+        let waiting = |route| {
+            running_setup_progress(WaitingForBroadcasterResponse, route).waiting_since(
+                std::rc::Rc::new(std::cell::Cell::new(
+                    std::time::Instant::now().checked_sub(std::time::Duration::from_secs(27)),
+                )),
+            )
+        };
         let (origin, destination_progress, error) = match setup {
             Setup::Running | Setup::Replaced => (
                 Some(staged_setup_progress(ProvingTransaction, None)),
@@ -1987,15 +2080,38 @@ impl PrivateSwapsView {
                 None,
             ),
             Setup::Waiting => (
-                Some(
-                    staged_setup_progress(WaitingForBroadcasterResponse, None).waiting_since(
-                        std::rc::Rc::new(std::cell::Cell::new(
-                            std::time::Instant::now()
-                                .checked_sub(std::time::Duration::from_secs(27)),
-                        )),
-                    ),
-                ),
+                Some(waiting(SubmissionRouteProgress {
+                    state: Ready,
+                    peers: 3,
+                    recoveries_used: 0,
+                    publishes: 6,
+                })),
                 None,
+                None,
+            ),
+            Setup::Reconnecting => (
+                Some(waiting(SubmissionRouteProgress {
+                    state: Reconnecting,
+                    peers: 0,
+                    recoveries_used: 1,
+                    publishes: 3,
+                })),
+                None,
+                None,
+            ),
+            Setup::TwoWaiting => (
+                Some(waiting(SubmissionRouteProgress {
+                    state: Ready,
+                    peers: 3,
+                    recoveries_used: 0,
+                    publishes: 6,
+                })),
+                Some(waiting(SubmissionRouteProgress {
+                    state: Ready,
+                    peers: 2,
+                    recoveries_used: 0,
+                    publishes: 6,
+                })),
                 None,
             ),
             Setup::Failed => (
@@ -2070,7 +2186,12 @@ impl PrivateSwapsView {
         // The view tells a running setup by its job, so one that never answers stands in.
         if matches!(
             setup,
-            Setup::Running | Setup::Waiting | Setup::Replaced | Setup::TwoAccounts
+            Setup::Running
+                | Setup::Waiting
+                | Setup::Reconnecting
+                | Setup::Replaced
+                | Setup::TwoAccounts
+                | Setup::TwoWaiting
         ) {
             self.job = Some(SwapJob {
                 operation,
@@ -2560,16 +2681,88 @@ impl WalletRoot {
         Self::open_blocked_shield_refund_dialog(REFUND_UTXO, window, cx);
         true
     }
+
+    /// In a `broadcaster-progress:` mode, open the progress dialog of a synthesized Send via
+    /// broadcaster of `asset` in place of its form, held at the mode's state. `true` when the
+    /// dialog opened.
+    pub(in crate::root) fn open_ui_fixture_broadcaster_progress(
+        &mut self,
+        asset: &crate::root::UnshieldAsset,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        use TransactionGenerationStage::WaitingForBroadcasterResponse;
+        use wallet_ops::SubmissionRouteState::{Ready, Reconnecting};
+        let Some(Mode::BroadcasterProgress(state)) = mode() else {
+            return false;
+        };
+        // The recipient is the wallet's own address, so the dialog shows no stranger's.
+        let recipient = self
+            .view_session
+            .as_ref()
+            .and_then(|session| session.receive_address().ok())
+            .unwrap_or_default();
+        let route = self.start_private_broadcaster_progress(
+            crate::root::DeliveryFormKind::Send,
+            crate::root::UnshieldAssetKey::from_asset(asset),
+            u64::MAX,
+            asset.label.clone(),
+            asset.icon_path.clone(),
+            recipient,
+            None,
+            Duration::from_mins(2),
+            cx,
+        );
+        route.send_replace(match state {
+            BroadcasterProgress::Ready | BroadcasterProgress::Direct => SubmissionRouteProgress {
+                state: Ready,
+                peers: 3,
+                recoveries_used: 0,
+                publishes: 4,
+            },
+            BroadcasterProgress::Reconnecting => SubmissionRouteProgress {
+                state: Reconnecting,
+                peers: 0,
+                recoveries_used: 1,
+                publishes: 3,
+            },
+            // The route was lost again after its last reconnect, and no answer came.
+            BroadcasterProgress::Timeout => SubmissionRouteProgress {
+                state: Reconnecting,
+                peers: 0,
+                recoveries_used: SUBMISSION_ROUTE_RECOVERY_LIMIT,
+                publishes: 9,
+            },
+        });
+        hold_route(route);
+        if let Some(progress) = self.private_broadcaster_progress.as_mut() {
+            apply_private_broadcaster_progress_stage(
+                &mut progress.steps,
+                WaitingForBroadcasterResponse,
+            );
+            progress.stage_seen = true;
+            progress.stop_available = false;
+            progress.public_broadcaster_wait_started_at =
+                std::time::Instant::now().checked_sub(Duration::from_secs(17));
+            progress.route_isolated = state != BroadcasterProgress::Direct;
+            if state == BroadcasterProgress::Timeout {
+                finish_private_broadcaster_progress_steps_at_stage(
+                    &mut progress.steps,
+                    WaitingForBroadcasterResponse,
+                    &PublicBroadcasterResultKind::TimedOut,
+                );
+            }
+        }
+        self.show_private_broadcaster_progress_dialog(window, cx);
+        true
+    }
 }
 
-/// The stand-in asset of the `unshield` mode: 1.0 of `chain_id`'s wrapped native token
-/// `wrapped_native`. `None` in every other mode.
-pub(in crate::root) fn unshield_asset(
-    chain_id: u64,
-    wrapped_native: Address,
-) -> Option<crate::root::UnshieldAsset> {
+/// 1.0 of `chain_id`'s wrapped native token `wrapped_native`, which stands in for a private
+/// asset the wallet doesn't hold.
+fn stand_in_asset(chain_id: u64, wrapped_native: Address) -> crate::root::UnshieldAsset {
     let amount = U256::from(10).pow(U256::from(18));
-    matches!(mode(), Some(Mode::Unshield)).then(|| crate::root::UnshieldAsset {
+    crate::root::UnshieldAsset {
         chain_id,
         token: wrapped_native,
         label: known_tokens_for_chain(chain_id)
@@ -2581,7 +2774,34 @@ pub(in crate::root) fn unshield_asset(
         poi_verified_total: amount,
         max_batched: amount,
         icon_path: None,
+    }
+}
+
+/// The stand-in asset of the `unshield` mode. `None` in every other mode.
+pub(in crate::root) fn unshield_asset(
+    chain_id: u64,
+    wrapped_native: Address,
+) -> Option<crate::root::UnshieldAsset> {
+    matches!(mode(), Some(Mode::Unshield)).then(|| stand_in_asset(chain_id, wrapped_native))
+}
+
+/// The stand-in asset Send offers in a `broadcaster-progress:` mode, with its token's icon.
+/// `None` in every other mode.
+pub(in crate::root) fn send_asset(
+    chain_id: u64,
+    wrapped_native: Address,
+) -> Option<crate::root::UnshieldAsset> {
+    matches!(mode(), Some(Mode::BroadcasterProgress(_))).then(|| crate::root::UnshieldAsset {
+        icon_path: token_icon_asset_path(chain_id, &wrapped_native).map(WalletIconSource::embedded),
+        ..stand_in_asset(chain_id, wrapped_native)
     })
+}
+
+/// The token the Private tab's Swap offers in a `setup:` mode, `wrapped_native`, so that a
+/// wallet without private funds or a funded Public account can open the mode's swap. `None` in
+/// every other mode.
+pub(in crate::root) fn setup_swap_token(wrapped_native: Address) -> Option<Address> {
+    matches!(mode(), Some(Mode::Setup(_))).then_some(wrapped_native)
 }
 
 /// What New Tor session stages in a `rotation:` mode: `Some(true)` when the broadcaster

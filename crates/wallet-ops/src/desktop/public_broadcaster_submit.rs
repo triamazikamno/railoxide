@@ -1,4 +1,7 @@
-use super::public_broadcaster_node::SubmissionNode;
+use super::public_broadcaster_node::{
+    SUBMISSION_NODE_READY_TIMEOUT, SUBMISSION_ROUTE_LOSS_GRACE, SUBMISSION_ROUTE_POLL_INTERVAL,
+    SUBMISSION_ROUTE_RECOVERY_LIMIT, SubmissionNode,
+};
 use super::*;
 use alloy::sol_types::SolCall;
 use broadcaster_core::contracts::railgun::{RelayAdapt7702, relayCall};
@@ -7,6 +10,7 @@ use broadcaster_core::transact::{
     railgun_txid_leaf_hash,
 };
 use eyre::eyre;
+use futures_util::future::BoxFuture;
 
 pub(super) async fn prepare_desktop_unshield_public_broadcaster(
     request: DesktopUnshieldPublicBroadcasterRequest,
@@ -1148,25 +1152,6 @@ pub(super) async fn publish_public_broadcaster_payload(
     Ok(())
 }
 
-/// Republishes every `republish_interval`, numbering attempts from 2, until the future is
-/// dropped.
-pub(crate) async fn public_broadcaster_republish_loop<F, Fut>(
-    republish_interval: Duration,
-    mut publish: F,
-) where
-    F: FnMut(usize) -> Fut,
-    Fut: Future<Output = Result<()>>,
-{
-    let mut attempt = 1usize;
-    loop {
-        tokio::time::sleep(republish_interval).await;
-        attempt = attempt.saturating_add(1);
-        if let Err(error) = publish(attempt).await {
-            tracing::warn!(%error, attempt, "republish public broadcaster transact request failed");
-        }
-    }
-}
-
 pub(super) async fn submit_public_broadcaster_plan(
     waku: &PublicBroadcasterWaku,
     transaction: TransactionRequest,
@@ -1193,6 +1178,7 @@ pub(super) async fn submit_public_broadcaster_plan(
     uses_relay_adapt: bool,
     native_top_up: Option<DesktopNativeTopUpPlan>,
     progress_tx: Option<TransactionGenerationProgressSender>,
+    route_tx: Option<SubmissionRouteSender>,
     timeout: Duration,
     republish_interval: Duration,
 ) -> Result<PublicBroadcasterSubmissionResult> {
@@ -1216,6 +1202,7 @@ pub(super) async fn submit_public_broadcaster_plan(
         &broadcaster,
         bound_min_gas_price,
         progress_tx,
+        route_tx,
         timeout,
         republish_interval,
     )
@@ -1249,7 +1236,7 @@ pub(super) async fn submit_public_broadcaster_plan(
 /// Publish an admitted complete transaction and its POIs through the existing
 /// encrypted request/response transport, on a Waku node of the submission's own.
 /// Dropping the future stops local retries and retires the node through its teardown delay,
-/// which a closed scope ends at once.
+/// which a closed scope ends at once. Every exit leaves the route `Closed`.
 pub(crate) async fn submit_public_broadcaster_transaction(
     waku: &PublicBroadcasterWaku,
     transaction: TransactionRequest,
@@ -1257,9 +1244,11 @@ pub(crate) async fn submit_public_broadcaster_transaction(
     broadcaster: &PublicBroadcasterCandidate,
     bound_min_gas_price: u128,
     progress_tx: Option<TransactionGenerationProgressSender>,
+    route_tx: Option<SubmissionRouteSender>,
     timeout: Duration,
     republish_interval: Duration,
 ) -> Result<PublicBroadcasterResultKind> {
+    let _closing = ClosingSubmissionRoute(route_tx.clone());
     let transact_topic = transact_topic(broadcaster.chain_id);
     let response_topic = transact_response_topic(broadcaster.chain_id);
     update_transaction_generation_stage(
@@ -1286,57 +1275,71 @@ pub(crate) async fn submit_public_broadcaster_transaction(
         elapsed_ms = encrypt_started.elapsed().as_millis(),
         "built public broadcaster encrypted Waku payload"
     );
-    let node = RetiringNode {
+    update_submission_route(route_tx.as_ref(), |route| {
+        route.state = SubmissionRouteState::Connecting;
+    });
+    let retiring = RetiringNode {
         waku,
         node: Some(waku.start_node().await?),
     };
+    let (node, operation) = retiring.get();
+    let peers = node.route_health().peers;
+    update_submission_route(route_tx.as_ref(), |route| {
+        route.state = SubmissionRouteState::Ready;
+        route.peers = peers;
+    });
     deliver_public_broadcaster_request(
-        node.get(),
+        node,
+        operation,
         &encrypted.shared_key,
         &payload,
         broadcaster,
         &transact_topic,
         &response_topic,
         progress_tx.as_ref(),
+        route_tx.as_ref(),
         timeout,
         republish_interval,
     )
     .await
 }
 
-/// Retires a started submission node however its submission ends, including when the
-/// submission's future is dropped.
+/// Retires a started submission node and its operation client however its submission ends,
+/// including when the submission's future is dropped.
 struct RetiringNode<'a> {
     waku: &'a PublicBroadcasterWaku,
     /// Taken only on drop.
-    node: Option<Box<dyn SubmissionNode>>,
+    node: Option<(Box<dyn SubmissionNode>, OperationHttpClient)>,
 }
 
 impl RetiringNode<'_> {
-    fn get(&self) -> &dyn SubmissionNode {
-        self.node
-            .as_deref()
-            .expect("the node is taken only on drop")
+    fn get(&self) -> (&dyn SubmissionNode, &OperationHttpClient) {
+        let (node, operation) = self.node.as_ref().expect("the node is taken only on drop");
+        (node.as_ref(), operation)
     }
 }
 
 impl Drop for RetiringNode<'_> {
     fn drop(&mut self) {
-        if let Some(node) = self.node.take() {
-            self.waku.retire(node);
+        if let Some((node, operation)) = self.node.take() {
+            self.waku.retire(node, operation);
         }
     }
 }
 
-/// Subscribe to the response topic, publish, and republish until a response or `timeout`.
+/// Subscribe to the response topic, publish, and until a response or `timeout` republish
+/// while the route is ready. A route lost in built-in Tor mode is recovered on new circuits
+/// with the same node, a bounded number of times.
 async fn deliver_public_broadcaster_request(
     node: &dyn SubmissionNode,
+    operation: &OperationHttpClient,
     shared_key: &[u8; 32],
     payload: &[u8],
     broadcaster: &PublicBroadcasterCandidate,
     transact_topic: &str,
     response_topic: &str,
     progress_tx: Option<&TransactionGenerationProgressSender>,
+    route_tx: Option<&SubmissionRouteSender>,
     timeout: Duration,
     republish_interval: Duration,
 ) -> Result<PublicBroadcasterResultKind> {
@@ -1359,22 +1362,57 @@ async fn deliver_public_broadcaster_request(
     publish_public_broadcaster_payload(node, pubsub_path, transact_topic, payload, 1)
         .await
         .wrap_err("publish initial public broadcaster transact request")?;
+    let published = tokio::time::Instant::now();
+    let deadline = published + timeout;
+    let mut publishes = 1u32;
+    update_submission_route(route_tx, |route| route.publishes = publishes);
     update_transaction_generation_stage(
         progress_tx,
         TransactionGenerationStage::WaitingForBroadcasterResponse,
     );
 
-    // Polled alongside the response and timeout, so a pending republish delays neither,
-    // and returning ends it.
-    let republish = public_broadcaster_republish_loop(republish_interval, move |attempt| {
-        publish_public_broadcaster_payload(node, pubsub_path, transact_topic, payload, attempt)
-    });
-    tokio::pin!(republish);
-    let sleep = tokio::time::sleep(timeout);
+    let republish = move |attempt: usize| async move {
+        if let Err(error) =
+            publish_public_broadcaster_payload(node, pubsub_path, transact_topic, payload, attempt)
+                .await
+        {
+            tracing::warn!(%error, attempt, "republish public broadcaster transact request failed");
+        }
+    };
+    let recover = move |attempt: u32| async move {
+        tracing::info!(
+            attempt,
+            peer_id = ?node.local_peer_id(),
+            "recovering public broadcaster submission route"
+        );
+        if let Err(error) = operation.reisolate() {
+            tracing::warn!(%error, attempt, "re-isolate public broadcaster submission route failed");
+        }
+        node.refresh_route();
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        node.wait_ready(SUBMISSION_NODE_READY_TIMEOUT.min(left))
+            .await
+            .is_ok()
+    };
+    // Polled alongside the response and timeout, so a pending publish or recovery delays
+    // neither, and returning drops them.
+    let mut publishing: Option<BoxFuture<'_, ()>> = None;
+    let mut recovering: Option<BoxFuture<'_, bool>> = None;
+    let recoverable = operation.isolation() == OperationNetworkIsolation::Dedicated;
+    let mut recoveries_used = 0u32;
+    let mut not_ready_since: Option<tokio::time::Instant> = None;
+    let mut attempt = 1usize;
+    let mut next_republish = published + republish_interval;
+    let mut poll = tokio::time::interval_at(
+        published + SUBMISSION_ROUTE_POLL_INTERVAL,
+        SUBMISSION_ROUTE_POLL_INTERVAL,
+    );
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let sleep = tokio::time::sleep_until(deadline);
     tokio::pin!(sleep);
     let result = loop {
+        let (mut publish_now, mut recover_now) = (false, false);
         tokio::select! {
-            () = &mut republish => {}
             () = &mut sleep => {
                 tracing::warn!(
                     chain_id = broadcaster.chain_id,
@@ -1410,6 +1448,71 @@ async fn deliver_public_broadcaster_request(
                     Err(error) => tracing::debug!(%error, "ignoring undecryptable public broadcaster response"),
                 }
             }
+            () = async { publishing.as_mut().expect("polled while publishing").await },
+                if publishing.is_some() => publishing = None,
+            ready = async { recovering.as_mut().expect("polled while recovering").await },
+                if recovering.is_some() =>
+            {
+                recovering = None;
+                let now = tokio::time::Instant::now();
+                tracing::info!(attempt = recoveries_used, ready, "public broadcaster submission route recovery ended");
+                if ready {
+                    not_ready_since = None;
+                    let peers = node.route_health().peers;
+                    update_submission_route(route_tx, |route| {
+                        route.state = SubmissionRouteState::Ready;
+                        route.peers = peers;
+                    });
+                    // A publish pending since before the loss would hold off the resend;
+                    // its attempt was already counted.
+                    publishing = None;
+                    publish_now = true;
+                    next_republish = now + republish_interval;
+                    poll.reset_at(now + SUBMISSION_ROUTE_POLL_INTERVAL);
+                } else {
+                    recover_now = recoveries_used < SUBMISSION_ROUTE_RECOVERY_LIMIT && now < deadline;
+                }
+            }
+            now = poll.tick() => {
+                let health = node.route_health();
+                let ready = health.ready();
+                not_ready_since = if ready { None } else { Some(not_ready_since.unwrap_or(now)) };
+                let recovery_running = recovering.is_some();
+                update_submission_route(route_tx, |route| {
+                    route.peers = health.peers;
+                    if !recovery_running {
+                        route.state = if ready {
+                            SubmissionRouteState::Ready
+                        } else {
+                            SubmissionRouteState::Reconnecting
+                        };
+                    }
+                });
+                if !recovery_running {
+                    publish_now = ready && publishing.is_none() && now >= next_republish;
+                    if publish_now {
+                        next_republish = now + republish_interval;
+                    }
+                    recover_now = recoverable
+                        && recoveries_used < SUBMISSION_ROUTE_RECOVERY_LIMIT
+                        && not_ready_since
+                            .is_some_and(|since| now.duration_since(since) >= SUBMISSION_ROUTE_LOSS_GRACE);
+                }
+            }
+        }
+        if publish_now {
+            attempt = attempt.saturating_add(1);
+            publishes = publishes.saturating_add(1);
+            update_submission_route(route_tx, |route| route.publishes = publishes);
+            publishing = Some(Box::pin(republish(attempt)));
+        }
+        if recover_now {
+            recoveries_used += 1;
+            update_submission_route(route_tx, |route| {
+                route.state = SubmissionRouteState::Reconnecting;
+                route.recoveries_used = recoveries_used;
+            });
+            recovering = Some(Box::pin(recover(recoveries_used)));
         }
     };
 

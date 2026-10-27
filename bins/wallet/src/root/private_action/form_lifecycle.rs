@@ -205,6 +205,14 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         window.close_all_dialogs(cx);
+        // Debug UI fixture: a `broadcaster-progress:` mode opens its progress dialog in place of
+        // the form.
+        #[cfg(debug_assertions)]
+        {
+            if self.open_ui_fixture_broadcaster_progress(&asset, window, cx) {
+                return;
+            }
+        }
         let key = UnshieldAssetKey::from_asset(&asset);
         self.initialize_send_form(asset, window, cx);
         let focus_recipient_input = self.send_forms[&key].recipient_input.clone();

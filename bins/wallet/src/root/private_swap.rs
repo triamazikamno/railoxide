@@ -49,6 +49,8 @@ mod setup_progress;
 #[cfg(debug_assertions)]
 mod ui_fixture;
 pub(super) use ui_fixture::refund_dialog_state as ui_fixture_refund_dialog_state;
+pub(super) use ui_fixture::send_asset as ui_fixture_send_asset;
+pub(super) use ui_fixture::setup_swap_token as ui_fixture_setup_swap_token;
 pub(super) use ui_fixture::shows_utxos as ui_fixture_shows_utxos;
 pub(super) use ui_fixture::stealth_accounts as ui_fixture_stealth_accounts;
 pub(super) use ui_fixture::tor_rotation as ui_fixture_tor_rotation;
@@ -91,6 +93,19 @@ mod ui_fixture {
         _chain_id: u64,
         _wrapped_native: alloy::primitives::Address,
     ) -> Option<crate::root::UnshieldAsset> {
+        None
+    }
+
+    pub(in crate::root) const fn send_asset(
+        _chain_id: u64,
+        _wrapped_native: alloy::primitives::Address,
+    ) -> Option<crate::root::UnshieldAsset> {
+        None
+    }
+
+    pub(in crate::root) const fn setup_swap_token(
+        _wrapped_native: alloy::primitives::Address,
+    ) -> Option<alloy::primitives::Address> {
         None
     }
 
@@ -150,7 +165,7 @@ const SWAP_BROADCASTER_RESPONSE_TIMEOUT: Duration = Duration::from_mins(2);
 const SWAP_BROADCASTER_REPUBLISH_INTERVAL: Duration = Duration::from_secs(5);
 /// The re-sends after which a setup still waiting for a broadcaster's answer offers to be sent
 /// again, with another broadcaster.
-const SWAP_SETUP_RETRY_RESENDS: usize = 5;
+const SWAP_SETUP_RETRY_RESENDS: u32 = 5;
 /// Why a setup that private sync shows included isn't sent again.
 const SETUP_ALREADY_INCLUDED: &str =
     "The setup is already included. Wait for confirmation and verification.";
@@ -1830,10 +1845,9 @@ impl PrivateSwapsView {
         else {
             return false;
         };
-        let now = std::time::Instant::now();
         tracking
             .setup_progress(side)
-            .is_some_and(|progress| progress.wait_outlasted(now))
+            .is_some_and(SetupProgress::wait_outlasted)
             && [SetupSide::Origin, SetupSide::Destination]
                 .into_iter()
                 .filter_map(|side| tracking.setup_progress(side))

@@ -66,3 +66,59 @@ pub(super) fn update_transaction_generation_stage(
         let _ = progress_tx.send(stage);
     }
 }
+
+/// Where a public broadcaster submission's own Waku route stands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SubmissionRouteState {
+    /// The submission hasn't started its node yet.
+    #[default]
+    Preparing,
+    /// The node is dialing its first peers.
+    Connecting,
+    /// The node has a `LightPush` peer and a filter peer.
+    Ready,
+    /// The node lost its route and is reconnecting.
+    Reconnecting,
+    /// The submission stopped using its route. Its node may still be retiring.
+    Closed,
+}
+
+/// A submission's route, for its progress view. A submission that ends, however it ends,
+/// leaves its route `Closed` with its counts kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubmissionRouteProgress {
+    pub state: SubmissionRouteState,
+    /// The node's connected Waku peers.
+    pub peers: usize,
+    /// Route recoveries started, out of `SUBMISSION_ROUTE_RECOVERY_LIMIT`.
+    pub recoveries_used: u32,
+    /// Publish attempts made while the route was ready, the first one included.
+    pub publishes: u32,
+}
+
+pub type SubmissionRouteSender = watch::Sender<SubmissionRouteProgress>;
+
+pub(super) fn update_submission_route(
+    route_tx: Option<&SubmissionRouteSender>,
+    update: impl FnOnce(&mut SubmissionRouteProgress),
+) {
+    if let Some(route_tx) = route_tx {
+        route_tx.send_if_modified(|route| {
+            let before = *route;
+            update(route);
+            *route != before
+        });
+    }
+}
+
+/// Closes a submission's route however the submission ends, including when its future is
+/// dropped. Only the state changes, so the counts stay readable.
+pub(super) struct ClosingSubmissionRoute(pub(super) Option<SubmissionRouteSender>);
+
+impl Drop for ClosingSubmissionRoute {
+    fn drop(&mut self) {
+        update_submission_route(self.0.as_ref(), |route| {
+            route.state = SubmissionRouteState::Closed;
+        });
+    }
+}

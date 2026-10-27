@@ -83,6 +83,7 @@ mod spend_authorization;
 mod startup;
 mod stealth_accounts;
 mod submission_progress;
+mod submission_route;
 mod tokens;
 mod ui_helpers;
 mod utxo;

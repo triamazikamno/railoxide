@@ -33,9 +33,9 @@ use crate::vault::{ExecutorOperationId, SwapSetupFeeLimit};
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorAsset, ExecutorDelivery, OperationHttpClient,
     PreparedExecutorOperation, PublicBroadcasterCandidate, PublicBroadcasterResultKind,
-    PublicBroadcasterWaku, TransactionGenerationProgressSender, TransactionGenerationStage,
-    WalletSession, broadcaster_fee_amount, public_broadcaster_bound_min_gas_price,
-    public_broadcaster_service_gas_price,
+    PublicBroadcasterWaku, SubmissionRouteSender, TransactionGenerationProgressSender,
+    TransactionGenerationStage, WalletSession, broadcaster_fee_amount,
+    public_broadcaster_bound_min_gas_price, public_broadcaster_service_gas_price,
 };
 
 #[derive(Clone)]
@@ -394,6 +394,7 @@ impl ExecutorOwner {
             &request.waku,
             request.verify_proof,
             request.progress_tx.as_ref(),
+            None,
             request.response_timeout,
             request.republish_interval,
             &request.client,
@@ -418,6 +419,7 @@ impl ExecutorOwner {
         waku: &PublicBroadcasterWaku,
         verify_proof: bool,
         progress_tx: Option<&TransactionGenerationProgressSender>,
+        route_tx: Option<&SubmissionRouteSender>,
         response_timeout: Duration,
         republish_interval: Duration,
         client: &OperationHttpClient,
@@ -438,6 +440,7 @@ impl ExecutorOwner {
                 waku,
                 verify_proof,
                 progress_tx,
+                route_tx,
                 response_timeout,
                 republish_interval,
                 client,
@@ -460,6 +463,7 @@ impl ExecutorOwner {
         waku: &PublicBroadcasterWaku,
         verify_proof: bool,
         progress_tx: Option<&TransactionGenerationProgressSender>,
+        route_tx: Option<&SubmissionRouteSender>,
         response_timeout: Duration,
         republish_interval: Duration,
         client: &OperationHttpClient,
@@ -664,6 +668,7 @@ impl ExecutorOwner {
                     candidate,
                     bound_min_gas_price,
                     progress_tx.cloned(),
+                    route_tx.cloned(),
                     response_timeout,
                     republish_interval,
                 ),
