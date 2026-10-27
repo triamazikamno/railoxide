@@ -5373,9 +5373,10 @@ fn swap_receiver_rejects_addresses_that_would_lose_the_proceeds(cx: &mut TestApp
     });
 }
 
-/// The Buy list is ERC-20 only. A Public address receiving the chain's wrapped native token
-/// can take the native asset instead, through Private Unshield's output switch, and the order
-/// then buys the native marker.
+/// A Public address can take the chain's native asset instead of its wrapped native token,
+/// from its own Buy entry or Private Unshield's output switch, and the order then buys the
+/// native marker. Private balance lists no native entry, and neither does a list without the
+/// wrapped token.
 #[gpui::test]
 fn native_output_is_a_switch_on_wrapped_native_for_a_public_address(cx: &mut TestAppContext) {
     use alloy::primitives::address;
@@ -5450,7 +5451,12 @@ fn native_output_is_a_switch_on_wrapped_native_for_a_public_address(cx: &mut Tes
             swaps.update(cx, |swaps, cx| {
                 swaps.set_receive_to(ReceiveTo::PublicAddress, window, cx);
                 set_receiver_text(swaps, &receiver.to_checksum(None), window, cx);
-                assert!(!offers_native(swaps, cx), "the Buy list stays ERC-20");
+                let items = swaps.buy_picker_items(swaps.form.as_ref().unwrap(), cx);
+                assert_eq!(
+                    (items[0].asset.token, items[1].asset.token),
+                    (Address::ZERO, weth),
+                    "ETH leads the Buy list, WETH next"
+                );
             });
         });
         assert_eq!(
@@ -5459,12 +5465,25 @@ fn native_output_is_a_switch_on_wrapped_native_for_a_public_address(cx: &mut Tes
             "WETH to a Public address offers ETH"
         );
 
+        // The picker's ETH entry, and then its WETH entry, set the switch, and reopening the
+        // picker selects the entry in effect.
+        let selected = |swaps: &PrivateSwapsView, cx: &App| {
+            let tokens = swaps.form.as_ref().unwrap().picker.tokens.read(cx);
+            let row = tokens.selected_index().unwrap().row;
+            tokens.delegate().listed().nth(row)
+        };
         cx.update(|window, cx| {
             swaps.update(cx, |swaps, cx| {
-                swaps.set_native_output(true, window, cx);
+                swaps.open_buy_picker(window, cx);
+                swaps.pick_buy_token(Address::ZERO, window, cx);
                 let form = swaps.form.as_ref().unwrap();
                 assert_eq!(form.buy, Some(weth));
+                assert!(form.native_output);
                 assert_eq!(form.order_buy(), Some(Address::ZERO));
+                swaps.open_buy_picker(window, cx);
+                assert_eq!(selected(swaps, cx), Some(Address::ZERO));
+                swaps.close_buy_picker(cx);
+                window.close_dialog(cx);
             });
         });
         let review = ready_review(swaps, runtime, cx);
@@ -5480,6 +5499,38 @@ fn native_output_is_a_switch_on_wrapped_native_for_a_public_address(cx: &mut Tes
             (true, true),
             "native output explains the contract wallet limit"
         );
+
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.open_buy_picker(window, cx);
+                swaps.pick_buy_token(weth, window, cx);
+                let form = swaps.form.as_ref().unwrap();
+                assert_eq!(form.buy, Some(weth));
+                assert!(!form.native_output);
+                swaps.open_buy_picker(window, cx);
+                assert_eq!(selected(swaps, cx), Some(weth));
+                swaps.close_buy_picker(cx);
+                window.close_dialog(cx);
+            });
+        });
+        assert_eq!(ready_review(swaps, runtime, cx).plan().buy_token(), weth);
+        assert_eq!(
+            stubs.quotes().last().unwrap()["buyToken"]
+                .as_str()
+                .and_then(|value| value.parse::<Address>().ok()),
+            Some(weth),
+            "picking WETH requotes it"
+        );
+        assert_eq!(shown(cx), (true, false));
+
+        // A WETH sell token leaves WETH, and so ETH, out of the Buy list.
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                let sell = std::mem::replace(&mut swaps.form.as_mut().unwrap().sell, weth);
+                assert!(!offers_native(swaps, cx));
+                swaps.form.as_mut().unwrap().sell = sell;
+            });
+        });
 
         // Another Buy asset has no native form, and choosing WETH again starts wrapped.
         cx.update(|window, cx| {

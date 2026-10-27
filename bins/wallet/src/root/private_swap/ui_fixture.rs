@@ -103,6 +103,10 @@
 //!   so Retry and changed terms leave the failure on screen, and Retry doesn't collapse the
 //!   Details as it does on a form that quotes. The wallet holds no WETH, so the Sell select
 //!   lists nothing.
+//! - `native-buy` opens the private swap form in place of a Public account's, on Ethereum: a
+//!   new swap of USDC for WETH, so a Public address can pick ETH from the Buy picker. The
+//!   Private tab's Swap opens it too, and is offered there without private funds. The form
+//!   has no synthesized record and asks for no quote or routes, so it can't be reviewed.
 //! - `split:<stage>` opens the swap dialog, in place of a Public account's form, on the detail
 //!   of that swap once its retry traded and the settlement made the expired first order's
 //!   deposit: `bridging` has the hand-off and no outcome, `delivered` a verified delivery of 90
@@ -271,7 +275,7 @@
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
 //! only, and nothing reads, tracks or acts on them. A `retry-review` or speed-up mode, and the
 //! Speed up… of `setup:included-order-open`, opens the route its orderbook client would use,
-//! and sends nothing on it. A `quote-error` or `cancelled:` mode opens no route. A `reported:`
+//! and sends nothing on it. A `quote-error`, `native-buy` or `cancelled:` mode opens no route. A `reported:`
 //! mode asks no orderbook, chain or bridge provider about its swap. The review of a
 //! `setup:fee-token` or `setup:retired` mode holds the broadcaster network's client, as any
 //! setup's review does, and publishes nothing on it.
@@ -350,6 +354,7 @@ enum Mode {
     Rotation { waku_failed: bool },
     RetryReview,
     QuoteError,
+    NativeBuy,
     Split(Split),
     SpeedUp(SpeedUp),
     Setup(Setup),
@@ -566,6 +571,9 @@ fn parse(value: &str) -> Option<Mode> {
     if value == "quote-error" {
         return Some(Mode::QuoteError);
     }
+    if value == "native-buy" {
+        return Some(Mode::NativeBuy);
+    }
     if value == "speed-up-review" {
         return Some(Mode::SpeedUp(SpeedUp::Review));
     }
@@ -738,6 +746,7 @@ pub(super) fn holds_swaps() -> bool {
         Some(
             Mode::RetryReview
                 | Mode::QuoteError
+                | Mode::NativeBuy
                 | Mode::Split(_)
                 | Mode::SpeedUp(_)
                 | Mode::Setup(_)
@@ -2377,6 +2386,7 @@ impl PrivateSwapsView {
             Some(
                 Mode::RetryReview
                 | Mode::QuoteError
+                | Mode::NativeBuy
                 | Mode::SpeedUp(SpeedUp::Review)
                 | Mode::Setup(_)
                 | Mode::SetupUnderOrder(_)
@@ -2416,6 +2426,10 @@ impl PrivateSwapsView {
         }
         if matches!(mode(), Some(Mode::QuoteError)) {
             self.open_ui_fixture_quote_error(window, cx);
+            return true;
+        }
+        if matches!(mode(), Some(Mode::NativeBuy)) {
+            self.open_ui_fixture_new_swap(USDC, WETH, window, cx);
             return true;
         }
         let Some((split, speed_up)) = detail else {
@@ -2797,10 +2811,14 @@ pub(in crate::root) fn send_asset(
     })
 }
 
-/// The token the Private tab's Swap offers in a `setup:` or `retry-review` mode,
+/// The token the Private tab's Swap offers in a `setup:`, `retry-review` or `native-buy` mode,
 /// `wrapped_native`, so an unfunded wallet can open the mode's swap. `None` in every other mode.
 pub(in crate::root) fn setup_swap_token(wrapped_native: Address) -> Option<Address> {
-    matches!(mode(), Some(Mode::Setup(_) | Mode::RetryReview)).then_some(wrapped_native)
+    matches!(
+        mode(),
+        Some(Mode::Setup(_) | Mode::RetryReview | Mode::NativeBuy)
+    )
+    .then_some(wrapped_native)
 }
 
 /// What New Tor session stages in a `rotation:` mode: `Some(true)` when the broadcaster

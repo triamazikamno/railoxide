@@ -3141,9 +3141,9 @@ impl PrivateSwapsView {
         cx.notify();
     }
 
-    /// Debug UI fixture: in a `cancelled:` mode, open the private form of a new swap of `sell`
-    /// for `buy` over the synthesized records the mode staged. The fixture holds back the
-    /// form's own quote and routes, so the form has no quote.
+    /// Debug UI fixture: in a `cancelled:` or `native-buy` mode, open the private form of a new
+    /// swap of `sell` for `buy` over the records the mode staged, if any. The fixture holds back
+    /// the form's own quote and routes, so the form has no quote.
     #[cfg(debug_assertions)]
     pub(super) fn open_ui_fixture_new_swap(
         &mut self,
@@ -3743,7 +3743,8 @@ impl PrivateSwapsView {
             locked: self
                 .private_session()
                 .map_or(U256::ZERO, |session| session.locked_note_value(sell)),
-            // The Buy list leaves out the token sold, and never lists the native asset.
+            // The Buy list leaves out the token sold. Its configured tokens never hold the native
+            // asset, which the picker adds beside the wrapped native token.
             sell_receivable: self
                 .buy_items(Address::ZERO, cx)
                 .iter()
@@ -3752,7 +3753,8 @@ impl PrivateSwapsView {
     }
 
     /// The destination list: configured tokens the swap profile accepts, the wrapped native
-    /// token first. Native output is a switch on that token, not an entry.
+    /// token first. The native asset a Public address can take instead is added by
+    /// [`Self::buy_items_on`].
     fn buy_items(&self, sell: Address, cx: &App) -> Vec<PrivateActionAssetSelectItem> {
         let Some(root) = self.root.upgrade() else {
             return Vec::new();
@@ -3877,7 +3879,27 @@ impl PrivateSwapsView {
                 .collect();
         }
         match network {
-            None => same_chain_buy_items(self.buy_items(form.sell, cx)),
+            None => {
+                let mut items = self.buy_items(form.sell, cx);
+                // A Public address can take the listed wrapped native token as the native asset,
+                // which leads the list.
+                if form.receive_to == ReceiveTo::PublicAddress
+                    && let Some(wrapped) = self.wrapped_native_token(cx)
+                    && items.iter().any(|item| item.token == wrapped)
+                    && let Some(native) =
+                        self.chain_token_metadata(self.origin_chain_id, Address::ZERO, cx)
+                {
+                    items.insert(
+                        0,
+                        PrivateActionAssetSelectItem {
+                            token: Address::ZERO,
+                            label: Arc::from(native.symbol.as_str()),
+                            icon_path: native.icon_path,
+                        },
+                    );
+                }
+                same_chain_buy_items(items)
+            }
             Some(network) => match form.bridge.routes.get(&(form.sell, network)) {
                 Some(Ok(routes)) => self.bridge_buy_items(
                     network,
@@ -9598,7 +9620,7 @@ impl PrivateSwapsView {
         form: &SwapForm,
         cx: &App,
     ) -> Option<(String, Option<WalletIconSource>)> {
-        let token = form.buy?;
+        let token = form.order_buy()?;
         let network = form.network.unwrap_or(self.origin_chain_id);
         let metadata = self.chain_token_metadata(network, token, cx);
         // A provider's token takes the provider's symbol, as its row does.

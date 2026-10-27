@@ -1060,7 +1060,7 @@ impl PrivateSwapsView {
         if busy || form.picker.open || (form.operation.is_some() && !form.reuse_account) {
             return;
         }
-        let buy = form.buy;
+        let buy = form.order_buy();
         let picker = &mut form.picker;
         picker.open = true;
         picker.network = form.network.unwrap_or(own);
@@ -1199,6 +1199,7 @@ impl PrivateSwapsView {
         cx: &mut Context<'_, Self>,
     ) {
         let own = self.origin_chain_id;
+        let wrapped = self.wrapped_native_token(cx);
         let Some(form) = self.form.as_mut().filter(|form| form.picker.open) else {
             return;
         };
@@ -1208,7 +1209,14 @@ impl PrivateSwapsView {
         form.picker.open = false;
         window.close_dialog(cx);
         let network = (form.picker.network != own).then_some(form.picker.network);
-        if form.network == network && form.buy == Some(token) {
+        // This network's native entry is its wrapped native token paid out as the native asset,
+        // as a restored form holds it.
+        let (token, native_output) = match (network, wrapped) {
+            (None, Some(wrapped)) if token == Address::ZERO => (wrapped, true),
+            _ => (token, false),
+        };
+        if form.network == network && form.buy == Some(token) && form.native_output == native_output
+        {
             cx.notify();
             return;
         }
@@ -1220,7 +1228,7 @@ impl PrivateSwapsView {
             form.bridge.chosen = None;
         }
         form.buy = Some(token);
-        form.native_output = false;
+        form.native_output = native_output;
         form.error = None;
         if network_changed {
             // An account chosen on the old network doesn't follow to the new one.
