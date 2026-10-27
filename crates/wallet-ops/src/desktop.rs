@@ -12,6 +12,7 @@ mod private_plan;
 mod private_tx;
 mod prover_cache;
 mod public_broadcaster;
+mod public_broadcaster_node;
 mod public_broadcaster_submit;
 mod requests;
 mod self_broadcast;
@@ -60,6 +61,9 @@ pub use prover_cache::*;
 #[cfg(test)]
 pub(crate) use public_broadcaster::random_eligible_public_broadcasters;
 pub use public_broadcaster::*;
+pub use public_broadcaster_node::{PublicBroadcasterWaku, SubmissionNodeScope};
+#[cfg(test)]
+pub(crate) use public_broadcaster_node::{SubmissionNode, SubmissionNodeSpec};
 pub(crate) use public_broadcaster_submit::*;
 pub use requests::*;
 pub use self_broadcast::SelfBroadcastResolvedGasFee;

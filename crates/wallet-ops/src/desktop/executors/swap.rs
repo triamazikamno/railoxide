@@ -30,7 +30,8 @@ use crate::vault::{
 };
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorAsset, HardwareExecutorAction, OperationHttpClient,
-    PublicBroadcasterCandidate, TransactionGenerationProgressSender, WakuClient, WalletSession,
+    PublicBroadcasterCandidate, PublicBroadcasterWaku, TransactionGenerationProgressSender,
+    WalletSession,
 };
 
 mod admission;
@@ -162,7 +163,7 @@ pub struct SwapSetupRequest<A = DesktopPrivateSpendAuthorization> {
     pub maximum_private_fee: U256,
     pub session: Arc<WalletSession>,
     pub authorization: A,
-    pub waku: Arc<WakuClient>,
+    pub waku: PublicBroadcasterWaku,
     pub verify_proof: bool,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
     pub response_timeout: Duration,

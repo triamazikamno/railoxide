@@ -2737,7 +2737,7 @@ pub async fn submit_desktop_unshield_public_broadcaster(
     request: DesktopUnshieldPublicBroadcasterRequest,
     http: &HttpContext,
 ) -> Result<PublicBroadcasterSubmissionResult> {
-    let waku = Arc::clone(&request.waku);
+    let waku = request.waku.clone();
     let timeout = request.response_timeout;
     let republish_interval = request.republish_interval;
     let progress_tx = request.progress_tx.clone();
@@ -2757,7 +2757,7 @@ pub async fn submit_desktop_unshield_public_broadcaster(
         None
     };
     let result = submit_public_broadcaster_plan(
-        waku,
+        &waku,
         transaction,
         prepared.pre_transaction_pois_per_txid_leaf_per_list,
         prepared.broadcaster,
@@ -2801,7 +2801,7 @@ pub async fn submit_desktop_send_public_broadcaster(
     request: DesktopSendPublicBroadcasterRequest,
     http: &HttpContext,
 ) -> Result<PublicBroadcasterSubmissionResult> {
-    let waku = Arc::clone(&request.waku);
+    let waku = request.waku.clone();
     let timeout = request.response_timeout;
     let republish_interval = request.republish_interval;
     let progress_tx = request.progress_tx.clone();
@@ -2814,7 +2814,7 @@ pub async fn submit_desktop_send_public_broadcaster(
         .map(|input| input.utxo.clone())
         .collect::<Vec<_>>();
     let result = submit_public_broadcaster_plan(
-        waku,
+        &waku,
         prepared.transaction.unwrap_or_else(|| {
             TransactionRequest::default()
                 .to(prepared.plan.call.to)

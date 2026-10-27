@@ -35,7 +35,7 @@ mod network;
 pub use network::{
     GatewayNetworkActivity, GatewayNetworkCommand, GatewayNetworkError, GatewayNetworkOperation,
     GatewayNetworkOutcome, GatewayNetworkRequest, GatewayNetworkResult, GatewayNetworkStatus,
-    GatewayNetworkView,
+    GatewayNetworkView, GatewayTorRotation,
 };
 #[path = "public_view.rs"]
 mod public_view;

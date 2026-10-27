@@ -9,19 +9,174 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 pub(super) use ui::network_status::TorExitIpQueryState;
 use ui::network_status::{NetworkActivity, NetworkStatus, NetworkStatusIntent, NetworkStatusKind};
-use wallet_ops::gateway::{GatewayNetworkError, GatewayNetworkView};
+use wallet_ops::gateway::{
+    GatewayNetworkError, GatewayNetworkOutcome, GatewayNetworkRequest, GatewayNetworkView,
+    GatewayTorRotation,
+};
 use wallet_ops::{
-    HttpContext, TorBridgeActivitySnapshot, WalletNetworkHealth, WalletNetworkHealthCause,
-    WalletNetworkHealthState, WalletNetworkMode, request_tor_state_reset,
+    HttpContext, TorBridgeActivitySnapshot, WakuDeliveryClient, WalletNetworkHealth,
+    WalletNetworkHealthCause, WalletNetworkHealthState, WalletNetworkMode, request_tor_state_reset,
 };
 
 use super::{
     NETWORK_HEALTH_REFRESH_INTERVAL, TOR_EXIT_IP_QUERY_TIMEOUT, TOR_EXIT_IP_QUERY_URL,
-    TOR_HEALTH_RETRY_TIMEOUT, VaultState, WalletRoot,
+    TOR_HEALTH_RETRY_TIMEOUT, VaultState, WakuStoppingState, WakuWorkerCompletionToken, WalletRoot,
+    WalletWakuRuntime,
 };
 
 const TOR_ACTIVITY_RATE_WINDOW: Duration = Duration::from_secs(5);
 const TOR_ACTIVITY_INTERVAL_LIMIT: usize = 8;
+/// Bounds the old embedded Waku node's termination. Rotation stays pending meanwhile, and a node
+/// that can't stop within it fails the rotation and keeps the current Tor session.
+const TOR_ROTATION_WAKU_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The root's pending explicit Tor rotation.
+pub(super) struct TorRotation {
+    id: u64,
+    /// The active Waku runtime this rotation retires and replaces; `None` when Waku was
+    /// inactive or only stopping, so the rotation starts none.
+    retired_generation: Option<u64>,
+    retired_peer_id: Option<String>,
+    /// Gateway activations completed when the rotation finishes.
+    requests: Vec<GatewayNetworkRequest>,
+    /// An ordinary restart that this rotation held back, run when it finishes.
+    pub(super) restart_deferred: bool,
+}
+
+#[cfg(test)]
+impl TorRotation {
+    pub(super) const fn for_test(id: u64, retired_generation: Option<u64>) -> Self {
+        Self {
+            id,
+            retired_generation,
+            retired_peer_id: None,
+            requests: Vec::new(),
+            restart_deferred: false,
+        }
+    }
+}
+
+/// Installs `next` when no rotation is pending and reports whether it did. Otherwise `next`'s
+/// requests join the pending rotation, which never schedules another.
+pub(super) fn join_or_begin_tor_rotation(
+    pending: &mut Option<TorRotation>,
+    next: TorRotation,
+) -> bool {
+    if let Some(pending) = pending {
+        pending.requests.extend(next.requests);
+        return false;
+    }
+    *pending = Some(next);
+    true
+}
+
+/// Takes rotation `id` if it is still the pending one.
+pub(super) fn take_tor_rotation(pending: &mut Option<TorRotation>, id: u64) -> Option<TorRotation> {
+    pending.take_if(|rotation| rotation.id == id)
+}
+
+/// Decides the ordinary restart that finalizing worker `generation` asks for, and returns
+/// whether it runs now. A pending rotation holds it back until it finishes. The rotation's own
+/// stop of the runtime it replaces owes none, since the rotation decides about a replacement.
+pub(super) fn restart_now_or_defer_to_rotation(
+    rotation: Option<&mut TorRotation>,
+    generation: u64,
+) -> bool {
+    let Some(rotation) = rotation else {
+        return true;
+    };
+    if rotation.retired_generation != Some(generation) {
+        rotation.restart_deferred = true;
+    }
+    false
+}
+
+/// Orders a rotation's last steps: commit only once the old transport has retired, and start
+/// Waku at most once, only after the commit, when it was active or a held-back ordinary restart
+/// is owed. Failure before the commit leaves the session unchanged and starts only an owed
+/// restart; after it, the new session stays and Waku that was active is reported unavailable if
+/// it can't start.
+pub(super) fn complete_tor_rotation<C, T>(
+    steps: &mut C,
+    waku_was_active: bool,
+    restart_deferred: bool,
+    retired: Result<(), String>,
+    commit: impl FnOnce(&mut C) -> eyre::Result<T>,
+    start_waku: impl FnOnce(&mut C) -> bool,
+) -> Result<(T, Option<GatewayNetworkError>), GatewayNetworkError> {
+    let committed = match retired
+        .map_err(eyre::Report::msg)
+        .and_then(|()| commit(steps))
+    {
+        Ok(committed) => committed,
+        Err(error) => {
+            // The retired identity stays retired; the rotation starts nothing on the old
+            // session. An ordinary restart it held back still runs, with a fresh identity.
+            tracing::warn!(%error, "Tor rotation failed before changing isolation");
+            if restart_deferred {
+                start_waku(steps);
+            }
+            return Err(GatewayNetworkError::NewSessionFailed);
+        }
+    };
+    let started = (waku_was_active || restart_deferred).then(|| start_waku(steps));
+    let waku_failed = waku_was_active && started == Some(false);
+    Ok((
+        committed,
+        waku_failed.then_some(GatewayNetworkError::WakuUnavailable),
+    ))
+}
+
+/// The native control's error: the latest network error, or else the last rotation's failure,
+/// which the gateway shows too and which a later Waku start or a closed popover doesn't clear.
+pub(super) fn native_network_status_error(
+    network_status_error: Option<&Arc<str>>,
+    rotation_failure: Option<GatewayNetworkError>,
+) -> Option<Arc<str>> {
+    network_status_error
+        .cloned()
+        .or_else(|| rotation_failure.map(|error| Arc::from(error.message())))
+}
+
+/// The Waku transport a rotation retires before committing, with the generation it replaces:
+/// the active runtime, or else a runtime still stopping, which the rotation awaits but doesn't
+/// replace. The root's ordinary rules decide whether the stopped one starts again.
+pub(super) fn waku_to_retire(
+    runtime: Option<&WalletWakuRuntime>,
+    stopping: Option<&WakuStoppingState>,
+) -> Option<(
+    Option<u64>,
+    Arc<WakuDeliveryClient>,
+    WakuWorkerCompletionToken,
+)> {
+    if let Some(runtime) = runtime {
+        return Some((
+            Some(runtime.generation),
+            Arc::clone(&runtime.client),
+            runtime.completion.clone(),
+        ));
+    }
+    stopping.map(|stopping| {
+        (
+            None,
+            Arc::clone(&stopping.client),
+            stopping.completion.clone(),
+        )
+    })
+}
+
+/// Waits for the monitor workers to stop using `client`, then for its transport to terminate,
+/// so the old identity can't dial through the next session.
+pub(super) async fn retire_root_waku(
+    completion: WakuWorkerCompletionToken,
+    client: Arc<WakuDeliveryClient>,
+) -> Result<(), String> {
+    completion.wait().await?;
+    client
+        .shutdown(TOR_ROTATION_WAKU_SHUTDOWN_TIMEOUT)
+        .await
+        .map_err(|error| error.to_string())
+}
 
 #[derive(Clone, Copy, Debug)]
 struct DownloadInterval {
@@ -177,6 +332,7 @@ impl WalletRoot {
             self.tor_download_rate,
         );
         view.direct_rpc_endpoints = self.effective_chain_configs.direct_rpc_endpoint_count();
+        view.rotation = self.tor_rotation_presentation();
         view
     }
 
@@ -231,7 +387,7 @@ impl WalletRoot {
             return;
         }
         match intent {
-            NetworkStatusIntent::NewTorSession => self.start_new_tor_session(cx),
+            NetworkStatusIntent::NewTorSession => self.request_tor_rotation(None, cx),
             NetworkStatusIntent::QueryExitIp => self.query_tor_exit_ip(cx),
             NetworkStatusIntent::BeginReset => self.begin_tor_state_reset_confirmation(cx),
             NetworkStatusIntent::CancelReset => self.cancel_tor_state_reset_confirmation(cx),
@@ -377,32 +533,167 @@ impl WalletRoot {
         self.set_network_status_popover_open(!self.network_status_popover_open, cx);
     }
 
-    pub(super) fn rotate_tor_session(&mut self, cx: &mut Context<'_, Self>) -> eyre::Result<u64> {
+    /// Starts the explicit Tor rotation, or joins `request` to the pending one. Native and
+    /// gateway activations both enter here.
+    pub(super) fn request_tor_rotation(
+        &mut self,
+        request: Option<GatewayNetworkRequest>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        // A retiring root must not rotate the network context it hands to its replacement.
+        if self.wallet_sync_lifecycle_shutdown_started || *self.root_shutdown.borrow() {
+            return;
+        }
+        // Outside Tor mode the commit fails before any Waku change.
+        let retiring = waku_to_retire(
+            self.waku_runtime.as_ref(),
+            self.waku_stopping_generation.as_ref(),
+        )
+        .filter(|_| self.http.network_mode() == WalletNetworkMode::Tor);
+        let id = self.tor_rotation_id.wrapping_add(1);
+        let rotation = TorRotation {
+            id,
+            retired_generation: retiring.as_ref().and_then(|(replaced, ..)| *replaced),
+            retired_peer_id: retiring
+                .as_ref()
+                .and_then(|(_, client, _)| client.local_peer_id())
+                .map(|peer_id| peer_id.to_string()),
+            requests: request.into_iter().collect(),
+            restart_deferred: false,
+        };
+        if !join_or_begin_tor_rotation(&mut self.tor_rotation, rotation) {
+            return;
+        }
+        self.tor_rotation_id = id;
+        self.tor_rotation_failure = None;
+        self.network_status_error = None;
+        if let Some(waku_failed) = super::private_swap::ui_fixture_tor_rotation() {
+            if waku_failed && let Some(rotation) = take_tor_rotation(&mut self.tor_rotation, id) {
+                let error = GatewayNetworkError::WakuUnavailable;
+                self.tor_rotation_failure = Some(error);
+                self.network_status_error = Some(Arc::from(error.message()));
+                self.complete_gateway_network_requests(
+                    rotation.requests,
+                    &GatewayNetworkOutcome::Failed { error },
+                );
+            }
+            self.publish_gateway_network_state();
+            cx.notify();
+            return;
+        }
+        let Some((_, client, completion)) = retiring else {
+            // Inactive Waku stays inactive: there is nothing to retire or restart.
+            self.finish_tor_rotation(id, Ok(()), cx);
+            return;
+        };
+        // Only an active runtime needs stopping here; a stopping one is just awaited.
+        self.stop_waku();
+        self.publish_gateway_network_state();
+        cx.notify();
+        let retire = self.runtime.spawn(retire_root_waku(completion, client));
+        cx.spawn(async move |this, cx| {
+            let retired = retire
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|retired| retired);
+            let _ = this.update(cx, |root, cx| root.finish_tor_rotation(id, retired, cx));
+        })
+        .detach();
+    }
+
+    /// Commits rotation `id` once the old Waku transport has retired, then starts a fresh
+    /// runtime. Lock, root replacement and shutdown cancel the rotation first, so a retired
+    /// operation finds nothing to commit and starts nothing.
+    fn finish_tor_rotation(
+        &mut self,
+        id: u64,
+        retired: Result<(), String>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(rotation) = take_tor_rotation(&mut self.tor_rotation, id) else {
+            return;
+        };
+        if let Some(generation) = rotation.retired_generation {
+            super::release_retired_waku_generation(
+                &mut self.waku_stopping_generation,
+                generation,
+                &self.monitor_state,
+                &self.monitor_event_tx,
+            );
+        }
+        // The ordinary restart policy decides any start; the retired identity is never revived.
+        let completed = complete_tor_rotation(
+            &mut (&mut *self, &mut *cx),
+            rotation.retired_generation.is_some(),
+            rotation.restart_deferred,
+            retired,
+            |(root, cx)| root.commit_tor_session(cx),
+            |(root, cx)| {
+                root.ensure_waku_started(cx);
+                root.waku_runtime.is_some()
+            },
+        );
+        let failure = match completed {
+            Ok(((generation, walletconnect_refreshed), failure)) => {
+                let waku_peer_id = self
+                    .waku_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.client.local_peer_id())
+                    .map(|peer_id| peer_id.to_string());
+                tracing::info!(
+                    tor_session_generation = generation,
+                    retired_waku_peer_id = ?rotation.retired_peer_id,
+                    waku_peer_id = ?waku_peer_id,
+                    walletconnect_refreshed,
+                    "started new Tor session"
+                );
+                failure
+            }
+            Err(failure) => Some(failure),
+        };
+        self.tor_rotation_failure = failure;
+        if let Some(error) = failure {
+            self.network_status_error = Some(Arc::from(error.message()));
+        }
+        self.complete_gateway_network_requests(
+            rotation.requests,
+            &failure.map_or(GatewayNetworkOutcome::Done, |error| {
+                GatewayNetworkOutcome::Failed { error }
+            }),
+        );
+        self.publish_gateway_network_state();
+        cx.notify();
+    }
+
+    /// The only step that advances the Tor session generation. Returns the new generation and
+    /// how many `WalletConnect` relay workers restart.
+    fn commit_tor_session(&mut self, cx: &mut Context<'_, Self>) -> eyre::Result<(u64, usize)> {
         let generation = self.http.start_new_tor_session()?;
         self.network_health = self.http.network_health();
         self.tor_bridge_activity = self.http.tor_bridge_activity_snapshot();
         self.tor_download_rate = None;
         self.invalidate_tor_exit_ip_query();
         self.tor_state_reset_confirming = false;
-        let waku_refreshed = super::refresh_active_waku(self.waku_runtime.as_ref());
         let walletconnect_refreshed =
             self.restart_walletconnect_relay_workers_for_network_session(cx);
-        tracing::info!(
-            tor_session_generation = generation,
-            waku_refreshed,
-            walletconnect_refreshed,
-            "started new Tor session"
-        );
         self.publish_gateway_network_state();
-        Ok(generation)
+        Ok((generation, walletconnect_refreshed))
     }
 
-    fn start_new_tor_session(&mut self, cx: &mut Context<'_, Self>) {
-        self.network_status_error = self
-            .rotate_tor_session(cx)
-            .err()
-            .map(|_| Arc::from(GatewayNetworkError::NewSessionFailed.message()));
-        cx.notify();
+    /// Retires an uncommitted rotation and its presentation on lock and root replacement. A
+    /// dropped root's continuation can't reach it at all.
+    pub(super) fn cancel_tor_rotation(&mut self) {
+        self.tor_rotation = None;
+        self.tor_rotation_failure = None;
+    }
+
+    fn tor_rotation_presentation(&self) -> Option<GatewayTorRotation> {
+        if self.tor_rotation.is_some() {
+            Some(GatewayTorRotation::InProgress)
+        } else {
+            self.tor_rotation_failure
+                .map(|error| GatewayTorRotation::Failed { error })
+        }
     }
 
     fn invalidate_tor_exit_ip_query(&mut self) {

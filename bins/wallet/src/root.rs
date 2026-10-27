@@ -24,8 +24,8 @@ use ui::theme::APP_TEXT_SIZE;
 use wallet_ops::{
     BlockedShieldRescueUtxoId, BroadcasterFeePolicy, HttpContext, PoiArtifactCacheProgress,
     PoiReadSource, ProverCacheBuildProgress, PublicBalanceCache, PublicBalanceSnapshot,
-    SponsoredSelfBroadcastCommand, TokenAnchorRateCache, TokenAnchorRefreshHandle,
-    WakuDeliveryClient, WalletNetworkHealth,
+    PublicBroadcasterWaku, SponsoredSelfBroadcastCommand, SubmissionNodeScope,
+    TokenAnchorRateCache, TokenAnchorRefreshHandle, WakuDeliveryClient, WalletNetworkHealth,
     hardware::HardwareWalletSyncIntent,
     settings::{
         EffectiveChainRegistry, EffectiveTokenRegistry, WalletUiState, load_wallet_settings,
@@ -426,6 +426,11 @@ pub(crate) struct WalletRoot {
     tor_exit_ip_query: TorExitIpQueryState,
     tor_exit_ip_query_generation: u64,
     tor_state_reset_confirming: bool,
+    /// The one pending explicit Tor rotation, which later activations join.
+    tor_rotation: Option<network::TorRotation>,
+    tor_rotation_id: u64,
+    /// The last rotation's failure, shown until the next rotation, lock or root retirement.
+    tor_rotation_failure: Option<wallet_ops::gateway::GatewayNetworkError>,
     prover_cache_build_progress: Option<ProverCacheBuildProgress>,
     prover_cache_build_popover_open: bool,
     prover_cache_build_monitor_active: bool,
@@ -437,6 +442,8 @@ pub(crate) struct WalletRoot {
     waku_runtime: Option<WalletWakuRuntime>,
     waku_session_generation: u64,
     waku_stopping_generation: Option<WakuStoppingState>,
+    /// Ends public broadcaster submission nodes on lock and root shutdown.
+    submission_scope: SubmissionNodeScope,
     public_broadcaster_anchor_cache: Arc<TokenAnchorRateCache>,
     public_broadcaster_anchor_refresh: TokenAnchorRefreshHandle,
     monitor: Entity<broadcaster_monitor_gpui::BroadcasterMonitorPane>,
@@ -623,14 +630,21 @@ async fn run_waku_worker_task(
 
 struct WakuStoppingState {
     generation: u64,
+    /// Kept so a Tor rotation can await this transport's termination before committing.
+    client: Arc<WakuDeliveryClient>,
     completion: WakuWorkerCompletionToken,
 }
 
 #[cfg(test)]
 impl WakuStoppingState {
     fn for_test(generation: u64) -> Self {
+        let config = WakuMonitorConfig {
+            network: broadcaster_monitor_waku::RelayNetworkConfig::proxy(reqwest::Client::new()),
+            ..WakuMonitorConfig::default()
+        };
         Self {
             generation,
+            client: config.build_client().expect("proxy Waku delivery client"),
             completion: WakuWorkerCompletionToken::closed_for_test(),
         }
     }
@@ -682,6 +696,14 @@ fn should_start_waku_for_delivery(
         )
 }
 
+/// A pending Tor rotation holds Waku stopped until it commits, like a runtime still stopping.
+const fn waku_start_blocked(
+    stopping: Option<&WakuStoppingState>,
+    rotation: Option<&network::TorRotation>,
+) -> bool {
+    stopping.is_some() || rotation.is_some()
+}
+
 fn build_waku_client_if_needed<C, E>(
     should_start: bool,
     build: impl FnOnce() -> Result<C, E>,
@@ -697,8 +719,10 @@ fn active_waku_client(runtime: Option<&WalletWakuRuntime>) -> Option<Arc<WakuDel
     runtime.map(|runtime| Arc::clone(&runtime.client))
 }
 
-fn refresh_active_waku(runtime: Option<&WalletWakuRuntime>) -> bool {
-    runtime.is_some_and(|runtime| runtime.client.refresh_network_session())
+/// Closes `scope`, which ends every submission node's teardown delay and refuses nodes to
+/// callbacks still holding it, and leaves a fresh open scope in its place.
+fn renew_submission_scope(scope: &mut SubmissionNodeScope) {
+    std::mem::take(scope).close();
 }
 
 fn take_waku_runtime_for_stop(
@@ -708,6 +732,7 @@ fn take_waku_runtime_for_stop(
     let _ = runtime.worker_shutdown.send(true);
     Some(WakuStoppingState {
         generation: runtime.generation,
+        client: runtime.client,
         completion: runtime.completion,
     })
 }
@@ -755,9 +780,29 @@ fn complete_waku_worker_generation(
     }
 }
 
+/// Ends the stopping state of `generation`, whose workers and transport the caller has retired,
+/// and clears rows those workers wrote while stopping. Its late completion then changes nothing.
+fn release_retired_waku_generation(
+    stopping: &mut Option<WakuStoppingState>,
+    generation: u64,
+    monitor_state: &Shared,
+    monitor_event_tx: &EventTx,
+) {
+    if stopping
+        .as_ref()
+        .is_some_and(|stopping| stopping.generation == generation)
+    {
+        *stopping = None;
+    }
+    if let Some(rev) = monitor_state.write().clear() {
+        publish_revision(monitor_event_tx, rev);
+    }
+}
+
 impl Drop for WalletRoot {
     fn drop(&mut self) {
         self.begin_public_transaction_shutdown();
+        self.submission_scope.close();
         self.pending_software_profile_open = None;
         self.pending_software_profile_open_operation_generation = self
             .pending_software_profile_open_operation_generation
@@ -789,8 +834,16 @@ impl Drop for WalletRoot {
 }
 
 impl WalletRoot {
-    pub(super) fn active_waku(&self) -> Option<Arc<WakuDeliveryClient>> {
-        active_waku_client(self.waku_runtime.as_ref())
+    /// Public broadcaster delivery over the active runtime, which supplies only seed peers.
+    pub(super) fn public_broadcaster_waku(&self) -> Option<PublicBroadcasterWaku> {
+        active_waku_client(self.waku_runtime.as_ref()).map(|root| {
+            PublicBroadcasterWaku::new(
+                root,
+                self.waku_config.to_waku_config(),
+                self.http.clone(),
+                self.submission_scope.clone(),
+            )
+        })
     }
 
     pub(in crate::root) fn ensure_waku_for_delivery(
@@ -802,7 +855,10 @@ impl WalletRoot {
             delivery_mode,
             self.vault_view_unlock.is_some(),
             self.waku_runtime.is_some(),
-            self.waku_stopping_generation.is_some(),
+            waku_start_blocked(
+                self.waku_stopping_generation.as_ref(),
+                self.tor_rotation.as_ref(),
+            ),
             self.wallet_sync_lifecycle_shutdown_started,
             self.waku_config.network.mode,
         ) {
@@ -814,7 +870,10 @@ impl WalletRoot {
         let should_start = should_start_waku_runtime(
             self.vault_view_unlock.is_some(),
             self.waku_runtime.is_some(),
-            self.waku_stopping_generation.is_some(),
+            waku_start_blocked(
+                self.waku_stopping_generation.as_ref(),
+                self.tor_rotation.as_ref(),
+            ),
             self.wallet_sync_lifecycle_shutdown_started,
             self.waku_config.network.mode,
         );
@@ -895,7 +954,12 @@ impl WalletRoot {
                                 tracing::warn!(%error, "Waku delivery worker task failed while stopping");
                             }
                         }
-                        if restart {
+                        if restart
+                            && network::restart_now_or_defer_to_rotation(
+                                root.tor_rotation.as_mut(),
+                                generation,
+                            )
+                        {
                             root.ensure_waku_started(cx);
                         } else {
                             cx.notify();
@@ -1492,6 +1556,9 @@ impl WalletRoot {
             tor_exit_ip_query: TorExitIpQueryState::Idle,
             tor_exit_ip_query_generation: 0,
             tor_state_reset_confirming: false,
+            tor_rotation: None,
+            tor_rotation_id: 0,
+            tor_rotation_failure: None,
             prover_cache_build_progress: None,
             prover_cache_build_popover_open: false,
             prover_cache_build_monitor_active: false,
@@ -1503,6 +1570,7 @@ impl WalletRoot {
             waku_runtime: None,
             waku_session_generation: 0,
             waku_stopping_generation: None,
+            submission_scope: SubmissionNodeScope::new(),
             public_broadcaster_anchor_cache,
             public_broadcaster_anchor_refresh,
             monitor,

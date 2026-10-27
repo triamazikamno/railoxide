@@ -1702,6 +1702,7 @@ impl WalletRoot {
         self.invalidate_pending_profile_open_tokens();
         self.revealed_passphrase_context_id = None;
         self.wallet_sync_lifecycle_shutdown_started = true;
+        self.cancel_tor_rotation();
         let waku_completion = self.stop_waku_for_root_replacement();
         let proposal_cleanup = self.proposals.take_cleanup();
         let cleanup = self.wallet_sync_lifecycle.invalidate();

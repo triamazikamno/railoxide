@@ -804,14 +804,9 @@ impl HttpContext {
     #[must_use]
     pub fn arti_client_provider(&self) -> Option<WalletTorClientProvider> {
         if let Some(socks_bridge) = self.socks_bridge.as_ref() {
-            let session: Weak<RwLock<TorBridgeSession>> = Arc::downgrade(&socks_bridge.session);
-            return Some(Arc::new(move || {
-                session.upgrade().and_then(|session| {
-                    ArtiSocksBridge::capture_session(&session)
-                        .ok()
-                        .map(|captured| captured.client)
-                })
-            }));
+            return Some(ArtiSocksBridge::session_client_provider(
+                &socks_bridge.session,
+            ));
         }
 
         let arti_client = self.arti_client.clone()?;
@@ -916,6 +911,7 @@ impl HttpContext {
                         .build()
                         .wrap_err("build operation RPC HTTP client")?,
                     isolation: OperationNetworkIsolation::Dedicated,
+                    tor_client: Some(ArtiSocksBridge::session_client_provider(&bridge.session)),
                     #[cfg(test)]
                     bridge: Some(Arc::downgrade(&bridge)),
                 })
@@ -924,6 +920,7 @@ impl HttpContext {
                 client: self.client.clone(),
                 rpc_client: self.rpc_client.clone(),
                 isolation: OperationNetworkIsolation::Unavailable(self.mode),
+                tor_client: None,
                 #[cfg(test)]
                 bridge: None,
             }),
@@ -1071,6 +1068,8 @@ pub struct OperationHttpClient {
     client: reqwest::Client,
     rpc_client: reqwest::Client,
     isolation: OperationNetworkIsolation,
+    /// The operation bridge's current Tor client, for libp2p dials on the same isolation.
+    tor_client: Option<WalletTorClientProvider>,
     #[cfg(test)]
     bridge: Option<Weak<ArtiSocksBridge>>,
 }
@@ -1089,6 +1088,13 @@ impl OperationHttpClient {
         &self.rpc_client
     }
 
+    /// Yields the client of the operation's own Tor bridge, which a new Tor session
+    /// re-isolates. `None` for the shared clients of proxy and direct modes.
+    #[must_use]
+    pub fn tor_client_provider(&self) -> Option<WalletTorClientProvider> {
+        self.tor_client.clone()
+    }
+
     #[cfg(test)]
     fn bridge(&self) -> Option<Arc<ArtiSocksBridge>> {
         self.bridge.as_ref().and_then(Weak::upgrade)
@@ -1102,9 +1108,21 @@ impl OperationHttpClient {
             rpc_client: client.clone(),
             client,
             isolation,
+            tor_client: None,
             #[cfg(test)]
             bridge: None,
         }
+    }
+
+    /// Reports `provider` as this client's Tor provider.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_tor_client_provider_for_tests(
+        mut self,
+        provider: WalletTorClientProvider,
+    ) -> Self {
+        self.tor_client = Some(provider);
+        self
     }
 
     /// A direct client of its own, leaked so that test closures and spawned futures can borrow
@@ -1645,6 +1663,18 @@ impl ArtiSocksBridge {
                 activity: Arc::clone(&session.activity),
             })
             .map_err(|_| eyre!("active Tor session client lock is poisoned"))
+    }
+
+    /// Yields the session's current client, so a new Tor session re-isolates later dials.
+    fn session_client_provider(session: &Arc<RwLock<TorBridgeSession>>) -> WalletTorClientProvider {
+        let session: Weak<RwLock<TorBridgeSession>> = Arc::downgrade(session);
+        Arc::new(move || {
+            session.upgrade().and_then(|session| {
+                Self::capture_session(&session)
+                    .ok()
+                    .map(|captured| captured.client)
+            })
+        })
     }
 
     const fn local_addr(&self) -> SocketAddr {

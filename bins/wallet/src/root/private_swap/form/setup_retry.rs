@@ -455,7 +455,7 @@ impl PrivateSwapsView {
     /// [`Self::continue_setup_retry`] with `waku`, the broadcaster network's client.
     pub(super) fn quote_setup_retry(
         &mut self,
-        waku: Option<Arc<WakuDeliveryClient>>,
+        waku: Option<PublicBroadcasterWaku>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -533,7 +533,7 @@ impl PrivateSwapsView {
         operation: ExecutorOperationId,
         side: SetupSide,
         estimate: eyre::Result<ExecutorRecoveryFeeEstimate>,
-        waku: Arc<WakuDeliveryClient>,
+        waku: PublicBroadcasterWaku,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -713,7 +713,7 @@ impl PrivateSwapsView {
         operation: ExecutorOperationId,
         side: SetupSide,
         estimate: &ExecutorRecoveryFeeEstimate,
-        waku: Arc<WakuDeliveryClient>,
+        waku: PublicBroadcasterWaku,
         cx: &App,
     ) -> Result<SetupRetry, String> {
         let unavailable = || SETUP_RETRY_UNAVAILABLE.to_owned();

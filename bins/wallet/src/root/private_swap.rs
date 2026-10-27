@@ -19,10 +19,9 @@ use tokio::sync::watch;
 use wallet_ops::cow::OrderUid;
 use wallet_ops::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, HardwareExecutorAction,
-    PublicBroadcasterCandidate, PublicBroadcasterResultKind, SwapOrderState,
+    PublicBroadcasterCandidate, PublicBroadcasterResultKind, PublicBroadcasterWaku, SwapOrderState,
     SwapPlacementReadiness, SwapReviewChange, SwapSetupInclusion, SwapSetupObservation,
-    SwapSetupStatus, SwapSpeedUpRefusal, TransactionGenerationStage, WakuDeliveryClient,
-    WalletSession,
+    SwapSetupStatus, SwapSpeedUpRefusal, TransactionGenerationStage, WalletSession,
     cow::{CowOrderStatusHint, CowOrderStatusReport, CowOrderbookClient},
     is_swap_record,
     settings::{
@@ -52,6 +51,7 @@ mod ui_fixture;
 pub(super) use ui_fixture::refund_dialog_state as ui_fixture_refund_dialog_state;
 pub(super) use ui_fixture::shows_utxos as ui_fixture_shows_utxos;
 pub(super) use ui_fixture::stealth_accounts as ui_fixture_stealth_accounts;
+pub(super) use ui_fixture::tor_rotation as ui_fixture_tor_rotation;
 pub(super) use ui_fixture::unshield_asset as ui_fixture_unshield_asset;
 pub(super) use ui_fixture::utxo_finality_context as ui_fixture_utxo_finality_context;
 pub(super) use ui_fixture::utxo_rows as ui_fixture_utxo_rows;
@@ -70,6 +70,10 @@ mod ui_fixture {
 
     pub(in crate::root) const fn shows_utxos() -> bool {
         false
+    }
+
+    pub(in crate::root) const fn tor_rotation() -> Option<bool> {
+        None
     }
 
     pub(in crate::root) const fn utxo_finality_context()
@@ -3857,11 +3861,11 @@ impl PrivateSwapsView {
     }
 
     /// The broadcaster network client for a paid setup or cancellation.
-    fn broadcaster_network(&self, cx: &mut Context<'_, Self>) -> Option<Arc<WakuDeliveryClient>> {
+    fn broadcaster_network(&self, cx: &mut Context<'_, Self>) -> Option<PublicBroadcasterWaku> {
         self.root
             .update(cx, |root, cx| {
                 root.ensure_waku_for_delivery(super::DeliveryMode::PublicBroadcaster, cx);
-                root.active_waku()
+                root.public_broadcaster_waku()
             })
             .ok()
             .flatten()

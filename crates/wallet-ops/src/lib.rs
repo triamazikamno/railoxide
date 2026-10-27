@@ -80,9 +80,8 @@ pub use sync_service::{
     SyncProgressUpdate, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus,
     reset_persisted_public_sync_caches,
 };
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
-use waku_relay::client::Client as WakuClient;
 use waku_relay::msg::ContentTopic;
 use zeroize::{Zeroize, Zeroizing};
 

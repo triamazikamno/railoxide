@@ -1,3 +1,4 @@
+use super::public_broadcaster_node::SubmissionNode;
 use super::*;
 use alloy::sol_types::SolCall;
 use broadcaster_core::contracts::railgun::{RelayAdapt7702, relayCall};
@@ -1120,7 +1121,7 @@ pub(crate) fn public_broadcaster_transact_params(
 }
 
 pub(super) async fn publish_public_broadcaster_payload(
-    waku: &WakuClient,
+    node: &dyn SubmissionNode,
     pubsub_path: &str,
     transact_topic: &str,
     payload: &[u8],
@@ -1134,7 +1135,7 @@ pub(super) async fn publish_public_broadcaster_payload(
         "publishing public broadcaster transact request"
     );
     let publish_started = Instant::now();
-    waku.publish(transact_topic, payload)
+    node.publish(transact_topic, payload)
         .await
         .wrap_err("publish public broadcaster transact request")?;
     tracing::info!(
@@ -1147,30 +1148,27 @@ pub(super) async fn publish_public_broadcaster_payload(
     Ok(())
 }
 
+/// Republishes every `republish_interval`, numbering attempts from 2, until the future is
+/// dropped.
 pub(crate) async fn public_broadcaster_republish_loop<F, Fut>(
-    mut stop_rx: oneshot::Receiver<()>,
     republish_interval: Duration,
     mut publish: F,
 ) where
-    F: FnMut(usize) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<()>> + Send,
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<()>>,
 {
     let mut attempt = 1usize;
     loop {
-        tokio::select! {
-            _ = &mut stop_rx => break,
-            () = tokio::time::sleep(republish_interval) => {
-                attempt = attempt.saturating_add(1);
-                if let Err(error) = publish(attempt).await {
-                    tracing::warn!(%error, attempt, "republish public broadcaster transact request failed");
-                }
-            }
+        tokio::time::sleep(republish_interval).await;
+        attempt = attempt.saturating_add(1);
+        if let Err(error) = publish(attempt).await {
+            tracing::warn!(%error, attempt, "republish public broadcaster transact request failed");
         }
     }
 }
 
 pub(super) async fn submit_public_broadcaster_plan(
-    waku: Arc<WakuClient>,
+    waku: &PublicBroadcasterWaku,
     transaction: TransactionRequest,
     pre_transaction_pois_per_txid_leaf_per_list: PreTransactionPoiMap,
     broadcaster: PublicBroadcasterCandidate,
@@ -1249,9 +1247,11 @@ pub(super) async fn submit_public_broadcaster_plan(
 }
 
 /// Publish an admitted complete transaction and its POIs through the existing
-/// encrypted request/response transport. Dropping the future stops local retries.
-pub(super) async fn submit_public_broadcaster_transaction(
-    waku: Arc<WakuClient>,
+/// encrypted request/response transport, on a Waku node of the submission's own.
+/// Dropping the future stops local retries and retires the node through its teardown delay,
+/// which a closed scope ends at once.
+pub(crate) async fn submit_public_broadcaster_transaction(
+    waku: &PublicBroadcasterWaku,
     transaction: TransactionRequest,
     pre_transaction_pois_per_txid_leaf_per_list: PreTransactionPoiMap,
     broadcaster: &PublicBroadcasterCandidate,
@@ -1286,15 +1286,69 @@ pub(super) async fn submit_public_broadcaster_transaction(
         elapsed_ms = encrypt_started.elapsed().as_millis(),
         "built public broadcaster encrypted Waku payload"
     );
-    let pubsub_path = waku.pubsub_path().to_string();
+    let node = RetiringNode {
+        waku,
+        node: Some(waku.start_node().await?),
+    };
+    deliver_public_broadcaster_request(
+        node.get(),
+        &encrypted.shared_key,
+        &payload,
+        broadcaster,
+        &transact_topic,
+        &response_topic,
+        progress_tx.as_ref(),
+        timeout,
+        republish_interval,
+    )
+    .await
+}
+
+/// Retires a started submission node however its submission ends, including when the
+/// submission's future is dropped.
+struct RetiringNode<'a> {
+    waku: &'a PublicBroadcasterWaku,
+    /// Taken only on drop.
+    node: Option<Box<dyn SubmissionNode>>,
+}
+
+impl RetiringNode<'_> {
+    fn get(&self) -> &dyn SubmissionNode {
+        self.node
+            .as_deref()
+            .expect("the node is taken only on drop")
+    }
+}
+
+impl Drop for RetiringNode<'_> {
+    fn drop(&mut self) {
+        if let Some(node) = self.node.take() {
+            self.waku.retire(node);
+        }
+    }
+}
+
+/// Subscribe to the response topic, publish, and republish until a response or `timeout`.
+async fn deliver_public_broadcaster_request(
+    node: &dyn SubmissionNode,
+    shared_key: &[u8; 32],
+    payload: &[u8],
+    broadcaster: &PublicBroadcasterCandidate,
+    transact_topic: &str,
+    response_topic: &str,
+    progress_tx: Option<&TransactionGenerationProgressSender>,
+    timeout: Duration,
+    republish_interval: Duration,
+) -> Result<PublicBroadcasterResultKind> {
+    let pubsub_path = node.pubsub_path();
     tracing::info!(
         pubsub_path = %pubsub_path,
         response_topic = %response_topic,
         "subscribing to public broadcaster response topic"
     );
     let subscribe_started = Instant::now();
-    let mut response_rx = waku
-        .subscribe(vec![response_topic.clone()])
+    let mut response_rx = node
+        .subscribe(vec![response_topic.to_owned()])
         .await
         .wrap_err("subscribe to public broadcaster response topic")?;
     tracing::info!(
@@ -1302,44 +1356,25 @@ pub(super) async fn submit_public_broadcaster_transaction(
         elapsed_ms = subscribe_started.elapsed().as_millis(),
         "subscribed to public broadcaster response topic"
     );
-    publish_public_broadcaster_payload(&waku, &pubsub_path, &transact_topic, &payload, 1)
+    publish_public_broadcaster_payload(node, pubsub_path, transact_topic, payload, 1)
         .await
         .wrap_err("publish initial public broadcaster transact request")?;
     update_transaction_generation_stage(
-        progress_tx.as_ref(),
+        progress_tx,
         TransactionGenerationStage::WaitingForBroadcasterResponse,
     );
 
-    let (republish_stop_tx, republish_stop_rx) = oneshot::channel();
-    let republish_waku = Arc::clone(&waku);
-    let republish_pubsub_path = pubsub_path.clone();
-    let republish_transact_topic = transact_topic.clone();
-    let republish_payload = payload.clone();
-    let republish_handle = tokio::spawn(public_broadcaster_republish_loop(
-        republish_stop_rx,
-        republish_interval,
-        move |attempt| {
-            let waku = Arc::clone(&republish_waku);
-            let pubsub_path = republish_pubsub_path.clone();
-            let transact_topic = republish_transact_topic.clone();
-            let payload = republish_payload.clone();
-            async move {
-                publish_public_broadcaster_payload(
-                    &waku,
-                    &pubsub_path,
-                    &transact_topic,
-                    &payload,
-                    attempt,
-                )
-                .await
-            }
-        },
-    ));
-
+    // Polled alongside the response and timeout, so a pending republish delays neither,
+    // and returning ends it.
+    let republish = public_broadcaster_republish_loop(republish_interval, move |attempt| {
+        publish_public_broadcaster_payload(node, pubsub_path, transact_topic, payload, attempt)
+    });
+    tokio::pin!(republish);
     let sleep = tokio::time::sleep(timeout);
     tokio::pin!(sleep);
     let result = loop {
         tokio::select! {
+            () = &mut republish => {}
             () = &mut sleep => {
                 tracing::warn!(
                     chain_id = broadcaster.chain_id,
@@ -1361,7 +1396,7 @@ pub(super) async fn submit_public_broadcaster_transaction(
                     payload_len = msg.payload.len(),
                     "received public broadcaster response candidate"
                 );
-                match decode_public_broadcaster_response(&encrypted.shared_key, &msg.payload) {
+                match decode_public_broadcaster_response(shared_key, &msg.payload) {
                     Ok(Some(result)) => {
                         // Detailed errors can contain the broadcaster's RPC data.
                         // Show them in progress without copying them into wallet logs.
@@ -1377,8 +1412,6 @@ pub(super) async fn submit_public_broadcaster_transaction(
             }
         }
     };
-    let _ = republish_stop_tx.send(());
-    republish_handle.abort();
 
     Ok(result)
 }

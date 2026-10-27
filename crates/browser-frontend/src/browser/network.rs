@@ -18,6 +18,9 @@ pub(super) struct NetworkControl {
     query: TorExitIpQueryState,
     confirming: bool,
     error: Option<Arc<str>>,
+    /// The desktop's shared Tor rotation: pending, or its redacted failure.
+    rotating: bool,
+    rotation_error: Option<Arc<str>>,
     sequence: u64,
     seen: BTreeMap<String, String>,
     focus: gpui::FocusHandle,
@@ -34,6 +37,8 @@ impl NetworkControl {
             query: TorExitIpQueryState::Idle,
             confirming: false,
             error: None,
+            rotating: false,
+            rotation_error: None,
             sequence: 0,
             seen: BTreeMap::new(),
             focus: cx.focus_handle(),
@@ -43,6 +48,8 @@ impl NetworkControl {
         self.status = None;
         self.activity = None;
         self.rate = None;
+        self.rotating = false;
+        self.rotation_error = None;
         self.revision.clear();
         self.close();
     }
@@ -93,6 +100,11 @@ impl NetworkControl {
             ),
         );
         self.rate = chain_id_field(&value, "download_rate");
+        let rotation = field(&value, "rotation");
+        let rotation_state = text_field(&rotation, "state");
+        self.rotating = rotation_state == "in_progress";
+        self.rotation_error =
+            (rotation_state == "failed").then(|| Arc::from(text_field(&rotation, "error")));
         let activity = field(&value, "activity");
         self.activity = if activity.is_null() || activity.is_undefined() {
             None
@@ -214,7 +226,12 @@ impl GatewayView {
         let content_root = root.clone();
         let activity = self.network.activity.clone();
         let rate = self.network.rate;
-        let error = self.network.error.clone();
+        let error = self
+            .network
+            .error
+            .clone()
+            .or_else(|| self.network.rotation_error.clone());
+        let rotating = self.network.rotating;
         let query = self.network.query.clone();
         let confirming = self.network.confirming;
         let revision = self.network.revision.clone();
@@ -283,6 +300,7 @@ impl GatewayView {
                         error.clone(),
                         query.clone(),
                         confirming,
+                        rotating,
                         activity.as_ref(),
                         rate,
                         move |intent, _, cx| {

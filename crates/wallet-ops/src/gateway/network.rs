@@ -40,6 +40,16 @@ pub struct GatewayNetworkView {
     pub download_rate: Option<u64>,
     /// Enabled-chain RPC and archive endpoints that bypass Tor or the proxy.
     pub direct_rpc_endpoints: usize,
+    /// The desktop's explicit Tor rotation, pending or last failed.
+    pub rotation: Option<GatewayTorRotation>,
+}
+
+/// Explicit Tor rotation state shared by every network control of the wallet root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum GatewayTorRotation {
+    InProgress,
+    Failed { error: GatewayNetworkError },
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -116,6 +126,7 @@ impl GatewayNetworkView {
                 None
             },
             direct_rpc_endpoints: 0,
+            rotation: None,
         }
     }
     #[must_use]
@@ -168,6 +179,8 @@ pub enum GatewayNetworkOutcome {
 pub enum GatewayNetworkError {
     Unavailable,
     NewSessionFailed,
+    /// The Tor session changed, but the replacement Waku runtime did not start.
+    WakuUnavailable,
     ExitIpFailed,
     ResetFailed,
 }
@@ -180,6 +193,9 @@ impl GatewayNetworkError {
                 "Network control is unavailable. Reopen the popover and try again."
             }
             Self::NewSessionFailed => "Could not start a new Tor session. Try again.",
+            Self::WakuUnavailable => {
+                "Started a new Tor session, but the broadcaster network could not restart. Try again later."
+            }
             Self::ExitIpFailed => "Could not query the exit IP through Tor. Try again.",
             Self::ResetFailed => "Could not request the Tor state reset. The wallet remains open.",
         }
@@ -618,6 +634,115 @@ mod tests {
         let locked = snapshot(&output);
         assert!(locked.get("network_view").is_none());
         assert!(locked.get("network_results").is_none());
+        drop(provider);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn admitted_tor_rotation_is_shared_and_retired_views_get_no_late_result() {
+        let (path, mut provider, _) = fixture();
+        let peer = PeerId::from_bytes([7; 16]);
+        provider.attach_ui_peer(1, peer);
+        provider.attach_ui_peer(2, peer);
+        let tor = |revision: &str, rotation| {
+            let mut view = GatewayNetworkView::new(
+                revision.into(),
+                &WalletNetworkHealth::new(
+                    WalletNetworkMode::Tor,
+                    WalletNetworkHealthState::Ready,
+                    "",
+                ),
+                None,
+                None,
+            );
+            view.rotation = rotation;
+            view
+        };
+        let new_session = |view: &str, request: &str| GatewayNetworkCommand::Run {
+            view_id: view.into(),
+            request_id: request.into(),
+            operation: GatewayNetworkOperation::NewTorSession,
+        };
+        let mut wallet = provider.wallet.clone();
+        wallet.network_view = Some(tor("context-a", None));
+        provider.update_wallet(wallet.clone(), 1);
+        for (session, view) in [(1, "popup"), (2, "panel")] {
+            let _ = provider.network_command(
+                session,
+                peer,
+                1,
+                "context-a",
+                GatewayNetworkCommand::Open {
+                    view_id: view.into(),
+                },
+            );
+        }
+
+        // Each view admits one pending request; the desktop joins both to its single rotation.
+        let first = provider
+            .network_command(1, peer, 1, "context-a", new_session("popup", "first"))
+            .unwrap();
+        assert!(
+            provider
+                .network_command(1, peer, 1, "context-a", new_session("popup", "again"))
+                .is_none()
+        );
+        let second = provider
+            .network_command(2, peer, 1, "context-a", new_session("panel", "second"))
+            .unwrap();
+        let _ = messages(&mut provider);
+        wallet.network_view = Some(tor("context-a", Some(GatewayTorRotation::InProgress)));
+        provider.update_wallet(wallet.clone(), 1);
+        assert!(first.is_current("context-a"));
+        provider.push_ui(2);
+        let output = messages(&mut provider);
+        assert_eq!(
+            snapshot(&output)["network_view"]["rotation"],
+            serde_json::json!({"state": "in_progress"})
+        );
+
+        // Closing the initiating view retires only its presentation.
+        let _ = provider.network_command(
+            1,
+            peer,
+            1,
+            "context-a",
+            GatewayNetworkCommand::Close {
+                view_id: "popup".into(),
+            },
+        );
+        assert!(!first.is_current("context-a"));
+        assert!(second.is_current("context-a"));
+
+        // Waku fails after the session advanced: no request result survives the new revision,
+        // and the snapshot carries the failure to current views.
+        let _ = messages(&mut provider);
+        wallet.network_view = Some(tor(
+            "context-b",
+            Some(GatewayTorRotation::Failed {
+                error: GatewayNetworkError::WakuUnavailable,
+            }),
+        ));
+        provider.update_wallet(wallet, 1);
+        for request in [first, second] {
+            provider.complete_network_request(
+                request,
+                GatewayNetworkOutcome::Failed {
+                    error: GatewayNetworkError::WakuUnavailable,
+                },
+            );
+        }
+        assert!(provider.network_results(1).is_empty());
+        assert!(provider.network_results(2).is_empty());
+        provider.push_ui(2);
+        let output = messages(&mut provider);
+        assert_eq!(
+            snapshot(&output)["network_view"]["rotation"],
+            serde_json::json!({
+                "state": "failed",
+                "error": GatewayNetworkError::WakuUnavailable.message(),
+            })
+        );
         drop(provider);
         std::fs::remove_dir_all(path).unwrap();
     }

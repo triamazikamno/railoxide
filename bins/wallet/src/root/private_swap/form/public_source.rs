@@ -310,7 +310,7 @@ enum PublicSwapCommand {
         quote_terms: PublicQuoteTerms,
         approval: PublicSwapApproval,
         clients: PublicSwapClients,
-        waku: Option<Arc<WakuDeliveryClient>>,
+        waku: Option<PublicBroadcasterWaku>,
     },
     Withdraw {
         review: PublicSwapWithdrawalReview,
@@ -1287,7 +1287,7 @@ impl PrivateSwapsView {
 
     fn public_review_command(
         &self,
-        waku: Option<Arc<WakuDeliveryClient>>,
+        waku: Option<PublicBroadcasterWaku>,
         cx: &mut Context<'_, Self>,
     ) -> Result<PublicSwapAuthorization, String> {
         let form = self.form.as_ref().ok_or("The swap form closed.")?;

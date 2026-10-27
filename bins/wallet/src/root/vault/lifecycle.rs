@@ -1241,6 +1241,8 @@ impl WalletRoot {
         self.governance.proposal_participation.clear_session();
         self.invalidate_proposals_chain(self.selected_chain);
         self.clear_private_broadcaster_progress_state();
+        super::super::renew_submission_scope(&mut self.submission_scope);
+        self.cancel_tor_rotation();
         self.stop_waku();
         window.close_all_dialogs(cx);
         self.set_network_status_popover_open(false, cx);

@@ -236,6 +236,11 @@
 //!   native token when the wallet holds nothing it can unshield, so the form's Output toggle
 //!   and gas top-up can be looked at. The network's private session must be started. Nothing
 //!   about the asset is real, so its estimates and Unshield fail.
+//! - `rotation:in-progress` and `rotation:waku-failed` change what New Tor session does, in
+//!   the native popover and from the extension. `in-progress` holds the rotation pending, so
+//!   the shared control shows it in progress for as long as the wallet runs. `waku-failed`
+//!   ends it at once as if the new session had started and the broadcaster network couldn't
+//!   restart. Neither stops Waku or changes the Tor session.
 //!
 //! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
@@ -313,6 +318,7 @@ enum Mode {
     Refund(Refund),
     Utxos,
     Unshield,
+    Rotation { waku_failed: bool },
     RetryReview,
     QuoteError,
     Split(Split),
@@ -487,6 +493,15 @@ fn parse(value: &str) -> Option<Mode> {
     }
     if value == "unshield" {
         return Some(Mode::Unshield);
+    }
+    if let Some(state) = value.strip_prefix("rotation:") {
+        return Some(Mode::Rotation {
+            waku_failed: match state {
+                "in-progress" => false,
+                "waku-failed" => true,
+                _ => return None,
+            },
+        });
     }
     if value == "retry-review" {
         return Some(Mode::RetryReview);
@@ -2567,6 +2582,15 @@ pub(in crate::root) fn unshield_asset(
         max_batched: amount,
         icon_path: None,
     })
+}
+
+/// What New Tor session stages in a `rotation:` mode: `Some(true)` when the broadcaster
+/// network fails after the commit, `Some(false)` when the rotation stays pending.
+pub(in crate::root) fn tor_rotation() -> Option<bool> {
+    match mode()? {
+        Mode::Rotation { waku_failed } => Some(waku_failed),
+        _ => None,
+    }
 }
 
 /// Whether the UTXO table shows the rows of the `utxos` mode in place of the wallet's own,

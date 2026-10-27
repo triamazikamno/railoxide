@@ -259,9 +259,13 @@ impl WalletRoot {
         let popover_root = root.clone();
         let content_root = root.clone();
         let popover_focus = self.network_status_popover_focus.clone();
-        let network_status_error = self.network_status_error.clone();
+        let network_status_error = super::network::native_network_status_error(
+            self.network_status_error.as_ref(),
+            self.tor_rotation_failure,
+        );
         let tor_exit_ip_query = self.tor_exit_ip_query.clone();
         let tor_state_reset_confirming = self.tor_state_reset_confirming;
+        let tor_rotation_in_progress = self.tor_rotation.is_some();
 
         let trigger = network_status_pill(
             "wallet-network-status-pill-trigger",
@@ -318,6 +322,7 @@ impl WalletRoot {
                         network_status_error.clone(),
                         tor_exit_ip_query.clone(),
                         tor_state_reset_confirming,
+                        tor_rotation_in_progress,
                         activity.as_ref(),
                         download_rate,
                         move |intent, _window, cx| {

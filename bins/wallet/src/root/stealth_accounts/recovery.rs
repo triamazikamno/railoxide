@@ -16,7 +16,7 @@ use wallet_ops::{
     ExecutorRecoveryCompletion, ExecutorRecoveryExecution, ExecutorRecoveryFeeEstimate,
     ExecutorRecoveryFunding, PreparedExecutorRecovery, PublicActionGasFeeSelection,
     PublicActionProgressUpdate, PublicBroadcasterCandidate, PublicBroadcasterResultKind,
-    SelfBroadcastGasFeeQuote, TransactionGenerationStage, WakuDeliveryClient,
+    PublicBroadcasterWaku, SelfBroadcastGasFeeQuote, TransactionGenerationStage,
 };
 
 use crate::root::gas_fee::{GasRetryInputs, format_gwei, parse_gwei_to_wei};
@@ -40,7 +40,7 @@ pub(super) enum RecoveryAuthorization {
     },
     Submit {
         prepared: Arc<PreparedExecutorRecovery>,
-        waku: Option<Arc<WakuDeliveryClient>>,
+        waku: Option<Box<PublicBroadcasterWaku>>,
     },
 }
 
@@ -528,7 +528,7 @@ impl StealthAccountsView {
                                     recovery: prepared,
                                     session,
                                     authorization,
-                                    waku,
+                                    waku: *waku,
                                     verify_proof: true,
                                     progress_tx: Some(progress),
                                     response_timeout: std::time::Duration::from_mins(2),
@@ -639,7 +639,7 @@ impl StealthAccountsView {
                             crate::root::DeliveryMode::PublicBroadcaster,
                             cx,
                         );
-                        root.active_waku()
+                        root.public_broadcaster_waku()
                     })
                     .ok()
                     .flatten();
@@ -658,7 +658,10 @@ impl StealthAccountsView {
             "Shield only this approved amount.",
             rows,
         );
-        let action = RecoveryAuthorization::Submit { prepared, waku };
+        let action = RecoveryAuthorization::Submit {
+            prepared,
+            waku: waku.map(Box::new),
+        };
         if let Some((authorization, _)) = authorization {
             if approved {
                 self.continue_recovery_with_progress(

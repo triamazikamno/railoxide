@@ -33,8 +33,8 @@ use crate::vault::{ExecutorOperationId, SwapSetupFeeLimit};
 use crate::{
     DesktopPrivateSpendAuthorization, ExecutorAsset, ExecutorDelivery, OperationHttpClient,
     PreparedExecutorOperation, PublicBroadcasterCandidate, PublicBroadcasterResultKind,
-    TransactionGenerationProgressSender, TransactionGenerationStage, WakuClient, WalletSession,
-    broadcaster_fee_amount, public_broadcaster_bound_min_gas_price,
+    PublicBroadcasterWaku, TransactionGenerationProgressSender, TransactionGenerationStage,
+    WalletSession, broadcaster_fee_amount, public_broadcaster_bound_min_gas_price,
     public_broadcaster_service_gas_price,
 };
 
@@ -114,7 +114,7 @@ pub struct ExecutorPaidRecoveryRequest {
     pub client: OperationHttpClient,
     pub session: Arc<WalletSession>,
     pub authorization: DesktopPrivateSpendAuthorization,
-    pub waku: Arc<WakuClient>,
+    pub waku: PublicBroadcasterWaku,
     pub verify_proof: bool,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
     pub response_timeout: Duration,
@@ -415,7 +415,7 @@ impl ExecutorOwner {
         maximum_private_fee: U256,
         session: &WalletSession,
         authorization: A,
-        waku: &Arc<WakuClient>,
+        waku: &PublicBroadcasterWaku,
         verify_proof: bool,
         progress_tx: Option<&TransactionGenerationProgressSender>,
         response_timeout: Duration,
@@ -457,7 +457,7 @@ impl ExecutorOwner {
         maximum_private_fee: U256,
         session: &WalletSession,
         authorization: A,
-        waku: &Arc<WakuClient>,
+        waku: &PublicBroadcasterWaku,
         verify_proof: bool,
         progress_tx: Option<&TransactionGenerationProgressSender>,
         response_timeout: Duration,
@@ -658,7 +658,7 @@ impl ExecutorOwner {
             let result = trace_step(
                 "paid_submit",
                 submit_public_broadcaster_transaction(
-                    Arc::clone(waku),
+                    waku,
                     transaction,
                     pois.request_pois,
                     candidate,

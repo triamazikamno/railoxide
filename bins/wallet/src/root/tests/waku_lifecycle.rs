@@ -1,10 +1,15 @@
 use broadcaster_monitor::{event_channel, shared};
 use broadcaster_monitor_waku::{RelayNetworkConfig, RelayNetworkMode, WakuMonitorConfig};
 use tokio::sync::watch;
+use wallet_ops::gateway::GatewayNetworkError;
 
 use super::super::chain_load::{
     WalletRootReplacementCleanup, WalletSyncLifecycleCleanupReport,
     WalletSyncLifecycleCleanupWaitGroup,
+};
+use super::super::network::{
+    TorRotation, complete_tor_rotation, join_or_begin_tor_rotation, native_network_status_error,
+    restart_now_or_defer_to_rotation, retire_root_waku, take_tor_rotation, waku_to_retire,
 };
 use super::super::private_broadcaster::{
     cancel_private_broadcaster_progress, cancel_public_broadcaster_tasks,
@@ -29,7 +34,6 @@ fn locked_startup_and_proxy_mode_keep_waku_inactive() {
         RelayNetworkMode::Proxy
     ));
     assert!(active_waku_client(None).is_none());
-    assert!(!refresh_active_waku(None));
 }
 
 #[test]
@@ -594,4 +598,341 @@ async fn lock_cancellation_aborts_every_tracked_broadcaster_task() {
             .expect_err("second task was aborted")
             .is_cancelled()
     );
+}
+
+#[test]
+fn lock_scope_renewal_closes_the_old_submission_scope() {
+    let mut scope = SubmissionNodeScope::new();
+    let held = scope.clone();
+
+    renew_submission_scope(&mut scope);
+
+    // A stale callback's handle builds no node, and nodes in their teardown delay stop.
+    assert!(held.is_closed());
+    // The next unlock submits on an open scope.
+    assert!(!scope.is_closed());
+}
+
+/// A Direct-mode runtime config with no discovery and no peers, so nothing dials.
+fn quiet_waku_config() -> WakuMonitorConfig {
+    WakuMonitorConfig {
+        dns_enr_trees: Some(Vec::new()),
+        max_peers: Some(0),
+        network: RelayNetworkConfig::direct(),
+        ..WakuMonitorConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn rotation_retires_the_old_transport_without_waiting_for_submissions() {
+    let config = quiet_waku_config();
+    let client = config.build_client().expect("quiet Waku client");
+    // A submission in flight holds the root client for its seed snapshot.
+    let scope = SubmissionNodeScope::new();
+    let submission = PublicBroadcasterWaku::new(
+        Arc::clone(&client),
+        config.to_waku_config(),
+        HttpContext::with_rpc_client_for_tests(
+            reqwest::Client::new(),
+            wallet_ops::WalletNetworkMode::Direct,
+        ),
+        scope.clone(),
+    );
+    let (completion, quiesced_tx) = WakuWorkerCompletionToken::channel_for_test();
+    let retire = tokio::spawn(retire_root_waku(completion, Arc::clone(&client)));
+
+    tokio::task::yield_now().await;
+    assert!(
+        !retire.is_finished(),
+        "rotation stays pending while monitor workers still use the client"
+    );
+    quiesced_tx
+        .send(true)
+        .expect("quiescence receiver is alive");
+    tokio::time::timeout(Duration::from_secs(10), retire)
+        .await
+        .expect("retirement doesn't wait for the submission")
+        .expect("retirement task completes")
+        .expect("old transport retires");
+
+    // Only now may the rotation commit: the old identity can do no more Waku work.
+    assert!(
+        client
+            .subscribe(vec!["/railgun/v2/0-1-fees/json".to_owned()])
+            .await
+            .is_err()
+    );
+    assert!(
+        !scope.is_closed(),
+        "rotation doesn't retire submission nodes"
+    );
+    drop(submission);
+}
+
+#[test]
+fn rotation_commits_only_after_retirement_and_replaces_only_active_waku() {
+    // (Tor session generation, Waku starts attempted)
+    let run = |waku_was_active: bool,
+               restart_deferred: bool,
+               retired: Result<(), String>,
+               commit_ok: bool,
+               start_ok: bool| {
+        let mut steps = (7_u64, 0_u32);
+        let result = complete_tor_rotation(
+            &mut steps,
+            waku_was_active,
+            restart_deferred,
+            retired,
+            |steps| {
+                if commit_ok {
+                    steps.0 += 1;
+                    Ok(steps.0)
+                } else {
+                    Err(eyre::eyre!("no SOCKS bridge"))
+                }
+            },
+            |steps| {
+                steps.1 += 1;
+                start_ok
+            },
+        );
+        (steps, result)
+    };
+
+    for restart_deferred in [false, true] {
+        assert_eq!(
+            run(true, restart_deferred, Ok(()), true, true),
+            ((8, 1), Ok((8, None))),
+            "one start replaces active Waku"
+        );
+        assert_eq!(
+            run(true, restart_deferred, Ok(()), true, false),
+            ((8, 1), Ok((8, Some(GatewayNetworkError::WakuUnavailable)))),
+            "failure after commit keeps the new session and isn't retried"
+        );
+        for (retired, commit_ok) in [
+            (Err("shutdown timed out".to_owned()), true),
+            (Ok(()), false),
+        ] {
+            assert_eq!(
+                run(true, restart_deferred, retired, commit_ok, true),
+                (
+                    (7, u32::from(restart_deferred)),
+                    Err(GatewayNetworkError::NewSessionFailed)
+                ),
+                "failure before commit keeps the session and starts only an owed restart"
+            );
+        }
+    }
+    assert_eq!(
+        run(false, false, Ok(()), true, true),
+        ((8, 0), Ok((8, None))),
+        "inactive Waku isn't constructed"
+    );
+    assert_eq!(
+        run(false, true, Ok(()), true, false),
+        ((8, 1), Ok((8, None))),
+        "an owed ordinary restart runs once, and its failure isn't the rotation's"
+    );
+}
+
+#[test]
+fn a_rotation_failure_stays_on_the_native_control_after_its_error_is_cleared() {
+    let failure = Some(GatewayNetworkError::NewSessionFailed);
+    let later: Arc<str> = Arc::from("Waku delivery network is unavailable: no peer");
+    assert_eq!(
+        native_network_status_error(Some(&later), failure),
+        Some(Arc::clone(&later))
+    );
+    // A later Waku start, including a late worker's ordinary restart, clears the root's error.
+    assert_eq!(
+        native_network_status_error(None, failure).as_deref(),
+        Some(GatewayNetworkError::NewSessionFailed.message())
+    );
+    assert_eq!(native_network_status_error(None, None), None);
+}
+
+#[test]
+fn one_pending_rotation_joins_duplicates_and_holds_waku_until_commit() {
+    let mut pending = None;
+    assert!(join_or_begin_tor_rotation(
+        &mut pending,
+        TorRotation::for_test(1, Some(4))
+    ));
+    // Native and gateway activations while pending join it.
+    assert!(!join_or_begin_tor_rotation(
+        &mut pending,
+        TorRotation::for_test(2, Some(4))
+    ));
+    assert!(!join_or_begin_tor_rotation(
+        &mut pending,
+        TorRotation::for_test(3, None)
+    ));
+
+    // The retired workers finalize while the rotation is pending. That stop is the rotation's
+    // own, so it owes no restart.
+    let mut stopping = Some(WakuStoppingState::for_test(4));
+    let monitor_state = shared();
+    let (event_tx, _event_rx) = event_channel(16);
+    let action = complete_waku_worker_generation(
+        None,
+        &mut stopping,
+        4,
+        WakuWorkerCompletionKind::Clean,
+        true,
+        false,
+        &monitor_state,
+        &event_tx,
+    );
+    assert_eq!(
+        action,
+        WakuWorkerCompletionAction::FinalizedStop { restart: true }
+    );
+    assert!(!restart_now_or_defer_to_rotation(pending.as_mut(), 4));
+    assert!(!pending.as_ref().unwrap().restart_deferred);
+    // A runtime already stopping when the rotation began, as after lock and unlock, owes unlock's
+    // restart, which the rotation holds back.
+    assert!(!restart_now_or_defer_to_rotation(pending.as_mut(), 3));
+    assert!(pending.as_ref().unwrap().restart_deferred);
+    assert!(!should_start_waku_for_delivery(
+        DeliveryMode::PublicBroadcaster,
+        true,
+        false,
+        waku_start_blocked(stopping.as_ref(), pending.as_ref()),
+        false,
+        RelayNetworkMode::Tor,
+    ));
+
+    let commits = [2, 3, 1, 1]
+        .into_iter()
+        .filter(|id| take_tor_rotation(&mut pending, *id).is_some())
+        .count();
+    assert_eq!(commits, 1, "the session advances once");
+    assert!(
+        restart_now_or_defer_to_rotation(pending.as_mut(), 3),
+        "after the rotation a late completion restarts at once"
+    );
+    assert!(should_start_waku_runtime(
+        true,
+        false,
+        waku_start_blocked(stopping.as_ref(), pending.as_ref()),
+        false,
+        RelayNetworkMode::Tor,
+    ));
+}
+
+#[test]
+fn cancelled_rotation_cannot_commit_a_later_one() {
+    let mut pending = None;
+    assert!(join_or_begin_tor_rotation(
+        &mut pending,
+        TorRotation::for_test(1, Some(2))
+    ));
+    // Lock or root replacement cancels before commit.
+    pending = None;
+    assert!(join_or_begin_tor_rotation(
+        &mut pending,
+        TorRotation::for_test(2, None)
+    ));
+
+    assert!(
+        take_tor_rotation(&mut pending, 1).is_none(),
+        "the cancelled operation neither commits nor starts Waku"
+    );
+    assert!(take_tor_rotation(&mut pending, 2).is_some());
+}
+
+#[tokio::test]
+async fn replacement_has_a_new_identity_and_late_old_completion_leaves_it_alone() {
+    let config = quiet_waku_config();
+    let old = config.build_client().expect("old Waku client");
+    let replacement = config.build_client().expect("replacement Waku client");
+    assert!(old.local_peer_id().is_some());
+    assert_ne!(old.local_peer_id(), replacement.local_peer_id());
+
+    let retired_generation = 5;
+    let mut stopping = Some(WakuStoppingState::for_test(retired_generation));
+    let monitor_state = shared();
+    let (event_tx, _event_rx) = event_channel(16);
+    monitor_state
+        .write()
+        .upsert_fee(fee_row(1, Address::from([0x12; 20]), "retired-worker-fees"));
+    release_retired_waku_generation(&mut stopping, retired_generation, &monitor_state, &event_tx);
+    assert!(stopping.is_none());
+    assert_eq!(monitor_state.read().fee_rows(), [] as [FeeRow; 0]);
+
+    monitor_state
+        .write()
+        .upsert_fee(fee_row(2, Address::from([0x13; 20]), "replacement-fees"));
+    let action = complete_waku_worker_generation(
+        Some(retired_generation + 1),
+        &mut stopping,
+        retired_generation,
+        WakuWorkerCompletionKind::WorkerError,
+        true,
+        false,
+        &monitor_state,
+        &event_tx,
+    );
+    assert_eq!(action, WakuWorkerCompletionAction::Ignore);
+    assert_eq!(monitor_state.read().fee_rows().len(), 1);
+    assert_eq!(monitor_state.read().fee_rows()[0].chain_id, 2);
+}
+
+#[tokio::test]
+async fn rotation_during_a_stop_awaits_that_transport_and_starts_nothing() {
+    // Lock stopped the runtime, but its workers and transport are still winding down.
+    let client = quiet_waku_config()
+        .build_client()
+        .expect("quiet Waku client");
+    let (completion, quiesced_tx) = WakuWorkerCompletionToken::channel_for_test();
+    let stopping = WakuStoppingState {
+        generation: 9,
+        client: Arc::clone(&client),
+        completion,
+    };
+    let (replaced, retiring_client, completion) =
+        waku_to_retire(None, Some(&stopping)).expect("a stopping transport is retired");
+    assert_eq!(replaced, None, "a stopping runtime isn't replaced");
+    assert!(Arc::ptr_eq(&retiring_client, &client));
+
+    let retire = tokio::spawn(retire_root_waku(completion, retiring_client));
+    tokio::task::yield_now().await;
+    assert!(
+        !retire.is_finished(),
+        "the commit waits for the stopping workers"
+    );
+    quiesced_tx
+        .send(true)
+        .expect("quiescence receiver is alive");
+    let retired = tokio::time::timeout(Duration::from_secs(10), retire)
+        .await
+        .expect("stopping transport retires")
+        .expect("retirement task completes");
+    assert!(
+        client
+            .subscribe(vec!["/railgun/v2/0-1-fees/json".to_owned()])
+            .await
+            .is_err(),
+        "the stopping transport has terminated before the commit"
+    );
+
+    // (Tor session generation, Waku runtimes started)
+    let mut steps = (3_u64, 0_u32);
+    let result = complete_tor_rotation(
+        &mut steps,
+        replaced.is_some(),
+        false,
+        retired,
+        |steps| {
+            steps.0 += 1;
+            Ok(steps.0)
+        },
+        |steps| {
+            steps.1 += 1;
+            true
+        },
+    );
+    assert_eq!(result, Ok((4, None)));
+    assert_eq!(steps, (4, 0), "rotation constructs no runtime");
 }

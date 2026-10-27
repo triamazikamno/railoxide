@@ -1620,6 +1620,29 @@ impl WalletRoot {
         });
     }
 
+    /// Completes rotation requests whose view and network context are still current. A committed
+    /// session changes the context, so its outcome reaches views through the snapshot instead.
+    pub(super) fn complete_gateway_network_requests(
+        &self,
+        requests: Vec<GatewayNetworkRequest>,
+        outcome: &GatewayNetworkOutcome,
+    ) {
+        let Some(handle) = &self.gateway.handle else {
+            return;
+        };
+        let revision = self.network_context_revision();
+        for request in requests
+            .into_iter()
+            .filter(|request| request.is_current(&revision))
+        {
+            let handle = handle.clone();
+            let outcome = outcome.clone();
+            self.runtime.spawn(async move {
+                handle.complete_network_request(request, outcome).await;
+            });
+        }
+    }
+
     pub(super) fn apply_gateway_network_command(
         &mut self,
         request: GatewayNetworkRequest,
@@ -1667,12 +1690,11 @@ impl WalletRoot {
             return;
         }
         let outcome = match request.operation() {
-            GatewayNetworkOperation::NewTorSession => self.rotate_tor_session(cx).map_or(
-                GatewayNetworkOutcome::Failed {
-                    error: GatewayNetworkError::NewSessionFailed,
-                },
-                |_| GatewayNetworkOutcome::Done,
-            ),
+            GatewayNetworkOperation::NewTorSession => {
+                // Admitted: the root owns the rotation, and closing this view doesn't cancel it.
+                self.request_tor_rotation(Some(request), cx);
+                return;
+            }
             GatewayNetworkOperation::QuitAndReset => {
                 reset_tor_state_and_quit(&self.options.db_path, || cx.quit()).map_or(
                     GatewayNetworkOutcome::Failed {

@@ -26,7 +26,7 @@ use ui::theme;
 use wallet_ops::{
     DesktopPrivateSpendAuthorization, ExecutorAsset, ExecutorPaidRecoveryRequest,
     ExecutorRecoveryFeeEstimate, PublicBroadcasterCandidate, PublicBroadcasterSelection,
-    SwapAccountReplacement, SwapOrderState, WakuDeliveryClient,
+    PublicBroadcasterWaku, SwapAccountReplacement, SwapOrderState,
     cow::OrderUid,
     vault::{
         BridgeDelivery, BridgeOrderTerms, BridgeProvider, ExecutorOperationId,
@@ -94,7 +94,7 @@ pub(super) struct CancelApproval {
     pub(super) operation: ExecutorOperationId,
     candidate: PublicBroadcasterCandidate,
     maximum_private_fee: U256,
-    waku: Arc<WakuDeliveryClient>,
+    waku: PublicBroadcasterWaku,
 }
 
 /// What cancelling a swap's preparation left of its claims, as its detail reports it.

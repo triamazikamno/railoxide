@@ -479,6 +479,7 @@ pub fn network_status_popover_content(
     error: Option<Arc<str>>,
     exit_ip_query: TorExitIpQueryState,
     reset_confirming: bool,
+    tor_rotation_in_progress: bool,
     activity: Option<&NetworkActivity>,
     download_rate: Option<u64>,
     on_intent: impl Fn(NetworkStatusIntent, &mut Window, &mut App) + 'static,
@@ -645,12 +646,21 @@ pub fn network_status_popover_content(
                             )),
                     )
                     .child(
-                        app_button("wallet-network-new-tor-session", "New Tor session")
+                        app_button(
+                            "wallet-network-new-tor-session",
+                            if tor_rotation_in_progress {
+                                "Starting new Tor session..."
+                            } else {
+                                "New Tor session"
+                            },
+                        )
 .debug_selector(|| "wallet-network-new-tor-session".into())
                             .w_full()
                             .primary()
                             .outline()
                             .small()
+                            .loading(tor_rotation_in_progress)
+                            .disabled(tor_rotation_in_progress)
                             .on_click(move |_event, window, cx| {
                                 cx.stop_propagation();
                                 session_intent(NetworkStatusIntent::NewTorSession, window, cx);
@@ -814,6 +824,7 @@ mod tests {
         kind: NetworkStatusKind,
         query: TorExitIpQueryState,
         confirming: bool,
+        rotating: bool,
         intents: Vec<NetworkStatusIntent>,
     }
 
@@ -829,6 +840,7 @@ mod tests {
             .with_direct_rpc_endpoints(2);
             let query = self.query.clone();
             let confirming = self.confirming;
+            let rotating = self.rotating;
             gpui_component::popover::Popover::new("network-probe")
                 .p_0()
                 .open(self.open)
@@ -862,6 +874,7 @@ mod tests {
                             None,
                             query.clone(),
                             confirming,
+                            rotating,
                             Some(&NetworkActivity {
                                 successful_connections: 9999,
                                 failed_connections: 9999,
@@ -899,6 +912,7 @@ mod tests {
             kind: NetworkStatusKind::TorDegraded,
             query: TorExitIpQueryState::Idle,
             confirming: false,
+            rotating: false,
             intents: Vec::new(),
         })
     }
@@ -936,11 +950,36 @@ mod tests {
                 .is_some()
         );
         click(cx, "wallet-network-new-tor-session");
-        first.update(cx, |probe, _| {
+        first.update(cx, |probe, cx| {
             assert!(probe.open, "session recovery keeps the popover open");
             assert_eq!(probe.intents, [NetworkStatusIntent::NewTorSession]);
             probe.intents.clear();
+            probe.rotating = true;
+            cx.notify();
         });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        click(cx, "wallet-network-new-tor-session");
+        assert!(
+            cx.read(|cx| first.read(cx).intents.is_empty()),
+            "a pending rotation accepts no duplicate activation"
+        );
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            cx.read(|cx| !first.read(cx).open),
+            "dismissal stays available while rotating"
+        );
+        cx.simulate_keystrokes("enter");
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            cx.read(|cx| first.read(cx).open),
+            "focus returns to the trigger, which reopens the popover"
+        );
+        first.update(cx, |probe, cx| {
+            probe.rotating = false;
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
         click(cx, "wallet-network-query-exit-ip");
         click(cx, "wallet-network-query-exit-ip");
         cx.read(|cx| {

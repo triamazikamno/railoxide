@@ -23,8 +23,9 @@ pub use provider::{
     GatewayChainEditorCommand, GatewayChainEditorOutcome, GatewayChainEditorRequest,
     GatewayConnectPrompt, GatewayNetworkActivity, GatewayNetworkCommand, GatewayNetworkError,
     GatewayNetworkOperation, GatewayNetworkOutcome, GatewayNetworkRequest, GatewayNetworkResult,
-    GatewayNetworkStatus, GatewayNetworkView, GatewayPermissionSummary, GatewayUnlockState,
-    GatewayWalletState, GatewayWalletSwitchRequest, GatewayWalletSwitchTransition,
+    GatewayNetworkStatus, GatewayNetworkView, GatewayPermissionSummary, GatewayTorRotation,
+    GatewayUnlockState, GatewayWalletState, GatewayWalletSwitchRequest,
+    GatewayWalletSwitchTransition,
 };
 mod private_drafts;
 pub use private_drafts::{

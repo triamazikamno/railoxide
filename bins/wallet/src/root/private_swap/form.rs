@@ -50,12 +50,12 @@ use ui::theme;
 use wallet_ops::{
     DesktopPrivateSpendAuthorization, ExecutorOwner, ExecutorRecoveryFeeEstimate,
     OperationHttpClient, OperationNetworkIsolation, PublicBroadcasterCandidate,
-    PublicBroadcasterResultKind, PublicBroadcasterSelection, QuoteDeviationError,
-    SwapAccountCandidate, SwapAccountReplacement, SwapAccountReplacements, SwapAmountPlan,
-    SwapAmountRequest, SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapDestinationContext,
-    SwapExecutor, SwapOrderOutcome, SwapOrderRequest, SwapPairPreparation, SwapPairSide, SwapPrice,
-    SwapReview, SwapReviewChange, SwapReviewRequest, SwapSetupRequest, TokenAnchorRateCache,
-    TransactionGenerationStage, WakuDeliveryClient, WalletSession,
+    PublicBroadcasterResultKind, PublicBroadcasterSelection, PublicBroadcasterWaku,
+    QuoteDeviationError, SwapAccountCandidate, SwapAccountReplacement, SwapAccountReplacements,
+    SwapAmountPlan, SwapAmountRequest, SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute,
+    SwapDestinationContext, SwapExecutor, SwapOrderOutcome, SwapOrderRequest, SwapPairPreparation,
+    SwapPairSide, SwapPrice, SwapReview, SwapReviewChange, SwapReviewRequest, SwapSetupRequest,
+    TokenAnchorRateCache, TransactionGenerationStage, WalletSession,
     bridge::{
         BridgeApiError, BridgeDestination, PublicBridgePath, across_destination_tokens,
         near_destination_tokens,
@@ -485,7 +485,7 @@ pub(super) struct SetupApproval {
     /// takes no setup and pays no setup fee.
     origin: Option<OriginSetup>,
     /// The wallet's broadcaster network client, which delivers to broadcasters of every network.
-    waku: Arc<WakuDeliveryClient>,
+    waku: PublicBroadcasterWaku,
     /// The destination action this attempt authorizes. `None` also covers a fresh account
     /// whose setup is already pending or confirmed and isn't sent again.
     destination: Option<DestinationPlan>,
@@ -619,7 +619,7 @@ pub(super) struct SetupRetry {
     pub(super) account: ExecutorOperationId,
     candidate: PublicBroadcasterCandidate,
     maximum_private_fee: U256,
-    waku: Arc<WakuDeliveryClient>,
+    waku: PublicBroadcasterWaku,
     /// The setup fee limit approved with the swap for this account, in its fee token.
     approved_fee: Option<SwapSetupFeeLimit>,
     /// The swap's approval with this review's fee token and limit, when the limit is above
@@ -6055,7 +6055,7 @@ impl PrivateSwapsView {
     fn setup_approval(
         &self,
         resume: bool,
-        waku: Option<Arc<WakuDeliveryClient>>,
+        waku: Option<PublicBroadcasterWaku>,
     ) -> Result<(SetupApproval, Arc<SwapReview>), String> {
         let form = self.form.as_ref().ok_or("The swap form closed.")?;
         let buy = form.quote_buy().ok_or("Choose the token to receive.")?;
@@ -6556,7 +6556,7 @@ impl PrivateSwapsView {
                         maximum_private_fee: origin.maximum_private_fee,
                         session: Arc::clone(&session),
                         authorization: &authorization,
-                        waku: Arc::clone(&waku),
+                        waku: waku.clone(),
                         verify_proof: true,
                         progress_tx: progress,
                         response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,
@@ -6570,7 +6570,7 @@ impl PrivateSwapsView {
                                     maximum_private_fee: setup.maximum_private_fee,
                                     session: Arc::clone(&destination.session),
                                     authorization: &destination.authorization,
-                                    waku: Arc::clone(&waku),
+                                    waku: waku.clone(),
                                     verify_proof: true,
                                     progress_tx: destination_progress,
                                     response_timeout: SWAP_BROADCASTER_RESPONSE_TIMEOUT,

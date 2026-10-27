@@ -2875,11 +2875,16 @@ fn a_setup_failure_is_told_on_its_stage_or_as_the_swaps_error(cx: &mut TestAppCo
 fn idle_waku(
     root: &Entity<WalletRoot>,
     cx: &gpui::VisualTestContext,
-) -> Arc<wallet_ops::WakuDeliveryClient> {
+) -> wallet_ops::PublicBroadcasterWaku {
     root.read_with(cx, |root, _| {
         let mut config = root.waku_config.clone();
         config.network.mode = broadcaster_monitor_waku::RelayNetworkMode::Proxy;
-        config.build_client().unwrap()
+        wallet_ops::PublicBroadcasterWaku::new(
+            config.build_client().unwrap(),
+            config.to_waku_config(),
+            root.http.clone(),
+            root.submission_scope.clone(),
+        )
     })
 }
 
@@ -3018,7 +3023,7 @@ fn a_setup_retry_review_tells_a_changed_fee_limit_and_fee_token(cx: &mut TestApp
                 account: operation,
                 candidate: candidate.clone(),
                 maximum_private_fee: U256::from(520_000),
-                waku: Arc::clone(&waku),
+                waku: waku.clone(),
                 approved_fee: Some(approved),
                 approval: None,
                 replaces: false,
@@ -3222,7 +3227,7 @@ fn a_setup_retry_reviews_the_broadcaster_and_fee_token_its_dialog_holds(cx: &mut
             cx.simulate_click(proceed.center(), gpui::Modifiers::none());
             cx.update(|window, cx| {
                 swaps.update(cx, |swaps, cx| {
-                    swaps.quote_setup_retry(Some(Arc::clone(&waku)), window, cx);
+                    swaps.quote_setup_retry(Some(waku.clone()), window, cx);
                     assert!(
                         swaps.job.is_none() && swaps.pending_authorization.is_none(),
                         "nothing is estimated or signed without a broadcaster"
@@ -9194,7 +9199,12 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
             let waku = root.read_with(cx, |root, _| {
                 let mut config = root.waku_config.clone();
                 config.network.mode = broadcaster_monitor_waku::RelayNetworkMode::Proxy;
-                config.build_client().unwrap()
+                wallet_ops::PublicBroadcasterWaku::new(
+                    config.build_client().unwrap(),
+                    config.to_waku_config(),
+                    root.http.clone(),
+                    root.submission_scope.clone(),
+                )
             });
             cx.update(|window, cx| {
                 swaps.update(cx, |swaps, cx| {

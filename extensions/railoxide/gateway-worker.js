@@ -140,6 +140,7 @@ const networkOperations = ['new_tor_session', 'query_exit_ip', 'quit_and_reset']
 const networkErrors = new Set([
   'Network control is unavailable. Reopen the popover and try again.',
   'Could not start a new Tor session. Try again.',
+  'Started a new Tor session, but the broadcaster network could not restart. Try again later.',
   'Could not query the exit IP through Tor. Try again.',
   'Could not request the Tor state reset. The wallet remains open.',
 ]);
@@ -172,6 +173,9 @@ function networkPresentation(message) {
       typeof value.detail !== 'string' || value.detail.length > 512 || typeof value.runtime_warning !== 'boolean' ||
       (value.download_rate != null && !networkInteger(value.download_rate)) ||
       (value.direct_rpc_endpoints != null && !networkInteger(value.direct_rpc_endpoints))) return null;
+  const rotation = value.rotation ?? null;
+  if (rotation !== null && !(rotation.state === 'in_progress' ||
+      (rotation.state === 'failed' && networkErrors.has(rotation.error)))) return null;
   let activity = null;
   if (value.activity != null) {
     if (!value.status.startsWith('tor_')) return null;
@@ -189,7 +193,8 @@ function networkPresentation(message) {
   }
   return { context_revision: value.context_revision, status: value.status, detail: value.detail,
     runtime_warning: value.runtime_warning, activity, download_rate: value.download_rate ?? null,
-    direct_rpc_endpoints: value.direct_rpc_endpoints ?? 0 };
+    direct_rpc_endpoints: value.direct_rpc_endpoints ?? 0,
+    rotation: rotation && (rotation.state === 'failed' ? { state: 'failed', error: rotation.error } : { state: 'in_progress' }) };
 }
 function closeNetworkView(port, send = true) {
   const view = networkViews.get(port);

@@ -662,7 +662,7 @@ impl WalletRoot {
 
         let http = self.http.clone();
         let waku = if delivery_mode == DeliveryMode::PublicBroadcaster {
-            let Some(waku) = self.active_waku() else {
+            let Some(waku) = self.public_broadcaster_waku() else {
                 self.set_send_form_error(
                     key,
                     "Public broadcaster delivery is unavailable. Ensure the vault is unlocked and Waku connectivity is active, then try again",
@@ -1718,7 +1718,7 @@ impl WalletRoot {
 
         let http = self.http.clone();
         let waku = if delivery_mode == DeliveryMode::PublicBroadcaster {
-            let Some(waku) = self.active_waku() else {
+            let Some(waku) = self.public_broadcaster_waku() else {
                 self.set_unshield_form_error(
                     key,
                     "Public broadcaster delivery is unavailable. Ensure the vault is unlocked and Waku connectivity is active, then try again",
