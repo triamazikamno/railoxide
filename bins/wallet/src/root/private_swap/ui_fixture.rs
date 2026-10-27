@@ -2797,11 +2797,10 @@ pub(in crate::root) fn send_asset(
     })
 }
 
-/// The token the Private tab's Swap offers in a `setup:` mode, `wrapped_native`, so that a
-/// wallet without private funds or a funded Public account can open the mode's swap. `None` in
-/// every other mode.
+/// The token the Private tab's Swap offers in a `setup:` or `retry-review` mode,
+/// `wrapped_native`, so an unfunded wallet can open the mode's swap. `None` in every other mode.
 pub(in crate::root) fn setup_swap_token(wrapped_native: Address) -> Option<Address> {
-    matches!(mode(), Some(Mode::Setup(_))).then_some(wrapped_native)
+    matches!(mode(), Some(Mode::Setup(_) | Mode::RetryReview)).then_some(wrapped_native)
 }
 
 /// What New Tor session stages in a `rotation:` mode: `Some(true)` when the broadcaster

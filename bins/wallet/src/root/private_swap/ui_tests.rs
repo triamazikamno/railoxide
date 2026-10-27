@@ -1130,6 +1130,63 @@ fn an_observation_pass_that_reads_the_setup_included_places_its_order(cx: &mut T
     });
 }
 
+/// An included setup can place its order before finality. If the terms changed, its form
+/// must review the order rather than silently return or offer to send the setup again.
+#[gpui::test]
+fn an_included_setup_can_review_changed_order_terms(cx: &mut TestAppContext) {
+    with_approved_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+        pending_setup(executors, operation);
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                swaps.apply_observations(vec![setup_read(operation, Some(20))], window, cx);
+                swaps.show_detail(operation, window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                let record = swaps.record(operation).unwrap();
+                assert_eq!(swaps.stage(record), SwapStage::SetupPending);
+                assert!(swaps.approved_use(record).is_some());
+                let approval = record.swap_approval().unwrap().clone();
+                swaps.open_setup_retry(operation, SetupSide::Origin, window, cx);
+                assert!(
+                    swaps.setup_retry.is_none(),
+                    "an included setup isn't sent again"
+                );
+                swaps.apply_approved_quote(
+                    operation,
+                    SwapUseId::first(operation),
+                    &approval,
+                    QuoteResult {
+                        orderbook: None,
+                        bridge_clients: None,
+                        bridge: None,
+                        outcome: Ok(QuoteOutcome::PriceBlocked(PriceBlock::Deviates)),
+                    },
+                    window,
+                    cx,
+                );
+                let form = swaps
+                    .form
+                    .as_ref()
+                    .expect("changed terms open the order form");
+                assert_eq!(form.operation(), Some(operation));
+                assert_eq!(swaps.form_mode(form), FormMode::Order);
+                assert_eq!(
+                    swaps.reapproval,
+                    Some((operation, SwapReviewChange::QuoteDeviates))
+                );
+                assert!(matches!(
+                    swaps.form_quote_terms(form, cx).unwrap().executor,
+                    QuoteExecutor::Order { operation: shown, reuse: false } if shown == operation
+                ));
+            });
+        });
+    });
+}
+
 /// When the approved spend fits only with the note the setup spent, as with a single note
 /// that paid the setup's fee in the sell token, the swap sends no quote at inclusion and keeps
 /// waiting to be placed by itself, while another ready swap is placed. It goes on waiting when

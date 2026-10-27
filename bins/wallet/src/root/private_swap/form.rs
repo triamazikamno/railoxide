@@ -2511,7 +2511,7 @@ impl PrivateSwapsView {
         if !self.session_is_current(cx) || self.busy() {
             return;
         }
-        // Debug UI fixture: a `setup:` mode shows its private swap instead.
+        // Debug UI fixture: a `setup:` or `retry-review` mode shows its private swap instead.
         #[cfg(debug_assertions)]
         if super::ui_fixture::setup_swap_token(sell).is_some()
             && self.open_ui_fixture_swap(window, cx)
@@ -2909,7 +2909,8 @@ impl PrivateSwapsView {
         let Some(record) = self.record(operation) else {
             return;
         };
-        if self.setup_retry_problem(record).is_some() {
+        // An included setup can't be sent again, but its approved order can be reviewed.
+        if self.setup_retry_problem(record).is_some() && self.approved_use(record).is_none() {
             return;
         }
         if let Some(pending) = self.pending_order(record) {
@@ -3655,15 +3656,16 @@ impl PrivateSwapsView {
         if form.public.is_some() {
             return FormMode::Order;
         }
+        let record = form.operation.and_then(|operation| self.record(operation));
+        // An approved order can use its included setup before the record confirms it.
         // A speed-up reviews a second order while its open one is placed.
-        if form.reuse_account || form.speed_up.is_some() {
+        if form.reuse_account
+            || form.speed_up.is_some()
+            || record.is_some_and(|record| self.approved_use(record).is_some())
+        {
             return FormMode::Order;
         }
-        swap_form_mode(
-            form.operation
-                .and_then(|operation| self.record(operation))
-                .map(|record| self.stage(record)),
-        )
+        swap_form_mode(record.map(|record| self.stage(record)))
     }
 
     pub(super) fn sell_assets(
