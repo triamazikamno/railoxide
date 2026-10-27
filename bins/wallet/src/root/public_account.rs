@@ -8,8 +8,8 @@ use alloy::primitives::Address;
 #[cfg(feature = "hardware")]
 use gpui::rgb;
 use gpui::{
-    Context, Entity, Focusable, IntoElement, ParentElement, Pixels, SharedString, Styled, Window,
-    div, prelude::FluentBuilder as _, px,
+    AppContext as _, Context, Entity, Focusable, InteractiveElement as _, IntoElement,
+    ParentElement, Pixels, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Disableable, Sizable, WindowExt,
@@ -36,6 +36,7 @@ use zeroize::Zeroizing;
 mod assets;
 mod commands;
 mod components;
+mod derive_preview;
 #[cfg(test)]
 mod device_auth_tests;
 mod hardware;
@@ -48,6 +49,7 @@ pub(super) use components::{
     next_public_account_label_number, public_account_display_label, public_account_matches_search,
     public_account_source_label,
 };
+pub(super) use derive_preview::DerivePreviewState;
 #[cfg(feature = "hardware")]
 use hardware::{HardwarePublicAccountDerivationProgress, create_hardware_public_account};
 pub(super) use hardware::{
@@ -136,6 +138,8 @@ impl WalletRoot {
     ) -> Weak<Cell<bool>> {
         window.close_all_dialogs(cx);
         self.public_form.error = None;
+        // Programmatic closure skips on_close, so a replaced Derive dialog's preview ends here.
+        self.public_form.derive_preview.reset();
         self.clear_public_account_dialog_inputs(kind, window, cx);
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACCOUNT_DIALOG_WIDTH);
@@ -143,7 +147,20 @@ impl WalletRoot {
         let content_width = secondary_dialog_content_width(dialog_width);
         let lease = Rc::new(Cell::new(true));
         let identity = Rc::downgrade(&lease);
+        self.public_form.derive_preview.lease = identity.clone();
+        // Closing the dialog by any path drops its builder and this entity with it, so the
+        // preview's key goes with the dialog even when on_close doesn't run.
+        let builder_alive = cx.new(|_| ());
+        let released_lease = identity.clone();
+        cx.observe_release(&builder_alive, move |root, (), _| {
+            let state = &mut root.public_form.derive_preview;
+            if Weak::ptr_eq(&state.lease, &released_lease) {
+                state.reset();
+            }
+        })
+        .detach();
         window.open_dialog(cx, move |dialog, _window, cx| {
+            let _ = &builder_alive;
             // Only the active builder owns the lease. Programmatic closure skips on_close.
             let identity = Rc::downgrade(&lease);
             let close_identity = identity.clone();
@@ -373,6 +390,7 @@ impl WalletRoot {
         self.invalidate_advanced_public_send_estimate();
         self.clear_public_action_progress_state();
         self.public_form.next_derived_index = None;
+        self.public_form.derive_preview.reset();
         self.public_form.next_account_label_number = 1;
         self.public_form.error = None;
         self.public_form.send_error = None;
@@ -433,6 +451,11 @@ impl WalletRoot {
         match kind {
             PublicAccountDialogKind::Derive => {
                 self.public_form.adding_account = false;
+                self.public_form.derive_preview.reset();
+                self.public_form
+                    .derive_preview
+                    .go_to_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
                 self.public_form.hardware_derivation_status =
                     HardwarePublicAccountDerivationStatus::Idle;
                 self.public_form.hardware_confirmation_address = None;
@@ -651,6 +674,10 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let Some(device_kind) = self.selected_hardware_public_device_kind() else {
+            self.authorize_derive_preview(device_auth_password, window, cx);
+            return;
+        };
         if self.public_form.adding_account
             || self.public_form.hardware_derivation_status
                 == HardwarePublicAccountDerivationStatus::AwaitingAddressConfirmation
@@ -679,64 +706,21 @@ impl WalletRoot {
             cx.notify();
             return;
         }
-        if let Some(device_kind) = self.selected_hardware_public_device_kind() {
-            #[cfg(feature = "hardware")]
-            let trezor_app_passphrase =
-                view_session.hardware_profile_session().and_then(|session| {
-                    self.read_trezor_app_passphrase_for_hardware_session(session, window, cx)
-                });
-            #[cfg(not(feature = "hardware"))]
-            let trezor_app_passphrase = None;
-            self.add_hardware_public_account_from_input(
-                store,
-                view_session,
-                device_kind,
-                label,
-                trezor_app_passphrase,
-                window,
-                cx,
-            );
-            return;
-        }
-        let password = match device_auth_password {
-            Some(password) => password,
-            None => Self::read_and_clear_input(&self.public_form.add_password_input, window, cx),
-        };
-        if password.trim().is_empty() {
-            self.public_form.error = Some(Arc::from("Enter the vault password to add an account"));
-            cx.notify();
-            return;
-        }
-        self.public_form.adding_account = true;
-        self.public_form.error = None;
-        let result = store.add_derived_public_account_with_session(
-            password.as_str(),
-            view_session.as_ref(),
-            Some(&label),
-            self.protected_software_seed_session.as_deref(),
+        #[cfg(feature = "hardware")]
+        let trezor_app_passphrase = view_session.hardware_profile_session().and_then(|session| {
+            self.read_trezor_app_passphrase_for_hardware_session(session, window, cx)
+        });
+        #[cfg(not(feature = "hardware"))]
+        let trezor_app_passphrase = None;
+        self.add_hardware_public_account_from_input(
+            store,
+            view_session,
+            device_kind,
+            label,
+            trezor_app_passphrase,
+            window,
+            cx,
         );
-        self.public_form.adding_account = false;
-        match result {
-            Ok(account) => {
-                self.public_form.selected_account_uuid =
-                    Some(Arc::from(account.public_account_uuid.as_str()));
-                self.public_form
-                    .add_label_input
-                    .update(cx, |input, cx| input.set_value("", window, cx));
-                self.reload_public_accounts(window, cx);
-                self.schedule_account_public_balance_refresh(
-                    self.selected_chain,
-                    [account.public_account_uuid],
-                    None,
-                    cx,
-                );
-                window.close_all_dialogs(cx);
-            }
-            Err(error) => {
-                self.public_form.error = Some(Arc::from(error.to_string()));
-            }
-        }
-        cx.notify();
     }
 
     fn add_hardware_public_account_from_input(
@@ -1287,30 +1271,34 @@ impl WalletRoot {
         if self.device_auth_in_progress
             || self.public_form.adding_account
             || self.public_form.importing_account
+            || self.public_form.derive_preview.authorizing
             || !lease.upgrade().is_some_and(|open| open.get())
         {
             return;
         }
-        let (label_input, missing_input_error) = match kind {
-            PublicAccountDialogKind::Derive => (&self.public_form.add_label_input, None),
-            PublicAccountDialogKind::Import => (
-                &self.public_form.import_label_input,
-                self.public_form
+        // Check the other fields before asking for device approval on a form that
+        // cannot be submitted.
+        let error = match kind {
+            // Device authentication reaches Derive only for software wallets, where it
+            // authorizes the address preview, which has no label.
+            PublicAccountDialogKind::Derive => None,
+            PublicAccountDialogKind::Import => {
+                let form = &self.public_form;
+                if form.import_label_input.read(cx).value().trim().is_empty() {
+                    Some("Enter an account label")
+                } else if form
                     .import_private_key_input
                     .read(cx)
                     .value()
                     .trim()
                     .is_empty()
-                    .then_some("Enter a private key to import an account"),
-            ),
+                {
+                    Some("Enter a private key to import an account")
+                } else {
+                    None
+                }
+            }
             PublicAccountDialogKind::EditLabel => return,
-        };
-        // Check the other fields before asking for device approval on a form that
-        // cannot be submitted.
-        let error = if label_input.read(cx).value().trim().is_empty() {
-            Some("Enter an account label")
-        } else {
-            missing_input_error
         };
         if let Some(error) = error {
             self.public_form.error = Some(Arc::from(error));
@@ -1458,7 +1446,10 @@ impl WalletRoot {
                             device_kind,
                         )))
                         .child(app_muted_text(next_index))
-                        .child(app_muted_text(path))
+                        .child(
+                            app_muted_text(path)
+                                .debug_selector(|| "public-derive-hardware-path".into()),
+                        )
                         .when(show_trezor_app_passphrase, |this| {
                             #[cfg(feature = "hardware")]
                             {
@@ -1560,52 +1551,7 @@ impl WalletRoot {
                             },
                         );
                 }
-                div()
-                    .w(content_width)
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(app_muted_text(
-                        "Derive a Public EVM account from the selected Private wallet mnemonic.",
-                    ))
-                    .child(app_muted_text(next_index))
-                    .child(
-                        app_input(&self.public_form.add_label_input)
-                            .disabled(self.device_auth_in_progress),
-                    )
-                    .child(masked_input_with_device_auth(
-                        &self.public_form.add_password_input,
-                        self.device_auth_in_progress,
-                        self.public_account_device_auth_buttons(
-                            add_root.clone(),
-                            PublicAccountDialogKind::Derive,
-                            "wallet-public-add-derived-touch-id",
-                            self.public_form.adding_account,
-                            device_auth_lease,
-                        ),
-                    ))
-                    .children(self.public_form.error.as_ref().map(|message| {
-                        Alert::error("wallet-public-add-derived-error", message.to_string()).small()
-                    }))
-                    .child(
-                        app_button(
-                            "wallet-public-add-derived-submit",
-                            if self.public_form.adding_account {
-                                "Deriving..."
-                            } else {
-                                "Derive account"
-                            },
-                        )
-                        .primary()
-                        .small()
-                        .loading(self.public_form.adding_account)
-                        .disabled(self.public_form.adding_account || self.device_auth_in_progress)
-                        .on_click(move |_event, window, cx| {
-                            add_root.update(cx, |root, cx| {
-                                root.add_public_derived_account_from_input(window, cx);
-                            });
-                        }),
-                    )
+                self.render_derive_preview_content(add_root, content_width, device_auth_lease)
             }
             PublicAccountDialogKind::Import => {
                 let import_root = root.clone();

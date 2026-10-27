@@ -940,6 +940,20 @@ impl PublicAccountMetadata {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewedPublicAccountSkip {
+    /// A derived account, active or inactive, already uses the index.
+    AlreadyAdded,
+    /// The address already belongs to a visible Public account.
+    DuplicateAddress,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewedPublicAccountsAdded {
+    pub added: Vec<PublicAccountMetadata>,
+    pub skipped: Vec<(u32, PreviewedPublicAccountSkip)>,
+}
+
 struct RedactedSecret;
 
 impl fmt::Debug for RedactedSecret {

@@ -124,7 +124,9 @@ use private_action::{
 };
 use private_broadcaster::PrivateBroadcasterProgressState;
 use proposals::ProposalsState;
-use public_account::{HardwarePublicAccountDerivationStatus, PublicAccountFormState};
+use public_account::{
+    DerivePreviewState, HardwarePublicAccountDerivationStatus, PublicAccountFormState,
+};
 use public_action::{PublicActionMode, PublicActionProgressLifecycle, PublicSendKind};
 use public_balances::{
     public_account_visible_balances_for_chain, public_asset_decimals, public_asset_label,
@@ -1384,6 +1386,7 @@ impl WalletRoot {
             action_action_error: None,
             action_contract_address: None,
             next_derived_index: None,
+            derive_preview: DerivePreviewState::new(window, cx),
             next_account_label_number: 1,
             error: None,
             send_error: None,

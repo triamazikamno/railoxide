@@ -1,12 +1,13 @@
 use std::collections::BTreeSet;
 
 use super::{
-    ConfirmedHardwarePublicAccount, DesktopVaultStore, DesktopViewSession, EncryptedRecord,
-    KEY_LEN, PUBLIC_ACCOUNT_METADATA_PREFIX, ProtectedSoftwareSeedSession, PublicAccountMetadata,
-    PublicAccountScope, PublicAccountSecret, PublicAccountSource, PublicAccountStatus,
-    SoftwareSeedSessionBinding, SpendGrant, VaultError, ViewUnlock, WalletSoftwareContextKind,
-    Zeroizing, derive_public_evm_address_from_entropy, derive_public_evm_address_from_seed,
-    derive_public_evm_private_key_from_entropy, derive_public_evm_private_key_from_seed,
+    ConfirmedHardwarePublicAccount, DerivedPublicAccountPreview, DesktopVaultStore,
+    DesktopViewSession, EncryptedRecord, KEY_LEN, PUBLIC_ACCOUNT_METADATA_PREFIX,
+    PreviewedPublicAccountSkip, PreviewedPublicAccountsAdded, ProtectedSoftwareSeedSession,
+    PublicAccountMetadata, PublicAccountScope, PublicAccountSecret, PublicAccountSource,
+    PublicAccountStatus, SoftwareSeedSessionBinding, SpendGrant, VaultError, ViewUnlock,
+    WalletSoftwareContextKind, Zeroizing, derive_public_evm_private_key_from_entropy,
+    derive_public_evm_private_key_from_seed, derived_public_account_indexes,
     ensure_public_account_address_available, generate_opaque_id, next_derived_public_account_index,
     next_public_account_display_order, normalize_public_account_label,
     parse_public_evm_private_key, public_account_metadata_record_entry,
@@ -79,32 +80,14 @@ impl DesktopVaultStore {
         let wallet_id = view_session.wallet_id();
         let accounts = self.list_public_account_metadata_with_view(&view)?;
         let derivation_index = next_derived_public_account_index(&accounts, wallet_id)?;
-        let metadata = self.load_wallet_metadata_with_view(&view, wallet_id)?;
-        let Some(context) = metadata.software_context.as_ref() else {
-            return Err(VaultError::InvalidWalletMetadata);
-        };
-        let address = match context.kind {
-            WalletSoftwareContextKind::Passphrase => {
-                let session =
-                    protected_seed_session.ok_or(VaultError::SoftwareSeedSessionRequired)?;
-                let binding = SoftwareSeedSessionBinding::new(
-                    &context.base_profile_uuid,
-                    wallet_id,
-                    session.binding().vault_session_id(),
-                );
-                let seed = session.open(&mut grant, &binding)?;
-                derive_public_evm_address_from_seed(&seed, derivation_index)?
-            }
-            WalletSoftwareContextKind::Standard => {
-                let spend = grant.take_spend_unlock()?;
-                let spend_record = self.encrypted_record(&wallet_spend_record_key(wallet_id))?;
-                let spend_bundle = spend.decrypt_spend_bundle(wallet_id, &spend_record)?;
-                derive_public_evm_address_from_entropy(
-                    &spend_bundle.bip39_entropy,
-                    derivation_index,
-                )?
-            }
-        };
+        let address = self
+            .authorize_derived_public_account_preview(
+                &view,
+                &mut grant,
+                wallet_id,
+                protected_seed_session,
+            )?
+            .address(derivation_index)?;
         ensure_public_account_address_available(
             &accounts,
             address,
@@ -130,6 +113,124 @@ impl DesktopVaultStore {
         let (key, data) = public_account_metadata_record_entry(&view, &account)?;
         self.db.put_desktop_wallet_vault_record(&key, &data)?;
         Ok(account)
+    }
+
+    /// Authorizes like `add_derived_public_account_with_session` and returns a
+    /// preview holding only the account-level public key. Writes nothing.
+    pub fn derived_public_account_preview(
+        &self,
+        password: &str,
+        view_session: &DesktopViewSession,
+        protected_seed_session: Option<&ProtectedSoftwareSeedSession>,
+    ) -> Result<DerivedPublicAccountPreview, VaultError> {
+        let vault_metadata = self.metadata()?;
+        let view = unlock_view(&vault_metadata, password)?;
+        let mut grant = SpendGrant::one_use(unlock_spend(&vault_metadata, password)?);
+        self.authorize_derived_public_account_preview(
+            &view,
+            &mut grant,
+            view_session.wallet_id(),
+            protected_seed_session,
+        )
+    }
+
+    fn authorize_derived_public_account_preview(
+        &self,
+        view: &ViewUnlock,
+        grant: &mut SpendGrant,
+        wallet_id: &str,
+        protected_seed_session: Option<&ProtectedSoftwareSeedSession>,
+    ) -> Result<DerivedPublicAccountPreview, VaultError> {
+        let metadata = self.load_wallet_metadata_with_view(view, wallet_id)?;
+        let Some(context) = metadata.software_context.as_ref() else {
+            return Err(VaultError::InvalidWalletMetadata);
+        };
+        match context.kind {
+            WalletSoftwareContextKind::Passphrase => {
+                let session =
+                    protected_seed_session.ok_or(VaultError::SoftwareSeedSessionRequired)?;
+                let binding = SoftwareSeedSessionBinding::new(
+                    &context.base_profile_uuid,
+                    wallet_id,
+                    session.binding().vault_session_id(),
+                );
+                let seed = session.open(grant, &binding)?;
+                DerivedPublicAccountPreview::from_seed(wallet_id, &seed)
+            }
+            WalletSoftwareContextKind::Standard => {
+                let spend = grant.take_spend_unlock()?;
+                let spend_record = self.encrypted_record(&wallet_spend_record_key(wallet_id))?;
+                let spend_bundle = spend.decrypt_spend_bundle(wallet_id, &spend_record)?;
+                DerivedPublicAccountPreview::from_entropy(wallet_id, &spend_bundle.bip39_entropy)
+            }
+        }
+    }
+
+    /// Adds active derived accounts for `indexes` from an authorized preview in
+    /// one write, skipping indexes already used by a derived account and
+    /// addresses that duplicate a visible account.
+    pub fn add_previewed_public_accounts(
+        &self,
+        view_session: &DesktopViewSession,
+        preview: &DerivedPublicAccountPreview,
+        indexes: &[u32],
+    ) -> Result<PreviewedPublicAccountsAdded, VaultError> {
+        let wallet_id = view_session.wallet_id();
+        if preview.wallet_uuid != wallet_id {
+            return Err(VaultError::PublicAccountPreviewWalletMismatch);
+        }
+        if indexes.is_empty() || indexes.len() > DerivedPublicAccountPreview::MAX_ADD_INDEXES {
+            return Err(VaultError::InvalidPublicAccountSelection);
+        }
+        let accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
+        let used_indexes: BTreeSet<u32> =
+            derived_public_account_indexes(&accounts, wallet_id).collect();
+        let scope = PublicAccountScope::PrivateWallet {
+            wallet_uuid: wallet_id.to_owned(),
+        };
+        let first_display_order = next_public_account_display_order(&accounts)?;
+        let mut seen = BTreeSet::new();
+        let mut added = Vec::new();
+        let mut skipped = Vec::new();
+        for &index in indexes {
+            if !seen.insert(index) {
+                continue;
+            }
+            let address = preview.address(index)?;
+            if used_indexes.contains(&index) {
+                skipped.push((index, PreviewedPublicAccountSkip::AlreadyAdded));
+                continue;
+            }
+            // Distinct indexes never share an address, so earlier accounts in
+            // this batch need no duplicate check.
+            if ensure_public_account_address_available(&accounts, address, &scope, wallet_id)
+                .is_err()
+            {
+                skipped.push((index, PreviewedPublicAccountSkip::DuplicateAddress));
+                continue;
+            }
+            added.push(PublicAccountMetadata {
+                public_account_uuid: generate_opaque_id()?,
+                address,
+                label: None,
+                source: PublicAccountSource::Derived,
+                scope: scope.clone(),
+                derivation_index: Some(index),
+                hardware_descriptor: None,
+                status: PublicAccountStatus::Active,
+                display_order: first_display_order
+                    .checked_add(added.len() as u32)
+                    .ok_or(VaultError::PublicAccountDisplayOrderOverflow)?,
+            });
+        }
+        if !added.is_empty() {
+            let entries = added
+                .iter()
+                .map(|account| public_account_metadata_record_entry(&view_session.view, account))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.db.put_desktop_wallet_vault_records(&entries)?;
+        }
+        Ok(PreviewedPublicAccountsAdded { added, skipped })
     }
 
     pub fn add_hardware_public_account(

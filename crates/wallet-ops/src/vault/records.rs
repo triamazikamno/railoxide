@@ -15,7 +15,7 @@ use super::{
     bip39_mnemonic_from_entropy, generate_opaque_id,
 };
 
-use coins_bip32::prelude::{Parent, XPriv};
+use coins_bip32::prelude::{Parent, XPriv, XPub};
 
 use crate::parse_railgun_recipient;
 
@@ -645,10 +645,11 @@ fn ensure_public_address_book_address_available_except(
     }
 }
 
-pub(super) fn next_derived_public_account_index(
-    metadata: &[PublicAccountMetadata],
-    wallet_uuid: &str,
-) -> Result<u32, VaultError> {
+/// Derivation indexes used by the wallet's derived Public accounts, of any status.
+pub(super) fn derived_public_account_indexes<'a>(
+    metadata: &'a [PublicAccountMetadata],
+    wallet_uuid: &'a str,
+) -> impl Iterator<Item = u32> + 'a {
     metadata
         .iter()
         .filter(|account| {
@@ -657,13 +658,20 @@ pub(super) fn next_derived_public_account_index(
                 PublicAccountSource::Derived | PublicAccountSource::HardwareDerived
             )
         })
-        .filter(|account| {
+        .filter(move |account| {
             matches!(
                 &account.scope,
                 PublicAccountScope::PrivateWallet { wallet_uuid: scoped } if scoped == wallet_uuid
             )
         })
         .filter_map(|account| account.derivation_index)
+}
+
+pub(super) fn next_derived_public_account_index(
+    metadata: &[PublicAccountMetadata],
+    wallet_uuid: &str,
+) -> Result<u32, VaultError> {
+    derived_public_account_indexes(metadata, wallet_uuid)
         .max()
         .map_or(Ok(0), |max_index| {
             max_index
@@ -786,19 +794,74 @@ pub(super) fn derive_public_evm_private_key_from_seed(
     seed: &[u8; 64],
     derivation_index: u32,
 ) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
-    let root = XPriv::root_from_seed(seed, None).map_err(|_| VaultError::PublicEvmKeyDerivation)?;
-    let child = root
-        .derive_child(coins_bip32::BIP32_HARDEN + 44)
-        .and_then(|key| key.derive_child(coins_bip32::BIP32_HARDEN + 60))
-        .and_then(|key| key.derive_child(coins_bip32::BIP32_HARDEN))
-        .and_then(|key| key.derive_child(0))
-        .and_then(|key| key.derive_child(derivation_index))
+    let child = derive_public_evm_account_key_from_seed(seed)?
+        .derive_child(derivation_index)
         .map_err(|_| VaultError::PublicEvmKeyDerivation)?;
     let signing_key: &coins_bip32::ecdsa::SigningKey = child.as_ref();
     let bytes = signing_key.to_bytes();
     let mut private_key = [0u8; KEY_LEN];
     private_key.copy_from_slice(bytes.as_slice());
     Ok(Zeroizing::new(private_key))
+}
+
+/// Extended key at `m/44'/60'/0'/0`, the parent of every derived Public account.
+fn derive_public_evm_account_key_from_seed(seed: &[u8; 64]) -> Result<XPriv, VaultError> {
+    XPriv::root_from_seed(seed, None)
+        .and_then(|root| root.derive_child(coins_bip32::BIP32_HARDEN + 44))
+        .and_then(|key| key.derive_child(coins_bip32::BIP32_HARDEN + 60))
+        .and_then(|key| key.derive_child(coins_bip32::BIP32_HARDEN))
+        .and_then(|key| key.derive_child(0))
+        .map_err(|_| VaultError::PublicEvmKeyDerivation)
+}
+
+/// Derives Public account addresses for one wallet from the extended public key
+/// at `m/44'/60'/0'/0`. It holds no signing material, but it links every derived
+/// address, so it deliberately has no `Debug` and should be dropped with its dialog.
+pub struct DerivedPublicAccountPreview {
+    pub(super) wallet_uuid: String,
+    account_key: XPub,
+}
+
+impl DerivedPublicAccountPreview {
+    pub const PAGE_SIZE: u32 = 20;
+    pub const MAX_ADD_INDEXES: usize = 100;
+    /// Exclusive bound: higher indexes would be hardened and need the private key.
+    pub const INDEX_LIMIT: u32 = coins_bip32::BIP32_HARDEN;
+
+    pub(super) fn from_seed(wallet_uuid: &str, seed: &[u8; 64]) -> Result<Self, VaultError> {
+        Ok(Self {
+            wallet_uuid: wallet_uuid.to_owned(),
+            account_key: derive_public_evm_account_key_from_seed(seed)?.verify_key(),
+        })
+    }
+
+    pub(super) fn from_entropy(wallet_uuid: &str, entropy: &[u8]) -> Result<Self, VaultError> {
+        let mnemonic = Zeroizing::new(bip39_mnemonic_from_entropy(entropy)?);
+        let seed = bip39_seed_from_mnemonic(&mnemonic, "")?;
+        Self::from_seed(wallet_uuid, &seed)
+    }
+
+    pub fn address(&self, derivation_index: u32) -> Result<Address, VaultError> {
+        if derivation_index >= Self::INDEX_LIMIT {
+            return Err(VaultError::InvalidPublicAccountSelection);
+        }
+        let child = self
+            .account_key
+            .derive_child(derivation_index)
+            .map_err(|_| VaultError::PublicEvmKeyDerivation)?;
+        Ok(Address::from_public_key(child.as_ref()))
+    }
+
+    /// Up to `PAGE_SIZE` consecutive indexes from `start`, stopping at `INDEX_LIMIT`.
+    pub fn page(&self, start: u32) -> Result<Vec<(u32, Address)>, VaultError> {
+        if start >= Self::INDEX_LIMIT {
+            return Err(VaultError::InvalidPublicAccountSelection);
+        }
+        let end = start.saturating_add(Self::PAGE_SIZE).min(Self::INDEX_LIMIT);
+        (start..end)
+            .map(|index| Ok((index, self.address(index)?)))
+            .collect()
+    }
 }
 
 pub(super) fn derive_public_evm_address_from_seed(

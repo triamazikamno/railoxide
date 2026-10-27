@@ -4177,6 +4177,10 @@ impl WalletRoot {
     }
 
     pub(super) fn clear_protected_software_seed_session(&mut self, cx: &mut Context<'_, Self>) {
+        if self.protected_software_seed_session.is_some() {
+            // A passphrase context's address preview was authorized with this session.
+            self.public_form.derive_preview.reset();
+        }
         if clear_protected_software_seed_session_state(
             &mut self.protected_software_seed_session,
             &mut self.spend_authorization_cache,

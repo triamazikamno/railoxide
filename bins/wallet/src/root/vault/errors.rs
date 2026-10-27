@@ -51,6 +51,8 @@ pub(in crate::root) const fn vault_error_kind(error: &VaultError) -> &'static st
         VaultError::PublicAccountDisplayOrderOverflow => "public_account_display_order_overflow",
         VaultError::InvalidPublicEvmPrivateKey => "invalid_public_evm_private_key",
         VaultError::PublicEvmKeyDerivation => "public_evm_key_derivation",
+        VaultError::PublicAccountPreviewWalletMismatch => "public_account_preview_wallet_mismatch",
+        VaultError::InvalidPublicAccountSelection => "invalid_public_account_selection",
         VaultError::InvalidAddressBookLabel => "invalid_address_book_label",
         VaultError::InvalidPrivateAddressBookAddress => "invalid_private_address_book_address",
         VaultError::DuplicatePrivateAddressBookAddress => "duplicate_private_address_book_address",
@@ -148,6 +150,12 @@ pub(in crate::root) fn vault_error_message(error: &VaultError) -> Arc<str> {
         }
         VaultError::InvalidHardwareAccountRecoveryRange => {
             "Enter a valid bounded hardware account recovery range.".into()
+        }
+        VaultError::PublicAccountPreviewWalletMismatch => {
+            "The address preview belongs to another wallet. Reopen it and try again.".into()
+        }
+        VaultError::InvalidPublicAccountSelection => {
+            "Select between 1 and 100 accounts to add.".into()
         }
         _ => "Wallet vault operation failed. See logs for non-sensitive diagnostics.".into(),
     }

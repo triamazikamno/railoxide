@@ -479,6 +479,106 @@ fn derived_duplicate_address_is_rejected() {
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 #[test]
+fn derived_public_account_preview_writes_nothing_and_adds_selected_indexes() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let view_session = import_wallet_with_metadata(&store, "preview-wallet", "Public A");
+    let other_session = import_wallet_with_metadata(&store, "preview-other-wallet", "Public B");
+    let hidden = store
+        .add_derived_public_account(TEST_PASSWORD, &view_session, None)
+        .expect("add index one");
+    store
+        .deactivate_derived_public_account(&view_session, &hidden.public_account_uuid)
+        .expect("hide index one");
+    let index_three_key =
+        derive_public_evm_private_key_from_mnemonic(TEST_MNEMONIC, 3).expect("index three key");
+    store
+        .import_public_account(
+            TEST_PASSWORD,
+            &view_session,
+            &format!("0x{}", alloy::hex::encode(index_three_key)),
+            None,
+            false,
+        )
+        .expect("import index three address");
+    let before = db
+        .list_desktop_wallet_vault_records("")
+        .expect("records before preview");
+
+    assert!(matches!(
+        store.derived_public_account_preview("wrong password", &view_session, None),
+        Err(VaultError::UnlockFailed)
+    ));
+    let preview = store
+        .derived_public_account_preview(TEST_PASSWORD, &view_session, None)
+        .expect("preview");
+    let page = preview.page(0).expect("first page");
+    assert_eq!(page.len(), 20);
+    for (index, address) in page {
+        assert_eq!(
+            address,
+            derive_public_evm_address_from_mnemonic_with_passphrase(TEST_MNEMONIC, "", index)
+                .expect("single-account address")
+        );
+    }
+    let last_page = preview
+        .page(DerivedPublicAccountPreview::INDEX_LIMIT - 1)
+        .expect("last page");
+    assert_eq!(last_page.len(), 1);
+    assert!(
+        preview
+            .address(DerivedPublicAccountPreview::INDEX_LIMIT)
+            .is_err()
+    );
+    assert!(matches!(
+        store.add_previewed_public_accounts(&other_session, &preview, &[4]),
+        Err(VaultError::PublicAccountPreviewWalletMismatch)
+    ));
+    assert!(matches!(
+        store.add_previewed_public_accounts(
+            &view_session,
+            &preview,
+            &(0..101).collect::<Vec<u32>>()
+        ),
+        Err(VaultError::InvalidPublicAccountSelection)
+    ));
+    assert_eq!(
+        db.list_desktop_wallet_vault_records("")
+            .expect("records after preview and rejected adds"),
+        before
+    );
+
+    let result = store
+        .add_previewed_public_accounts(&view_session, &preview, &[0, 1, 3, 4, 4, 23])
+        .expect("add previewed accounts");
+    assert_eq!(
+        result.skipped,
+        vec![
+            (0, PreviewedPublicAccountSkip::AlreadyAdded),
+            (1, PreviewedPublicAccountSkip::AlreadyAdded),
+            (3, PreviewedPublicAccountSkip::DuplicateAddress),
+        ]
+    );
+    let stored = store
+        .list_active_public_accounts_for_session(&view_session)
+        .expect("accounts after add");
+    let mut display_orders = Vec::new();
+    for (account, index) in result.added.iter().zip([4, 23]) {
+        assert_eq!(account.derivation_index, Some(index));
+        assert_eq!(account.address, preview.address(index).expect("address"));
+        assert_eq!(account.source, PublicAccountSource::Derived);
+        assert_eq!(account.label, None);
+        assert!(account.is_active_for_wallet("preview-wallet") && !account.is_global());
+        assert!(stored.contains(account));
+        display_orders.push(account.display_order);
+    }
+    assert_eq!(result.added.len(), 2);
+    assert_eq!(display_orders[1], display_orders[0] + 1);
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+#[test]
 fn public_account_signing_key_resolves_derived_and_imported_accounts() {
     let (root_dir, db, store) = desktop_store_with_vault();
     let view_session = import_wallet_with_metadata(&store, "public-signing-wallet", "Public A");
