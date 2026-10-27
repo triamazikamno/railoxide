@@ -836,7 +836,7 @@ impl WalletRoot {
                     "Available after wallet session starts"
                 })
         });
-        // The `unshield`, `broadcaster-progress:` and `setup:` UI fixtures offer a stand-in
+        // The `unshield`, `broadcaster-progress:`, `setup:` and `max:` UI fixtures offer a stand-in
         // asset without private funds.
         let stand_in =
             unshield_asset.is_some() || send_asset.is_some() || fixture_swap_token.is_some();

@@ -97,30 +97,6 @@ pub fn amount_input(
         .child(crate::controls::app_input(state).disabled(disabled))
 }
 
-#[must_use]
-pub fn amount_metric(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-    value: String,
-    disabled: bool,
-    on_select: impl Fn(&mut Window, &mut App) + 'static,
-) -> gpui_component::button::Button {
-    crate::controls::app_button_base(id)
-        .disabled(disabled)
-        .child(
-            div()
-                .w_full()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(app_muted_text(label))
-                .child(app_strong_text(value)),
-        )
-        .on_click(move |_, window, cx| on_select(window, cx))
-}
-
 pub struct BroadcasterSettings {
     pub allow_out_of_range: bool,
     pub favorites_only: bool,

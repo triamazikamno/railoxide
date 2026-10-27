@@ -40,9 +40,9 @@ use gpui_component::{
 };
 use ui::clipboard::{clipboard_with_toast, copy_to_clipboard_with_toast};
 use ui::controls::{
-    app_amount_input, app_amount_text, app_button, app_button_base, app_button_label, app_input,
-    app_muted_shimmer_text, app_muted_text, app_segment_button, app_shimmer_text, app_strong_text,
-    app_text,
+    amount_max_button, app_amount_input, app_amount_text, app_button, app_button_base,
+    app_button_label, app_input, app_muted_shimmer_text, app_muted_text, app_segment_button,
+    app_shimmer_text, app_strong_text, app_text,
 };
 use ui::hint::hint_card;
 use ui::recipient_picker::RecipientPickerEvent;
@@ -3673,9 +3673,6 @@ impl PrivateSwapsView {
         operation: Option<ExecutorOperationId>,
         cx: &App,
     ) -> Vec<UnshieldAsset> {
-        let (Some(owner), Some(session)) = (self.private_owner(), self.private_session()) else {
-            return Vec::new();
-        };
         let Some(root) = self.root.upgrade() else {
             return Vec::new();
         };
@@ -3691,6 +3688,15 @@ impl PrivateSwapsView {
             .effective_chain_configs
             .get(self.origin_chain_id)
             .and_then(|chain| chain.wrapped_native_token);
+        // Debug UI fixture: a `max:` mode sells a stand-in when the wallet holds nothing to swap.
+        let fixture_assets = || {
+            wrapped
+                .and_then(|wrapped| super::ui_fixture::max_asset(self.origin_chain_id, wrapped))
+                .map_or_else(Vec::new, |asset| vec![asset])
+        };
+        let (Some(owner), Some(session)) = (self.private_owner(), self.private_session()) else {
+            return fixture_assets();
+        };
         let mut assets = root
             .private_action_asset_options(DeliveryFormKind::Unshield, self.origin_chain_id)
             .into_iter()
@@ -3705,6 +3711,9 @@ impl PrivateSwapsView {
                 asset
             })
             .collect::<Vec<_>>();
+        if assets.is_empty() {
+            return fixture_assets();
+        }
         // The wrapped native token leads; the rest keep their order.
         assets.sort_by_key(|asset| native_rank(asset.token, wrapped));
         assets
@@ -3740,9 +3749,15 @@ impl PrivateSwapsView {
         FormAssets {
             sell_assets: self.sell_assets(operation, cx),
             totals,
+            // Debug UI fixture: `max:locked` locks part of its stand-in Sell asset.
             locked: self
                 .private_session()
-                .map_or(U256::ZERO, |session| session.locked_note_value(sell)),
+                .map(|session| session.locked_note_value(sell))
+                .filter(|locked| !locked.is_zero())
+                .or_else(|| {
+                    super::ui_fixture::locked_sell_value(sell, self.wrapped_native_token(cx))
+                })
+                .unwrap_or_default(),
             // The Buy list leaves out the token sold. Its configured tokens never hold the native
             // asset, which the picker adds beside the wrapped native token.
             sell_receivable: self
@@ -10016,15 +10031,6 @@ impl PrivateSwapsView {
             available = available.saturating_sub(review.gas_plan().max_gas_cost);
         }
         let available_label = self.form_sell_amount(form, available, cx);
-        let source_balance_label = form.public.as_ref().map_or_else(
-            || available_label.clone(),
-            |public| {
-                format!(
-                    "{available_label} in {}",
-                    public_source_label(&public.account)
-                )
-            },
-        );
         let locked_value = asset.map_or(U256::ZERO, |_| form.assets.locked);
         let usd = self
             .form_amount(form, cx)
@@ -10088,17 +10094,19 @@ impl PrivateSwapsView {
                             .items_center()
                             .gap_1()
                             .children(asset.map(|_| {
-                                balance_text(if locked_value.is_zero() {
-                                    source_balance_label.clone()
-                                } else {
-                                    format!(
-                                        "{available_label} · {} locked",
-                                        self.token_amount(form.sell, locked_value, cx)
-                                    )
-                                })
+                                amount_max_button("swap-amount-max", Some(available_label))
+                                    .debug_selector(|| "swap-amount-max".into())
+                                    .disabled(!editable || available.is_zero())
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.use_amount(available, window, cx);
+                                    }))
                             }))
                             .when(!locked_value.is_zero(), |row| {
-                                row.child(
+                                row.child(balance_text(format!(
+                                    "{} locked",
+                                    self.token_amount(form.sell, locked_value, cx)
+                                )))
+                                .child(
                                     app_button_base("swap-review-locked-notes")
                                         .label("Review")
                                         .ghost()
@@ -10108,24 +10116,6 @@ impl PrivateSwapsView {
                                         .tooltip("Show the locked notes and what holds them")
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.open_locked_notes(window, cx);
-                                        })),
-                                )
-                            })
-                            .when(!available.is_zero(), |row| {
-                                row.child(
-                                    app_button_base("swap-amount-max")
-                                        .debug_selector(|| "swap-amount-max".into())
-                                        .label("Max")
-                                        .ghost()
-                                        .xsmall()
-                                        .compact()
-                                        .line_height(relative(theme::APP_TEXT_LINE_HEIGHT))
-                                        .disabled(!editable)
-                                        .tooltip(format!(
-                                            "Use {available_label}, the most one swap can spend"
-                                        ))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.use_amount(available, window, cx);
                                         })),
                                 )
                             }),

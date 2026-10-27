@@ -259,6 +259,15 @@ pub(super) fn unshield_form_max_entered_amount(
     }
 }
 
+/// Without an estimate, Max fills the fee-mode batched max; an estimate error clamps it later.
+pub(super) fn unshield_max_fill_amount(
+    limit: Option<U256>,
+    max_batched: U256,
+    fee_mode: FeeHandlingMode,
+) -> U256 {
+    limit.unwrap_or_else(|| unshield_max_entered_amount_for_mode(max_batched, fee_mode))
+}
+
 fn max_broadcaster_fee_token_amount_from_snapshot(
     snapshot: &ListUtxosOutput,
     token: Address,

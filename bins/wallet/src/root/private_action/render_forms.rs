@@ -5,19 +5,21 @@ use super::{
     app_strong_text, delivery_element_id, div, effective_self_broadcast_funding_mode,
     fee_policy_eligible_public_broadcasters, format_form_error_for_asset,
     is_effective_wrapped_native_token, labeled_field, private_action_amount_input,
-    private_broadcaster_closed_active_progress, public_broadcaster_cost_status,
-    public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
-    px, render_delivery_selector, render_fee_mode_toggle, render_private_action_metrics,
+    private_action_metric_display_amount, private_broadcaster_closed_active_progress,
+    public_broadcaster_cost_status, public_broadcaster_fee_token_warning,
+    public_broadcaster_submit_disabled_for_fee_token_options, px, render_delivery_selector,
+    render_fee_mode_toggle, render_private_action_amount_field,
     render_private_broadcaster_status_notice, render_private_self_broadcast_status_notice,
     render_private_submission_active_status_notice, render_public_broadcaster_cost_estimate,
     render_public_broadcaster_cost_status, render_public_broadcaster_settings,
     render_recipient_picker, render_self_broadcast_settings, render_send_result,
     render_sponsored_funding_estimate, render_unshield_generating_status,
     render_unshield_native_top_up_control, render_unshield_output_toggle, render_unshield_result,
-    selected_broadcaster_fee_warning, send_element_id,
+    selected_broadcaster_fee_warning, send_element_id, send_form_max_entered_amount,
     should_render_public_broadcaster_cost_preview, sponsored_estimate_allows_submission,
     sponsored_funding_choice_visible, sponsored_funding_enabled,
     sponsored_self_broadcast_availability_reason, unshield_element_id,
+    unshield_form_max_entered_amount,
 };
 
 impl WalletRoot {
@@ -37,7 +39,7 @@ impl WalletRoot {
             "Raw base units for this unknown token".to_string()
         };
         let delivery_root = root.clone();
-        let metrics_root = root.clone();
+        let max_root = root.clone();
         let chooser_root = root.clone();
         let estimate_root = root.clone();
         let progress_root = root.clone();
@@ -79,20 +81,7 @@ impl WalletRoot {
             public_broadcaster_submitted || self_broadcast_submitted || sponsored_submitted;
         let recipient_options = self.private_send_recipient_options();
 
-        let mut card =
-            div()
-                .w(content_width)
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(render_private_action_metrics(
-                    metrics_root,
-                    key,
-                    DeliveryFormKind::Send,
-                    asset,
-                    form.generating,
-                    content_width,
-                ));
+        let mut card = div().w(content_width).flex().flex_col().gap_3();
 
         if asset.total > asset.max_batched {
             card = card.child(
@@ -254,8 +243,15 @@ impl WalletRoot {
                     .min_w(px(0.0)),
                 )
                 .child(
-                    labeled_field(
+                    render_private_action_amount_field(
+                        max_root,
+                        key,
+                        DeliveryFormKind::Send,
                         unit_hint,
+                        send_form_max_entered_amount(form, form.delivery_mode, form.fee_mode).map(
+                            |amount| private_action_metric_display_amount(amount, asset.decimals),
+                        ),
+                        form.generating,
                         private_action_amount_input(
                             &form.amount_input,
                             form.generating,
@@ -467,7 +463,7 @@ impl WalletRoot {
         };
         let delivery_root = root.clone();
         let fee_mode_root = root.clone();
-        let metrics_root = root.clone();
+        let max_root = root.clone();
         let chooser_root = root.clone();
         let output_root = root.clone();
         let estimate_root = root.clone();
@@ -511,20 +507,7 @@ impl WalletRoot {
             public_broadcaster_submitted || self_broadcast_submitted || sponsored_submitted;
         let recipient_options = self.private_unshield_recipient_options();
 
-        let mut card =
-            div()
-                .w(content_width)
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(render_private_action_metrics(
-                    metrics_root,
-                    key,
-                    DeliveryFormKind::Unshield,
-                    asset,
-                    form.generating,
-                    content_width,
-                ));
+        let mut card = div().w(content_width).flex().flex_col().gap_3();
 
         if form.native_top_up_enabled {
             card = card.child(ui::private_action::warning(
@@ -713,8 +696,20 @@ impl WalletRoot {
                         )
                     }))
                     .child(
-                        labeled_field(
+                        render_private_action_amount_field(
+                            max_root,
+                            key,
+                            DeliveryFormKind::Unshield,
                             unit_hint,
+                            unshield_form_max_entered_amount(
+                                form,
+                                form.delivery_mode,
+                                form.fee_mode,
+                            )
+                            .map(|amount| {
+                                private_action_metric_display_amount(amount, asset.decimals)
+                            }),
+                            form.generating,
                             private_action_amount_input(
                                 &form.amount_input,
                                 form.generating,

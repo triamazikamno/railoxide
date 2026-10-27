@@ -251,6 +251,13 @@
 //!   native token when the wallet holds nothing it can unshield, so the form's Output toggle
 //!   and gas top-up can be looked at. The network's private session must be started. Nothing
 //!   about the asset is real, so its estimates and Unshield fail.
+//! - `max:fragmented` and `max:locked` let the Private tab's Send and Unshield offer a
+//!   stand-in 12.345678901234567891 of the network's wrapped native token, with its icon, whose
+//!   Max is 7.123456789012345678, when the wallet holds nothing it can spend. Swap is offered
+//!   too, and the private swap form's Sell panel offers the same stand-in when the wallet holds
+//!   nothing it can swap. `max:locked` also shows 0.5 of it locked there. The network's private
+//!   session must be started. Nothing about the assets is real, so estimates, quotes and
+//!   submission fail or do nothing.
 //! - `rotation:in-progress` and `rotation:waku-failed` change what New Tor session does, in
 //!   the native popover and from the extension. `in-progress` holds the rotation pending, so
 //!   the shared control shows it in progress for as long as the wallet runs. `waku-failed`
@@ -351,6 +358,7 @@ enum Mode {
     Refund(Refund),
     Utxos,
     Unshield,
+    Max(Max),
     Rotation { waku_failed: bool },
     RetryReview,
     QuoteError,
@@ -375,6 +383,13 @@ enum BroadcasterProgress {
     Timeout,
     /// Waiting in direct network mode, with no route of its own.
     Direct,
+}
+
+/// Whether a `max:` mode's stand-in Sell asset has locked notes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Max {
+    Fragmented,
+    Locked,
 }
 
 /// What a `cancelled:` mode holds of stealth account #5 once the fresh source preparation that
@@ -546,6 +561,13 @@ fn parse(value: &str) -> Option<Mode> {
     }
     if value == "unshield" {
         return Some(Mode::Unshield);
+    }
+    if let Some(state) = value.strip_prefix("max:") {
+        return Some(Mode::Max(match state {
+            "fragmented" => Max::Fragmented,
+            "locked" => Max::Locked,
+            _ => return None,
+        }));
     }
     if let Some(state) = value.strip_prefix("broadcaster-progress:") {
         return Some(Mode::BroadcasterProgress(match state {
@@ -2791,32 +2813,62 @@ fn stand_in_asset(chain_id: u64, wrapped_native: Address) -> crate::root::Unshie
     }
 }
 
-/// The stand-in asset of the `unshield` mode. `None` in every other mode.
-pub(in crate::root) fn unshield_asset(
+/// The stand-in asset of a `max:` mode: 12.345678901234567891 of `chain_id`'s wrapped native
+/// token `wrapped_native`, with its icon, in notes whose largest spend is 7.123456789012345678.
+/// Send, Unshield and the swap's Sell panel offer it. `None` in every other mode.
+pub(super) fn max_asset(
     chain_id: u64,
     wrapped_native: Address,
 ) -> Option<crate::root::UnshieldAsset> {
-    matches!(mode(), Some(Mode::Unshield)).then(|| stand_in_asset(chain_id, wrapped_native))
-}
-
-/// The stand-in asset Send offers in a `broadcaster-progress:` mode, with its token's icon.
-/// `None` in every other mode.
-pub(in crate::root) fn send_asset(
-    chain_id: u64,
-    wrapped_native: Address,
-) -> Option<crate::root::UnshieldAsset> {
-    matches!(mode(), Some(Mode::BroadcasterProgress(_))).then(|| crate::root::UnshieldAsset {
+    let total = U256::from(12_345_678_901_234_567_891_u64);
+    matches!(mode(), Some(Mode::Max(_))).then(|| crate::root::UnshieldAsset {
+        total,
+        poi_verified_total: total,
+        max_batched: U256::from(7_123_456_789_012_345_678_u64),
         icon_path: token_icon_asset_path(chain_id, &wrapped_native).map(WalletIconSource::embedded),
         ..stand_in_asset(chain_id, wrapped_native)
     })
 }
 
-/// The token the Private tab's Swap offers in a `setup:`, `retry-review` or `native-buy` mode,
-/// `wrapped_native`, so an unfunded wallet can open the mode's swap. `None` in every other mode.
+/// What a `max:locked` mode reports locked of `token`, 0.5 when it is the stand-in Sell asset
+/// `wrapped_native`. `None` in every other mode.
+pub(super) fn locked_sell_value(token: Address, wrapped_native: Option<Address>) -> Option<U256> {
+    (matches!(mode(), Some(Mode::Max(Max::Locked))) && wrapped_native == Some(token))
+        .then_some(U256::from(500_000_000_000_000_000_u64))
+}
+
+/// The stand-in asset of the `unshield` or a `max:` mode. `None` in every other mode.
+pub(in crate::root) fn unshield_asset(
+    chain_id: u64,
+    wrapped_native: Address,
+) -> Option<crate::root::UnshieldAsset> {
+    max_asset(chain_id, wrapped_native).or_else(|| {
+        matches!(mode(), Some(Mode::Unshield)).then(|| stand_in_asset(chain_id, wrapped_native))
+    })
+}
+
+/// The stand-in asset Send offers in a `broadcaster-progress:` or `max:` mode, with its token's
+/// icon. `None` in every other mode.
+pub(in crate::root) fn send_asset(
+    chain_id: u64,
+    wrapped_native: Address,
+) -> Option<crate::root::UnshieldAsset> {
+    max_asset(chain_id, wrapped_native).or_else(|| {
+        matches!(mode(), Some(Mode::BroadcasterProgress(_))).then(|| crate::root::UnshieldAsset {
+            icon_path: token_icon_asset_path(chain_id, &wrapped_native)
+                .map(WalletIconSource::embedded),
+            ..stand_in_asset(chain_id, wrapped_native)
+        })
+    })
+}
+
+/// The token the Private tab's Swap offers in a `setup:`, `retry-review`, `native-buy` or `max:`
+/// mode, `wrapped_native`, so an unfunded wallet can open the mode's swap. `None` in every other
+/// mode.
 pub(in crate::root) fn setup_swap_token(wrapped_native: Address) -> Option<Address> {
     matches!(
         mode(),
-        Some(Mode::Setup(_) | Mode::RetryReview | Mode::NativeBuy)
+        Some(Mode::Setup(_) | Mode::RetryReview | Mode::NativeBuy | Mode::Max(_))
     )
     .then_some(wrapped_native)
 }

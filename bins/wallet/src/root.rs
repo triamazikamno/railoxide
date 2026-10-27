@@ -136,6 +136,7 @@ use public_broadcaster::{
     public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
     send_form_max_entered_amount, should_show_distinct_amount, should_show_fee_mode_toggle,
     unshield_form_max_entered_amount, unshield_max_entered_amount_for_mode,
+    unshield_max_fill_amount,
 };
 use settings::WalletSettingsEditor;
 use shell::{PoiArtifactCacheRetryAttempts, WalletTab};
@@ -195,14 +196,14 @@ use manage_wallets::{
 use private_action::native_top_up_request_from_plan;
 #[cfg(test)]
 use private_action::{
-    PrivateActionMetric, PrivateWalletRecipientSource, RecipientOption, RecipientOptionSource,
+    PrivateWalletRecipientSource, RecipientOption, RecipientOptionSource,
     SEND_AUTHORIZATION_FAILED_ERROR, SelfBroadcastNativeBalanceState,
     UNSHIELD_AUTHORIZATION_FAILED_ERROR, adjusted_amount_for_max_change,
     can_save_private_recipient, can_save_public_recipient, default_self_broadcast_gas_payer_uuid,
     form_error_clears_public_broadcaster_cost_estimate, format_exact_asset_amount_for_display,
     format_form_error_for_asset, normalized_address_book_save_label,
     private_action_assets_from_snapshot, private_action_metric_display_amount,
-    private_action_metrics, private_send_recipient_options, private_unshield_recipient_options,
+    private_send_recipient_options, private_unshield_recipient_options,
     random_self_broadcast_gas_payer_uuid, recipient_option_matches_search,
     selected_recipient_address, self_broadcast_gas_payer_matches_search,
     self_broadcast_native_balance_label, self_broadcast_native_balance_state,

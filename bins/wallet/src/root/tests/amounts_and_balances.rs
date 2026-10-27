@@ -53,60 +53,6 @@ fn balance_sync_data_source_is_active_and_progress_scoped() {
 }
 
 #[test]
-fn private_action_metrics_hide_values_matching_total() {
-    let token = Address::from([0x11; 20]);
-    let mut asset = UnshieldAsset {
-        chain_id: 1,
-        token,
-        label: "WETH".to_string(),
-        decimals: Some(18),
-        total: uint!(10_U256),
-        poi_verified_total: uint!(10_U256),
-        max_batched: uint!(10_U256),
-        icon_path: None,
-    };
-
-    assert_eq!(
-        private_action_metrics(&asset),
-        vec![PrivateActionMetric {
-            label: "Total private balance",
-            amount: uint!(10_U256),
-        }]
-    );
-
-    asset.poi_verified_total = uint!(7_U256);
-    assert_eq!(
-        private_action_metrics(&asset),
-        vec![
-            PrivateActionMetric {
-                label: "Total private balance",
-                amount: uint!(10_U256),
-            },
-            PrivateActionMetric {
-                label: "POI-verified balance",
-                amount: uint!(7_U256),
-            },
-        ]
-    );
-
-    asset.poi_verified_total = asset.total;
-    asset.max_batched = uint!(8_U256);
-    assert_eq!(
-        private_action_metrics(&asset),
-        vec![
-            PrivateActionMetric {
-                label: "Total private balance",
-                amount: uint!(10_U256),
-            },
-            PrivateActionMetric {
-                label: "Max batched transaction",
-                amount: uint!(8_U256),
-            },
-        ]
-    );
-}
-
-#[test]
 fn private_action_metric_display_amount_uses_compact_precision() {
     assert_eq!(
         private_action_metric_display_amount(uint!(10_447_680_100_412_055_662_U256), Some(18)),

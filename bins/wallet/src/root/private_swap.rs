@@ -109,6 +109,20 @@ mod ui_fixture {
         None
     }
 
+    pub(super) const fn max_asset(
+        _chain_id: u64,
+        _wrapped_native: alloy::primitives::Address,
+    ) -> Option<crate::root::UnshieldAsset> {
+        None
+    }
+
+    pub(super) const fn locked_sell_value(
+        _token: alloy::primitives::Address,
+        _wrapped_native: Option<alloy::primitives::Address>,
+    ) -> Option<alloy::primitives::U256> {
+        None
+    }
+
     pub(super) const fn active() -> bool {
         false
     }

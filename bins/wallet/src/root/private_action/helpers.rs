@@ -266,32 +266,6 @@ pub(in crate::root) fn form_error_decimal_after_marker(error: &str, marker: &str
     U256::from_str_radix(digits, 10).ok()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::root) struct PrivateActionMetric {
-    pub(in crate::root) label: &'static str,
-    pub(in crate::root) amount: U256,
-}
-
-pub(in crate::root) fn private_action_metrics(asset: &UnshieldAsset) -> Vec<PrivateActionMetric> {
-    let mut metrics = vec![PrivateActionMetric {
-        label: "Total private balance",
-        amount: asset.total,
-    }];
-    if asset.poi_verified_total != asset.total {
-        metrics.push(PrivateActionMetric {
-            label: "POI-verified balance",
-            amount: asset.poi_verified_total,
-        });
-    }
-    if asset.max_batched != asset.total {
-        metrics.push(PrivateActionMetric {
-            label: "Max batched transaction",
-            amount: asset.max_batched,
-        });
-    }
-    metrics
-}
-
 pub(in crate::root) fn private_action_metric_display_amount(
     amount: U256,
     decimals: Option<u8>,
@@ -766,81 +740,37 @@ pub(in crate::root) fn amount_adjustment_for_max_change(
     Some(format_send_amount_input(adjusted_amount, asset.decimals))
 }
 
-const PRIVATE_ACTION_METRIC_MIN_WIDTH: Pixels = px(280.0);
-const PRIVATE_ACTION_METRIC_GAP: Pixels = px(8.0);
-
-pub(in crate::root) fn render_private_action_metrics(
+pub(in crate::root) fn render_private_action_amount_field(
     root: Entity<WalletRoot>,
     key: UnshieldAssetKey,
     kind: DeliveryFormKind,
-    asset: &UnshieldAsset,
+    label: String,
+    max_label: Option<String>,
     disabled: bool,
-    content_width: Pixels,
+    input: impl IntoElement,
 ) -> gpui::Div {
-    let decimals = asset.decimals;
-    let metrics = private_action_metrics(asset);
-    let metric_width = private_action_metric_width(content_width, metrics.len());
     div()
-        .w(content_width)
         .flex()
-        .flex_wrap()
-        .gap_2()
-        .children(metrics.into_iter().map(move |metric| {
-            render_private_action_metric(
-                root.clone(),
-                key,
-                kind,
-                delivery_element_id(key, kind, private_action_metric_id_suffix(metric.label)),
-                metric,
-                decimals,
-                disabled,
-                metric_width,
-            )
-        }))
-}
-
-fn private_action_metric_width(content_width: Pixels, metric_count: usize) -> Pixels {
-    match metric_count {
-        2 if content_width >= PRIVATE_ACTION_METRIC_MIN_WIDTH * 2.0 + PRIVATE_ACTION_METRIC_GAP => {
-            (content_width - PRIVATE_ACTION_METRIC_GAP) * 0.5
-        }
-        3 if content_width
-            >= PRIVATE_ACTION_METRIC_MIN_WIDTH * 3.0 + PRIVATE_ACTION_METRIC_GAP * 2.0 =>
-        {
-            (content_width - PRIVATE_ACTION_METRIC_GAP * 2.0) / 3.0
-        }
-        _ => content_width,
-    }
-}
-
-pub(in crate::root) fn render_private_action_metric(
-    root: Entity<WalletRoot>,
-    key: UnshieldAssetKey,
-    kind: DeliveryFormKind,
-    id: SharedString,
-    metric: PrivateActionMetric,
-    decimals: Option<u8>,
-    disabled: bool,
-    width: Pixels,
-) -> impl IntoElement {
-    let value = private_action_metric_display_amount(metric.amount, decimals);
-    ui::private_action::amount_metric(id, metric.label, value, disabled, move |window, cx| {
-        root.update(cx, |root, cx| {
-            root.set_private_action_metric_amount(kind, key, metric.amount, window, cx);
-        });
-    })
-    .w(width)
-    .flex_none()
-    .min_w(PRIVATE_ACTION_METRIC_MIN_WIDTH)
-}
-
-pub(in crate::root) fn private_action_metric_id_suffix(label: &'static str) -> &'static str {
-    match label {
-        "Total private balance" => "metric-total",
-        "POI-verified balance" => "metric-poi-verified",
-        "Max batched transaction" => "metric-max-batched",
-        _ => "metric",
-    }
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(app_muted_text(label))
+                .child(
+                    amount_max_button(delivery_element_id(key, kind, "amount-max"), max_label)
+                        .disabled(disabled)
+                        .on_click(move |_event, window, cx| {
+                            root.update(cx, |root, cx| {
+                                root.set_private_action_amount_to_max(kind, key, window, cx);
+                            });
+                        }),
+                ),
+        )
+        .child(input)
 }
 
 pub(in crate::root) fn render_unshield_generating_status(

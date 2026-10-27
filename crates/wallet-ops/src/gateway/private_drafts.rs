@@ -212,7 +212,6 @@ pub struct GatewayPrivateTopUpOption {
 #[non_exhaustive]
 pub struct GatewayPrivateDraftOptions {
     pub assets: Vec<GatewayPrivateAssetChoice>,
-    pub metrics: Vec<GatewayPrivateAmountMetric>,
     pub warnings: Vec<String>,
     pub fee_tokens: Vec<GatewayPrivateAssetChoice>,
     pub show_fee_mode: bool,
@@ -256,12 +255,4 @@ pub struct GatewayPrivateDraftPicker {
     pub total_count: usize,
     /// Render-only records serialized by the shared UI model. Never accepted as commands.
     pub rows: Vec<serde_json::Value>,
-}
-
-#[derive(Clone, Default, Serialize, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct GatewayPrivateAmountMetric {
-    pub label: String,
-    pub value: String,
-    pub amount: String,
 }

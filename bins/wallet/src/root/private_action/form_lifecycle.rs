@@ -491,14 +491,32 @@ impl WalletRoot {
         }
     }
 
-    pub(in crate::root) fn set_private_action_metric_amount(
+    pub(in crate::root) fn set_private_action_amount_to_max(
         &mut self,
         kind: DeliveryFormKind,
         key: UnshieldAssetKey,
-        amount: U256,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let amount = match kind {
+            DeliveryFormKind::Send => {
+                let Some(form) = self.send_forms.get(&key) else {
+                    return;
+                };
+                send_form_max_entered_amount(form, form.delivery_mode, form.fee_mode)
+                    .unwrap_or(form.asset.max_batched)
+            }
+            DeliveryFormKind::Unshield => {
+                let Some(form) = self.unshield_forms.get(&key) else {
+                    return;
+                };
+                unshield_max_fill_amount(
+                    unshield_form_max_entered_amount(form, form.delivery_mode, form.fee_mode),
+                    form.asset.max_batched,
+                    form.fee_mode,
+                )
+            }
+        };
         let changed = self.set_programmatic_amount_input(kind, key, amount, window, cx);
         if changed {
             if kind == DeliveryFormKind::Unshield {

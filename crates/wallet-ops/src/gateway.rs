@@ -29,13 +29,12 @@ pub use provider::{
 };
 mod private_drafts;
 pub use private_drafts::{
-    GatewayBroadcasterChoice, GatewayPrivateAmountMetric, GatewayPrivateAssetChoice,
-    GatewayPrivateBroadcasterInput, GatewayPrivateDelivery, GatewayPrivateDisplayRow,
-    GatewayPrivateDraftControl, GatewayPrivateDraftEstimate, GatewayPrivateDraftInput,
-    GatewayPrivateDraftKind, GatewayPrivateDraftOptions, GatewayPrivateDraftPicker,
-    GatewayPrivateDraftProgress, GatewayPrivateDraftResult, GatewayPrivateFeeMode,
-    GatewayPrivateFunding, GatewayPrivateGasFee, GatewayPrivateIncentive,
-    GatewayPrivateSelfBroadcastInput, GatewayPrivateSelfBroadcastOptions,
+    GatewayBroadcasterChoice, GatewayPrivateAssetChoice, GatewayPrivateBroadcasterInput,
+    GatewayPrivateDelivery, GatewayPrivateDisplayRow, GatewayPrivateDraftControl,
+    GatewayPrivateDraftEstimate, GatewayPrivateDraftInput, GatewayPrivateDraftKind,
+    GatewayPrivateDraftOptions, GatewayPrivateDraftPicker, GatewayPrivateDraftProgress,
+    GatewayPrivateDraftResult, GatewayPrivateFeeMode, GatewayPrivateFunding, GatewayPrivateGasFee,
+    GatewayPrivateIncentive, GatewayPrivateSelfBroadcastInput, GatewayPrivateSelfBroadcastOptions,
     GatewayPrivateSignerChoice, GatewayPrivateTopUpOption,
 };
 mod drafts;

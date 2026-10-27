@@ -666,6 +666,22 @@ fn unshield_max_entered_amount_depends_on_fee_handling() {
         format_unshield_amount_input(add_on_top_max, Some(6)),
         "1.995"
     );
+    assert_eq!(
+        super::super::public_broadcaster::unshield_max_fill_amount(
+            None,
+            max_receiver,
+            FeeHandlingMode::AddToAmount,
+        ),
+        add_on_top_max
+    );
+    assert_eq!(
+        super::super::public_broadcaster::unshield_max_fill_amount(
+            Some(uint!(1_500_000_U256)),
+            max_receiver,
+            FeeHandlingMode::AddToAmount,
+        ),
+        uint!(1_500_000_U256)
+    );
 }
 
 #[test]

@@ -11,12 +11,11 @@ use crate::root::{
 use wallet_ops::{
     FeeHandlingMode, ListUtxosOutput, PublicBroadcasterCostEstimate,
     gateway::{
-        GatewayBroadcasterChoice, GatewayPrivateAmountMetric, GatewayPrivateAssetChoice,
-        GatewayPrivateDelivery, GatewayPrivateDisplayRow, GatewayPrivateDraftEstimate,
-        GatewayPrivateDraftInput, GatewayPrivateDraftKind, GatewayPrivateDraftOptions,
-        GatewayPrivateDraftPicker, GatewayPrivateFeeMode, GatewayPrivateFunding,
-        GatewayPrivateGasFee, GatewayPrivateIncentive, GatewayPrivateSelfBroadcastInput,
-        GatewayPrivateTopUpOption,
+        GatewayBroadcasterChoice, GatewayPrivateAssetChoice, GatewayPrivateDelivery,
+        GatewayPrivateDisplayRow, GatewayPrivateDraftEstimate, GatewayPrivateDraftInput,
+        GatewayPrivateDraftKind, GatewayPrivateDraftOptions, GatewayPrivateDraftPicker,
+        GatewayPrivateFeeMode, GatewayPrivateFunding, GatewayPrivateGasFee,
+        GatewayPrivateIncentive, GatewayPrivateSelfBroadcastInput, GatewayPrivateTopUpOption,
     },
 };
 
@@ -397,19 +396,6 @@ impl WalletRoot {
         let Ok(asset) = self.private_draft_asset(input) else {
             return options;
         };
-        options.metrics = crate::root::private_action::private_action_metrics(&asset)
-            .into_iter()
-            .map(|metric| {
-                let mut row = GatewayPrivateAmountMetric::default();
-                row.label = metric.label.into();
-                row.value = crate::root::private_action::private_action_metric_display_amount(
-                    metric.amount,
-                    asset.decimals,
-                );
-                row.amount = format_send_amount_input(metric.amount, asset.decimals);
-                row
-            })
-            .collect();
         if asset.total > asset.max_batched {
             options.warnings.push(
                 ui::private_action::spend_capacity_warning(
