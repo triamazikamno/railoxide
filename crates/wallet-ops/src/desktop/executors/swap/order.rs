@@ -985,7 +985,29 @@ impl SwapReview {
         }
         // Within the cushion, more allowed gas or a lower minimum needs no review.
         let cushioned = self.cushioned_minimum(approved, approved_allowance);
-        if cushioned.is_none() && self.gas_allowance() > approved_allowance {
+        let cushion = approval_cushion(approved_allowance);
+        tracing::debug!(
+            target: "swap_quote",
+            step = "approval_check",
+            approved_minimum = %approved.private_minimum,
+            suggested_minimum = %self.suggested_private_minimum(),
+            approved_buy_amount = %approved.buy_amount,
+            buy_amount = %self.limit.buy_amount,
+            best_case = %self.limit.best_case,
+            approved_gas_allowance = %approved_allowance,
+            gas_allowance = %self.gas_allowance(),
+            cushion = %cushion,
+            approved_gas_price_wei = ?approved.gas_price_wei,
+            gas_price_wei = self.gas.gas_price_wei,
+            approved_destination_minimum = ?approved.destination_minimum,
+            destination_minimum = ?self.bridge.map(|bridge| bridge.destination_minimum),
+            cushioned_minimum = ?cushioned,
+            "compared the requote with the approval"
+        );
+        // Only a rise beyond the cushion needs a review on its own. A smaller one just adds to a
+        // quote shortfall, which the minimum checks below name.
+        if cushioned.is_none() && self.gas_allowance() > approved_allowance.saturating_add(cushion)
+        {
             return Err(SwapReviewChange::GasAllowance {
                 approved: approved_allowance,
                 current: self.gas_allowance(),
@@ -1045,26 +1067,37 @@ impl SwapReview {
     /// falls short of them by at most the cushion, a fifth of the approved allowed gas. It is
     /// the approved minimum, or for a Bridge delivery quoted below the approved destination
     /// minimum, the deposit scaled up to it: `ceil(deposit * approved / quoted)` plus the
-    /// margin, and at least the approved deposit. The shortfall is that minimum's buy amount
-    /// less this review's, and it also stays within this review's allowed gas, so the order
-    /// never asks for more than the best case after the price tolerance. `None` when the
-    /// shortfall is larger, or for a Bridge delivery without a quote or an approved destination
-    /// minimum.
+    /// margin, and at least the approved deposit. A NEAR Intents deposit is scaled so whenever
+    /// that fits the cushion, because signing quotes it only once, for the deposit it signs,
+    /// and must deliver the approved destination minimum then. The shortfall is that minimum's
+    /// buy amount less this review's, and it also stays within this review's allowed gas, so
+    /// the order never asks for more than the best case after the price tolerance. `None` when
+    /// the shortfall is larger, or for a Bridge delivery without a quote or an approved
+    /// destination minimum.
     fn cushioned_minimum(
         &self,
         approved: &SwapApprovedBounds,
         approved_allowance: U256,
     ) -> Option<U256> {
         let quoted_buy_amount = self.limit.buy_amount;
-        let minimum = if matches!(self.plan.delivery, SwapDelivery::Bridge(_)) {
+        let minimum = if let SwapDelivery::Bridge(delivery) = self.plan.delivery {
             let approved_destination = approved.destination_minimum?;
             let quoted_destination = self.bridge?.destination_minimum;
-            if quoted_destination >= approved_destination {
-                approved.private_minimum
+            // Bridge orders carry no shield, so the deposit is the private minimum.
+            let scaled =
+                scaled_bridge_deposit(quoted_buy_amount, approved_destination, quoted_destination)
+                    .map(|deposit| deposit.max(approved.private_minimum));
+            if quoted_destination < approved_destination {
+                scaled?
             } else {
-                // Bridge orders carry no shield, so the deposit is the private minimum.
-                scaled_bridge_deposit(quoted_buy_amount, approved_destination, quoted_destination)?
-                    .max(approved.private_minimum)
+                // Signing can raise an Across deposit and quote it again, but not a NEAR Intents
+                // one, so that takes the margin too when it fits the cushion.
+                scaled
+                    .filter(|&deposit| {
+                        delivery.provider == BridgeProvider::NearIntents
+                            && self.within_cushion(deposit, approved_allowance)
+                    })
+                    .unwrap_or(approved.private_minimum)
             }
         } else {
             approved.private_minimum
@@ -1222,7 +1255,8 @@ pub enum SwapReviewChange {
     /// The approval was saved before gas shares and records neither a share nor the allowed
     /// gas. It needs a full review.
     GasShare,
-    /// The fresh review allows more gas than the approval, in buy-token base units.
+    /// The fresh review allows more gas than the approval by more than the cushion, in
+    /// buy-token base units.
     GasAllowance {
         approved: U256,
         current: U256,

@@ -1240,6 +1240,17 @@ fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
             }),
             "{delivery:?}"
         );
+        // More gas within the cushion and a lower quote together go past it: the quote names it.
+        let fresh = price(delivery, bought - cushion, gas_up(cushion / U256::from(2)));
+        assert!(fresh.gas_allowance() > allowance);
+        assert_eq!(
+            fresh.approval_change(&approval),
+            Some(SwapReviewChange::Minimum {
+                approved: minimum,
+                current: fresh.suggested_private_minimum(),
+            }),
+            "{delivery:?}"
+        );
 
         // A lower quote at the same gas is taken from the allowed gas the same way.
         let fresh = price(delivery, bought - cushion / U256::from(2), data_cost);
@@ -1316,6 +1327,31 @@ fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
     let deposit = reviewed.suggested_private_minimum();
     let approval = reviewed.approval(deposit, false).unwrap();
     let cushion = reviewed.gas_allowance() / U256::from(5);
+
+    // An unchanged NEAR Intents quote still raises the deposit by the margin. Signing quotes it
+    // once more, and the same rate would only just deliver the approved minimum.
+    let margin = (deposit * U256::from(5)).div_ceil(U256::from(10_000));
+    assert_eq!(
+        reviewed.approved_order_minimum(&approval),
+        Ok(deposit + margin)
+    );
+    // A margin beyond the cushion is left out: a small drift still keeps the approved deposit.
+    let small = |buy_amount: u64| {
+        bridged(
+            &price_at(delivery, U256::from(buy_amount), U256::from(4_000), 0),
+            1_000_000,
+        )
+    };
+    let small_approval = small(1_000_000)
+        .approval(small(1_000_000).suggested_private_minimum(), false)
+        .unwrap();
+    let small_deposit = small_approval.bounds.private_minimum;
+    let fresh = small(999_900);
+    assert!(fresh.suggested_private_minimum() < small_deposit);
+    assert_eq!(
+        fresh.approved_order_minimum(&small_approval),
+        Ok(small_deposit)
+    );
 
     // 0.1% less on the destination: the deposit grows by that and the 5 bps margin.
     let scaled = (deposit * U256::from(1_000_000)).div_ceil(U256::from(999_000));
