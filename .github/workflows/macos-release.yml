@@ -104,6 +104,24 @@ jobs:
           python3 scripts/install-browser-extension-tools.py "$RUNNER_TEMP/browser-extension-tools"
           printf '%s\n' "$RUNNER_TEMP/browser-extension-tools/bin" >>"$GITHUB_PATH"
 
+      # Lint before the long build; style does not depend on the digest value.
+      - name: Check cask style
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_ANALYTICS: '1'
+        run: |
+          set -euo pipefail
+          version="$(python3 scripts/macos-packaging.py version)"
+          sums="$RUNNER_TEMP/placeholder-SHA256SUMS"
+          printf '%064d  RailOxide-v%s-macos-arm64.dmg\n' 0 "$version" >"$sums"
+          # Homebrew only lints casks inside a tap.
+          brew tap-new --no-git railoxide/ci
+          python3 scripts/macos-packaging.py render-cask \
+            --version "$version" \
+            --checksums "$sums" \
+            --output "$(brew --repository railoxide/ci)/Casks/railoxide.rb"
+          brew style --cask railoxide/ci/railoxide
+
       - name: Package release
         env:
           MACOS_MINIMUM_VERSION: '15.0'
@@ -176,20 +194,14 @@ jobs:
           cmp "$mount_point/RailOxide.app/Contents/MacOS/RailOxide" \
             target/macos/RailOxide.app/Contents/MacOS/RailOxide
 
-      - name: Check generated cask
-        env:
-          HOMEBREW_NO_AUTO_UPDATE: '1'
-          HOMEBREW_NO_ANALYTICS: '1'
+      - name: Render generated cask
         run: |
           set -euo pipefail
           version="$(python3 scripts/macos-packaging.py version)"
-          cask="$RUNNER_TEMP/homebrew-ci/Casks/railoxide.rb"
-          mkdir -p "$(dirname "$cask")"
           python3 scripts/macos-packaging.py render-cask \
             --version "$version" \
             --checksums "target/macos/release/RailOxide-v$version-macos-SHA256SUMS" \
-            --output "$cask"
-          brew style --cask "$cask"
+            --output "$RUNNER_TEMP/homebrew-ci/Casks/railoxide.rb"
 
       - name: Record build provenance
         env:
