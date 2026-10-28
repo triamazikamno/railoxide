@@ -1554,6 +1554,7 @@ fn build_reqwest_context(
         // `no_proxy` also keeps proxy environment variables from redirecting it.
         reqwest::Client::builder()
             .no_proxy()
+            .referer(false)
             .timeout(rpc_request_timeout(WalletNetworkMode::Direct))
             .build()
             .wrap_err("build direct RPC HTTP client")?
@@ -1584,7 +1585,7 @@ fn wallet_reqwest_client_builder(
     mode: WalletNetworkMode,
     proxy_url: Option<&Url>,
 ) -> Result<reqwest::ClientBuilder> {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder().referer(false);
     if let Some(proxy_url) = proxy_url {
         let display_proxy_url = redact_url_for_display(proxy_url);
         let proxy = reqwest::Proxy::all(proxy_url.as_str())
@@ -1594,7 +1595,31 @@ fn wallet_reqwest_client_builder(
     if mode == WalletNetworkMode::Tor {
         builder = builder.pool_max_idle_per_host(0);
     }
+    if mode != WalletNetworkMode::Direct {
+        builder = builder
+            .tls_backend_preconfigured(tls_config_without_resumption(&[b"h2", b"http/1.1"])?);
+    }
     Ok(builder)
+}
+
+/// Reqwest's default rustls setup with session resumption off, so a server cannot link
+/// connections that arrive over different Tor circuits or proxy exits.
+pub(crate) fn tls_config_without_resumption(alpn: &[&[u8]]) -> Result<rustls::ClientConfig> {
+    // Mirrors the `TlsBackend::Rustls` branch of reqwest 0.13's `ClientBuilder::build`.
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+    let verifier = rustls_platform_verifier::Verifier::new(Arc::clone(&provider))
+        .wrap_err("load platform TLS verifier")?;
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(rustls::ALL_VERSIONS)
+        .wrap_err("configure TLS protocol versions")?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|protocol| protocol.to_vec()).collect();
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(config)
 }
 
 const fn rpc_request_timeout(mode: WalletNetworkMode) -> Duration {
@@ -2496,6 +2521,153 @@ mod tests {
         assert!(!redacted.contains("path"));
         assert!(!redacted.contains("token"));
         assert!(!redacted.contains("fragment"));
+    }
+
+    async fn serve_one_http_request(listener: TcpListener, response: String) -> String {
+        let (mut stream, _) = listener.accept().await.expect("accept HTTP request");
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.ends_with(b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).await.expect("read HTTP request");
+            assert_ne!(read, 0, "client closed before sending headers");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write HTTP response");
+        String::from_utf8(request).expect("UTF-8 HTTP request")
+    }
+
+    #[tokio::test]
+    async fn wallet_client_follows_cross_origin_redirect_without_referer() {
+        let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind target");
+        let target_url = format!("http://{}/end", target.local_addr().unwrap());
+        let start = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind start");
+        let start_url = format!("http://{}/start?key=secret", start.local_addr().unwrap());
+        tokio::spawn(serve_one_http_request(
+            start,
+            format!("HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\n\r\n"),
+        ));
+        let target_request = tokio::spawn(serve_one_http_request(
+            target,
+            "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond".to_owned(),
+        ));
+        let context = build_reqwest_context(
+            WalletNetworkMode::Direct,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("direct context");
+
+        let body = context
+            .client
+            .get(start_url)
+            .send()
+            .await
+            .expect("follow redirect")
+            .text()
+            .await
+            .expect("read body");
+
+        assert_eq!(body, "second");
+        let target_request = target_request.await.unwrap().to_ascii_lowercase();
+        assert!(target_request.starts_with("get /end "));
+        assert!(!target_request.contains("referer:"), "{target_request}");
+    }
+
+    #[tokio::test]
+    async fn proxied_tls_config_never_resumes_and_keeps_platform_verification() {
+        use rustls::HandshakeKind;
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+
+        async fn connect(config: &Arc<rustls::ClientConfig>, addr: SocketAddr) -> io::Result<()> {
+            let stream = TcpStream::connect(addr).await?;
+            let mut tls = tokio_rustls::TlsConnector::from(Arc::clone(config))
+                .connect(ServerName::try_from("localhost").unwrap(), stream)
+                .await?;
+            // TLS 1.3 tickets arrive after the handshake, ahead of this byte.
+            tls.read_exact(&mut [0; 1]).await?;
+            Ok(())
+        }
+
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("test certificate");
+        let cert = certified.cert.der().clone();
+        let server_config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der())),
+            )
+            .expect("server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind TLS server");
+        let addr = listener.local_addr().unwrap();
+        let (kinds_tx, mut kinds_rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept TLS client");
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    continue;
+                };
+                let kind = tls.get_ref().1.handshake_kind();
+                tls.write_all(b"x").await.expect("write TLS byte");
+                tls.flush().await.expect("flush TLS byte");
+                kinds_tx.send(kind).expect("report handshake kind");
+            }
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).expect("trust test certificate");
+        let test_root_verifier =
+            rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .expect("test verifier");
+        let mut without_resumption = tls_config_without_resumption(&[b"http/1.1"]).unwrap();
+        without_resumption
+            .dangerous()
+            .set_certificate_verifier(test_root_verifier);
+        let mut control = without_resumption.clone();
+        control.resumption = rustls::client::Resumption::default();
+
+        let without_resumption = Arc::new(without_resumption);
+        for _ in 0..3 {
+            connect(&without_resumption, addr).await.expect("connect");
+            assert_eq!(kinds_rx.recv().await.unwrap(), Some(HandshakeKind::Full));
+        }
+        let control = Arc::new(control);
+        connect(&control, addr).await.expect("control connect");
+        assert_eq!(kinds_rx.recv().await.unwrap(), Some(HandshakeKind::Full));
+        connect(&control, addr).await.expect("control reconnect");
+        assert_eq!(kinds_rx.recv().await.unwrap(), Some(HandshakeKind::Resumed));
+
+        let unmodified = Arc::new(tls_config_without_resumption(&[b"http/1.1"]).unwrap());
+        let error = connect(&unmodified, addr)
+            .await
+            .expect_err("platform verifier rejects the test certificate");
+        assert!(
+            matches!(
+                error
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<rustls::Error>()),
+                Some(rustls::Error::InvalidCertificate(_))
+            ),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

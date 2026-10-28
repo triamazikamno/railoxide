@@ -597,7 +597,7 @@ impl WalletConnectRelaySocket {
 }
 
 fn relay_websocket_client(http: &HttpContext) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().http1_only();
+    let mut builder = reqwest::Client::builder().http1_only().referer(false);
     if let Some(proxy_url) = http.proxy_url.as_ref() {
         builder = builder.proxy(
             reqwest::Proxy::all(proxy_url.as_str())
@@ -605,7 +605,12 @@ fn relay_websocket_client(http: &HttpContext) -> Result<reqwest::Client> {
         );
     }
     if http.fail_closed() {
-        builder = builder.pool_max_idle_per_host(0);
+        // Offering `h2` would let the relay pick a protocol this HTTP/1.1 upgrade cannot use.
+        let tls = crate::http::tls_config_without_resumption(&[b"http/1.1"])
+            .map_err(|error| relay_transport_error("configure relay TLS", error))?;
+        builder = builder
+            .pool_max_idle_per_host(0)
+            .tls_backend_preconfigured(tls);
     }
     builder
         .build()
