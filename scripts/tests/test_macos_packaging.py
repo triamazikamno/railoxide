@@ -64,7 +64,7 @@ class MacosPackagingTests(unittest.TestCase):
         self.assertIn(f'version "{VERSION}"', cask)
         self.assertIn(f'sha256 "{digest}"', cask)
         self.assertIn('depends_on arch: :arm64', cask)
-        self.assertIn('depends_on macos: ">= :sequoia"', cask)
+        self.assertIn('depends_on macos: :sequoia', cask)
         self.assertIn('app "RailOxide.app"', cask)
         hooks = re.findall(
             r'^\s*(zap|uninstall\w*|preflight|postflight|auto_updates|installer)\b',

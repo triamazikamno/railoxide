@@ -8,7 +8,7 @@ cask "railoxide" do
   homepage "https://github.com/triamazikamno/railoxide"
 
   depends_on arch: :arm64
-  depends_on macos: ">= :sequoia"
+  depends_on macos: :sequoia
 
   app "RailOxide.app"
 
