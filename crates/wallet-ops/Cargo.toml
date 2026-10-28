@@ -83,6 +83,8 @@ block2 = "0.6"
 core-foundation = "0.10"
 # Link the bundled libusb statically so packaged apps never reference Homebrew's copy.
 libusb1-sys = { version = "0.7", optional = true, features = ["vendored"] }
+# Same for Arti's liblzma, which otherwise links Homebrew's xz when pkg-config finds it.
+liblzma-sys = { version = "0.4", features = ["static"] }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString"] }
 security-framework = "3"

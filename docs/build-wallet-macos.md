@@ -143,7 +143,8 @@ version as `MAJOR.MINOR.PATCH`, so `0.2.0-beta.10` becomes `0.2.0`. The app itse
 shows the full version.
 
 Hardware builds link libusb statically, so you do not need Homebrew's libusb. The
-app ships libusb's LGPL-2.1 license text in `Contents/Resources`.
+app ships libusb's LGPL-2.1 license text in `Contents/Resources`. liblzma, used by
+the built-in Tor client, is also linked statically, so Homebrew's xz is not needed.
 
 ### Release packaging
 
