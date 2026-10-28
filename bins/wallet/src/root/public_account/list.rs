@@ -1246,7 +1246,9 @@ impl WalletRoot {
         };
         let mut tags = div().flex().items_center().gap_1().flex_none();
         let source = match (account.source, account.derivation_index) {
-            (PublicAccountSource::Derived, Some(index)) => format!("Derived #{index}").into(),
+            (PublicAccountSource::Derived | PublicAccountSource::HardwareDerived, Some(index)) => {
+                format!("Derived #{index}").into()
+            }
             (source, _) => super::public_account_source_label(source).into(),
         };
         tags = tags.child(tag(source, gpui::rgb(ui::theme::TEXT_MUTED).into()));
