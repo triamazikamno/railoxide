@@ -247,55 +247,6 @@ jobs:
           path: ${{ runner.temp }}/homebrew-ci/Casks/railoxide.rb
           if-no-files-found: error
 
-  source-install-packaging:
-    if: github.event_name == 'pull_request'
-    needs: tooling
-    runs-on: macos-15
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - name: Install pinned Rust toolchain
-        run: |
-          set -euo pipefail
-          toolchain="$(sed -n 's/^rust-version = "\([0-9.]*\)"$/\1/p' Cargo.toml)"
-          [[ "$toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          rustup toolchain install "$toolchain" --profile minimal --target wasm32-unknown-unknown
-          printf 'CARGO_TOOLCHAIN=%s\n' "$toolchain" >>"$GITHUB_ENV"
-
-      - name: Install browser extension helper
-        run: |
-          set -euo pipefail
-          python3 scripts/install-browser-extension-tools.py "$RUNNER_TEMP/browser-extension-tools"
-          printf '%s\n' "$RUNNER_TEMP/browser-extension-tools/bin" >>"$GITHUB_PATH"
-
-      - name: Package for a source install
-        run: scripts/package-wallet-macos
-
-      - name: Check source-install output
-        run: |
-          set -euo pipefail
-          plist=target/macos/RailOxide.app/Contents/Info.plist
-          bundle_version="$(python3 scripts/macos-packaging.py version --bundle)"
-          checked_in_floor="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' bins/wallet/packaging/macos/Info.plist)"
-          expect_plist() {
-            local actual
-            actual="$(/usr/libexec/PlistBuddy -c "Print :$1" "$plist")"
-            if [[ "$actual" != "$2" ]]; then
-              printf '%s: expected %s, got %s\n' "$1" "$2" "$actual" >&2
-              exit 1
-            fi
-          }
-          expect_plist LSMinimumSystemVersion "$checked_in_floor"
-          expect_plist CFBundleShortVersionString "$bundle_version"
-          expect_plist CFBundleVersion "$bundle_version"
-          [[ ! -e target/macos/release ]]
-          [[ -f target/macos/RailOxide.dmg ]]
-
   publish:
     if: github.event_name == 'release'
     needs: [source, build]

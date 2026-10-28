@@ -172,14 +172,16 @@ class SourceBuildTests(unittest.TestCase):
 import json, os, pathlib, sys
 args = sys.argv[1:]
 with open(os.environ['TRACE'], 'a') as trace:
-    trace.write(json.dumps([args, os.environ.get('RUSTC_BOOTSTRAP'), os.environ.get('RAILOXIDE_EXTENSION_BUNDLE')]) + '\\n')
+    trace.write(json.dumps([args, os.environ.get('RUSTC_BOOTSTRAP'), os.environ.get('RAILOXIDE_EXTENSION_BUNDLE'),
+                            os.environ.get('MACOSX_DEPLOYMENT_TARGET')]) + '\\n')
 if 'browser-frontend' in args and os.environ.get('FAIL_EXTENSION'):
     sys.exit(23)
 if 'metadata' in args:
     print('{}')
 if 'wallet' in args:
     bundle = os.environ.get('RAILOXIDE_EXTENSION_BUNDLE')
-    pathlib.Path('target/release/wallet').write_bytes(b'executable' + (pathlib.Path(bundle).read_bytes() if bundle else b''))
+    # Mach-O magic lets the packager's linkage check find the fake executable.
+    pathlib.Path('target/release/wallet').write_bytes(b'\\xcf\\xfa\\xed\\xfeexecutable' + (pathlib.Path(bundle).read_bytes() if bundle else b''))
 ''')
         shutil.copy2(ROOT / 'scripts/build-browser-extension', self.root / 'scripts')
         shutil.copy2(ROOT / 'scripts/verify-browser-extension.py', self.root / 'scripts')
@@ -234,7 +236,7 @@ with zipfile.ZipFile('target/browser-extension.zip', 'w') as archive:
         self.assertEqual(len(self.trace()), 1)
         self.assertFalse((self.root / 'target/browser-extension.zip').exists())
 
-    def test_macos_packager_embeds_extension_with_its_selected_cargo(self):
+    def run_macos_packager(self, **extra_env):
         for name in ('package-wallet-macos', 'macos-packaging.py'):
             shutil.copy2(ROOT / 'scripts' / name, self.root / 'scripts')
         for name in ('macos/Info.plist', 'icons/macos/RailOxide.icns', 'macos/libusb-LICENSE-LGPL-2.1.txt'):
@@ -243,14 +245,53 @@ with zipfile.ZipFile('target/browser-extension.zip', 'w') as archive:
             path.write_bytes(b'fixture')
         (self.root / 'bins/wallet/Cargo.toml').write_text('[package]\nversion = "0.2.0-beta.10"\n')
         self.write_tool('uname', "print('Darwin')")
-        for name in ('codesign', 'ditto', 'hdiutil'):
+        for name in ('codesign', 'ditto'):
             self.write_tool(name, 'pass')
-        self.write_tool('plutil', "import sys\nif '-extract' in sys.argv: print('app.railoxide.wallet')")
-        env = dict(self.env, CARGO_BIN=str(self.root / 'tools/cargo'), CARGO_TOOLCHAIN='1.97.1')
+        self.write_tool('hdiutil', "import pathlib, sys\nif sys.argv[1] == 'create': pathlib.Path(sys.argv[-1]).write_bytes(b'dmg')")
+        self.write_tool('plutil', '''import json, os, sys
+with open(os.environ['PLUTIL_LOG'], 'a') as log:
+    log.write(json.dumps(sys.argv[1:]) + '\\n')
+if '-extract' in sys.argv:
+    print('app.railoxide.wallet')''')
+        self.write_tool('lipo', "print('arm64')")
+        self.write_tool('otool', '''import os, sys
+if sys.argv[1] == '-l':
+    print(f"      cmd LC_BUILD_VERSION\\n    minos {os.environ.get('MACOSX_DEPLOYMENT_TARGET')}")
+else:
+    print(f'{sys.argv[-1]}:')''')
+        self.write_tool('shasum', "import hashlib, sys\nprint(f'{hashlib.sha256(open(sys.argv[-1], \"rb\").read()).hexdigest()}  {sys.argv[-1]}')")
+        env = dict(self.env, CARGO_BIN=str(self.root / 'tools/cargo'), CARGO_TOOLCHAIN='1.97.1',
+                   PLUTIL_LOG=str(self.root / 'plutil-log'), **extra_env)
+        env.pop('MACOSX_DEPLOYMENT_TARGET', None)
         # Calling from another directory must still build this checkout.
         result = subprocess.run(['bash', str(self.root / 'scripts/package-wallet-macos')],
                                 cwd=self.root.parent, env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+        return [json.loads(line) for line in (self.root / 'plutil-log').read_text().splitlines()]
+
+    def test_macos_packager_applies_the_release_floor_only_when_set(self):
+        release_dir = self.root / 'target/macos/release'
+        for floor in (None, '15.0'):
+            with self.subTest(floor=floor):
+                (self.root / 'trace').unlink(missing_ok=True)
+                (self.root / 'plutil-log').unlink(missing_ok=True)
+                plutil = self.run_macos_packager(**({'MACOS_MINIMUM_VERSION': floor} if floor else {}))
+                self.assertEqual(self.trace()[-1][3], floor)
+                replaced = {call[1]: call[3] for call in plutil if call[0] == '-replace'}
+                self.assertEqual(replaced.pop('CFBundleShortVersionString'), '0.2.0')
+                self.assertEqual(replaced.pop('CFBundleVersion'), '0.2.0')
+                # Source installs keep the checked-in LSMinimumSystemVersion.
+                self.assertEqual(replaced, {'LSMinimumSystemVersion': floor} if floor else {})
+                if floor is None:
+                    self.assertFalse(release_dir.exists())
+                else:
+                    dmg = 'RailOxide-v0.2.0-beta.10-macos-arm64.dmg'
+                    sums = 'RailOxide-v0.2.0-beta.10-macos-SHA256SUMS'
+                    self.assertEqual(sorted(path.name for path in release_dir.iterdir()), sorted([dmg, sums]))
+                    self.assertTrue((release_dir / sums).read_text().endswith(f'  {dmg}\n'))
+
+    def test_macos_packager_embeds_extension_with_its_selected_cargo(self):
+        self.run_macos_packager()
         binary = self.root / 'target/macos/RailOxide.app/Contents/MacOS/RailOxide'
         self.assertIn((self.root / 'target/browser-extension.zip').read_bytes(), binary.read_bytes())
         self.assertTrue(all(entry[0][0] == '+1.97.1' for entry in self.trace()))
