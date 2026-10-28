@@ -239,7 +239,9 @@ class ReleaseAssetsTests(unittest.TestCase):
     def test_retry_accepts_matching_assets(self):
         files = self.macos_files()
         dmg, sums, signature = files
-        resigned = self.keys.sign(sums, self.root / signature.name, 'release', '--digest-algo', 'SHA512')
+        # ed25519 signatures are deterministic; a notation keeps same-second re-signatures distinct.
+        resigned = self.keys.sign(sums, self.root / signature.name, 'release',
+                                  '--sig-notation', 'retry@railoxide.invalid=1')
         self.assertNotEqual(resigned.read_bytes(), signature.read_bytes())
         for label, seeded, uploaded in [
             ('complete', [dmg, sums, resigned], []),
