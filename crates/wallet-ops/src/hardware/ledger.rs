@@ -1,10 +1,11 @@
 use std::io::Cursor;
 
 use super::{
-    ConfirmedHardwarePublicAccount, HardwareAppVersion, HardwareDerivationClient,
-    HardwareDerivationDescriptor, HardwareDerivationError, HardwareDerivationMethod,
-    HardwareDeviceKind, HardwareOperationOutput, HardwarePublicAccountDescriptor,
-    HardwareTypedDataSigningMode, hardware_profile_fingerprint,
+    ConfirmedHardwarePublicAccount, HardwareAccountPublicKey, HardwareAppVersion,
+    HardwareDerivationClient, HardwareDerivationDescriptor, HardwareDerivationError,
+    HardwareDerivationMethod, HardwareDeviceKind, HardwareOperationOutput,
+    HardwarePublicAccountDescriptor, HardwareTypedDataSigningMode, hardware_profile_fingerprint,
+    hardware_public_account_key_path,
 };
 use crate::hardware_typed_data::{
     HardwareEip712ArrayElement, HardwareEip712FieldDefinition, HardwareEip712FieldValue,
@@ -192,6 +193,21 @@ impl LedgerHardwareDerivationClient {
         let data = ledger_response_data(&answer, "get Ethereum address")?;
         let address = ledger_address_from_response(data)?;
         Ok(format!("0x{}", address.to_ascii_lowercase()))
+    }
+
+    /// Reads the public key and chain code at `m/44'/60'/{wallet}'/0` without
+    /// on-device display.
+    pub async fn account_public_key(
+        &self,
+        wallet_account_index: u32,
+    ) -> Result<HardwareAccountPublicKey, HardwareDerivationError> {
+        let path = hardware_public_account_key_path(wallet_account_index)?;
+        let command = ledger_account_public_key_command(&path)?;
+        let answer = ledger_exchange(&command)
+            .await
+            .map_err(|error| ledger_exchange_error(error, "get Ethereum account key"))?;
+        let data = ledger_response_data(&answer, "get Ethereum account key")?;
+        ledger_account_public_key_from_response(data)
     }
 
     pub async fn public_ethereum_address(
@@ -1272,7 +1288,45 @@ fn ledger_path_payload(path: &[u32]) -> Result<Vec<u8>, HardwareDerivationError>
     Ok(data)
 }
 
+fn ledger_account_public_key_command(path: &[u32]) -> Result<APDUCommand, HardwareDerivationError> {
+    let data = ledger_path_payload(path)?;
+    Ok(APDUCommand {
+        cla: 0xe0,
+        ins: 0x02,
+        p1: ledger_address_display_p1(false),
+        // Return the chain code after the address.
+        p2: 0x01,
+        data: APDUData::new(&data),
+        response_len: None,
+    })
+}
+
 fn ledger_address_from_response(data: &[u8]) -> Result<String, HardwareDerivationError> {
+    let (_, address, _) = ledger_address_response_parts(data)?;
+    Ok(address.to_owned())
+}
+
+fn ledger_account_public_key_from_response(
+    data: &[u8],
+) -> Result<HardwareAccountPublicKey, HardwareDerivationError> {
+    let (public_key, _, rest) = ledger_address_response_parts(data)?;
+    let chain_code = rest
+        .get(..32)
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or(HardwareDerivationError::UnexpectedHardwareResponse(
+            "Ledger account key response is missing the chain code",
+        ))?;
+    Ok(HardwareAccountPublicKey {
+        public_key: public_key.to_vec(),
+        chain_code,
+    })
+}
+
+/// Splits a GET ETH ADDRESS response into the public key, the ASCII hex
+/// address and the bytes after the address.
+fn ledger_address_response_parts(
+    data: &[u8],
+) -> Result<(&[u8], &str, &[u8]), HardwareDerivationError> {
     let Some((&public_key_len, rest)) = data.split_first() else {
         return Err(HardwareDerivationError::UnexpectedHardwareResponse(
             "Ledger address response is missing public key length",
@@ -1300,7 +1354,7 @@ fn ledger_address_from_response(data: &[u8]) -> Result<String, HardwareDerivatio
             "Ledger address response is not an EVM address",
         ));
     }
-    Ok(address.to_owned())
+    Ok((&rest[..address_len_offset], address, &rest[address_end..]))
 }
 
 #[async_trait(?Send)]
@@ -1498,6 +1552,51 @@ mod tests {
     fn ledger_address_confirmation_sets_display_flag() {
         assert_eq!(ledger_address_display_p1(false), 0x00);
         assert_eq!(ledger_address_display_p1(true), 0x01);
+    }
+
+    #[test]
+    fn ledger_account_public_key_command_requests_chain_code_without_display() {
+        let path = hardware_public_account_key_path(0).expect("account key path");
+        assert_eq!(path, [0x8000_002c, 0x8000_003c, 0x8000_0000, 0]);
+        let command = ledger_account_public_key_command(&path).expect("account key command");
+        assert_eq!(
+            (command.cla, command.ins, command.p1, command.p2),
+            (0xe0, 0x02, 0x00, 0x01)
+        );
+        assert_eq!(
+            *command.data,
+            ledger_path_payload(&path).expect("path payload")
+        );
+    }
+
+    #[test]
+    fn ledger_account_public_key_response_parses_key_and_chain_code() {
+        use crate::hardware::{TEST_ACCOUNT_CHAIN_CODE, TEST_ACCOUNT_PUBLIC_KEY};
+
+        let mut response = vec![65];
+        response.extend_from_slice(&TEST_ACCOUNT_PUBLIC_KEY);
+        response.push(40);
+        response.extend_from_slice(b"1111111111111111111111111111111111111111");
+        response.extend_from_slice(&TEST_ACCOUNT_CHAIN_CODE);
+
+        let key = ledger_account_public_key_from_response(&response).expect("account key");
+        assert_eq!(key.public_key, TEST_ACCOUNT_PUBLIC_KEY);
+        assert_eq!(key.chain_code, TEST_ACCOUNT_CHAIN_CODE);
+        assert_eq!(
+            ledger_address_from_response(&response).expect("address"),
+            "1111111111111111111111111111111111111111"
+        );
+
+        // Empty, inside the public key, inside the address, inside the chain code.
+        for len in [0, 30, 87, response.len() - 1] {
+            assert!(
+                matches!(
+                    ledger_account_public_key_from_response(&response[..len]),
+                    Err(HardwareDerivationError::UnexpectedHardwareResponse(_))
+                ),
+                "response cut at {len}"
+            );
+        }
     }
 
     #[test]

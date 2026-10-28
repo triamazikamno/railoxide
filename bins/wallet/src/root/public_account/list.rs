@@ -1137,12 +1137,19 @@ impl WalletRoot {
                     .font_weight(gpui::FontWeight::SEMIBOLD)
             },
         );
+        // An unlabeled title is a short address that must not truncate, so its tags and
+        // shortcuts wrap below it instead.
         let mut identity_line = div()
             .flex()
             .items_center()
             .gap(dimension(6.0))
             .min_w_0()
-            .child(name.truncate().when(dim, |text| text.text_color(subtle)));
+            .when(label.is_none(), Styled::flex_wrap)
+            .child(
+                name.truncate()
+                    .when(label.is_none(), Styled::flex_none)
+                    .when(dim, |text| text.text_color(subtle)),
+            );
         let excluded = self
             .ui_state
             .public_refresh_excluded
@@ -1223,7 +1230,7 @@ impl WalletRoot {
                 .child(shortcuts)
                 .child(refresh)
         };
-        let tag = |text: &'static str, color: gpui::Hsla| {
+        let tag = |text: SharedString, color: gpui::Hsla| {
             div()
                 .flex_none()
                 .px(dimension(6.0))
@@ -1238,14 +1245,15 @@ impl WalletRoot {
                 .child(text)
         };
         let mut tags = div().flex().items_center().gap_1().flex_none();
-        if account.source != PublicAccountSource::Derived {
-            tags = tags.child(tag(
-                super::public_account_source_label(account.source),
-                gpui::rgb(ui::theme::TEXT_MUTED).into(),
-            ));
-        }
+        let source = match (account.source, account.derivation_index) {
+            (PublicAccountSource::Derived | PublicAccountSource::HardwareDerived, Some(index)) => {
+                format!("Derived #{index}").into()
+            }
+            (source, _) => super::public_account_source_label(source).into(),
+        };
+        tags = tags.child(tag(source, gpui::rgb(ui::theme::TEXT_MUTED).into()));
         if account.is_global() {
-            tags = tags.child(tag("Global", cx.theme().info));
+            tags = tags.child(tag("Global".into(), cx.theme().info));
         }
         if excluded {
             tags = tags.child(
@@ -1273,7 +1281,7 @@ impl WalletRoot {
             &account.public_account_uuid,
             account.status,
         ) {
-            tags = tags.child(tag("Stale", cx.theme().warning));
+            tags = tags.child(tag("Stale".into(), cx.theme().warning));
         }
         let sessions = self.walletconnect_account_session_count(&uuid);
         if sessions > 0 {

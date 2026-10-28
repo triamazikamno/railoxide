@@ -3,7 +3,6 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use alloy::primitives::Address;
 use gpui::Entity;
 use gpui_component::input::{InputState, TextareaState};
 use wallet_ops::{
@@ -19,10 +18,9 @@ use crate::root::public_action::{
     PublicShieldRoute,
 };
 
-use super::hardware::HardwarePublicAccountDerivationStatus;
+use super::derive_preview::DerivePreviewState;
 
 pub(in crate::root) struct PublicAccountFormState {
-    pub(in crate::root) add_label_input: Entity<InputState>,
     pub(in crate::root) add_password_input: Entity<InputState>,
     pub(in crate::root) import_label_input: Entity<InputState>,
     pub(in crate::root) import_private_key_input: Entity<InputState>,
@@ -83,13 +81,12 @@ pub(in crate::root) struct PublicAccountFormState {
     pub(in crate::root) action_action_error: Option<Arc<str>>,
     pub(in crate::root) action_contract_address: Option<Arc<str>>,
     pub(in crate::root) next_derived_index: Option<u32>,
+    /// The Derive dialog's authorization and address preview.
+    pub(in crate::root) derive_preview: DerivePreviewState,
     pub(in crate::root) next_account_label_number: u32,
     pub(in crate::root) error: Option<Arc<str>>,
     pub(in crate::root) send_error: Option<Arc<str>>,
     pub(in crate::root) shield_error: Option<Arc<str>>,
-    pub(in crate::root) adding_account: bool,
-    pub(in crate::root) hardware_derivation_status: HardwarePublicAccountDerivationStatus,
-    pub(in crate::root) hardware_confirmation_address: Option<Address>,
     pub(in crate::root) importing_account: bool,
     pub(in crate::root) sending: bool,
     pub(in crate::root) shielding: bool,

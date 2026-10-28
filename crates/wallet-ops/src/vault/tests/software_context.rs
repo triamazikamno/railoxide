@@ -1334,6 +1334,22 @@ fn passphrase_signers_and_derived_accounts_require_the_bound_session() {
         ),
         Err(VaultError::SoftwareSeedSessionRequired)
     ));
+    assert!(matches!(
+        store.derived_public_account_preview(TEST_PASSWORD, &context_session, None),
+        Err(VaultError::SoftwareSeedSessionRequired)
+    ));
+    let preview = store
+        .derived_public_account_preview(
+            TEST_PASSWORD,
+            &context_session,
+            Some(protected_seed_session.as_ref()),
+        )
+        .expect("passphrase preview");
+    assert_eq!(
+        preview.address(1).expect("preview index one"),
+        derive_public_evm_address_from_mnemonic_with_passphrase(TEST_MNEMONIC, PASSPHRASE, 1)
+            .expect("passphrase index one address")
+    );
     assert_eq!(
         db.list_desktop_wallet_vault_records("")
             .expect("records after blocked account"),

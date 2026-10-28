@@ -25,7 +25,7 @@ use railgun_ui::DEFAULT_CHAINS;
 use tracing::metadata::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{EnvFilter, filter::filter_fn, fmt};
 use ui::logs::{DEFAULT_LOG_CAPACITY, LogStore, UiLogLayer};
 
 use crate::assets::WalletAssets;
@@ -248,12 +248,19 @@ fn install_tracing(logs: LogStore) -> Result<()> {
 
     tracing_subscriber::registry()
         .with(env_filter)
+        .with(filter_fn(allows_trezor_client_event))
         .with(console_layer)
         .with(ui_layer)
         .try_init()
         .map_err(|error| eyre::eyre!("install tracing subscriber: {error}"))?;
 
     Ok(())
+}
+
+/// Caps `trezor-client` at INFO whatever `RUST_LOG` asks for: its DEBUG and TRACE events carry
+/// whole device messages, including PIN and passphrase acks, session ids and derived keys.
+fn allows_trezor_client_event(metadata: &tracing::Metadata<'_>) -> bool {
+    !metadata.target().starts_with("trezor_client") || *metadata.level() <= tracing::Level::INFO
 }
 
 fn install_quit_behavior(app: &mut App) {
@@ -277,5 +284,22 @@ fn install_quit_behavior(app: &mut App) {
                 gpui::MenuItem::action("Quit RailOxide", Quit),
             ],
         }]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing::{Level, event_enabled};
+
+    #[test]
+    fn trezor_client_events_stop_at_info() {
+        let subscriber = tracing_subscriber::registry().with(filter_fn(allows_trezor_client_event));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(event_enabled!(target: "trezor_client::client", Level::INFO));
+            assert!(!event_enabled!(target: "trezor_client::client", Level::DEBUG));
+            assert!(!event_enabled!(target: "trezor_client::client", Level::TRACE));
+            assert!(event_enabled!(target: "wallet_ops::hardware", Level::TRACE));
+        });
     }
 }

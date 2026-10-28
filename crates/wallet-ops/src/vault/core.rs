@@ -135,6 +135,12 @@ pub enum VaultError {
     InvalidPublicEvmPrivateKey,
     #[error("public EVM key derivation failed")]
     PublicEvmKeyDerivation,
+    #[error("public account preview belongs to a different wallet")]
+    PublicAccountPreviewWalletMismatch,
+    #[error("invalid public account index selection")]
+    InvalidPublicAccountSelection,
+    #[error("public account index is already added")]
+    PublicAccountIndexAlreadyAdded,
     #[error("address book label cannot be empty")]
     InvalidAddressBookLabel,
     #[error("invalid private address book recipient")]

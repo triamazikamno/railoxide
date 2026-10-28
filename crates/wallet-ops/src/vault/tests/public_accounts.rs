@@ -3,7 +3,7 @@ use super::helpers::*;
 use std::fs;
 
 #[test]
-fn hardware_public_account_stores_descriptor_without_secret() {
+fn hardware_public_account_stores_descriptor_without_secret_at_unused_indexes() {
     let (root_dir, db, store) = desktop_store_with_vault();
     let wallet_id = "hardware-public-wallet";
     let wallet_descriptor = test_hardware_descriptor(0);
@@ -60,6 +60,44 @@ fn hardware_public_account_stores_descriptor_without_secret() {
             .expect("next hardware public index"),
         1,
     );
+
+    let index_500 = HardwarePublicAccountDescriptor::for_wallet_public_index(
+        HardwareDeviceKind::Ledger,
+        0,
+        500,
+    )
+    .expect("index 500 descriptor");
+    let account_500 = store
+        .add_hardware_public_account(
+            &view_session,
+            &crate::hardware::ConfirmedHardwarePublicAccount::new_for_tests(
+                index_500.clone(),
+                Address::from([0x45; 20]),
+            ),
+            None,
+        )
+        .expect("add index 500 after index 0");
+    assert_eq!(account_500.derivation_index, Some(500));
+    assert_eq!(
+        store
+            .next_derived_public_account_index_for_session(&view_session)
+            .expect("next hardware public index after 500"),
+        501,
+    );
+    store
+        .deactivate_derived_public_account(&view_session, &account_500.public_account_uuid)
+        .expect("hide index 500");
+    // Index 0 is active and index 500 hidden; both stay taken.
+    for used in [descriptor, index_500] {
+        let confirmed = crate::hardware::ConfirmedHardwarePublicAccount::new_for_tests(
+            used,
+            Address::from([0x46; 20]),
+        );
+        assert!(matches!(
+            store.add_hardware_public_account(&view_session, &confirmed, None),
+            Err(VaultError::PublicAccountIndexAlreadyAdded)
+        ));
+    }
 
     drop(store);
     drop(db);
@@ -477,6 +515,168 @@ fn derived_duplicate_address_is_rejected() {
     drop(store);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+#[test]
+fn derived_public_account_preview_writes_nothing_and_adds_selected_indexes() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let view_session = import_wallet_with_metadata(&store, "preview-wallet", "Public A");
+    let other_session = import_wallet_with_metadata(&store, "preview-other-wallet", "Public B");
+    let hidden = store
+        .add_derived_public_account(TEST_PASSWORD, &view_session, None)
+        .expect("add index one");
+    store
+        .deactivate_derived_public_account(&view_session, &hidden.public_account_uuid)
+        .expect("hide index one");
+    let index_three_key =
+        derive_public_evm_private_key_from_mnemonic(TEST_MNEMONIC, 3).expect("index three key");
+    store
+        .import_public_account(
+            TEST_PASSWORD,
+            &view_session,
+            &format!("0x{}", alloy::hex::encode(index_three_key)),
+            None,
+            false,
+        )
+        .expect("import index three address");
+    let before = db
+        .list_desktop_wallet_vault_records("")
+        .expect("records before preview");
+
+    assert!(matches!(
+        store.derived_public_account_preview("wrong password", &view_session, None),
+        Err(VaultError::UnlockFailed)
+    ));
+    let preview = store
+        .derived_public_account_preview(TEST_PASSWORD, &view_session, None)
+        .expect("preview");
+    let page = preview.page(0).expect("first page");
+    assert_eq!(page.len(), 20);
+    for (index, address) in page {
+        assert_eq!(
+            address,
+            derive_public_evm_address_from_mnemonic_with_passphrase(TEST_MNEMONIC, "", index)
+                .expect("single-account address")
+        );
+    }
+    let last_page = preview
+        .page(DerivedPublicAccountPreview::INDEX_LIMIT - 1)
+        .expect("last page");
+    assert_eq!(last_page.len(), 1);
+    assert!(
+        preview
+            .address(DerivedPublicAccountPreview::INDEX_LIMIT)
+            .is_err()
+    );
+    assert!(matches!(
+        store.add_previewed_public_accounts(&other_session, &preview, &[4]),
+        Err(VaultError::PublicAccountPreviewWalletMismatch)
+    ));
+    assert!(matches!(
+        store.add_previewed_public_accounts(
+            &view_session,
+            &preview,
+            &(0..101).collect::<Vec<u32>>()
+        ),
+        Err(VaultError::InvalidPublicAccountSelection)
+    ));
+    assert!(matches!(
+        store.previewed_public_account_skip(&other_session, &preview, 4),
+        Err(VaultError::PublicAccountPreviewWalletMismatch)
+    ));
+    for (index, skip) in [
+        (1, Some(PreviewedPublicAccountSkip::AlreadyAdded)),
+        (3, Some(PreviewedPublicAccountSkip::DuplicateAddress)),
+        (4, None),
+    ] {
+        assert_eq!(
+            store
+                .previewed_public_account_skip(&view_session, &preview, index)
+                .expect("skip check"),
+            skip
+        );
+    }
+    assert_eq!(
+        db.list_desktop_wallet_vault_records("")
+            .expect("records after preview and rejected adds"),
+        before
+    );
+
+    let result = store
+        .add_previewed_public_accounts(&view_session, &preview, &[0, 1, 3, 4, 4, 23])
+        .expect("add previewed accounts");
+    assert_eq!(
+        result.skipped,
+        vec![
+            (0, PreviewedPublicAccountSkip::AlreadyAdded),
+            (1, PreviewedPublicAccountSkip::AlreadyAdded),
+            (3, PreviewedPublicAccountSkip::DuplicateAddress),
+        ]
+    );
+    let stored = store
+        .list_active_public_accounts_for_session(&view_session)
+        .expect("accounts after add");
+    let mut display_orders = Vec::new();
+    for (account, index) in result.added.iter().zip([4, 23]) {
+        assert_eq!(account.derivation_index, Some(index));
+        assert_eq!(account.address, preview.address(index).expect("address"));
+        assert_eq!(account.source, PublicAccountSource::Derived);
+        assert_eq!(account.label, None);
+        assert!(account.is_active_for_wallet("preview-wallet") && !account.is_global());
+        assert!(stored.contains(account));
+        display_orders.push(account.display_order);
+    }
+    assert_eq!(result.added.len(), 2);
+    assert_eq!(display_orders[1], display_orders[0] + 1);
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+#[test]
+fn hardware_account_key_preview_matches_mnemonic_derivation() {
+    use crate::hardware::{TEST_ACCOUNT_CHAIN_CODE, TEST_ACCOUNT_PUBLIC_KEY};
+    use coins_bip32::prelude::{Parent, XKeyInfo, XPriv};
+
+    let seed = bip39_seed_from_mnemonic(TEST_MNEMONIC, "").expect("seed");
+    let account_key = XPriv::root_from_seed(&seed[..], None)
+        .and_then(|key| key.derive_child(coins_bip32::BIP32_HARDEN + 44))
+        .and_then(|key| key.derive_child(coins_bip32::BIP32_HARDEN + 60))
+        .and_then(|key| key.derive_child(coins_bip32::BIP32_HARDEN))
+        .and_then(|key| key.derive_child(0))
+        .expect("account key")
+        .verify_key();
+    let verifying_key: &coins_bip32::ecdsa::VerifyingKey = account_key.as_ref();
+    let info: &XKeyInfo = account_key.as_ref();
+    assert_eq!(
+        verifying_key.to_encoded_point(false).as_bytes(),
+        TEST_ACCOUNT_PUBLIC_KEY
+    );
+    assert_eq!(info.chain_code.0, TEST_ACCOUNT_CHAIN_CODE);
+
+    let compressed = verifying_key.to_encoded_point(true);
+    for public_key in [&TEST_ACCOUNT_PUBLIC_KEY[..], compressed.as_bytes()] {
+        let preview = DerivedPublicAccountPreview::from_account_public_key(
+            "hardware-wallet",
+            public_key,
+            TEST_ACCOUNT_CHAIN_CODE,
+        )
+        .expect("preview from account key");
+        for index in [0, 1, 500] {
+            assert_eq!(
+                preview.address(index).expect("preview address"),
+                derive_public_evm_address_from_mnemonic_with_passphrase(TEST_MNEMONIC, "", index)
+                    .expect("mnemonic address")
+            );
+        }
+    }
+    assert!(matches!(
+        DerivedPublicAccountPreview::from_account_public_key(
+            "hardware-wallet",
+            &[0x04; 65],
+            TEST_ACCOUNT_CHAIN_CODE,
+        ),
+        Err(VaultError::PublicEvmKeyDerivation)
+    ));
 }
 #[test]
 fn public_account_signing_key_resolves_derived_and_imported_accounts() {

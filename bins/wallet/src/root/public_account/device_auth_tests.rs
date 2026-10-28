@@ -1,5 +1,5 @@
 use super::*;
-use gpui::{AppContext as _, Render, TestAppContext};
+use gpui::{Render, TestAppContext};
 
 struct DialogWindow;
 
@@ -121,6 +121,8 @@ fn device_auth_public_account_blocks_typed_submission_then_creates_one_account(
         .build()
         .unwrap();
     let _entered = runtime.enter();
+    // Derive's preview authorization finishes on a blocking thread.
+    cx.executor().allow_parking();
     cx.update(gpui_component::init);
     let mut root = None;
     let (_host, cx) = cx.add_window_view(|window, cx| {
@@ -178,14 +180,22 @@ fn device_auth_public_account_blocks_typed_submission_then_creates_one_account(
                     window,
                     cx,
                 );
-                assert_eq!(
-                    account_count(root),
-                    before + 1,
-                    "{:?}",
-                    root.public_form.error
-                );
                 assert!(!root.device_auth_in_progress);
-                assert!(!window.has_active_dialog(cx));
+                if matches!(kind, PublicAccountDialogKind::Derive) {
+                    // A software wallet's password authorizes the address preview instead.
+                    assert!(root.public_form.derive_preview.authorizing);
+                    assert_eq!(account_count(root), before);
+                    assert!(window.has_active_dialog(cx));
+                    window.close_all_dialogs(cx);
+                } else {
+                    assert_eq!(
+                        account_count(root),
+                        before + 1,
+                        "{:?}",
+                        root.public_form.error
+                    );
+                    assert!(!window.has_active_dialog(cx));
+                }
             });
         });
     }
