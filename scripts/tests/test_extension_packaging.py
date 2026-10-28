@@ -235,14 +235,17 @@ with zipfile.ZipFile('target/browser-extension.zip', 'w') as archive:
         self.assertFalse((self.root / 'target/browser-extension.zip').exists())
 
     def test_macos_packager_embeds_extension_with_its_selected_cargo(self):
-        shutil.copy2(ROOT / 'scripts/package-wallet-macos', self.root / 'scripts')
-        for name in ('macos/Info.plist', 'icons/macos/RailOxide.icns'):
+        for name in ('package-wallet-macos', 'macos-packaging.py'):
+            shutil.copy2(ROOT / 'scripts' / name, self.root / 'scripts')
+        for name in ('macos/Info.plist', 'icons/macos/RailOxide.icns', 'macos/libusb-LICENSE-LGPL-2.1.txt'):
             path = self.root / 'bins/wallet/packaging' / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b'fixture')
+        (self.root / 'bins/wallet/Cargo.toml').write_text('[package]\nversion = "0.2.0-beta.10"\n')
         self.write_tool('uname', "print('Darwin')")
-        for name in ('codesign', 'ditto', 'hdiutil', 'plutil'):
+        for name in ('codesign', 'ditto', 'hdiutil'):
             self.write_tool(name, 'pass')
+        self.write_tool('plutil', "import sys\nif '-extract' in sys.argv: print('app.railoxide.wallet')")
         env = dict(self.env, CARGO_BIN=str(self.root / 'tools/cargo'), CARGO_TOOLCHAIN='1.97.1')
         # Calling from another directory must still build this checkout.
         result = subprocess.run(['bash', str(self.root / 'scripts/package-wallet-macos')],

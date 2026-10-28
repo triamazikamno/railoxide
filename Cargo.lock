@@ -15944,6 +15944,7 @@ dependencies = [
  "httparse",
  "libc",
  "libp2p",
+ "libusb1-sys",
  "local-db",
  "merkletree",
  "objc2 0.6.4",

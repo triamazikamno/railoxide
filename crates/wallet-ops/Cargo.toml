@@ -9,6 +9,7 @@ default = []
 hardware = [
     "dep:coins-ledger",
     "dep:hidapi-rusb",
+    "dep:libusb1-sys",
     "dep:protobuf",
     "dep:trezor-client",
 ]
@@ -80,6 +81,8 @@ waku-relay = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 core-foundation = "0.10"
+# Link the bundled libusb statically so packaged apps never reference Homebrew's copy.
+libusb1-sys = { version = "0.7", optional = true, features = ["vendored"] }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString"] }
 security-framework = "3"

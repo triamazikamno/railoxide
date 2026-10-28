@@ -129,12 +129,42 @@ scripts/package-wallet-macos
 The source installer performs this setup automatically. If selecting a different
 compiler with `CARGO_TOOLCHAIN`, install the WASM target for that toolchain as well.
 
+The native wallet build uses `--locked`, so it fails if `Cargo.lock` is out of date.
+
 The packaged app and DMG are written to:
 
 ```bash
 target/macos/RailOxide.app
 target/macos/RailOxide.dmg
 ```
+
+The bundle's `CFBundleShortVersionString` and `CFBundleVersion` carry the wallet
+version as `MAJOR.MINOR.PATCH`, so `0.2.0-beta.10` becomes `0.2.0`. The app itself
+shows the full version.
+
+Hardware builds link libusb statically, so you do not need Homebrew's libusb. The
+app ships libusb's LGPL-2.1 license text in `Contents/Resources`.
+
+### Release packaging
+
+Release builds run on Apple Silicon with a macOS floor:
+
+```bash
+MACOS_MINIMUM_VERSION=15.0 scripts/package-wallet-macos
+```
+
+This sets `MACOSX_DEPLOYMENT_TARGET` for the native build and writes the same
+value to `LSMinimumSystemVersion`. Before signing, the script checks that the
+binary is arm64 only, that its Mach-O minimum OS matches the floor, and that the
+app links only libraries supplied by macOS. It then writes the release assets:
+
+```bash
+target/macos/release/RailOxide-v<VERSION>-macos-arm64.dmg
+target/macos/release/RailOxide-v<VERSION>-macos-SHA256SUMS
+```
+
+Without `MACOS_MINIMUM_VERSION`, source installs keep the checked-in 13.0
+`LSMinimumSystemVersion` and set no deployment target.
 
 ## Troubleshooting
 

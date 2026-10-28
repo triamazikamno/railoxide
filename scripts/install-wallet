@@ -50,6 +50,10 @@ log() {
   printf '==> %s\n' "$*" >&2
 }
 
+warn() {
+  printf 'warning: %s\n' "$*" >&2
+}
+
 die() {
   printf 'error: %s\n' "$*" >&2
   exit 1
@@ -238,6 +242,12 @@ source_ref_label() {
   esac
 }
 
+warn_existing_macos_app() {
+  if [[ -e /Applications/RailOxide.app ]]; then
+    warn "/Applications/RailOxide.app exists. It and the source build in ~/Applications/RailOxide.app share one wallet profile, and the railoxide-wallet command launches the source build. Nothing will be removed."
+  fi
+}
+
 dry_run_plan() {
   local os_name="$1"
 
@@ -254,6 +264,7 @@ dry_run_plan() {
   printf 'detected OS: %s\n' "$os_name"
   if [[ "$os_name" == "Darwin" ]]; then
     printf 'would install: ~/Applications/RailOxide.app and %s/bin/railoxide-wallet\n' "$prefix"
+    warn_existing_macos_app
   elif [[ "$os_name" == "Linux" ]]; then
     printf 'would install: %s/bin/railoxide-wallet\n' "$prefix"
     printf 'would install desktop entry and icons under ~/.local/share\n'
@@ -671,6 +682,7 @@ main() {
   ensure_not_root
 
   if [[ "$os_name" == "Darwin" ]]; then
+    warn_existing_macos_app
     ensure_macos_command_line_tools
     ensure_common_tools
     choose_source_ref

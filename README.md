@@ -12,6 +12,7 @@
 <p align="center">
   <a href="https://github.com/triamazikamno/railoxide/releases">Releases</a> ·
   <a href="#flatpak">Install</a> ·
+  <a href="#macos">macOS</a> ·
   <a href="#build">Build</a> ·
   <a href="#privacy-model">Privacy Model</a>
 </p>
@@ -54,9 +55,25 @@ flatpak install --user https://triamazikamno.github.io/railoxide/flatpak/RailOxi
 
 Both builds otherwise use the same sandbox and update repository. Install only one variant at a time. See the [`Flatpak guide`](docs/flatpak.md) for permissions, updates, and data migration.
 
+## macOS
+
+Prebuilt releases support Apple Silicon Macs on macOS 15 or later and install through the project's Homebrew tap. Homebrew collects its own analytics. To opt out of them for every `brew` command on your Mac, optionally run this first:
+
+```bash
+brew analytics off
+```
+
+```bash
+brew install --cask triamazikamno/tap/railoxide
+```
+
+> RailOxide is ad-hoc signed and is not notarized by Apple. Our Homebrew cask removes the app's quarantine attribute to bypass the usual first-launch Gatekeeper assessment. Installing through this tap means trusting our published binaries and release process. Homebrew verifies the download checksum; it does not certify the app's safety.
+
+Intel Macs and older macOS versions can install from source. See the [`macOS install guide`](docs/install-macos.md) for upgrades, the DMG download, privacy details, and switching from a source install.
+
 ## Install From Source
 
-RailOxide is alpha software and installs by building from source. The installer prompts for the source to build and defaults to the latest published GitHub release.
+RailOxide is alpha software. On platforms without a prebuilt package, or to build it yourself, install from source. The installer prompts for the source to build and defaults to the latest published GitHub release.
 
 macOS/Linux:
 

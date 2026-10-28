@@ -1,0 +1,412 @@
+name: macOS release
+
+on:
+  pull_request:
+    paths:
+      - scripts/package-wallet-macos
+      - scripts/macos-packaging.py
+      - scripts/release-assets
+      - scripts/tests/test_macos_packaging.py
+      - scripts/tests/test_release_assets.py
+      - scripts/*browser-extension*
+      - bins/wallet/packaging/macos/**
+      - bins/wallet/Cargo.toml
+      - crates/wallet-ops/Cargo.toml
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/macos-release.yml
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'release' && 'macos-release' || format('macos-release-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tooling:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Test macOS packaging helpers
+        run: python3 -m unittest discover -s scripts/tests -p test_macos_packaging.py -v
+
+      - name: Test release asset publication
+        run: python3 -m unittest discover -s scripts/tests -p test_release_assets.py -v
+
+  source:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release source
+        id: release_source
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          scripts/release-assets check-source --tag "$RELEASE_TAG" --commit "$EVENT_SHA" --require-head
+          printf 'release_sha=%s\n' "$EVENT_SHA" >>"$GITHUB_OUTPUT"
+    outputs:
+      release_sha: ${{ steps.release_source.outputs.release_sha }}
+
+  build:
+    needs: [tooling, source]
+    if: ${{ !cancelled() && needs.tooling.result == 'success' && (needs.source.result == 'success' || needs.source.result == 'skipped') }}
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Empty for pull requests, which selects the default ref.
+          ref: ${{ needs.source.outputs.release_sha }}
+          persist-credentials: false
+
+      - name: Check runner architecture
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          if [[ "$arch" != arm64 ]]; then
+            printf 'expected an arm64 runner, got %s\n' "$arch" >&2
+            exit 1
+          fi
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^rust-version = "\([0-9.]*\)"$/\1/p' Cargo.toml)"
+          [[ "$toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          rustup toolchain install "$toolchain" --profile minimal --target wasm32-unknown-unknown
+          printf 'CARGO_TOOLCHAIN=%s\n' "$toolchain" >>"$GITHUB_ENV"
+
+      - name: Install browser extension helper
+        run: |
+          set -euo pipefail
+          python3 scripts/install-browser-extension-tools.py "$RUNNER_TEMP/browser-extension-tools"
+          printf '%s\n' "$RUNNER_TEMP/browser-extension-tools/bin" >>"$GITHUB_PATH"
+
+      - name: Package release
+        env:
+          MACOS_MINIMUM_VERSION: '15.0'
+        run: scripts/package-wallet-macos
+
+      - name: Check app metadata, signature and linkage
+        run: |
+          set -euo pipefail
+          app=target/macos/RailOxide.app
+          bundle_version="$(python3 scripts/macos-packaging.py version --bundle)"
+          expect_plist() {
+            local actual
+            actual="$(/usr/libexec/PlistBuddy -c "Print :$1" "$app/Contents/Info.plist")"
+            if [[ "$actual" != "$2" ]]; then
+              printf '%s: expected %s, got %s\n' "$1" "$2" "$actual" >&2
+              exit 1
+            fi
+          }
+          expect_plist CFBundleShortVersionString "$bundle_version"
+          expect_plist CFBundleVersion "$bundle_version"
+          expect_plist CFBundleIdentifier app.railoxide.wallet
+          expect_plist CFBundleExecutable RailOxide
+          expect_plist LSMinimumSystemVersion 15.0
+          codesign --verify --deep --strict --verbose=2 "$app"
+          python3 scripts/macos-packaging.py check-linkage "$app"
+
+      - name: Check linkage rejects a Homebrew library
+        run: |
+          set -euo pipefail
+          fixture="$RUNNER_TEMP/linkage-fixture"
+          app="$RUNNER_TEMP/Fixture.app"
+          mkdir -p "$fixture" "$app/Contents/MacOS"
+          printf 'int railoxide_fixture(void) { return 0; }\n' >"$fixture/library.c"
+          printf 'int railoxide_fixture(void);\nint main(void) { return railoxide_fixture(); }\n' >"$fixture/main.c"
+          cc -dynamiclib -install_name /opt/homebrew/lib/librailoxide-fixture.dylib \
+            -o "$fixture/librailoxide-fixture.dylib" "$fixture/library.c"
+          cc -o "$app/Contents/MacOS/Fixture" "$fixture/main.c" "$fixture/librailoxide-fixture.dylib"
+          status=0
+          python3 scripts/macos-packaging.py check-linkage "$app" >"$fixture/output" 2>&1 || status=$?
+          cat "$fixture/output"
+          if [[ "$status" -eq 0 ]]; then
+            printf 'check-linkage accepted a Homebrew library reference\n' >&2
+            exit 1
+          fi
+          grep -q /opt/homebrew "$fixture/output"
+
+      - name: Check release assets
+        run: |
+          set -euo pipefail
+          version="$(python3 scripts/macos-packaging.py version)"
+          dmg="RailOxide-v$version-macos-arm64.dmg"
+          sums="RailOxide-v$version-macos-SHA256SUMS"
+          release_dir=target/macos/release
+          listing="$(cd "$release_dir" && ls -A | LC_ALL=C sort)"
+          expected="$(printf '%s\n%s\n' "$dmg" "$sums" | LC_ALL=C sort)"
+          if [[ "$listing" != "$expected" ]]; then
+            printf 'unexpected release directory contents:\n%s\n' "$listing" >&2
+            exit 1
+          fi
+          (cd "$release_dir" && shasum -a 256 -c "$sums")
+
+          mount_point="$RUNNER_TEMP/railoxide-dmg"
+          mkdir -p "$mount_point"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_point" "$release_dir/$dmg"
+          trap 'hdiutil detach "$mount_point" || hdiutil detach -force "$mount_point"' EXIT
+          [[ -d "$mount_point/RailOxide.app" ]]
+          [[ -L "$mount_point/Applications" ]]
+          [[ "$(readlink "$mount_point/Applications")" == /Applications ]]
+          codesign --verify --deep --strict --verbose=2 "$mount_point/RailOxide.app"
+          cmp "$mount_point/RailOxide.app/Contents/MacOS/RailOxide" \
+            target/macos/RailOxide.app/Contents/MacOS/RailOxide
+
+      - name: Check generated cask
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_ANALYTICS: '1'
+        run: |
+          set -euo pipefail
+          version="$(python3 scripts/macos-packaging.py version)"
+          cask="$RUNNER_TEMP/homebrew-ci/Casks/railoxide.rb"
+          mkdir -p "$(dirname "$cask")"
+          python3 scripts/macos-packaging.py render-cask \
+            --version "$version" \
+            --checksums "target/macos/release/RailOxide-v$version-macos-SHA256SUMS" \
+            --output "$cask"
+          brew style --cask "$cask"
+
+      - name: Record build provenance
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          VERSION="$(python3 scripts/macos-packaging.py version)" \
+          SOURCE_COMMIT="$(git rev-parse HEAD)" \
+          RUSTC_VERSION="$(rustc "+$CARGO_TOOLCHAIN" --version)" \
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+
+          version = os.environ["VERSION"]
+          dmg = f"RailOxide-v{version}-macos-arm64.dmg"
+          with open(f"target/macos/release/{dmg}", "rb") as image:
+              digest = hashlib.sha256(image.read()).hexdigest()
+          provenance = {
+              "version": version,
+              "tag": os.environ["RELEASE_TAG"] or None,
+              "source_commit": os.environ["SOURCE_COMMIT"],
+              "rustc": os.environ["RUSTC_VERSION"],
+              "arch": "arm64",
+              "macos_deployment_target": "15.0",
+              "dmg": dmg,
+              "dmg_sha256": digest,
+              "runner_image": os.environ.get("ImageOS"),
+              "runner_image_version": os.environ.get("ImageVersion"),
+          }
+          with open("target/macos/build-provenance.json", "w", encoding="utf-8") as output:
+              json.dump(provenance, output, indent=2)
+              output.write("\n")
+          PY
+          {
+            printf '### macOS build provenance\n\n| Field | Value |\n| --- | --- |\n'
+            jq -r 'to_entries[] | "| \(.key) | \(.value // "") |"' target/macos/build-provenance.json
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload release files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-release
+          path: |
+            target/macos/release/RailOxide-v*-macos-arm64.dmg
+            target/macos/release/RailOxide-v*-macos-SHA256SUMS
+            target/macos/build-provenance.json
+          if-no-files-found: error
+
+      - name: Upload unverified cask
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: railoxide-cask-unverified
+          path: ${{ runner.temp }}/homebrew-ci/Casks/railoxide.rb
+          if-no-files-found: error
+
+  source-install-packaging:
+    if: github.event_name == 'pull_request'
+    needs: tooling
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^rust-version = "\([0-9.]*\)"$/\1/p' Cargo.toml)"
+          [[ "$toolchain" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          rustup toolchain install "$toolchain" --profile minimal --target wasm32-unknown-unknown
+          printf 'CARGO_TOOLCHAIN=%s\n' "$toolchain" >>"$GITHUB_ENV"
+
+      - name: Install browser extension helper
+        run: |
+          set -euo pipefail
+          python3 scripts/install-browser-extension-tools.py "$RUNNER_TEMP/browser-extension-tools"
+          printf '%s\n' "$RUNNER_TEMP/browser-extension-tools/bin" >>"$GITHUB_PATH"
+
+      - name: Package for a source install
+        run: scripts/package-wallet-macos
+
+      - name: Check source-install output
+        run: |
+          set -euo pipefail
+          plist=target/macos/RailOxide.app/Contents/Info.plist
+          bundle_version="$(python3 scripts/macos-packaging.py version --bundle)"
+          checked_in_floor="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' bins/wallet/packaging/macos/Info.plist)"
+          expect_plist() {
+            local actual
+            actual="$(/usr/libexec/PlistBuddy -c "Print :$1" "$plist")"
+            if [[ "$actual" != "$2" ]]; then
+              printf '%s: expected %s, got %s\n' "$1" "$2" "$actual" >&2
+              exit 1
+            fi
+          }
+          expect_plist LSMinimumSystemVersion "$checked_in_floor"
+          expect_plist CFBundleShortVersionString "$bundle_version"
+          expect_plist CFBundleVersion "$bundle_version"
+          [[ ! -e target/macos/release ]]
+          [[ -f target/macos/RailOxide.dmg ]]
+
+  publish:
+    if: github.event_name == 'release'
+    needs: [source, build]
+    runs-on: ubuntu-24.04
+    environment: flatpak-release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout trusted release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download release files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: macos-release
+          path: out/macos
+
+      - name: Check downloaded release files
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          dmg="RailOxide-$RELEASE_TAG-macos-arm64.dmg"
+          sums="RailOxide-$RELEASE_TAG-macos-SHA256SUMS"
+          listing="$(cd out/macos/release && ls -A | LC_ALL=C sort)"
+          expected="$(printf '%s\n%s\n' "$dmg" "$sums" | LC_ALL=C sort)"
+          if [[ "$listing" != "$expected" ]]; then
+            printf 'unexpected release files:\n%s\n' "$listing" >&2
+            exit 1
+          fi
+          [[ -f out/macos/build-provenance.json ]]
+          (cd out/macos/release && sha256sum -c "$sums")
+
+      - name: Import protected signing key
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          GNUPGHOME: ${{ runner.temp }}/macos-gnupg
+        run: |
+          set -euo pipefail
+          [[ -n "$FLATPAK_GPG_PRIVATE_KEY" ]]
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Sign checksum file
+        env:
+          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+          GNUPGHOME: ${{ runner.temp }}/macos-gnupg
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          [[ -n "$FLATPAK_GPG_KEY_ID" ]]
+          sums="out/macos/release/RailOxide-$RELEASE_TAG-macos-SHA256SUMS"
+          gpg --batch --armor --detach-sign --local-user "$FLATPAK_GPG_KEY_ID" --output "$sums.asc" "$sums"
+          gpg --batch --armor --export "$FLATPAK_GPG_KEY_ID" >"$RUNNER_TEMP/release-public.gpg"
+          [[ -s "$RUNNER_TEMP/release-public.gpg" ]]
+
+      - name: Remove signing key
+        if: always()
+        env:
+          GNUPGHOME: ${{ runner.temp }}/macos-gnupg
+        run: |
+          gpgconf --homedir "$GNUPGHOME" --kill all || true
+          rm -rf "$GNUPGHOME"
+
+      - name: Publish and verify GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.source.outputs.release_sha }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          release_dir=out/macos/release
+          scripts/release-assets publish \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --existing verify \
+            --public-key "$RUNNER_TEMP/release-public.gpg" \
+            --source-commit "$RELEASE_SHA" \
+            "$release_dir/RailOxide-$RELEASE_TAG-macos-arm64.dmg" \
+            "$release_dir/RailOxide-$RELEASE_TAG-macos-SHA256SUMS" \
+            "$release_dir/RailOxide-$RELEASE_TAG-macos-SHA256SUMS.asc"
+
+      # Runs only after publication verified the downloaded assets.
+      - name: Render verified cask
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p out/cask/Casks
+          python3 scripts/macos-packaging.py render-cask \
+            --version "${RELEASE_TAG#v}" \
+            --checksums "out/macos/release/RailOxide-$RELEASE_TAG-macos-SHA256SUMS" \
+            --output out/cask/Casks/railoxide.rb
+          {
+            printf '### macOS release provenance\n\n| Field | Value |\n| --- | --- |\n'
+            jq -r 'to_entries[] | "| \(.key) | \(.value // "") |"' out/macos/build-provenance.json
+            printf '\n### Verified macOS release assets\n\n'
+            printf -- '- `%s`\n' \
+              "RailOxide-$RELEASE_TAG-macos-arm64.dmg" \
+              "RailOxide-$RELEASE_TAG-macos-SHA256SUMS" \
+              "RailOxide-$RELEASE_TAG-macos-SHA256SUMS.asc"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verified cask
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: railoxide-cask
+          path: out/cask/Casks/railoxide.rb
+          if-no-files-found: error
