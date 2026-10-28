@@ -389,27 +389,33 @@ fn balance_check_summary_route_and_warning_follow_network_mode() {
     .get(1)
     .cloned()
     .unwrap();
-    // An endpoint marked Direct that serves Sensitive reads doesn't change the Tor route text.
-    chain.rpc_route = RpcChainRoute::new_with_transports(
-        1,
-        vec![
-            (
-                reqwest::Url::parse("http://127.0.0.1:1").unwrap().into(),
-                RpcTransport::Wallet,
-                RpcEndpointRoles::default(),
-            ),
-            (
-                reqwest::Url::parse("http://127.0.0.1:2").unwrap().into(),
-                RpcTransport::Direct,
-                RpcEndpointRoles::default(),
-            ),
-        ],
-    );
+    let general_only = RpcEndpointRoles {
+        general: true,
+        sensitive: false,
+        submit: false,
+    };
+    let route = |endpoints: &[(u16, RpcTransport, RpcEndpointRoles)]| {
+        RpcChainRoute::new_with_transports(
+            1,
+            endpoints
+                .iter()
+                .map(|(port, transport, roles)| {
+                    let url = reqwest::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+                    (url.into(), *transport, *roles)
+                })
+                .collect(),
+        )
+    };
+    // A Direct endpoint that doesn't serve Sensitive reads never receives the addresses.
+    chain.rpc_route = route(&[
+        (1, RpcTransport::Wallet, RpcEndpointRoles::default()),
+        (2, RpcTransport::Direct, general_only),
+    ]);
     let few = BTreeSet::from([23, 1, 5]);
     let (rows, warning) = balance_check_summary(&chain, WalletNetworkMode::Tor, &few);
     assert_eq!(rows[1].1, "1, 5, 23 (3 addresses)");
     assert!(rows[3].1.contains("own Tor route"));
-    assert!(!rows[3].1.contains("IP") && !rows[3].1.contains("Direct"));
+    assert!(!rows[3].1.contains("Direct") && !warning.contains("IP"));
     assert!(warning.contains("timing"));
     let (rows, _) = balance_check_summary(&chain, WalletNetworkMode::Tor, &BTreeSet::from([7]));
     assert_eq!(rows[1].1, "7 (1 address)");
@@ -422,6 +428,22 @@ fn balance_check_summary_route_and_warning_follow_network_mode() {
     for mode in [WalletNetworkMode::Proxy, WalletNetworkMode::Direct] {
         let (rows, warning) = balance_check_summary(&chain, mode, &few);
         assert!(rows[3].1.contains("aren't isolated"), "{mode:?}");
+        assert!(warning.contains("to each other and to you"), "{mode:?}");
+    }
+    // A Sensitive endpoint set to Direct sees the addresses with the user's IP in any mode.
+    chain.rpc_route = route(&[
+        (1, RpcTransport::Wallet, RpcEndpointRoles::default()),
+        (2, RpcTransport::Direct, RpcEndpointRoles::default()),
+    ]);
+    for mode in [WalletNetworkMode::Tor, WalletNetworkMode::Proxy] {
+        let (rows, warning) = balance_check_summary(&chain, mode, &few);
+        assert!(rows[3].1.contains("set to Direct"), "{mode:?}");
+        assert!(warning.contains("your IP"), "{mode:?}");
+    }
+    chain.rpc_route = route(&[(2, RpcTransport::Direct, RpcEndpointRoles::default())]);
+    for mode in [WalletNetworkMode::Tor, WalletNetworkMode::Proxy] {
+        let (rows, warning) = balance_check_summary(&chain, mode, &few);
+        assert!(rows[3].1.starts_with("Directly"), "{mode:?}");
         assert!(warning.contains("to each other and to you"), "{mode:?}");
     }
 }

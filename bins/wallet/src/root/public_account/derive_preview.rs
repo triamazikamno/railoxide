@@ -32,7 +32,6 @@ use railgun_ui::short_address;
 use rand::seq::SliceRandom as _;
 use ui::chain_select::{ChainSelectItem, ChainSelectItems, chain_select, chain_select_state};
 use ui::controls::{app_button, app_input, app_muted_text, app_text};
-use wallet_ops::WalletNetworkMode;
 use wallet_ops::hardware::{
     ConfirmedHardwarePublicAccount, HardwareDeviceKind, HardwarePublicAccountDescriptor,
 };
@@ -43,6 +42,7 @@ use wallet_ops::vault::{
     PublicAccountMetadata, PublicAccountScope, PublicAccountSource, PublicAccountStatus,
     VaultError,
 };
+use wallet_ops::{RpcTrafficClass, RpcTransport, WalletNetworkMode};
 use zeroize::Zeroizing;
 
 use super::hardware::{
@@ -242,10 +242,34 @@ fn balance_check_summary(
     } else {
         format!("About {} min", (seconds + 30) / 60)
     };
+    // Endpoints set to Direct bypass Tor and the proxy, so they see the addresses with your IP.
+    let (direct, total) = chain
+        .rpc_route
+        .for_class(RpcTrafficClass::Sensitive)
+        .map_or((0, 0), |route| {
+            let direct = route
+                .endpoints()
+                .iter()
+                .filter(|url| route.endpoint_transport(url.expose_url()) == RpcTransport::Direct)
+                .count();
+            (direct, route.endpoints().len())
+        });
     let (route, warning) = match mode {
+        WalletNetworkMode::Tor | WalletNetworkMode::Proxy if direct > 0 && direct == total => (
+            "Directly to a randomly chosen provider, because this chain's Sensitive endpoints are set to Direct. The addresses aren't isolated from each other",
+            "RPC providers receive these addresses and can link them to each other and to you.",
+        ),
+        WalletNetworkMode::Tor if direct > 0 => (
+            "Each address on its own Tor route to a randomly chosen provider. A provider set to Direct gets its addresses directly instead",
+            "RPC providers receive these addresses and can still link them by timing. A provider set to Direct also sees your IP and can link the addresses it receives to each other and to you.",
+        ),
         WalletNetworkMode::Tor => (
             "Each address on its own Tor route to a randomly chosen provider",
             "RPC providers receive these addresses and can still link them by timing. Tor doesn't prevent that.",
+        ),
+        WalletNetworkMode::Proxy if direct > 0 => (
+            "Over your proxy to a randomly chosen provider, or directly to a provider set to Direct. The addresses aren't isolated from each other",
+            "RPC providers receive these addresses and can link them to each other and to you. The proxy doesn't prevent that, and a provider set to Direct also sees your IP.",
         ),
         WalletNetworkMode::Proxy => (
             "Over your proxy to a randomly chosen provider. The addresses aren't isolated from each other",
