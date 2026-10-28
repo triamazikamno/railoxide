@@ -124,9 +124,7 @@ use private_action::{
 };
 use private_broadcaster::PrivateBroadcasterProgressState;
 use proposals::ProposalsState;
-use public_account::{
-    DerivePreviewState, HardwarePublicAccountDerivationStatus, PublicAccountFormState,
-};
+use public_account::{DerivePreviewState, PublicAccountFormState};
 use public_action::{PublicActionMode, PublicActionProgressLifecycle, PublicSendKind};
 use public_balances::{
     public_account_visible_balances_for_chain, public_asset_decimals, public_asset_label,
@@ -1326,7 +1324,6 @@ impl WalletRoot {
         };
         let public_list_scroll = gpui::ScrollHandle::new();
         let public_form = PublicAccountFormState {
-            add_label_input: new_text_input(window, cx, "account label"),
             add_password_input: new_masked_input(window, cx, "vault password"),
             import_label_input: new_text_input(window, cx, "account label"),
             import_private_key_input: new_masked_input(window, cx, "private key hex"),
@@ -1391,9 +1388,6 @@ impl WalletRoot {
             error: None,
             send_error: None,
             shield_error: None,
-            adding_account: false,
-            hardware_derivation_status: HardwarePublicAccountDerivationStatus::Idle,
-            hardware_confirmation_address: None,
             importing_account: false,
             sending: false,
             shielding: false,
@@ -2143,16 +2137,6 @@ impl WalletRoot {
                 }
             }
         })
-        .detach();
-        cx.subscribe_in(
-            &root.public_form.add_label_input,
-            window,
-            |this, _input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.add_public_derived_account_from_input(window, cx);
-                }
-            },
-        )
         .detach();
         for input in [
             &root.public_form.import_label_input,

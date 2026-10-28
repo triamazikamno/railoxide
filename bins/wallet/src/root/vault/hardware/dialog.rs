@@ -334,6 +334,10 @@ impl WalletRoot {
         self.view_session = Some(Arc::new(
             view_session.clone_with_hardware_profile_session(hardware_session),
         ));
+        // A discarded Trezor session ends a hardware address preview like a cleared one.
+        self.public_form
+            .derive_preview
+            .end_hardware_preview_unless(None);
         cx.notify();
     }
 

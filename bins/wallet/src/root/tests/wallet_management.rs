@@ -1485,11 +1485,9 @@ fn hardware_public_account_copy_uses_device_signing_language() {
         wallet_ops::hardware::HardwareDeviceKind::Trezor,
     );
 
-    assert!(copy.contains("hardware-native Public EVM account"));
-    assert!(copy.contains("Trezor"));
-    assert!(copy.contains("partitioned by the selected Private wallet account index"));
-    assert!(copy.contains("Confirm the receive address on your device"));
-    assert!(copy.contains("public transactions will require device approval"));
+    assert!(copy.contains("hardware-native Public EVM addresses your Trezor derives"));
+    assert!(copy.contains("you confirm each added address on your Trezor"));
+    assert!(copy.contains("will require device approval"));
     assert_eq!(
         crate::root::public_account::public_account_source_label(
             wallet_ops::vault::PublicAccountSource::HardwareDerived,

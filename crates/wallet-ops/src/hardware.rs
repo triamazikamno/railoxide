@@ -20,8 +20,11 @@ pub use path::{
     DEFAULT_HARDWARE_DERIVATION_PATH, HARDENED_BIP32_INDEX, format_bip32_path, parse_bip32_path,
 };
 pub use public_account::{
-    ConfirmedHardwarePublicAccount, HardwarePublicAccountDescriptor, HardwarePublicAccountPathKind,
+    ConfirmedHardwarePublicAccount, HardwareAccountPublicKey, HardwarePublicAccountDescriptor,
+    HardwarePublicAccountPathKind, hardware_public_account_key_path,
 };
+#[cfg(test)]
+pub(crate) use public_account::{TEST_ACCOUNT_CHAIN_CODE, TEST_ACCOUNT_PUBLIC_KEY};
 pub use types::{
     HardwareAppVersion, HardwareDerivationMethod, HardwareDeviceKind, HardwareTypedDataSigningMode,
     HardwareWalletSyncIntent,

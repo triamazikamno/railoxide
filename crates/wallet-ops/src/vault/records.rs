@@ -15,7 +15,7 @@ use super::{
     bip39_mnemonic_from_entropy, generate_opaque_id,
 };
 
-use coins_bip32::prelude::{Parent, XPriv, XPub};
+use coins_bip32::prelude::{ChainCode, Hint, KeyFingerprint, Parent, XKeyInfo, XPriv, XPub};
 
 use crate::parse_railgun_recipient;
 
@@ -832,6 +832,28 @@ impl DerivedPublicAccountPreview {
         Ok(Self {
             wallet_uuid: wallet_uuid.to_owned(),
             account_key: derive_public_evm_account_key_from_seed(seed)?.verify_key(),
+        })
+    }
+
+    /// Builds a preview from a hardware account key at `m/44'/60'/{wallet}'/0`.
+    /// Unhardened child derivation ignores the parent fingerprint, so it is zero.
+    pub fn from_account_public_key(
+        wallet_uuid: &str,
+        public_key: &[u8],
+        chain_code: [u8; 32],
+    ) -> Result<Self, VaultError> {
+        let key = coins_bip32::ecdsa::VerifyingKey::from_sec1_bytes(public_key)
+            .map_err(|_| VaultError::PublicEvmKeyDerivation)?;
+        let info = XKeyInfo {
+            depth: 4,
+            parent: KeyFingerprint([0; 4]),
+            index: 0,
+            chain_code: ChainCode(chain_code),
+            hint: Hint::Legacy,
+        };
+        Ok(Self {
+            wallet_uuid: wallet_uuid.to_owned(),
+            account_key: XPub::new(key, info),
         })
     }
 

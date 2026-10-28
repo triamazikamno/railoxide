@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use alloy::primitives::Address;
+
 use super::{
     ConfirmedHardwarePublicAccount, DerivedPublicAccountPreview, DesktopVaultStore,
     DesktopViewSession, EncryptedRecord, KEY_LEN, PUBLIC_ACCOUNT_METADATA_PREFIX,
@@ -197,16 +199,12 @@ impl DesktopVaultStore {
                 continue;
             }
             let address = preview.address(index)?;
-            if used_indexes.contains(&index) {
-                skipped.push((index, PreviewedPublicAccountSkip::AlreadyAdded));
-                continue;
-            }
             // Distinct indexes never share an address, so earlier accounts in
             // this batch need no duplicate check.
-            if ensure_public_account_address_available(&accounts, address, &scope, wallet_id)
-                .is_err()
+            if let Some(skip) =
+                previewed_index_skip(&accounts, &used_indexes, &scope, wallet_id, index, address)
             {
-                skipped.push((index, PreviewedPublicAccountSkip::DuplicateAddress));
+                skipped.push((index, skip));
                 continue;
             }
             added.push(PublicAccountMetadata {
@@ -231,6 +229,33 @@ impl DesktopVaultStore {
             self.db.put_desktop_wallet_vault_records(&entries)?;
         }
         Ok(PreviewedPublicAccountsAdded { added, skipped })
+    }
+
+    /// Why `index` would be skipped by a previewed add right now, without writing.
+    pub fn previewed_public_account_skip(
+        &self,
+        view_session: &DesktopViewSession,
+        preview: &DerivedPublicAccountPreview,
+        index: u32,
+    ) -> Result<Option<PreviewedPublicAccountSkip>, VaultError> {
+        let wallet_id = view_session.wallet_id();
+        if preview.wallet_uuid != wallet_id {
+            return Err(VaultError::PublicAccountPreviewWalletMismatch);
+        }
+        let address = preview.address(index)?;
+        let accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
+        let used_indexes = derived_public_account_indexes(&accounts, wallet_id).collect();
+        let scope = PublicAccountScope::PrivateWallet {
+            wallet_uuid: wallet_id.to_owned(),
+        };
+        Ok(previewed_index_skip(
+            &accounts,
+            &used_indexes,
+            &scope,
+            wallet_id,
+            index,
+            address,
+        ))
     }
 
     pub fn add_hardware_public_account(
@@ -259,11 +284,14 @@ impl DesktopVaultStore {
         if descriptor.device_kind != hardware_account.descriptor.device_kind {
             return Err(VaultError::InvalidHardwareWalletDescriptor);
         }
-        let derivation_index = next_derived_public_account_index(&accounts, wallet_id)?;
-        if descriptor.wallet_account_index != view_session.derivation_index()
-            || descriptor.public_account_index != derivation_index
-        {
+        if descriptor.wallet_account_index != view_session.derivation_index() {
             return Err(VaultError::InvalidHardwareWalletDescriptor);
+        }
+        let derivation_index = descriptor.public_account_index;
+        if derived_public_account_indexes(&accounts, wallet_id)
+            .any(|index| index == derivation_index)
+        {
+            return Err(VaultError::PublicAccountIndexAlreadyAdded);
         }
         let scope = PublicAccountScope::PrivateWallet {
             wallet_uuid: wallet_id.to_owned(),
@@ -572,5 +600,25 @@ impl DesktopVaultStore {
         }
         sort_public_account_metadata(&mut accounts);
         Ok(accounts)
+    }
+}
+
+/// Why a previewed add skips `index`: a derived account of any status uses it,
+/// or its address duplicates a visible account.
+fn previewed_index_skip(
+    accounts: &[PublicAccountMetadata],
+    used_indexes: &BTreeSet<u32>,
+    scope: &PublicAccountScope,
+    wallet_id: &str,
+    index: u32,
+    address: Address,
+) -> Option<PreviewedPublicAccountSkip> {
+    if used_indexes.contains(&index) {
+        Some(PreviewedPublicAccountSkip::AlreadyAdded)
+    } else if ensure_public_account_address_available(accounts, address, scope, wallet_id).is_err()
+    {
+        Some(PreviewedPublicAccountSkip::DuplicateAddress)
+    } else {
+        None
     }
 }

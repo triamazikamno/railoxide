@@ -5,11 +5,9 @@ use std::{
 };
 
 use alloy::primitives::Address;
-#[cfg(feature = "hardware")]
-use gpui::rgb;
 use gpui::{
-    AppContext as _, Context, Entity, Focusable, InteractiveElement as _, IntoElement,
-    ParentElement, Pixels, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
+    AppContext as _, Context, Entity, Focusable, IntoElement, ParentElement, Pixels, SharedString,
+    Styled, Window, div, px,
 };
 use gpui_component::{
     Disableable, Sizable, WindowExt,
@@ -21,14 +19,11 @@ use gpui_component::{
 };
 use railgun_ui::{chain_name, short_address};
 use ui::controls::{app_button, app_input, app_masked_input, app_muted_text, app_strong_text};
-#[cfg(feature = "hardware")]
-use ui::theme;
 use wallet_ops::{
     PublicAssetId, PublicBalanceEntry,
-    hardware::{HardwareDeviceKind, HardwarePublicAccountDescriptor},
+    hardware::HardwareDeviceKind,
     vault::{
-        DesktopVaultStore, DesktopViewSession, PublicAccountMetadata, PublicAccountStatus,
-        WalletSource, public_account_default_label,
+        PublicAccountMetadata, PublicAccountStatus, WalletSource, public_account_default_label,
     },
 };
 use zeroize::Zeroizing;
@@ -50,15 +45,8 @@ pub(super) use components::{
     public_account_source_label,
 };
 pub(super) use derive_preview::DerivePreviewState;
-#[cfg(feature = "hardware")]
-use hardware::{HardwarePublicAccountDerivationProgress, create_hardware_public_account};
-pub(super) use hardware::{
-    HardwarePublicAccountDerivationStatus, hardware_public_account_setup_copy,
-};
-use hardware::{
-    hardware_public_device_label, render_hardware_public_account_checking,
-    render_hardware_public_account_confirmation_wait,
-};
+#[cfg(test)]
+pub(super) use hardware::hardware_public_account_setup_copy;
 #[cfg(test)]
 pub(super) use identicon::{
     PUBLIC_ACCOUNT_IDENTICON_CELL_COUNT, PUBLIC_ACCOUNT_IDENTICON_GRID_SIZE,
@@ -301,6 +289,12 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         match kind {
+            // A hardware wallet's authorize state has no password, so Enter reaches Show addresses.
+            PublicAccountDialogKind::Derive
+                if self.selected_hardware_public_device_kind().is_some() =>
+            {
+                self.public_form.derive_preview.focus.focus(window, cx);
+            }
             PublicAccountDialogKind::Derive => self
                 .public_form
                 .add_password_input
@@ -397,9 +391,6 @@ impl WalletRoot {
         self.public_form.shield_error = None;
         self.walletconnect.clear_runtime();
         self.sync_platform_attention();
-        self.public_form.adding_account = false;
-        self.public_form.hardware_derivation_status = HardwarePublicAccountDerivationStatus::Idle;
-        self.public_form.hardware_confirmation_address = None;
         self.public_form.importing_account = false;
         self.public_form.sending = false;
         self.public_form.shielding = false;
@@ -414,7 +405,6 @@ impl WalletRoot {
     ) {
         self.clear_public_wallet_runtime_state(cx);
         for input in [
-            &self.public_form.add_label_input,
             &self.public_form.add_password_input,
             &self.public_form.import_label_input,
             &self.public_form.import_private_key_input,
@@ -450,18 +440,11 @@ impl WalletRoot {
             public_account_default_label(self.public_form.next_account_label_number);
         match kind {
             PublicAccountDialogKind::Derive => {
-                self.public_form.adding_account = false;
                 self.public_form.derive_preview.reset();
                 self.public_form
                     .derive_preview
                     .go_to_input
                     .update(cx, |input, cx| input.set_value("", window, cx));
-                self.public_form.hardware_derivation_status =
-                    HardwarePublicAccountDerivationStatus::Idle;
-                self.public_form.hardware_confirmation_address = None;
-                self.public_form
-                    .add_label_input
-                    .update(cx, |input, cx| input.set_value(&default_label, window, cx));
                 self.public_form
                     .add_password_input
                     .update(cx, |input, cx| input.set_value("", window, cx));
@@ -674,198 +657,16 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(device_kind) = self.selected_hardware_public_device_kind() else {
-            self.authorize_derive_preview(device_auth_password, window, cx);
-            return;
-        };
-        if self.public_form.adding_account
-            || self.public_form.hardware_derivation_status
-                == HardwarePublicAccountDerivationStatus::AwaitingAddressConfirmation
-        {
-            return;
+        match self.selected_hardware_public_device_kind() {
+            Some(device_kind) => self.authorize_hardware_derive_preview(device_kind, window, cx),
+            None => self.authorize_derive_preview(device_auth_password, window, cx),
         }
-        let Some(store) = self.vault_store.clone() else {
-            self.public_form.error = Some(Arc::from("Wallet vault storage is unavailable"));
-            cx.notify();
-            return;
-        };
-        let Some(view_session) = self.view_session.clone() else {
-            self.public_form.error = Some(Arc::from("Wallet vault is locked"));
-            cx.notify();
-            return;
-        };
-        let label = self
-            .public_form
-            .add_label_input
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        if label.is_empty() {
-            self.public_form.error = Some(Arc::from("Enter an account label"));
-            cx.notify();
-            return;
-        }
-        #[cfg(feature = "hardware")]
-        let trezor_app_passphrase = view_session.hardware_profile_session().and_then(|session| {
-            self.read_trezor_app_passphrase_for_hardware_session(session, window, cx)
-        });
-        #[cfg(not(feature = "hardware"))]
-        let trezor_app_passphrase = None;
-        self.add_hardware_public_account_from_input(
-            store,
-            view_session,
-            device_kind,
-            label,
-            trezor_app_passphrase,
-            window,
-            cx,
-        );
-    }
-
-    fn add_hardware_public_account_from_input(
-        &mut self,
-        store: Arc<DesktopVaultStore>,
-        view_session: Arc<DesktopViewSession>,
-        device_kind: HardwareDeviceKind,
-        label: String,
-        trezor_app_passphrase: Option<Zeroizing<String>>,
-        window: &Window,
-        cx: &mut Context<'_, Self>,
-    ) {
-        self.public_form.adding_account = true;
-        self.public_form.hardware_derivation_status =
-            HardwarePublicAccountDerivationStatus::CheckingDevice;
-        self.public_form.hardware_confirmation_address = None;
-        self.public_form.error = None;
-
-        #[cfg(feature = "hardware")]
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-        #[cfg(feature = "hardware")]
-        let trezor_pin_matrix_provider = if device_kind == HardwareDeviceKind::Trezor {
-            Some(self.trezor_pin_matrix_provider_for_operation(window, cx))
-        } else {
-            None
-        };
-
-        #[cfg(feature = "hardware")]
-        let join = self.runtime.spawn(async move {
-            create_hardware_public_account(
-                store,
-                view_session,
-                device_kind,
-                label,
-                trezor_app_passphrase,
-                trezor_pin_matrix_provider,
-                progress_tx,
-            )
-            .await
-        });
-
-        #[cfg(not(feature = "hardware"))]
-        let join: tokio::task::JoinHandle<Result<PublicAccountMetadata, String>> =
-            self.runtime.spawn(async move {
-                let _ = (
-                    store,
-                    view_session,
-                    device_kind,
-                    label,
-                    trezor_app_passphrase,
-                );
-                Err("hardware public account support is not enabled in this build".to_owned())
-            });
-
-        #[cfg(feature = "hardware")]
-        cx.spawn_in(window, async move |this, cx| {
-            while let Some(progress) = progress_rx.recv().await {
-                let Ok(active) = this.update(cx, |root, cx| {
-                    if !root.public_form.adding_account {
-                        return false;
-                    }
-                    match progress {
-                        HardwarePublicAccountDerivationProgress::CheckingDevice => {
-                            root.public_form.hardware_derivation_status =
-                                HardwarePublicAccountDerivationStatus::CheckingDevice;
-                            root.public_form.hardware_confirmation_address = None;
-                        }
-                        HardwarePublicAccountDerivationProgress::AwaitingAddressConfirmation(
-                            address,
-                        ) => {
-                            root.public_form.hardware_derivation_status =
-                                HardwarePublicAccountDerivationStatus::AwaitingAddressConfirmation;
-                            root.public_form.hardware_confirmation_address = Some(address);
-                        }
-                    }
-                    cx.notify();
-                    true
-                }) else {
-                    break;
-                };
-                if !active {
-                    break;
-                }
-            }
-        })
-        .detach();
-
-        cx.spawn_in(window, async move |this, cx| {
-            let result = join.await;
-            let _ = this.update_in(cx, |root, window, cx| {
-                root.public_form.adding_account = false;
-                root.public_form.hardware_derivation_status =
-                    HardwarePublicAccountDerivationStatus::Idle;
-                root.public_form.hardware_confirmation_address = None;
-                match result {
-                    #[cfg(feature = "hardware")]
-                    Ok(Ok((account, hardware_session))) => {
-                        root.refresh_active_hardware_profile_session(hardware_session, cx);
-                        root.public_form.selected_account_uuid =
-                            Some(Arc::from(account.public_account_uuid.as_str()));
-                        root.public_form
-                            .add_label_input
-                            .update(cx, |input, cx| input.set_value("", window, cx));
-                        root.reload_public_accounts(window, cx);
-                        root.schedule_account_public_balance_refresh(
-                            root.selected_chain,
-                            [account.public_account_uuid],
-                            None,
-                            cx,
-                        );
-                        root.clear_trezor_pin_matrix_prompt(cx);
-                        window.close_all_dialogs(cx);
-                    }
-                    #[cfg(not(feature = "hardware"))]
-                    Ok(Ok(account)) => {
-                        root.public_form.selected_account_uuid =
-                            Some(Arc::from(account.public_account_uuid.as_str()));
-                        root.public_form
-                            .add_label_input
-                            .update(cx, |input, cx| input.set_value("", window, cx));
-                        root.reload_public_accounts(window, cx);
-                        root.schedule_account_public_balance_refresh(
-                            root.selected_chain,
-                            [account.public_account_uuid],
-                            None,
-                            cx,
-                        );
-                        window.close_all_dialogs(cx);
-                    }
-                    Ok(Err(error)) => {
-                        root.discard_active_trezor_session_if_stale(&error, cx);
-                        root.public_form.error = Some(Arc::from(error));
-                    }
-                    Err(error) => {
-                        root.public_form.error = Some(Arc::from(error.to_string()));
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
     }
 
     fn selected_hardware_public_device_kind(&self) -> Option<HardwareDeviceKind> {
+        if super::private_swap::ui_fixture_hardware_derive() {
+            return Some(HardwareDeviceKind::Ledger);
+        }
         match self.selected_wallet_source() {
             WalletSource::LedgerDerived => Some(HardwareDeviceKind::Ledger),
             WalletSource::TrezorDerived => Some(HardwareDeviceKind::Trezor),
@@ -1226,7 +1027,6 @@ impl WalletRoot {
             .disabled(
                 self.vault_store.is_none()
                     || self.view_session.is_none()
-                    || self.public_form.adding_account
                     || self.public_form.importing_account,
             )
             .dropdown_menu(move |menu, _window, _cx| {
@@ -1269,7 +1069,6 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         if self.device_auth_in_progress
-            || self.public_form.adding_account
             || self.public_form.importing_account
             || self.public_form.derive_preview.authorizing
             || !lease.upgrade().is_some_and(|open| open.get())
@@ -1396,162 +1195,7 @@ impl WalletRoot {
     ) -> gpui::Div {
         match kind {
             PublicAccountDialogKind::Derive => {
-                #[cfg(feature = "hardware")]
-                let add_root = root.clone();
-                #[cfg(not(feature = "hardware"))]
-                let add_root = root;
-                let next_index = self.public_form.next_derived_index.map_or_else(
-                    || "Next index unavailable".to_string(),
-                    |index| format!("Next derived index: {index}"),
-                );
-                if let Some(device_kind) = self.selected_hardware_public_device_kind() {
-                    let hardware_status = self.public_form.hardware_derivation_status;
-                    let show_trezor_app_passphrase =
-                        self.current_session_needs_trezor_app_passphrase();
-                    #[cfg(feature = "hardware")]
-                    let trezor_pin_matrix_prompt = self
-                        .hardware_profile_unlock
-                        .trezor_pin_matrix_prompt
-                        .as_ref()
-                        .map(|prompt| {
-                            super::vault_ui::render_trezor_pin_matrix_prompt(&root, prompt)
-                                .into_any_element()
-                        });
-                    #[cfg(not(feature = "hardware"))]
-                    let trezor_pin_matrix_prompt: Option<gpui::AnyElement> = None;
-                    let path = self
-                        .public_form
-                        .next_derived_index
-                        .and_then(|public_index| {
-                            let wallet_index = self.view_session.as_ref()?.derivation_index();
-                            HardwarePublicAccountDescriptor::for_wallet_public_index(
-                                device_kind,
-                                wallet_index,
-                                public_index,
-                            )
-                            .ok()
-                        })
-                        .map_or_else(
-                            || "Next hardware path unavailable".to_string(),
-                            |descriptor| {
-                                format!("Next hardware path: {}", descriptor.path_display())
-                            },
-                        );
-                    return div()
-                        .w(content_width)
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .child(app_muted_text(hardware_public_account_setup_copy(
-                            device_kind,
-                        )))
-                        .child(app_muted_text(next_index))
-                        .child(
-                            app_muted_text(path)
-                                .debug_selector(|| "public-derive-hardware-path".into()),
-                        )
-                        .when(show_trezor_app_passphrase, |this| {
-                            #[cfg(feature = "hardware")]
-                            {
-                                this.child(
-                                    div()
-                                        .w_full()
-                                        .p(px(12.0))
-                                        .flex()
-                                        .flex_col()
-                                        .gap_2()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(theme::BORDER))
-                                        .bg(rgb(theme::SURFACE))
-                                        .child(app_strong_text("Trezor app passphrase"))
-                                        .child(
-                                            app_muted_text(
-                                                "If the Trezor session expired, enter the app passphrase for this account request.",
-                                            )
-                                            .whitespace_normal(),
-                                        )
-                                        .child(
-                                            super::ui_helpers::input_enter_scope(
-                                                !self.public_form.adding_account
-                                                    && hardware_status != HardwarePublicAccountDerivationStatus::AwaitingAddressConfirmation,
-                                                {
-                                                    let root = root.clone();
-                                                    move |window, cx| {
-                                                        root.update(cx, |root, cx| {
-                                                            root.add_public_derived_account_from_input(window, cx);
-                                                        });
-                                                    }
-                                                },
-                                            ).child(app_masked_input(
-                                                &self.trezor_app_passphrase_input,
-                                                self.public_form.adding_account,
-                                            )),
-                                        ),
-                                )
-                            }
-                            #[cfg(not(feature = "hardware"))]
-                            {
-                                this
-                            }
-                        })
-                        .children(trezor_pin_matrix_prompt)
-                        .child(
-                            app_input(&self.public_form.add_label_input)
-                                .disabled(self.public_form.adding_account),
-                        )
-                        .children(self.public_form.error.as_ref().map(|message| {
-                            Alert::error("wallet-public-add-derived-error", message.to_string())
-                                .small()
-                        }))
-                        .when(
-                            hardware_status == HardwarePublicAccountDerivationStatus::CheckingDevice,
-                            |this| this.child(render_hardware_public_account_checking(device_kind)),
-                        )
-                        .when(
-                            hardware_status == HardwarePublicAccountDerivationStatus::AwaitingAddressConfirmation,
-                            |this| {
-                                this.child(render_hardware_public_account_confirmation_wait(
-                                    device_kind,
-                                    self.public_form.hardware_confirmation_address,
-                                ))
-                            },
-                        )
-                        .when(
-                            hardware_status
-                                != HardwarePublicAccountDerivationStatus::AwaitingAddressConfirmation,
-                            |this| {
-                                this.child(
-                                    app_button(
-                                        "wallet-public-add-derived-submit",
-                                        if self.public_form.adding_account {
-                                            match hardware_status {
-                                                HardwarePublicAccountDerivationStatus::CheckingDevice => {
-                                                    format!(
-                                                        "Checking {}...",
-                                                        hardware_public_device_label(device_kind)
-                                                    )
-                                                }
-                                                _ => "Deriving...".to_owned(),
-                                            }
-                                        } else {
-                                            "Add hardware account".to_owned()
-                                        },
-                                    )
-                                    .primary()
-                                    .small()
-                                    .loading(self.public_form.adding_account)
-                                    .disabled(self.public_form.adding_account)
-                                    .on_click(move |_event, window, cx| {
-                                        add_root.update(cx, |root, cx| {
-                                            root.add_public_derived_account_from_input(window, cx);
-                                        });
-                                    }),
-                                )
-                            },
-                        );
-                }
-                self.render_derive_preview_content(add_root, content_width, device_auth_lease)
+                self.render_derive_preview_content(root, content_width, device_auth_lease)
             }
             PublicAccountDialogKind::Import => {
                 let import_root = root.clone();

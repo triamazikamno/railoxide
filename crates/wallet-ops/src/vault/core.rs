@@ -139,6 +139,8 @@ pub enum VaultError {
     PublicAccountPreviewWalletMismatch,
     #[error("invalid public account index selection")]
     InvalidPublicAccountSelection,
+    #[error("public account index is already added")]
+    PublicAccountIndexAlreadyAdded,
     #[error("address book label cannot be empty")]
     InvalidAddressBookLabel,
     #[error("invalid private address book recipient")]

@@ -10,10 +10,12 @@ use zeroize::Zeroizing;
 
 use super::super::{
     HardwareAppVersion, HardwareDerivationError, HardwareDeviceKind,
-    HardwarePublicAccountDescriptor, HardwareTypedDataSigningMode,
+    HardwarePublicAccountDescriptor, HardwareTypedDataSigningMode, TEST_ACCOUNT_CHAIN_CODE,
+    TEST_ACCOUNT_PUBLIC_KEY,
 };
 use super::client::{
-    TrezorDeviceInfo, TrezorHardwareDerivationClient, trezor_ethereum_get_address_request,
+    TrezorDeviceInfo, TrezorHardwareDerivationClient, trezor_account_public_key_from_node,
+    trezor_ethereum_get_address_request, trezor_ethereum_get_public_key_request,
 };
 use super::passphrase::{TrezorPassphraseState, TrezorPinMatrixRequestKind};
 use super::transaction::{TREZOR_ETHEREUM_TX_CHUNK_SIZE, TrezorLegacySignRequest};
@@ -82,6 +84,20 @@ impl Transport for RecordingTransport {
         self.responses
             .pop_front()
             .ok_or_else(|| TrezorTransportError::IO(std::io::Error::other("no queued response")))
+    }
+}
+
+#[derive(Clone)]
+struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("logs lock").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -450,6 +466,110 @@ fn trezor_address_confirmation_sets_display_flag() {
     let confirmed = trezor_ethereum_get_address_request(&path, true);
     assert_eq!(confirmed.address_n, path.to_vec());
     assert!(confirmed.show_display());
+}
+
+#[test]
+fn trezor_account_public_key_request_reads_account_path_without_display() {
+    let path = [0x8000_002c, 0x8000_003c, 0x8000_0000, 0];
+
+    let request = trezor_ethereum_get_public_key_request(&path);
+
+    assert_eq!(request.address_n, path.to_vec());
+    assert!(!request.show_display());
+}
+
+fn test_account_node() -> trezor_client::protos::HDNodeType {
+    let mut compressed = vec![0x02 | (TEST_ACCOUNT_PUBLIC_KEY[64] & 1)];
+    compressed.extend_from_slice(&TEST_ACCOUNT_PUBLIC_KEY[1..33]);
+    let mut node = trezor_client::protos::HDNodeType::new();
+    node.set_depth(4);
+    node.set_fingerprint(0);
+    node.set_child_num(0);
+    node.set_chain_code(TEST_ACCOUNT_CHAIN_CODE.to_vec());
+    node.set_public_key(compressed);
+    node
+}
+
+#[test]
+fn trezor_account_public_key_from_node_checks_lengths() {
+    let node = test_account_node();
+
+    let key = trezor_account_public_key_from_node(&node).expect("account key");
+    assert_eq!(key.public_key, node.public_key());
+    assert_eq!(key.chain_code, TEST_ACCOUNT_CHAIN_CODE);
+
+    let mut short_chain_code = node.clone();
+    short_chain_code.set_chain_code(TEST_ACCOUNT_CHAIN_CODE[..31].to_vec());
+    assert!(matches!(
+        trezor_account_public_key_from_node(&short_chain_code),
+        Err(HardwareDerivationError::UnexpectedHardwareResponse(_))
+    ));
+    let mut uncompressed = node;
+    uncompressed.set_public_key(TEST_ACCOUNT_PUBLIC_KEY.to_vec());
+    assert!(matches!(
+        trezor_account_public_key_from_node(&uncompressed),
+        Err(HardwareDerivationError::UnexpectedHardwareResponse(_))
+    ));
+}
+
+#[test]
+fn trezor_account_public_key_answers_pin_matrix_request() {
+    let mut pin_request = trezor_client::protos::PinMatrixRequest::new();
+    pin_request.set_type(
+        trezor_client::protos::pin_matrix_request::PinMatrixRequestType::PinMatrixRequestType_Current,
+    );
+    let mut public_key = trezor_client::protos::EthereumPublicKey::new();
+    public_key.node = Some(test_account_node()).into();
+    public_key.set_xpub("xpub-account-key-marker".to_owned());
+
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let transport = QueuedTransport {
+        responses: VecDeque::from([queued_message(&pin_request), queued_message(&public_key)]),
+        writes: Arc::clone(&writes),
+    };
+    let client = trezor_client::client::trezor_with_transport(
+        trezor_client::Model::Trezor,
+        Box::new(transport),
+    );
+    let mut client = TrezorHardwareDerivationClient {
+        client,
+        passphrase: TrezorPassphraseState::default(),
+        pin_matrix_provider: None,
+    };
+    client.set_pin_matrix_provider(Arc::new(
+        |_: TrezorPinMatrixRequestKind| -> Result<_, HardwareDerivationError> {
+            Ok(Zeroizing::new("123".to_owned()))
+        },
+    ));
+
+    // The account key links every derived address, so even trace logs must not carry it.
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogCapture(Arc::clone(&logs));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .finish();
+    let key = tracing::subscriber::with_default(subscriber, || {
+        tracing::trace!(target: "trezor_client", "capture check");
+        client.account_public_key(0)
+    })
+    .expect("PIN matrix request is acknowledged");
+    let logs = String::from_utf8(logs.lock().expect("logs lock").clone()).expect("UTF-8 logs");
+    assert!(logs.contains("capture check"));
+    assert!(!logs.contains("xpub-account-key-marker"));
+    assert!(!logs.contains("EthereumPublicKey"));
+
+    assert_eq!(key.public_key, test_account_node().public_key());
+    assert_eq!(key.chain_code, TEST_ACCOUNT_CHAIN_CODE);
+    assert_eq!(
+        writes.lock().expect("writes lock").as_slice(),
+        &[
+            MessageType::MessageType_EthereumGetPublicKey,
+            MessageType::MessageType_PinMatrixAck,
+        ]
+    );
 }
 
 #[test]

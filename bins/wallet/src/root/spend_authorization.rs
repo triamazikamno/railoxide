@@ -4597,6 +4597,9 @@ impl WalletRoot {
             &refreshed,
             self.active_wallet_generation,
         );
+        self.public_form
+            .derive_preview
+            .end_hardware_preview_unless(refreshed.hardware_profile_session());
         self.view_session = Some(refreshed);
         cx.notify();
     }

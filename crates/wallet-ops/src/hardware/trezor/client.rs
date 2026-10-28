@@ -3,17 +3,20 @@ use async_trait::async_trait;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::super::{
-    ConfirmedHardwarePublicAccount, HardwareAppVersion, HardwareDerivationClient,
-    HardwareDerivationDescriptor, HardwareDerivationError, HardwareDerivationMethod,
-    HardwareDeviceKind, HardwareOperationOutput, HardwarePublicAccountDescriptor,
-    HardwareTypedDataSigningMode, hardware_profile_fingerprint,
+    ConfirmedHardwarePublicAccount, HardwareAccountPublicKey, HardwareAppVersion,
+    HardwareDerivationClient, HardwareDerivationDescriptor, HardwareDerivationError,
+    HardwareDerivationMethod, HardwareDeviceKind, HardwareOperationOutput,
+    HardwarePublicAccountDescriptor, HardwareTypedDataSigningMode, hardware_profile_fingerprint,
+    hardware_public_account_key_path,
 };
 use super::bridge::BridgeTransport;
 use super::passphrase::{
     TrezorPassphraseState, TrezorPinMatrixProvider, handle_trezor_interaction,
 };
+use super::transport::{trezor_call_raw_with_interactions, trezor_decode_message};
 use super::typed_data::classify_trezor_typed_data_signing_mode;
 use crate::vault::{HardwareProfileBinding, HardwareProfileSession, TrezorPassphraseMode};
+use trezor_client::protos::MessageType;
 
 const TREZOR_CIPHER_INPUT_V1: [u8; 32] = [0u8; 32];
 
@@ -182,6 +185,37 @@ impl TrezorHardwareDerivationClient {
         Ok(address.to_ascii_lowercase())
     }
 
+    /// Reads the public key and chain code at `m/44'/60'/{wallet}'/0` without
+    /// on-device display.
+    pub fn account_public_key(
+        &mut self,
+        wallet_account_index: u32,
+    ) -> Result<HardwareAccountPublicKey, HardwareDerivationError> {
+        let path = hardware_public_account_key_path(wallet_account_index)?;
+        let request = trezor_ethereum_get_public_key_request(&path);
+        let Self {
+            client,
+            passphrase,
+            pin_matrix_provider,
+        } = self;
+        // `call` traces every decoded response, which here would log the account key.
+        let response = trezor_call_raw_with_interactions(
+            client,
+            request,
+            passphrase,
+            pin_matrix_provider.as_ref(),
+        );
+        passphrase.clear_app_passphrase();
+        let response = response?;
+        if response.message_type() != MessageType::MessageType_EthereumPublicKey {
+            return Err(
+                trezor_client::Error::UnexpectedMessageType(response.message_type()).into(),
+            );
+        }
+        let message: trezor_client::protos::EthereumPublicKey = trezor_decode_message(response)?;
+        trezor_account_public_key_from_node(&message.node.unwrap_or_default())
+    }
+
     pub fn public_ethereum_address(
         &mut self,
         descriptor: &HardwarePublicAccountDescriptor,
@@ -305,6 +339,34 @@ pub(super) fn trezor_ethereum_get_address_request(
     request.address_n = path.to_vec();
     request.set_show_display(display_and_confirm);
     request
+}
+
+pub(super) fn trezor_ethereum_get_public_key_request(
+    path: &[u32],
+) -> trezor_client::protos::EthereumGetPublicKey {
+    let mut request = trezor_client::protos::EthereumGetPublicKey::new();
+    request.address_n = path.to_vec();
+    request.set_show_display(false);
+    request
+}
+
+pub(super) fn trezor_account_public_key_from_node(
+    node: &trezor_client::protos::HDNodeType,
+) -> Result<HardwareAccountPublicKey, HardwareDerivationError> {
+    let chain_code = <[u8; 32]>::try_from(node.chain_code()).map_err(|_| {
+        HardwareDerivationError::UnexpectedHardwareResponse(
+            "Trezor account key chain code is not 32 bytes",
+        )
+    })?;
+    if node.public_key().len() != 33 {
+        return Err(HardwareDerivationError::UnexpectedHardwareResponse(
+            "Trezor account public key is not 33 bytes",
+        ));
+    }
+    Ok(HardwareAccountPublicKey {
+        public_key: node.public_key().to_vec(),
+        chain_code,
+    })
 }
 
 #[async_trait(?Send)]

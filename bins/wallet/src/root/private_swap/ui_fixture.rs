@@ -1,7 +1,8 @@
 //! A debug-only fixture for looking at the Public account swap screens, at a private swap's
 //! retry review, failed quote, speed-up, split outcome, reported fill, setup progress and
 //! cancelled preparation, at the Stealth accounts inspector, at the refund dialog of a blocked
-//! Shield, at a private Send's broadcaster progress and at the rows of the UTXO table: it opens
+//! Shield, at a private Send's broadcaster progress, at the rows of the UTXO table and at a
+//! hardware wallet's Derive from private dialog without a device: it opens
 //! them on a scratch wallet without private
 //! funds and holds a chosen state on screen. It is compiled only with `debug_assertions`, and
 //! does nothing unless `RAILOXIDE_UI_FIXTURE` is set.
@@ -277,6 +278,15 @@
 //!   isolated, whatever the wallet's network mode is. The route's chip and its hover card show
 //!   the synthesized route, which never changes. Stop waiting marks the wait stopped, and
 //!   Close closes the dialog. No job runs, nothing is proved or sent, and no record is written.
+//! - `hardware-derive` shows the Derive from private dialog, from Public's Add account, as a
+//!   hardware wallet's: its authorize state with Show addresses, its preview and the progress
+//!   of an add. Whatever wallet is selected, the dialog treats it as Ledger-derived and asks a
+//!   stand-in Ledger, which needs no unlocked hardware profile. Show addresses answers after
+//!   about 2 seconds with a fixed account key, the compressed secp256k1 generator with a fixed
+//!   chain code, so every wallet previews the same addresses. Add holds forever on the device
+//!   confirmation of the first selected index that has no account, which the stand-in never
+//!   answers. Close the dialog to leave it. Nothing is read from a device, no account is
+//!   stored, and nothing is sent.
 //!
 //! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
@@ -370,6 +380,7 @@ enum Mode {
     Reported(Reported),
     Cancelled(Cancelled),
     BroadcasterProgress(BroadcasterProgress),
+    HardwareDerive,
 }
 
 /// Where a `broadcaster-progress:` mode holds its synthesized Send via broadcaster.
@@ -561,6 +572,9 @@ fn parse(value: &str) -> Option<Mode> {
     }
     if value == "unshield" {
         return Some(Mode::Unshield);
+    }
+    if value == "hardware-derive" {
+        return Some(Mode::HardwareDerive);
     }
     if let Some(state) = value.strip_prefix("max:") {
         return Some(Mode::Max(match state {
@@ -2886,6 +2900,12 @@ pub(in crate::root) fn tor_rotation() -> Option<bool> {
 /// whatever the network's sync state.
 pub(in crate::root) fn shows_utxos() -> bool {
     matches!(mode(), Some(Mode::Utxos))
+}
+
+/// Whether the Derive dialog treats the selected wallet as Ledger-derived and asks the
+/// `hardware-derive` mode's stand-in Ledger.
+pub(in crate::root) fn hardware_derive() -> bool {
+    matches!(mode(), Some(Mode::HardwareDerive))
 }
 
 /// The finality the `utxos` mode counts from its own head block, in place of the network's.

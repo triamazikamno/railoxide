@@ -53,6 +53,7 @@ pub(in crate::root) const fn vault_error_kind(error: &VaultError) -> &'static st
         VaultError::PublicEvmKeyDerivation => "public_evm_key_derivation",
         VaultError::PublicAccountPreviewWalletMismatch => "public_account_preview_wallet_mismatch",
         VaultError::InvalidPublicAccountSelection => "invalid_public_account_selection",
+        VaultError::PublicAccountIndexAlreadyAdded => "public_account_index_already_added",
         VaultError::InvalidAddressBookLabel => "invalid_address_book_label",
         VaultError::InvalidPrivateAddressBookAddress => "invalid_private_address_book_address",
         VaultError::DuplicatePrivateAddressBookAddress => "duplicate_private_address_book_address",
@@ -156,6 +157,9 @@ pub(in crate::root) fn vault_error_message(error: &VaultError) -> Arc<str> {
         }
         VaultError::InvalidPublicAccountSelection => {
             "Select between 1 and 100 accounts to add.".into()
+        }
+        VaultError::PublicAccountIndexAlreadyAdded => {
+            "That index is already added. Reopen the address list and try again.".into()
         }
         _ => "Wallet vault operation failed. See logs for non-sensitive diagnostics.".into(),
     }

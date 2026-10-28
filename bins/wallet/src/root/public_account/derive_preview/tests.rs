@@ -107,23 +107,12 @@ fn authorize(
 }
 
 #[gpui::test]
-fn derive_dialog_keeps_hardware_flow_and_stays_in_authorize_on_failure(cx: &mut TestAppContext) {
+fn derive_dialog_stays_in_authorize_on_failure(cx: &mut TestAppContext) {
     let directory = tempfile::tempdir().unwrap();
     let runtime = runtime();
     let _entered = runtime.enter();
     let (root, cx) = fixture(cx, directory.path(), &runtime);
 
-    root.update(cx, |root, _| {
-        root.wallet_options = vec![WalletOption {
-            wallet_id: Arc::from("preview"),
-            source: WalletSource::LedgerDerived,
-        }];
-    });
-    open_derive(&root, cx);
-    assert!(cx.debug_bounds("public-derive-hardware-path").is_some());
-    assert!(cx.debug_bounds("public-derive-authorize").is_none());
-
-    root.update(cx, |root, _| root.wallet_options.clear());
     let lease = open_derive(&root, cx);
     assert!(cx.debug_bounds("public-derive-authorize").is_some());
     for outcome in [
@@ -769,5 +758,411 @@ fn derive_balance_check_stops_and_ends_with_the_dialog(cx: &mut TestAppContext) 
     drive_until(&root, &runtime, cx, |_| reads() == 6);
     drive_a_while(&root, &runtime, cx);
     assert_eq!(reads(), 6);
+    cx.update(|window, _| window.remove_window());
+}
+
+/// The compressed secp256k1 generator, standing in for the device's account key.
+const ACCOUNT_KEY: [u8; 33] =
+    alloy::primitives::hex!("0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798");
+const CHAIN_CODE: [u8; 32] = [7; 32];
+const LEDGER_PROFILE: &str = "ledger-profile-fingerprint";
+
+fn device_keys() -> DerivedPublicAccountPreview {
+    DerivedPublicAccountPreview::from_account_public_key("hw", &ACCOUNT_KEY, CHAIN_CODE).unwrap()
+}
+
+/// A Ledger stand-in. It answers with `ACCOUNT_KEY`, records each address it is asked to
+/// confirm, and fails or confirms another address where told to.
+#[derive(Default)]
+struct StubDevice {
+    read_error: Mutex<Option<String>>,
+    reject: Mutex<Option<u32>>,
+    mismatch: Mutex<Option<u32>>,
+    asked: Mutex<Vec<HardwarePublicAccountDescriptor>>,
+    /// When set, each confirmation waits for a permit.
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+impl StubDevice {
+    fn asked(&self) -> Vec<u32> {
+        let asked = self.asked.lock().unwrap();
+        asked
+            .iter()
+            .map(|descriptor| descriptor.public_account_index)
+            .collect()
+    }
+}
+
+impl HardwarePublicAccountDevice for StubDevice {
+    fn read_account_key(
+        &self,
+        request: HardwareDeviceRequest,
+    ) -> HardwareDeviceResult<wallet_ops::hardware::HardwareAccountPublicKey> {
+        let result = match self.read_error.lock().unwrap().clone() {
+            Some(error) => Err(error),
+            None => Ok((
+                wallet_ops::hardware::HardwareAccountPublicKey {
+                    public_key: ACCOUNT_KEY.to_vec(),
+                    chain_code: CHAIN_CODE,
+                },
+                request.hardware_session,
+            )),
+        };
+        Box::pin(async move { result })
+    }
+
+    fn confirm_account(
+        &self,
+        request: HardwareDeviceRequest,
+        descriptor: HardwarePublicAccountDescriptor,
+    ) -> HardwareDeviceResult<ConfirmedHardwarePublicAccount> {
+        let index = descriptor.public_account_index;
+        self.asked.lock().unwrap().push(descriptor.clone());
+        let result = if *self.reject.lock().unwrap() == Some(index) {
+            Err("Rejected on the device.".to_owned())
+        } else {
+            let address = if *self.mismatch.lock().unwrap() == Some(index) {
+                Address::repeat_byte(0xee)
+            } else {
+                device_keys().address(index).unwrap()
+            };
+            Ok((
+                ConfirmedHardwarePublicAccount::new_for_tests(descriptor, address),
+                request.hardware_session,
+            ))
+        };
+        let gate = self.gate.clone();
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.acquire().await.unwrap().forget();
+            }
+            result
+        })
+    }
+}
+
+/// Stores a Ledger-derived wallet, selects it under its hardware profile session and puts
+/// `device` in place of the Ledger.
+fn use_ledger_wallet(
+    root: &Entity<WalletRoot>,
+    device: &Arc<StubDevice>,
+    cx: &mut VisualTestContext,
+) {
+    use wallet_ops::hardware::{
+        HardwareDerivationDescriptor, HardwareViewAccessKey, HardwareWalletSyncIntent,
+        parse_bip32_path,
+    };
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            let store = root.vault_store.clone().unwrap();
+            let descriptor = HardwareDerivationDescriptor::ledger_eip1024_v1(
+                parse_bip32_path("m/44'/60'/0'/0/0").unwrap(),
+                0,
+                LEDGER_PROFILE.to_owned(),
+                HardwareWalletSyncIntent::CreateNew,
+            );
+            let metadata = store
+                .new_hardware_wallet_metadata(PASSWORD, "hw", "Ledger", descriptor)
+                .unwrap();
+            let access = HardwareViewAccessKey::new([9; 32]);
+            store
+                .store_hardware_derived_wallet_with_metadata(
+                    PASSWORD,
+                    "hw",
+                    0,
+                    &wallet_keys_from_mnemonic(MNEMONIC, "", 0).unwrap(),
+                    &metadata,
+                    &access,
+                )
+                .unwrap();
+            let session = store
+                .hardware_profile_session_for_fingerprint(
+                    PASSWORD,
+                    HardwareDeviceKind::Ledger,
+                    LEDGER_PROFILE,
+                    None,
+                )
+                .unwrap();
+            root.view_session = Some(Arc::new(
+                store
+                    .load_hardware_view_session(PASSWORD, &session, "hw", &access)
+                    .unwrap(),
+            ));
+            root.selected_wallet_id = Some(Arc::from("hw"));
+            root.wallet_options = vec![WalletOption {
+                wallet_id: Arc::from("hw"),
+                source: WalletSource::LedgerDerived,
+            }];
+            root.public_form.derive_preview.device_stub =
+                Some(Arc::clone(device) as Arc<dyn HardwarePublicAccountDevice>);
+            root.reload_public_accounts(window, cx);
+        });
+    });
+}
+
+fn start_hardware_authorization(root: &Entity<WalletRoot>, cx: &mut VisualTestContext) {
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.add_public_derived_account_from_input(window, cx);
+        });
+    });
+}
+
+/// The active Hardware accounts in the vault's order, by derivation index.
+fn hardware_indexes(root: &WalletRoot) -> Vec<u32> {
+    root.vault_store
+        .as_ref()
+        .unwrap()
+        .list_all_public_accounts(root.view_session.as_ref().unwrap())
+        .unwrap()
+        .into_iter()
+        .filter(|account| {
+            account.source == PublicAccountSource::HardwareDerived
+                && account.status == PublicAccountStatus::Active
+        })
+        .filter_map(|account| account.derivation_index)
+        .collect()
+}
+
+/// Selects exactly `indexes` and adds them, driving the add until it ends.
+fn add_hardware_indexes(
+    root: &Entity<WalletRoot>,
+    runtime: &tokio::runtime::Runtime,
+    cx: &mut VisualTestContext,
+    indexes: &[u32],
+) {
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            let selected = preview(root).selected.clone();
+            for index in selected {
+                root.toggle_derive_preview_index(index, false, window, cx);
+            }
+            for index in indexes {
+                root.toggle_derive_preview_index(*index, true, window, cx);
+            }
+            root.add_selected_derived_public_accounts(window, cx);
+        });
+    });
+    drive_until(root, runtime, cx, |root| {
+        !root.public_form.derive_preview.adding()
+    });
+}
+
+#[gpui::test]
+fn hardware_derive_reads_the_device_without_a_password_and_ignores_late_reads(
+    cx: &mut TestAppContext,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = runtime();
+    let _entered = runtime.enter();
+    let (root, cx) = fixture(cx, directory.path(), &runtime);
+    let device = Arc::new(StubDevice::default());
+    use_ledger_wallet(&root, &device, cx);
+    let mismatch = "wrong hardware device or passphrase context is active";
+    *device.read_error.lock().unwrap() = Some(mismatch.to_owned());
+
+    open_derive(&root, cx);
+    assert!(
+        cx.debug_bounds("public-derive-hardware-authorize")
+            .is_some()
+    );
+    assert!(
+        cx.debug_bounds("public-derive-authorize-password")
+            .is_none()
+    );
+    // Enter performs Show addresses, and a failed read stays in authorize with its error.
+    cx.simulate_keystrokes("enter");
+    wait_for_authorization(&root, &runtime, cx);
+    root.read_with(cx, |root, _| {
+        assert!(root.public_form.derive_preview.preview.is_none());
+        assert_eq!(root.public_form.error.as_deref(), Some(mismatch));
+    });
+    assert!(
+        cx.debug_bounds("public-derive-hardware-authorize")
+            .is_some()
+    );
+
+    // A read that returns after the dialog closes or the wallet changes opens nothing.
+    *device.read_error.lock().unwrap() = None;
+    open_derive(&root, cx);
+    start_hardware_authorization(&root, cx);
+    cx.update(gpui_component::WindowExt::close_all_dialogs);
+    drive_a_while(&root, &runtime, cx);
+    open_derive(&root, cx);
+    start_hardware_authorization(&root, cx);
+    root.update(cx, |root, _| root.advance_active_wallet_generation());
+    drive_a_while(&root, &runtime, cx);
+    root.read_with(cx, |root, _| {
+        let state = &root.public_form.derive_preview;
+        assert!(state.preview.is_none() && !state.authorizing);
+    });
+
+    open_derive(&root, cx);
+    start_hardware_authorization(&root, cx);
+    wait_for_authorization(&root, &runtime, cx);
+    assert!(cx.debug_bounds("public-derive-preview").is_some());
+    root.read_with(cx, |root, _| {
+        let preview = preview(root);
+        assert_eq!(
+            preview.keys.page(0).unwrap(),
+            device_keys().page(0).unwrap()
+        );
+        assert_eq!(preview.selected, BTreeSet::from([0]));
+    });
+    cx.update(|window, _| window.remove_window());
+}
+
+#[gpui::test]
+fn hardware_add_confirms_each_index_in_order_and_skips_existing_ones(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = runtime();
+    let _entered = runtime.enter();
+    let (root, cx) = fixture(cx, directory.path(), &runtime);
+    let device = Arc::new(StubDevice::default());
+    use_ledger_wallet(&root, &device, cx);
+    open_derive(&root, cx);
+    start_hardware_authorization(&root, cx);
+    wait_for_authorization(&root, &runtime, cx);
+
+    // Index 7 gains an account after the preview opened, so the device isn't asked about it.
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            let store = root.vault_store.clone().unwrap();
+            let view = root.view_session.clone().unwrap();
+            let descriptor = HardwarePublicAccountDescriptor::for_wallet_public_index(
+                HardwareDeviceKind::Ledger,
+                0,
+                7,
+            )
+            .unwrap();
+            let address = device_keys().address(7).unwrap();
+            store
+                .add_hardware_public_account(
+                    &view,
+                    &ConfirmedHardwarePublicAccount::new_for_tests(descriptor, address),
+                    None,
+                )
+                .unwrap();
+            root.reload_public_accounts(window, cx);
+        });
+    });
+    add_hardware_indexes(&root, &runtime, cx, &[500, 7, 23, 4]);
+
+    assert_eq!(device.asked(), [4, 23, 500]);
+    for descriptor in device.asked.lock().unwrap().iter() {
+        assert_eq!(
+            *descriptor,
+            HardwarePublicAccountDescriptor::for_wallet_public_index(
+                HardwareDeviceKind::Ledger,
+                0,
+                descriptor.public_account_index,
+            )
+            .unwrap()
+        );
+    }
+    root.read_with(cx, |root, _| {
+        assert_eq!(hardware_indexes(root), [7, 4, 23, 500]);
+        assert!(root.public_form.error.is_none());
+        let preview = preview(root);
+        assert!(preview.selected.is_empty());
+        let added = preview.last_add.as_ref().unwrap();
+        assert_eq!(added.added.len(), 3);
+        assert_eq!(
+            added.skipped,
+            [(7, PreviewedPublicAccountSkip::AlreadyAdded)]
+        );
+    });
+    cx.update(|window, _| window.remove_window());
+}
+
+#[gpui::test]
+fn hardware_add_stops_on_rejection_or_a_different_address(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = runtime();
+    let _entered = runtime.enter();
+    let (root, cx) = fixture(cx, directory.path(), &runtime);
+    let device = Arc::new(StubDevice::default());
+    use_ledger_wallet(&root, &device, cx);
+    open_derive(&root, cx);
+    start_hardware_authorization(&root, cx);
+    wait_for_authorization(&root, &runtime, cx);
+
+    // A rejection keeps the account confirmed before it and asks for nothing after it.
+    *device.reject.lock().unwrap() = Some(23);
+    add_hardware_indexes(&root, &runtime, cx, &[4, 23, 500]);
+    assert_eq!(device.asked(), [4, 23]);
+    root.read_with(cx, |root, _| {
+        assert_eq!(hardware_indexes(root), [4]);
+        assert_eq!(
+            root.public_form.error.as_deref(),
+            Some("Rejected on the device. Added index 4. Not added: indexes 23, 500.")
+        );
+        assert_eq!(preview(root).selected, BTreeSet::from([23, 500]));
+    });
+
+    // An address other than the preview's isn't stored and stops the add.
+    *device.reject.lock().unwrap() = None;
+    *device.mismatch.lock().unwrap() = Some(23);
+    device.asked.lock().unwrap().clear();
+    add_hardware_indexes(&root, &runtime, cx, &[23, 500]);
+    assert_eq!(device.asked(), [23]);
+    root.read_with(cx, |root, _| {
+        assert_eq!(hardware_indexes(root), [4]);
+        assert!(root.public_form.error.as_deref().unwrap().starts_with(
+            "The device showed a different address than the preview for index 23. It was not added."
+        ));
+    });
+    cx.update(|window, _| window.remove_window());
+}
+
+#[gpui::test]
+fn hardware_add_ends_with_the_dialog_or_the_hardware_session(cx: &mut TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = runtime();
+    let _entered = runtime.enter();
+    let (root, cx) = fixture(cx, directory.path(), &runtime);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let device = Arc::new(StubDevice {
+        gate: Some(Arc::clone(&gate)),
+        ..StubDevice::default()
+    });
+    use_ledger_wallet(&root, &device, cx);
+    open_derive(&root, cx);
+    start_hardware_authorization(&root, cx);
+    wait_for_authorization(&root, &runtime, cx);
+
+    // Closing the dialog while the device asks about index 4 stores nothing, even once the
+    // device confirms, and asks about nothing after it.
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.toggle_derive_preview_index(0, false, window, cx);
+            root.toggle_derive_preview_index(4, true, window, cx);
+            root.toggle_derive_preview_index(23, true, window, cx);
+            root.add_selected_derived_public_accounts(window, cx);
+        });
+    });
+    drive_until(&root, &runtime, cx, |_| device.asked() == [4]);
+    cx.update(gpui_component::WindowExt::close_all_dialogs);
+    gate.add_permits(10);
+    drive_a_while(&root, &runtime, cx);
+    assert_eq!(device.asked(), [4]);
+    root.read_with(cx, |root, _| {
+        assert_eq!(hardware_indexes(root), [] as [u32; 0]);
+    });
+
+    // A refreshed session keeps the preview. A replaced one ends it.
+    open_derive(&root, cx);
+    start_hardware_authorization(&root, cx);
+    wait_for_authorization(&root, &runtime, cx);
+    root.update(cx, |root, _| {
+        let session = root.view_session.clone().unwrap();
+        let state = &mut root.public_form.derive_preview;
+        state.end_hardware_preview_unless(session.hardware_profile_session());
+        assert!(state.preview.is_some());
+        let mut replaced = session.hardware_profile_session().unwrap().clone();
+        replaced.binding.fingerprint = "another device".to_owned();
+        state.end_hardware_preview_unless(Some(&replaced));
+        assert!(state.preview.is_none());
+    });
     cx.update(|window, _| window.remove_window());
 }
