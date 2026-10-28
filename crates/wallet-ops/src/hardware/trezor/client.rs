@@ -300,15 +300,22 @@ impl TrezorHardwareDerivationClient {
             passphrase,
             pin_matrix_provider,
         } = self;
-        let response = client.call(
+        // `call` traces every decoded response, which here would log the wallet's key material.
+        let response = trezor_call_raw_with_interactions(
+            client,
             request,
-            Box::new(|_, mut message: trezor_client::protos::CipheredKeyValue| {
-                Ok(message.take_value())
-            }),
-        )?;
-        let data = handle_trezor_interaction(response, passphrase, pin_matrix_provider.as_ref());
+            passphrase,
+            pin_matrix_provider.as_ref(),
+        );
         passphrase.clear_app_passphrase();
-        let mut data = data?;
+        let response = response?;
+        if response.message_type() != MessageType::MessageType_CipheredKeyValue {
+            return Err(
+                trezor_client::Error::UnexpectedMessageType(response.message_type()).into(),
+            );
+        }
+        let mut message: trezor_client::protos::CipheredKeyValue = trezor_decode_message(response)?;
+        let mut data = message.take_value();
         if data.len() != 32 {
             return Err(HardwareDerivationError::UnexpectedResponseLength {
                 got: data.len(),

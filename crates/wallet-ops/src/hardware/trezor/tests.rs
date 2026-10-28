@@ -9,9 +9,9 @@ use trezor_client::transport::{ProtoMessage, Transport, error::Error as TrezorTr
 use zeroize::Zeroizing;
 
 use super::super::{
-    HardwareAppVersion, HardwareDerivationError, HardwareDeviceKind,
-    HardwarePublicAccountDescriptor, HardwareTypedDataSigningMode, TEST_ACCOUNT_CHAIN_CODE,
-    TEST_ACCOUNT_PUBLIC_KEY,
+    HardwareAppVersion, HardwareDerivationDescriptor, HardwareDerivationError, HardwareDeviceKind,
+    HardwarePublicAccountDescriptor, HardwareTypedDataSigningMode, HardwareWalletSyncIntent,
+    TEST_ACCOUNT_CHAIN_CODE, TEST_ACCOUNT_PUBLIC_KEY,
 };
 use super::client::{
     TrezorDeviceInfo, TrezorHardwareDerivationClient, trezor_account_public_key_from_node,
@@ -99,6 +99,26 @@ impl std::io::Write for LogCapture {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+/// Runs `run` under a TRACE subscriber and returns what it logged. A `trezor_client` trace
+/// event is emitted first and checked, so the capture can't pass by filtering everything out.
+fn capture_trace_logs<T>(run: impl FnOnce() -> T) -> (T, String) {
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let writer = LogCapture(Arc::clone(&logs));
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || writer.clone())
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, || {
+        tracing::trace!(target: "trezor_client", "capture check");
+        run()
+    });
+    let logs = String::from_utf8(logs.lock().expect("logs lock").clone()).expect("UTF-8 logs");
+    assert!(logs.contains("capture check"));
+    (value, logs)
 }
 
 fn queued_message<M: TrezorMessage>(message: &M) -> ProtoMessage {
@@ -543,21 +563,8 @@ fn trezor_account_public_key_answers_pin_matrix_request() {
     ));
 
     // The account key links every derived address, so even trace logs must not carry it.
-    let logs = Arc::new(Mutex::new(Vec::new()));
-    let writer = LogCapture(Arc::clone(&logs));
-    let subscriber = tracing_subscriber::fmt()
-        .without_time()
-        .with_ansi(false)
-        .with_max_level(tracing::Level::TRACE)
-        .with_writer(move || writer.clone())
-        .finish();
-    let key = tracing::subscriber::with_default(subscriber, || {
-        tracing::trace!(target: "trezor_client", "capture check");
-        client.account_public_key(0)
-    })
-    .expect("PIN matrix request is acknowledged");
-    let logs = String::from_utf8(logs.lock().expect("logs lock").clone()).expect("UTF-8 logs");
-    assert!(logs.contains("capture check"));
+    let (key, logs) = capture_trace_logs(|| client.account_public_key(0));
+    let key = key.expect("PIN matrix request is acknowledged");
     assert!(!logs.contains("xpub-account-key-marker"));
     assert!(!logs.contains("EthereumPublicKey"));
 
@@ -567,6 +574,57 @@ fn trezor_account_public_key_answers_pin_matrix_request() {
         writes.lock().expect("writes lock").as_slice(),
         &[
             MessageType::MessageType_EthereumGetPublicKey,
+            MessageType::MessageType_PinMatrixAck,
+        ]
+    );
+}
+
+#[test]
+fn trezor_cipher_key_value_keeps_wallet_key_material_out_of_trace_logs() {
+    let mut pin_request = trezor_client::protos::PinMatrixRequest::new();
+    pin_request.set_type(
+        trezor_client::protos::pin_matrix_request::PinMatrixRequestType::PinMatrixRequestType_Current,
+    );
+    let mut ciphered = trezor_client::protos::CipheredKeyValue::new();
+    ciphered.set_value(vec![0xa5; 32]);
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let transport = QueuedTransport {
+        responses: VecDeque::from([queued_message(&pin_request), queued_message(&ciphered)]),
+        writes: Arc::clone(&writes),
+    };
+    let mut client = TrezorHardwareDerivationClient {
+        client: trezor_client::client::trezor_with_transport(
+            trezor_client::Model::Trezor,
+            Box::new(transport),
+        ),
+        passphrase: TrezorPassphraseState::default(),
+        pin_matrix_provider: None,
+    };
+    client.set_pin_matrix_provider(Arc::new(
+        |_: TrezorPinMatrixRequestKind| -> Result<_, HardwareDerivationError> {
+            Ok(Zeroizing::new("123".to_owned()))
+        },
+    ));
+    let descriptor = HardwareDerivationDescriptor::trezor_cipher_key_value_v1(
+        crate::hardware::parse_bip32_path("m/44'/60'/0'/0/0").expect("valid path"),
+        0,
+        "trezor-profile-fingerprint".to_owned(),
+        HardwareWalletSyncIntent::CreateNew,
+    );
+
+    // The output is the private wallet's entropy source, so even trace logs must not carry it.
+    let (output, logs) = capture_trace_logs(|| client.cipher_key_value(&descriptor));
+
+    assert_eq!(
+        output.expect("derivation succeeds").expose_secret(),
+        &[0xa5; 32]
+    );
+    assert!(!logs.contains("CipheredKeyValue"));
+    assert!(!logs.contains("PinMatrixAck"));
+    assert_eq!(
+        writes.lock().expect("writes lock").as_slice(),
+        &[
+            MessageType::MessageType_CipherKeyValue,
             MessageType::MessageType_PinMatrixAck,
         ]
     );
