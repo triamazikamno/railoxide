@@ -40,29 +40,26 @@ The macOS publish job renders the cask only after it has published and verified 
 
 To promote a release:
 
-1. If `triamazikamno/homebrew-tap` does not exist, create it as a public repository with a `Casks/` directory.
-2. Download the `railoxide-cask` artifact from the release's `macOS release` run.
-3. Without signing in, download the published DMG, checksum file and `.asc` from the release, then verify them:
+1. If `triamazikamno/homebrew-tap` does not exist, create it as a public repository with a README, so that it is not empty.
+2. On your Mac, with `gh` signed in, `gpg` and Homebrew installed, run:
 
    ```bash
-   curl -fsSLO https://triamazikamno.github.io/railoxide/flatpak/flatpak-release-public.gpg
-   gpg --import flatpak-release-public.gpg
-   gpg --verify RailOxide-<TAG>-macos-SHA256SUMS.asc RailOxide-<TAG>-macos-SHA256SUMS
-   shasum -a 256 -c RailOxide-<TAG>-macos-SHA256SUMS
+   scripts/promote-homebrew-cask
    ```
 
-4. Confirm that the cask's `sha256` equals the DMG checksum in the published checksum file, and that its `url` is the fixed release URL `https://github.com/triamazikamno/railoxide/releases/download/v#{version}/RailOxide-v#{version}-macos-arm64.dmg`.
-5. Confirm that the release is the latest published release and that the cask's `version` is newer than the version currently in the tap. Reject a stale or backwards promotion, such as a cask from an older release whose run finished late.
-6. Copy the cask into your local tap checkout and lint it:
+   Pass a tag, such as `scripts/promote-homebrew-cask v0.2.0`, to name the release you expect. The script refuses any tag other than the latest release.
 
-   ```bash
-   brew tap triamazikamno/tap
-   cp railoxide.rb "$(brew --repository triamazikamno/tap)/Casks/railoxide.rb"
-   brew style --cask triamazikamno/tap/railoxide
-   brew audit --cask triamazikamno/tap/railoxide
-   ```
+The script uses your own `gh` login and git credentials. It stops at the first failed check and leaves the tap unchanged. It:
 
-7. Commit `Casks/railoxide.rb` in that checkout and push it to the tap.
+- picks the latest published release, counting pre-releases;
+- downloads the DMG, checksum file and `.asc` without signing in, verifies the signature against the published public key in a temporary keyring, and checks the DMG against its signed checksum;
+- downloads the `railoxide-cask` artifact from the release's successful `macOS release` run, and checks that its `version`, `sha256` and fixed release `url` match the verified release;
+- taps `triamazikamno/tap` if needed, requires a clean checkout and fast-forwards it;
+- refuses a cask whose `version` is not newer than the one in the tap, and stops without changes if the tap already has this cask;
+- copies the cask into `Casks/railoxide.rb`, runs `brew style` and `brew audit`, and shows the change;
+- asks before it commits and pushes. If you decline, it restores the tap.
+
+If the push fails, the commit stays in your local tap checkout. Push it by hand.
 
 If any step fails, leave the tap unchanged. Users keep the previous cask until the problem is fixed.
 

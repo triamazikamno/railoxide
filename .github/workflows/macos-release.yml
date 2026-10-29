@@ -6,8 +6,10 @@ on:
       - scripts/package-wallet-macos
       - scripts/macos-packaging.py
       - scripts/release-assets
+      - scripts/promote-homebrew-cask
       - scripts/tests/test_macos_packaging.py
       - scripts/tests/test_release_assets.py
+      - scripts/tests/test_promote_homebrew_cask.py
       - scripts/*browser-extension*
       - bins/wallet/packaging/macos/**
       - bins/wallet/Cargo.toml
@@ -43,6 +45,9 @@ jobs:
 
       - name: Test release asset publication
         run: python3 -m unittest discover -s scripts/tests -p test_release_assets.py -v
+
+      - name: Test Homebrew cask promotion
+        run: python3 -m unittest discover -s scripts/tests -p test_promote_homebrew_cask.py -v
 
   source:
     if: github.event_name == 'release'
@@ -114,6 +119,8 @@ jobs:
           version="$(python3 scripts/macos-packaging.py version)"
           sums="$RUNNER_TEMP/placeholder-SHA256SUMS"
           printf '%064d  RailOxide-v%s-macos-arm64.dmg\n' 0 "$version" >"$sums"
+          # Lint with current Homebrew cops; the runner image's Homebrew can lag behind users'.
+          brew update
           # Homebrew only lints casks inside a tap.
           brew tap-new --no-git railoxide/ci
           python3 scripts/macos-packaging.py render-cask \

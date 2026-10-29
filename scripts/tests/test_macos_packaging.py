@@ -67,13 +67,13 @@ class MacosPackagingTests(unittest.TestCase):
         self.assertIn('depends_on macos: :sequoia', cask)
         self.assertIn('app "RailOxide.app"', cask)
         hooks = re.findall(
-            r'^\s*(zap|uninstall\w*|preflight|postflight|auto_updates|installer)\b',
+            r'^\s*(zap|uninstall\w*|preflight\w*|postflight\w*|auto_updates|installer)\b',
             cask, re.MULTILINE,
         )
-        self.assertEqual(hooks, ['postflight'])
-        postflight = cask.split('postflight do', 1)[1].split('\n  end', 1)[0]
+        self.assertEqual(hooks, ['postflight_steps'])
+        postflight = cask.split('postflight_steps do', 1)[1].split('\n  end', 1)[0]
         self.assertEqual(re.findall(r'"([^"]*/[^"]*)"', postflight), [
-            '/usr/bin/find', '#{appdir}/RailOxide.app', '/usr/bin/xattr',
+            '/usr/bin/find', '{{appdir}}/RailOxide.app', '/usr/bin/xattr', '{{appdir}}/RailOxide.app',
         ])
 
     def test_cask_requires_a_valid_dmg_checksum(self):

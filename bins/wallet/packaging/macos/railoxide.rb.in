@@ -13,13 +13,11 @@ cask "railoxide" do
   app "RailOxide.app"
 
   # Remove quarantine from the installed app only; the app is ad-hoc signed and not notarized.
-  postflight do
-    system_command "/usr/bin/find",
-                   args: [
-                     "#{appdir}/RailOxide.app",
-                     "-xattrname", "com.apple.quarantine",
-                     "-exec", "/usr/bin/xattr", "-s", "-d", "com.apple.quarantine", "{}", "+"
-                   ]
+  postflight_steps do
+    run "/usr/bin/find",
+        args:           ["{{appdir}}/RailOxide.app", "-xattrname", "com.apple.quarantine",
+                         "-exec", "/usr/bin/xattr", "-s", "-d", "com.apple.quarantine", "{}", "+"],
+        writable_paths: ["{{appdir}}/RailOxide.app"]
   end
 
   caveats <<~EOS
