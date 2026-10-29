@@ -35,15 +35,22 @@ REDISTRIBUTABLE_PATTERNS = (
 # DLLs and API set contracts that ship with x64 Windows 11 desktop. Add a name only after
 # confirming that; the build runner's System32 also holds redistributables.
 SYSTEM_DLLS = frozenset({
-    'advapi32.dll', 'bcrypt.dll', 'bcryptprimitives.dll', 'cfgmgr32.dll', 'comctl32.dll',
-    'comdlg32.dll', 'crypt32.dll', 'd2d1.dll', 'd3d11.dll', 'd3d12.dll', 'd3dcompiler_47.dll',
-    'dcomp.dll', 'dwmapi.dll', 'dwrite.dll', 'dxgi.dll', 'gdi32.dll', 'hid.dll', 'imm32.dll',
-    'iphlpapi.dll', 'kernel32.dll', 'ncrypt.dll', 'ntdll.dll', 'ole32.dll', 'oleaut32.dll',
-    'opengl32.dll', 'propsys.dll', 'rpcrt4.dll', 'secur32.dll', 'setupapi.dll', 'shcore.dll',
-    'shell32.dll', 'shlwapi.dll', 'user32.dll', 'userenv.dll', 'uxtheme.dll', 'version.dll',
+    'advapi32.dll', 'bcrypt.dll', 'bcryptprimitives.dll', 'cfgmgr32.dll', 'combase.dll',
+    'comctl32.dll', 'comdlg32.dll', 'crypt32.dll', 'd2d1.dll', 'd3d11.dll', 'd3d12.dll', 'd3dcompiler_47.dll',
+    'dcomp.dll', 'dwmapi.dll', 'dwrite.dll', 'dxgi.dll', 'gdi32.dll', 'gdiplus.dll', 'hid.dll',
+    # Windows' own ICU, in System32 since Windows 10 1703.
+    'icuuc.dll',
+    'imm32.dll', 'iphlpapi.dll', 'kernel32.dll', 'ncrypt.dll', 'ntdll.dll', 'ole32.dll',
+    'oleaut32.dll', 'opengl32.dll', 'pdh.dll', 'powrprof.dll', 'propsys.dll', 'psapi.dll',
+    'rpcrt4.dll', 'secur32.dll', 'setupapi.dll', 'shcore.dll',
+    'shell32.dll', 'shlwapi.dll', 'uiautomationcore.dll', 'user32.dll', 'userenv.dll', 'uxtheme.dll', 'version.dll',
     'windowscodecs.dll', 'winmm.dll', 'wintrust.dll', 'winusb.dll', 'ws2_32.dll',
     # Imported by windows-result through the pinned GPUI.
     'api-ms-win-core-winrt-error-l1-1-0.dll',
+    # RoInitialize and RoActivateInstance; mapped on Windows 8 and later desktop.
+    'api-ms-win-core-winrt-l1-1-0.dll',
+    # GetDpiForMonitor and SetProcessDpiAwareness; mapped on Windows 8.1 and later desktop.
+    'api-ms-win-shcore-scaling-l1-1-1.dll',
     # WaitOnAddress, used by Rust std.
     'api-ms-win-core-synch-l1-2-0.dll',
 })
