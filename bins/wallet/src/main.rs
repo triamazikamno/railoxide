@@ -88,6 +88,8 @@ fn main() -> Result<()> {
         .wrap_err("build tokio runtime")?;
     let logs = LogStore::new(DEFAULT_LOG_CAPACITY);
     install_tracing(logs.clone())?;
+    #[cfg(target_os = "windows")]
+    leave_reparse_point_working_directory();
 
     let runtime_handle = runtime.handle().clone();
     let monitor = shared();
@@ -234,6 +236,26 @@ fn read_jemalloc_usize(name: &CStr) -> Result<usize> {
         );
     }
     Ok(value)
+}
+
+/// Arti's path checker (fs-mistrust 0.14) inspects the bare drive `C:`, which Windows resolves
+/// to the working directory. When that directory is a junction or symlink, as Scoop's
+/// `current` shortcut directory is, the check loops and built-in Tor fails to start. Move to
+/// the same directory by its real path; relative paths keep resolving to the same place.
+#[cfg(target_os = "windows")]
+fn leave_reparse_point_working_directory() {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    if !cwd
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return;
+    }
+    if let Err(error) = dunce::canonicalize(&cwd).and_then(std::env::set_current_dir) {
+        tracing::warn!(%error, "could not leave a linked working directory; built-in Tor may fail to start");
+    }
 }
 
 fn install_tracing(logs: LogStore) -> Result<()> {

@@ -51,6 +51,7 @@ tikv-jemallocator = { workspace = true, optional = true }
 tikv-jemalloc-sys = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+dunce = "1"
 raw-window-handle = "0.6"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 

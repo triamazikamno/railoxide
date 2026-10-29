@@ -65,12 +65,12 @@ if ($actual -eq $expected) { 'checksum OK' } else { 'checksum MISMATCH: do not u
 
 > RailOxide's Windows binaries are not code-signed. Installing from the ZIP means trusting our published binaries and release process. A valid checksum and signature show that the file is the one we published; they do not certify the app's safety.
 
-A ZIP downloaded through a browser is marked as coming from the internet, and Windows passes that mark on to the files you extract. Because `wallet.exe` is not code-signed, SmartScreen then warns on its first launch. Allow this one file in either of these ways:
+A ZIP downloaded through a browser is marked as coming from the internet, and Windows passes that mark on to the files you extract. Because `wallet.exe` is not code-signed, SmartScreen may warn on its first launch. If it does, allow this one file in either of these ways:
 
 - Before extracting, right-click the ZIP, choose **Properties**, tick **Unblock** on the General tab and click **OK**. Then extract it.
 - Or extract it as it is, and when SmartScreen shows "Windows protected your PC" on the first launch of `wallet.exe`, click **More info** and then **Run anyway**.
 
-Extract the ZIP somewhere you keep programs, such as `%LOCALAPPDATA%\Programs`, and run `wallet.exe` from the extracted `RailOxide-v<VERSION>-windows-x64` folder. Do not turn off SmartScreen or Defender.
+Extract the ZIP somewhere you keep programs, such as `%LOCALAPPDATA%\Programs`. Explorer's **Extract All** creates a folder named after the ZIP, with a `RailOxide-v<VERSION>-windows-x64` folder inside it. Run `wallet.exe` from that inner folder. Do not turn off SmartScreen or Defender.
 
 ## Privacy
 

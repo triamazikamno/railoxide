@@ -15881,6 +15881,7 @@ dependencies = [
  "broadcaster-monitor-waku",
  "chrono",
  "directories",
+ "dunce",
  "eyre",
  "futures-util",
  "gpui-component",
