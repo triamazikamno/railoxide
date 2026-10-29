@@ -15,10 +15,13 @@ binary_src="$repo_root/target/release/wallet"
 binary_dst="$macos_dir/$app_name"
 plist_src="$repo_root/bins/wallet/packaging/macos/Info.plist"
 icon_src="$repo_root/bins/wallet/packaging/icons/macos/RailOxide.icns"
+libusb_license_src="$repo_root/bins/wallet/packaging/macos/libusb-LICENSE-LGPL-2.1.txt"
+release_dir="$bundle_root/release"
 codesign_identity="${CODESIGN_IDENTITY:--}"
 cargo_features="${CARGO_FEATURES-hardware}"
 cargo_bin="${CARGO_BIN:-cargo}"
 cargo_toolchain="${CARGO_TOOLCHAIN:-}"
+macos_minimum_version="${MACOS_MINIMUM_VERSION:-}"
 
 require_tool() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -33,6 +36,15 @@ require_tool ditto
 require_tool hdiutil
 require_tool plutil
 require_tool python3
+if [[ -n "$macos_minimum_version" ]]; then
+  require_tool lipo
+  require_tool otool
+fi
+
+if [[ -n "$macos_minimum_version" && ! "$macos_minimum_version" =~ ^[0-9]+\.[0-9]+$ ]]; then
+  printf 'invalid MACOS_MINIMUM_VERSION: %s\n' "$macos_minimum_version" >&2
+  exit 1
+fi
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   printf 'macOS app packaging requires macOS\n' >&2
@@ -49,6 +61,9 @@ if [[ ! -f "$icon_src" ]]; then
   exit 1
 fi
 
+version="$(python3 "$script_dir/macos-packaging.py" version)"
+bundle_version="$(python3 "$script_dir/macos-packaging.py" version --bundle)"
+
 cargo_command=("$cargo_bin")
 if [[ -n "$cargo_toolchain" ]]; then
   cargo_command+=("+$cargo_toolchain")
@@ -59,10 +74,13 @@ CARGO_BIN="$cargo_bin" CARGO_TOOLCHAIN="$cargo_toolchain" "$script_dir/build-bro
 export RAILOXIDE_EXTENSION_BUNDLE="$repo_root/target/browser-extension.zip"
 [[ -s "$RAILOXIDE_EXTENSION_BUNDLE" ]] || { printf 'extension build did not produce a ZIP\n' >&2; exit 1; }
 
+if [[ -n "$macos_minimum_version" ]]; then
+  export MACOSX_DEPLOYMENT_TARGET="$macos_minimum_version"
+fi
 if [[ -n "$cargo_features" ]]; then
-  "${cargo_command[@]}" build --release -p wallet --features "$cargo_features"
+  "${cargo_command[@]}" build --release --locked -p wallet --features "$cargo_features"
 else
-  "${cargo_command[@]}" build --release -p wallet
+  "${cargo_command[@]}" build --release --locked -p wallet
 fi
 python3 "$script_dir/verify-browser-extension.py" "$binary_src" "$RAILOXIDE_EXTENSION_BUNDLE"
 
@@ -73,8 +91,38 @@ cp "$binary_src" "$binary_dst"
 cp "$plist_src" "$contents_dir/Info.plist"
 cp "$icon_src" "$resources_dir/RailOxide.icns"
 chmod 755 "$binary_dst"
+if [[ ",${cargo_features// /}," == *,hardware,* ]]; then
+  cp "$libusb_license_src" "$resources_dir/libusb-LICENSE-LGPL-2.1.txt"
+fi
 
-plutil -lint "$contents_dir/Info.plist"
+plist_dst="$contents_dir/Info.plist"
+plutil -replace CFBundleShortVersionString -string "$bundle_version" "$plist_dst"
+plutil -replace CFBundleVersion -string "$bundle_version" "$plist_dst"
+if [[ -n "$macos_minimum_version" ]]; then
+  plutil -replace LSMinimumSystemVersion -string "$macos_minimum_version" "$plist_dst"
+fi
+plutil -lint "$plist_dst"
+bundle_identifier="$(plutil -extract CFBundleIdentifier raw "$plist_dst")"
+if [[ "$bundle_identifier" != "app.railoxide.wallet" ]]; then
+  printf 'unexpected bundle identifier: %s\n' "$bundle_identifier" >&2
+  exit 1
+fi
+
+if [[ -n "$macos_minimum_version" ]]; then
+  binary_archs="$(lipo -archs "$binary_dst")"
+  if [[ "$binary_archs" != "arm64" ]]; then
+    printf 'expected an arm64-only binary, found: %s\n' "$binary_archs" >&2
+    exit 1
+  fi
+  # awk reads all input; exiting early could SIGPIPE otool and fail the pipeline.
+  binary_minos="$(otool -l "$binary_dst" | awk '$1 == "cmd" { build = ($2 == "LC_BUILD_VERSION") } build && $1 == "minos" && !found { print $2; found = 1 }')"
+  if [[ "$binary_minos" != "$macos_minimum_version" ]]; then
+    printf 'expected minimum macOS %s, found: %s\n' "$macos_minimum_version" "${binary_minos:-none}" >&2
+    exit 1
+  fi
+  python3 "$script_dir/macos-packaging.py" check-linkage "$app_bundle"
+fi
+
 codesign --force --deep --sign "$codesign_identity" "$app_bundle"
 codesign --verify --deep --strict --verbose=2 "$app_bundle"
 
@@ -93,3 +141,14 @@ hdiutil verify "$dmg_path"
 
 printf 'packaged %s\n' "$app_bundle"
 printf 'packaged %s\n' "$dmg_path"
+
+if [[ -n "$macos_minimum_version" ]]; then
+  release_dmg="RailOxide-v$version-macos-arm64.dmg"
+  release_sums="RailOxide-v$version-macos-SHA256SUMS"
+  rm -rf "$release_dir"
+  mkdir -p "$release_dir"
+  cp "$dmg_path" "$release_dir/$release_dmg"
+  (cd "$release_dir" && shasum -a 256 "$release_dmg" > "$release_sums")
+  printf 'packaged %s\n' "$release_dir/$release_dmg"
+  printf 'packaged %s\n' "$release_dir/$release_sums"
+fi

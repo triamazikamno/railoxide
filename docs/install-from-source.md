@@ -67,6 +67,8 @@ The installer also writes a command wrapper to:
 ~/.local/bin/railoxide-wallet
 ```
 
+If `/Applications/RailOxide.app` already exists, for example from the Homebrew cask or a downloaded DMG, the installer prints a warning before building. Both copies share one wallet profile, and `railoxide-wallet` launches the source build. The installer removes nothing and continues. To keep only the prebuilt app, see [Switch from a source install](install-macos.md#switch-from-a-source-install).
+
 Useful macOS options:
 
 ```bash

@@ -6,6 +6,7 @@ on:
       - scripts/install-wallet
       - scripts/install-wallet.ps1
       - scripts/package-wallet-macos
+      - scripts/macos-packaging.py
       - scripts/*browser-extension*
       - scripts/tests/*extension*
       - extensions/**
@@ -21,6 +22,7 @@ on:
       - scripts/install-wallet
       - scripts/install-wallet.ps1
       - scripts/package-wallet-macos
+      - scripts/macos-packaging.py
       - scripts/*browser-extension*
       - scripts/tests/*extension*
       - extensions/**
@@ -87,6 +89,27 @@ jobs:
 
       - name: Dry run runtime shader compatibility option
         run: scripts/install-wallet --dry-run --runtime-shaders --no-deps --source-dir "$RUNNER_TEMP/railoxide-src" --prefix "$RUNNER_TEMP/railoxide-prefix"
+
+      - name: Warn about an existing /Applications app
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app=/Applications/RailOxide.app
+          [[ ! -e "$app" ]]
+          trap 'sudo rm -rf "$app"' EXIT
+          dry_run() {
+            scripts/install-wallet --dry-run --no-deps --source-dir "$RUNNER_TEMP/railoxide-src" --prefix "$RUNNER_TEMP/railoxide-prefix" 2>&1
+          }
+          output="$(dry_run)"
+          if grep -q '^warning: ' <<<"$output"; then
+            printf 'unexpected warning without %s:\n%s\n' "$app" "$output" >&2
+            exit 1
+          fi
+          sudo mkdir -p "$app"
+          output="$(dry_run)"
+          grep -q "^warning: $app exists" <<<"$output"
+          [[ -d "$app" ]]
 
       - name: Check macOS packaging features for current and legacy refs
         shell: bash

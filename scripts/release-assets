@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+"""Validate a release source and publish one platform's GitHub Release assets.
+
+Each publisher owns a fixed set of asset names. Assets with other names are
+never inspected or modified, so independent platform publishers can attach
+their files to the same release in either order.
+"""
+
+import argparse
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path, PurePosixPath
+import posixpath
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import urllib.request
+
+TAG_PATTERN = re.compile(r'[A-Za-z0-9._+-]+')
+SHA_PATTERN = re.compile(r'[0-9a-f]{40}')
+DEPENDENCY_TABLES = (
+    'dependencies', 'dev-dependencies', 'build-dependencies',
+    'dev_dependencies', 'build_dependencies',
+)
+TAG_REF = 'refs/release-assets/tag'
+MAIN_REF = 'refs/release-assets/main'
+DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_TIMEOUT = 120
+
+
+class ReleaseError(Exception):
+    pass
+
+
+def git(*args, check=True):
+    result = subprocess.run(['git', *args], stdout=subprocess.PIPE, text=True)
+    if check and result.returncode != 0:
+        raise ReleaseError(f'git {args[0]} failed with status {result.returncode}')
+    return result
+
+
+def git_bytes(*args):
+    result = subprocess.run(['git', *args], stdout=subprocess.PIPE)
+    if result.returncode != 0:
+        raise ReleaseError(f'git {args[0]} failed with status {result.returncode}')
+    return result.stdout
+
+
+def parse_toml(data, label):
+    try:
+        return tomllib.loads(data.decode('utf-8'))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise ReleaseError(f'{label} is not valid TOML: {error}') from None
+
+
+def dependency_paths(table):
+    if not isinstance(table, dict):
+        return
+    for name, dependency in table.items():
+        if isinstance(dependency, dict) and 'path' in dependency:
+            path = dependency['path']
+            if not isinstance(path, str):
+                raise ReleaseError(f'dependency {name} has a non-string path')
+            yield path
+
+
+def manifest_paths(manifest):
+    tables = [manifest]
+    targets = manifest.get('target')
+    if isinstance(targets, dict):
+        tables.extend(target for target in targets.values() if isinstance(target, dict))
+    for table in tables:
+        for key in DEPENDENCY_TABLES:
+            yield from dependency_paths(table.get(key))
+    workspace = manifest.get('workspace')
+    if isinstance(workspace, dict):
+        yield from dependency_paths(workspace.get('dependencies'))
+    yield from patch_paths(manifest)
+    yield from dependency_paths(manifest.get('replace'))
+
+
+def patch_paths(document):
+    patches = document.get('patch')
+    if isinstance(patches, dict):
+        for source in patches.values():
+            yield from dependency_paths(source)
+
+
+def config_paths(config):
+    yield from patch_paths(config)
+    paths = config.get('paths', [])
+    if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+        raise ReleaseError('.cargo config paths must be a list of strings')
+    yield from paths
+
+
+def check_local_paths(commit):
+    tracked = set(git_bytes('ls-tree', '-r', '-z', '--name-only', commit).decode('utf-8').split('\0'))
+    tracked.discard('')
+    sources = []
+    for name in sorted(tracked):
+        if PurePosixPath(name).name == 'Cargo.toml':
+            manifest = parse_toml(git_bytes('show', f'{commit}:{name}'), name)
+            sources.append((name, posixpath.dirname(name), manifest_paths(manifest)))
+    for name in ('.cargo/config.toml', '.cargo/config'):
+        if name in tracked:
+            config = parse_toml(git_bytes('show', f'{commit}:{name}'), name)
+            # Cargo resolves config paths relative to the directory containing `.cargo`.
+            sources.append((name, '', config_paths(config)))
+    for name, base, paths in sources:
+        for path in paths:
+            resolved = posixpath.normpath(posixpath.join(base, path))
+            if posixpath.isabs(path) or resolved == '..' or resolved.startswith('../'):
+                raise ReleaseError(f'{name} has local path {path!r} outside the release source')
+            manifest = 'Cargo.toml' if resolved == '.' else f'{resolved}/Cargo.toml'
+            if manifest not in tracked:
+                raise ReleaseError(f'{name} has local path {path!r} without a committed Cargo.toml')
+
+
+def check_source(tag, commit, remote, main_branch, require_head):
+    if not TAG_PATTERN.fullmatch(tag):
+        raise ReleaseError(f'invalid release tag {tag!r}')
+    if not SHA_PATTERN.fullmatch(commit):
+        raise ReleaseError(f'invalid source commit {commit!r}')
+    git('fetch', '--force', '--no-tags', remote,
+        f'+refs/tags/{tag}:{TAG_REF}', f'+refs/heads/{main_branch}:{MAIN_REF}')
+    tag_commit = git('rev-parse', '--verify', f'{TAG_REF}^{{commit}}').stdout.strip()
+    if tag_commit != commit:
+        raise ReleaseError(f'tag {tag} resolves to {tag_commit}, not {commit}')
+    if require_head:
+        head = git('rev-parse', 'HEAD').stdout.strip()
+        if head != commit:
+            raise ReleaseError(f'HEAD is {head}, not {commit}')
+    wallet = parse_toml(git_bytes('show', f'{commit}:bins/wallet/Cargo.toml'), 'bins/wallet/Cargo.toml')
+    package = wallet.get('package')
+    version = package.get('version') if isinstance(package, dict) else None
+    if not isinstance(version, str):
+        raise ReleaseError('wallet package version not found')
+    if tag != f'v{version}':
+        raise ReleaseError(f'tag {tag} does not match wallet version {version}')
+    ancestry = git('merge-base', '--is-ancestor', commit, MAIN_REF, check=False)
+    if ancestry.returncode == 1:
+        raise ReleaseError(f'{commit} is not an ancestor of {remote}/{main_branch}')
+    if ancestry.returncode != 0:
+        raise ReleaseError('git merge-base failed')
+    check_local_paths(commit)
+
+
+def gpg_verify(homedir, signature, data):
+    result = subprocess.run(
+        ['gpg', '--batch', '--homedir', homedir, '--verify', '--', signature, data],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def gh_json(*args):
+    result = subprocess.run(['gh', *args], stdout=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise ReleaseError(f'gh {args[0]} failed with status {result.returncode}')
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ReleaseError(f'gh returned invalid JSON: {error}') from None
+
+
+def release_assets(repo, tag):
+    release = gh_json('api', f'repos/{repo}/releases/tags/{tag}')
+    assets = release.get('assets') if isinstance(release, dict) else None
+    if not isinstance(assets, list):
+        raise ReleaseError(f'release {tag} has no asset list')
+    return assets
+
+
+def download(url, destination):
+    """Stream a release asset to `destination` and return its SHA-256 digest."""
+    request = urllib.request.Request(url, headers={'Accept': 'application/octet-stream'})
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        try:
+            digest = hashlib.sha256()
+            with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response, \
+                    open(destination, 'wb') as output:
+                while chunk := response.read(1 << 20):
+                    digest.update(chunk)
+                    output.write(chunk)
+            return digest.hexdigest()
+        except (OSError, http.client.HTTPException) as error:
+            if attempt == DOWNLOAD_ATTEMPTS:
+                raise ReleaseError(f'could not download {url}: {error}') from None
+            time.sleep(2 * attempt)
+
+
+def file_digest(path):
+    with open(path, 'rb') as source:
+        return hashlib.file_digest(source, 'sha256').hexdigest()
+
+
+class Publisher:
+    def __init__(self, repo, tag, files, homedir, workdir):
+        self.repo = repo
+        self.tag = tag
+        self.files = {path.name: path for path in files}
+        self.homedir = homedir
+        self.workdir = workdir
+
+    def matches(self, name, asset):
+        """Whether a published asset is acceptable for the owned local file `name`."""
+        downloaded = Path(self.workdir) / 'download'
+        url = asset.get('browser_download_url')
+        if not isinstance(url, str):
+            raise ReleaseError(f'release asset {name} has no download URL')
+        digest = download(url, downloaded)
+        if name.endswith('.asc'):
+            return gpg_verify(self.homedir, downloaded, self.files[name[:-4]])
+        return digest == file_digest(self.files[name])
+
+    def owned(self, assets, name):
+        found = [asset for asset in assets if asset.get('name') == name]
+        if len(found) > 1:
+            raise ReleaseError(f'release has {len(found)} assets named {name}')
+        if found and found[0].get('state') != 'uploaded':
+            raise ReleaseError(f'release asset {name} is in state {found[0].get("state")!r}')
+        return found[0] if found else None
+
+    def publish(self, existing):
+        assets = release_assets(self.repo, self.tag)
+        present = {}
+        for name in self.files:
+            asset = self.owned(assets, name)
+            if asset is not None:
+                present[name] = asset
+        if present and existing == 'reject':
+            raise ReleaseError(f'release already has owned assets: {", ".join(sorted(present))}')
+        for name, asset in present.items():
+            if not self.matches(name, asset):
+                raise ReleaseError(f'existing release asset {name} does not match the local file')
+        missing = [str(path) for name, path in self.files.items() if name not in present]
+        if missing:
+            result = subprocess.run(['gh', 'release', 'upload', self.tag, '--repo', self.repo, *missing])
+            if result.returncode != 0:
+                raise ReleaseError(f'gh release upload failed with status {result.returncode}')
+        assets = release_assets(self.repo, self.tag)
+        for name in self.files:
+            asset = self.owned(assets, name)
+            if asset is None:
+                raise ReleaseError(f'release asset {name} is missing after upload')
+            if not self.matches(name, asset):
+                raise ReleaseError(f'published release asset {name} does not match the local file')
+        return list(self.files)
+
+
+def validate_files(paths):
+    names = [path.name for path in paths]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ReleaseError(f'duplicate asset names: {", ".join(duplicates)}')
+    for path in paths:
+        if not path.is_file() or path.stat().st_size == 0:
+            raise ReleaseError(f'{path} is not a non-empty file')
+    for name in names:
+        if name.endswith('.asc') and name[:-4] not in names:
+            raise ReleaseError(f'signature {name} has no listed data file {name[:-4]}')
+
+
+def publish(args):
+    if args.source_commit is not None:
+        check_source(args.tag, args.source_commit, args.remote, args.main_branch, False)
+    elif not TAG_PATTERN.fullmatch(args.tag):
+        raise ReleaseError(f'invalid release tag {args.tag!r}')
+    files = [Path(file) for file in args.files]
+    validate_files(files)
+    workdir = tempfile.mkdtemp(prefix='release-assets-')
+    homedir = os.path.join(workdir, 'gnupg')
+    try:
+        os.mkdir(homedir, 0o700)
+        imported = subprocess.run(
+            ['gpg', '--batch', '--homedir', homedir, '--import', '--', args.public_key],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if imported.returncode != 0:
+            raise ReleaseError(f'could not import public key {args.public_key}')
+        for path in files:
+            if path.name.endswith('.asc') and not gpg_verify(homedir, path, path.with_name(path.name[:-4])):
+                raise ReleaseError(f'{path} is not a valid signature of {path.name[:-4]} by the release key')
+        names = Publisher(args.repo, args.tag, files, homedir, workdir).publish(args.existing)
+    finally:
+        subprocess.run(['gpgconf', '--homedir', homedir, '--kill', 'all'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        shutil.rmtree(workdir, ignore_errors=True)
+    for name in names:
+        print(f'verified release asset: {name}')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='command', required=True)
+
+    source = commands.add_parser('check-source', help='validate a release tag and source commit')
+    source.add_argument('--tag', required=True)
+    source.add_argument('--commit', required=True)
+    source.add_argument('--remote', default='origin')
+    source.add_argument('--main-branch', default='main')
+    source.add_argument('--require-head', action='store_true')
+
+    upload = commands.add_parser('publish', help='publish and verify owned release assets')
+    upload.add_argument('--repo', required=True)
+    upload.add_argument('--tag', required=True)
+    upload.add_argument('--existing', required=True, choices=('reject', 'verify'))
+    upload.add_argument('--public-key', required=True)
+    upload.add_argument('--source-commit')
+    upload.add_argument('--remote', default='origin')
+    upload.add_argument('--main-branch', default='main')
+    upload.add_argument('files', nargs='+', metavar='FILE')
+
+    args = parser.parse_args()
+    try:
+        if args.command == 'check-source':
+            check_source(args.tag, args.commit, args.remote, args.main_branch, args.require_head)
+            print(f'release source verified: {args.tag} {args.commit}')
+        else:
+            publish(args)
+    except ReleaseError as error:
+        print(f'error: {error}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
