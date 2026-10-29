@@ -1,0 +1,342 @@
+name: Windows release
+
+on:
+  pull_request:
+    paths:
+      - scripts/windows-packaging.py
+      - scripts/macos-packaging.py
+      - scripts/release-assets
+      - scripts/tests/test_windows_packaging.py
+      - scripts/tests/test_release_assets.py
+      - scripts/*browser-extension*
+      - bins/wallet/packaging/windows/**
+      - bins/wallet/packaging/icons/windows/**
+      - bins/wallet/packaging/macos/libusb-LICENSE-LGPL-2.1.txt
+      - bins/wallet/Cargo.toml
+      - crates/wallet-ops/Cargo.toml
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/windows-release.yml
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'release' && 'windows-release' || format('windows-release-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tooling:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Test Windows packaging helpers
+        run: python3 -m unittest discover -s scripts/tests -p test_windows_packaging.py -v
+
+      - name: Test release asset publication
+        run: python3 -m unittest discover -s scripts/tests -p test_release_assets.py -v
+
+  source:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release source
+        id: release_source
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          scripts/release-assets check-source --tag "$RELEASE_TAG" --commit "$EVENT_SHA" --require-head
+          printf 'release_sha=%s\n' "$EVENT_SHA" >>"$GITHUB_OUTPUT"
+    outputs:
+      release_sha: ${{ steps.release_source.outputs.release_sha }}
+
+  build:
+    needs: [tooling, source]
+    if: ${{ !cancelled() && needs.tooling.result == 'success' && (needs.source.result == 'success' || needs.source.result == 'skipped') }}
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Empty for pull requests, which selects the default ref.
+          ref: ${{ needs.source.outputs.release_sha }}
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $match = Select-String -LiteralPath Cargo.toml -Pattern '^rust-version = "([0-9]+\.[0-9]+\.[0-9]+)"$'
+          if (-not $match) { throw 'cannot read rust-version from Cargo.toml' }
+          $toolchain = $match.Matches[0].Groups[1].Value
+          rustup toolchain install $toolchain --profile minimal --target wasm32-unknown-unknown
+          "CARGO_TOOLCHAIN=$toolchain" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Install browser extension helper
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python scripts/install-browser-extension-tools.py "$env:RUNNER_TEMP\browser-extension-tools"
+          "$env:RUNNER_TEMP\browser-extension-tools\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      # Later steps inherit the developer environment, including the PATH set above.
+      - name: Enter Visual Studio developer environment
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vsDevCmd = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'Common7\Tools\VsDevCmd.bat' | Select-Object -First 1
+          if (-not $vsDevCmd) { throw 'VsDevCmd.bat not found' }
+          $lines = cmd.exe /d /c "`"$vsDevCmd`" -no_logo -arch=x64 -host_arch=x64 && set"
+          foreach ($line in $lines) {
+            $name, $value = $line -split '=', 2
+            if ($null -ne $value -and [Environment]::GetEnvironmentVariable($name) -ne $value) {
+              "$name=$value" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+            }
+          }
+
+      - name: Package release
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python scripts/windows-packaging.py package
+
+      - name: Check release assets and packaged imports
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = python scripts/windows-packaging.py version
+          $name = "RailOxide-v$version-windows-x64"
+          $zip = "$name.zip"
+          $sums = "RailOxide-v$version-windows-SHA256SUMS"
+          $release = 'target\windows\release'
+
+          $listing = (Get-ChildItem -LiteralPath $release -Name | Sort-Object) -join "`n"
+          $expected = (@($zip, $sums) | Sort-Object) -join "`n"
+          if ($listing -ne $expected) { throw "unexpected release directory contents:`n$listing" }
+
+          $digest = (Get-FileHash -Algorithm SHA256 -LiteralPath "$release\$zip").Hash.ToLowerInvariant()
+          $checksums = Get-Content -LiteralPath "$release\$sums" -Raw
+          if ($checksums -cne "$digest  $zip`n") { throw "unexpected checksum file:`n$checksums" }
+
+          $extracted = "$env:RUNNER_TEMP\windows-extracted"
+          Expand-Archive -LiteralPath "$release\$zip" -DestinationPath $extracted
+          $entries = (Get-ChildItem -LiteralPath $extracted -Recurse -Name | Sort-Object) -join "`n"
+          $expectedEntries = (@(
+            $name,
+            "$name\LICENSE",
+            "$name\RailOxide.ico",
+            "$name\libusb-LICENSE-LGPL-2.1.txt",
+            "$name\wallet.exe"
+          ) | Sort-Object) -join "`n"
+          if ($entries -ne $expectedEntries) { throw "unexpected ZIP contents:`n$entries" }
+
+          python scripts/windows-packaging.py check-imports "$extracted\$name"
+
+          # wallet.exe is a GUI-subsystem binary, so redirect its output instead of relying on a console.
+          $output = "$env:RUNNER_TEMP\wallet-version.txt"
+          $process = Start-Process -FilePath "$extracted\$name\wallet.exe" -ArgumentList '--version' -Wait -PassThru -NoNewWindow -RedirectStandardOutput $output
+          if ($process.ExitCode -ne 0) { throw "wallet.exe --version exited with $($process.ExitCode)" }
+          $reported = (Get-Content -LiteralPath $output -Raw).Trim()
+          if ($reported -cne "wallet $version") { throw "wallet.exe reported '$reported', expected 'wallet $version'" }
+
+      - name: Check imports reject a dynamic C runtime
+        run: |
+          $fixture = "$env:RUNNER_TEMP\imports-fixture"
+          New-Item -ItemType Directory -Path $fixture | Out-Null
+          Set-Content -LiteralPath "$fixture\main.c" -Value 'int main(void) { return 0; }'
+          cl /nologo /MD "/Fe$fixture\fixture.exe" "/Fo$fixture\main.obj" "$fixture\main.c"
+          if ($LASTEXITCODE -ne 0) { throw 'cannot compile the import fixture' }
+          $output = python scripts/windows-packaging.py check-imports "$fixture\fixture.exe" 2>&1 | Out-String
+          $status = $LASTEXITCODE
+          $output
+          if ($status -eq 0) { throw 'check-imports accepted a dynamic C runtime import' }
+          if (-not $output.Contains('VCRUNTIME140.dll', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'check-imports did not name VCRUNTIME140.dll'
+          }
+          exit 0
+
+      - name: Render generated manifest
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = python scripts/windows-packaging.py version
+          python scripts/windows-packaging.py render-manifest `
+            --version $version `
+            --checksums "target\windows\release\RailOxide-v$version-windows-SHA256SUMS" `
+            --output "$env:RUNNER_TEMP\scoop-ci\railoxide.json"
+
+      - name: Record build provenance
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = python scripts/windows-packaging.py version
+          $zip = "RailOxide-v$version-windows-x64.zip"
+          $provenance = [ordered]@{
+            version = $version
+            tag = if ($env:RELEASE_TAG) { $env:RELEASE_TAG } else { $null }
+            source_commit = git rev-parse HEAD
+            rustc = rustc "+$env:CARGO_TOOLCHAIN" --version
+            arch = 'x64'
+            target = 'x86_64-pc-windows-msvc'
+            zip = $zip
+            zip_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath "target\windows\release\$zip").Hash.ToLowerInvariant()
+            runner_image = $env:ImageOS
+            runner_image_version = $env:ImageVersion
+          }
+          $provenance | ConvertTo-Json | Set-Content -LiteralPath target\windows\build-provenance.json -Encoding utf8NoBOM
+          $summary = @('### Windows build provenance', '', '| Field | Value |', '| --- | --- |')
+          $summary += $provenance.GetEnumerator() | ForEach-Object { "| $($_.Key) | $($_.Value) |" }
+          $summary | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload release files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-release
+          path: |
+            target/windows/release/RailOxide-v*-windows-x64.zip
+            target/windows/release/RailOxide-v*-windows-SHA256SUMS
+            target/windows/build-provenance.json
+          if-no-files-found: error
+
+      - name: Upload unverified manifest
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: railoxide-scoop-manifest-unverified
+          path: ${{ runner.temp }}/scoop-ci/railoxide.json
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'release'
+    needs: [source, build]
+    runs-on: ubuntu-24.04
+    environment: flatpak-release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout trusted release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download release files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-release
+          path: out/windows
+
+      - name: Check downloaded release files
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          zip="RailOxide-$RELEASE_TAG-windows-x64.zip"
+          sums="RailOxide-$RELEASE_TAG-windows-SHA256SUMS"
+          listing="$(cd out/windows/release && ls -A | LC_ALL=C sort)"
+          expected="$(printf '%s\n%s\n' "$zip" "$sums" | LC_ALL=C sort)"
+          if [[ "$listing" != "$expected" ]]; then
+            printf 'unexpected release files:\n%s\n' "$listing" >&2
+            exit 1
+          fi
+          [[ -f out/windows/build-provenance.json ]]
+          (cd out/windows/release && sha256sum -c "$sums")
+
+      - name: Import protected signing key
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          GNUPGHOME: ${{ runner.temp }}/windows-gnupg
+        run: |
+          set -euo pipefail
+          [[ -n "$FLATPAK_GPG_PRIVATE_KEY" ]]
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Sign checksum file
+        env:
+          FLATPAK_GPG_KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+          GNUPGHOME: ${{ runner.temp }}/windows-gnupg
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          [[ -n "$FLATPAK_GPG_KEY_ID" ]]
+          sums="out/windows/release/RailOxide-$RELEASE_TAG-windows-SHA256SUMS"
+          gpg --batch --armor --detach-sign --local-user "$FLATPAK_GPG_KEY_ID" --output "$sums.asc" "$sums"
+          gpg --batch --armor --export "$FLATPAK_GPG_KEY_ID" >"$RUNNER_TEMP/release-public.gpg"
+          [[ -s "$RUNNER_TEMP/release-public.gpg" ]]
+
+      - name: Remove signing key
+        if: always()
+        env:
+          GNUPGHOME: ${{ runner.temp }}/windows-gnupg
+        run: |
+          gpgconf --homedir "$GNUPGHOME" --kill all || true
+          rm -rf "$GNUPGHOME"
+
+      - name: Publish and verify GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.source.outputs.release_sha }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          release_dir=out/windows/release
+          scripts/release-assets publish \
+            --repo "$GITHUB_REPOSITORY" \
+            --tag "$RELEASE_TAG" \
+            --existing verify \
+            --public-key "$RUNNER_TEMP/release-public.gpg" \
+            --source-commit "$RELEASE_SHA" \
+            "$release_dir/RailOxide-$RELEASE_TAG-windows-x64.zip" \
+            "$release_dir/RailOxide-$RELEASE_TAG-windows-SHA256SUMS" \
+            "$release_dir/RailOxide-$RELEASE_TAG-windows-SHA256SUMS.asc"
+
+      # Runs only after publication verified the downloaded assets.
+      - name: Render verified manifest
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p out/scoop/bucket
+          python3 scripts/windows-packaging.py render-manifest \
+            --version "${RELEASE_TAG#v}" \
+            --checksums "out/windows/release/RailOxide-$RELEASE_TAG-windows-SHA256SUMS" \
+            --output out/scoop/bucket/railoxide.json
+          {
+            printf '### Windows release provenance\n\n| Field | Value |\n| --- | --- |\n'
+            jq -r 'to_entries[] | "| \(.key) | \(.value // "") |"' out/windows/build-provenance.json
+            printf '\n### Verified Windows release assets\n\n'
+            printf -- '- `%s`\n' \
+              "RailOxide-$RELEASE_TAG-windows-x64.zip" \
+              "RailOxide-$RELEASE_TAG-windows-SHA256SUMS" \
+              "RailOxide-$RELEASE_TAG-windows-SHA256SUMS.asc"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload verified manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: railoxide-scoop-manifest
+          path: out/scoop/bucket/railoxide.json
+          if-no-files-found: error

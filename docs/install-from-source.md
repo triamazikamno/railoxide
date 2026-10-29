@@ -111,6 +111,8 @@ The installed files are written to:
 
 The installer creates a Start Menu shortcut unless `-NoShortcut` is passed.
 
+If Scoop has RailOxide installed, the installer prints a warning before building. Both copies share one wallet profile, and each has its own Start Menu shortcut. The installer removes nothing and continues. To keep only the prebuilt app, see [Switch from a source install](install-windows.md#switch-from-a-source-install).
+
 ## Options
 
 macOS/Linux options:

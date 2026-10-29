@@ -93,6 +93,13 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 security-framework = "3"
 security-framework-sys = { version = "2.17", features = ["OSX_10_15"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Build libusb from its bundled source so a vcpkg copy on the build machine can't change the linkage.
+libusb1-sys = { version = "0.7", optional = true, features = ["vendored"] }
+# Compile Arti's SQLite from the locked crate instead of linking a downloaded sqlite3.dll.
+# Keep the version on the one Arti's rusqlite resolves, or Cargo resolves two copies.
+libsqlite3-sys = { version = "0.37", features = ["bundled"] }
+
 [dev-dependencies]
 rcgen = "0.13"
 redb = { workspace = true }
