@@ -25,19 +25,21 @@ RailOxide is under active development. APIs, wallet storage formats, and UI flow
 
 ## Features
 
-- Fully open source
-- Zero telemetry, zero home calls
-- First-class integrated Tor support
+- Fully open source and non-profit
+- Zero telemetry, zero home calls, zero added fees
+- First-class integrated Tor support, isolated circuit for each sensitive operation
 - Indexed POI tree support, prevents UTXO spend intent leaking to the poi proxy operator
 - Hardware-derived wallets:
   - public accounts have full hardware wallet support.
   - 0zk accounts are derived deterministically by signing a hash with a hardware device, private keys are **not** stored in app, but for signing they are briefly exposed in memory.
     Full on-device 0zk signing support is to be added as soon as hardware wallet vendors add railgun-specific cryptography functions.
-- Aggressive request batching to reduce rpc throttling
+- Aggressive non-sensitive request batching to reduce rpc throttling
 - Resilient public broadcaster network connection management
 - Block-builder sponsored self-broadcasting mode (Mainnet only). This is a reliable and permissionless way to send private transactions using an empty/underfunded EOA without public broadcasters 
 - Decentralized and leak-free pricing discovery via on-chain chainlink oracles. Used both for display and suspicious public broadcaster filtering
-- WalletConnect support for DeFi exposure
+- Private and cross-chain swaps via CoW Protocol, Across and NEAR Intents
+- Companion browser extension that securely communicates with the main wallet process and opens up the world of DeFi
+- WalletConnect support
 
 ## Flatpak
 
@@ -66,7 +68,7 @@ brew analytics off
 ```bash
 brew install --cask triamazikamno/tap/railoxide
 ```
-
+> [!NOTE]
 > RailOxide is ad-hoc signed and is not notarized by Apple. Our Homebrew cask removes the app's quarantine attribute to bypass the usual first-launch Gatekeeper assessment. Installing through this tap means trusting our published binaries and release process. Homebrew verifies the download checksum; it does not certify the app's safety.
 
 Intel Macs and older macOS versions can install from source. See the [`macOS install guide`](docs/install-macos.md) for upgrades, the DMG download, privacy details, and switching from a source install.
