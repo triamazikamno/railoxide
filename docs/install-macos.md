@@ -71,14 +71,12 @@ Open the DMG and drag `RailOxide.app` onto the `Applications` folder.
 
 A DMG downloaded through a browser keeps its quarantine attribute, and this path does not run the cask's quarantine removal. macOS therefore blocks the first launch. To open RailOxide anyway, follow [Apple's procedure for apps from unidentified developers](https://support.apple.com/en-us/102445):
 
-<!-- The dialog sequence below is verified at the Mac checkpoint (task 6.2). -->
-
-1. Open `RailOxide.app`. macOS reports that it cannot verify the app and does not open it. Close the dialog.
+1. Open `RailOxide.app`. macOS shows "RailOxide" Not Opened, saying Apple could not verify it is free of malware. Click **Done**, not **Move to Bin**, which deletes the app.
 2. Open System Settings, then Privacy & Security.
-3. In the Security section, click "Open Anyway" next to the message about RailOxide.
-4. Confirm that you want to open it, and authenticate if asked.
+3. In the Security section, click **Open Anyway** next to the message about RailOxide.
+4. Enter your login password. RailOxide then opens.
 
-macOS remembers this choice for RailOxide only. Do not disable Gatekeeper or clear quarantine attributes system-wide.
+macOS remembers this choice for RailOxide only, and later launches open without a prompt. Do not disable Gatekeeper or clear quarantine attributes system-wide.
 
 ## Privacy
 
