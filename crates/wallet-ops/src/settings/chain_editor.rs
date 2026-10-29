@@ -34,10 +34,13 @@ pub fn chain_editor_snapshot(
                     .unwrap_or("Chain")
                     .clone_into(&mut summary.name);
                 let overrides = settings.chains.per_chain.get(&id);
-                summary.enabled = overrides.is_none_or(|chain| chain.enabled);
+                summary.enabled = overrides.map_or_else(
+                    || ChainSettingsOverride::for_chain(id).enabled,
+                    |chain| chain.enabled,
+                );
                 // Enabled is its own row affordance, so it never counts as a preset deviation.
                 summary.modified = overrides.is_some_and(|chain| {
-                    let unchanged = ChainSettingsOverride::default();
+                    let unchanged = ChainSettingsOverride::for_chain(id);
                     let mut compared = chain.clone();
                     compared.enabled = unchanged.enabled;
                     compared != unchanged
@@ -118,7 +121,7 @@ fn fill_native_pricing(draft: &mut ChainDraft, pricing: NativeUsdPricing) {
 
 fn built_in_draft(settings: &WalletSettings, id: u64) -> Result<ChainDraft, String> {
     let preset = presets::EvmPreset::for_chain(id).ok_or("Chain is no longer configured")?;
-    let defaults = ChainSettingsOverride::default();
+    let defaults = ChainSettingsOverride::for_chain(id);
     let chain = settings.chains.per_chain.get(&id).unwrap_or(&defaults);
     let mut draft = ChainDraft::new();
     draft.chain_id = id.to_string();
@@ -814,24 +817,27 @@ mod tests {
             );
             assert_eq!(save_draft(&settings, draft.clone()), settings);
 
-            // Flagging one preset makes the whole preset list the override.
-            let mut flagged = draft.clone();
-            flagged.rpc_endpoints[0].sensitive = false;
-            let mut expected = settings.clone();
-            expected
-                .chains
-                .per_chain
-                .get_mut(&id)
-                .unwrap()
-                .rpc_endpoints = preset_rows
-                .iter()
-                .enumerate()
-                .map(|(index, preset)| RpcEndpointSetting {
-                    sensitive: index != 0,
-                    ..preset.url.clone().into()
-                })
-                .collect();
-            assert_eq!(save_draft(&settings, flagged), expected);
+            // A second endpoint must retain Sensitive coverage when the first loses it.
+            if preset_rows.len() > 1 {
+                // Flagging one preset makes the whole preset list the override.
+                let mut flagged = draft.clone();
+                flagged.rpc_endpoints[0].sensitive = false;
+                let mut expected = settings.clone();
+                expected
+                    .chains
+                    .per_chain
+                    .get_mut(&id)
+                    .unwrap()
+                    .rpc_endpoints = preset_rows
+                    .iter()
+                    .enumerate()
+                    .map(|(index, preset)| RpcEndpointSetting {
+                        sensitive: index != 0,
+                        ..preset.url.clone().into()
+                    })
+                    .collect();
+                assert_eq!(save_draft(&settings, flagged), expected);
+            }
 
             draft.fields.insert(
                 ChainField::GasLimitBuffer,

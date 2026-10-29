@@ -74,6 +74,10 @@ fn native_wrapped_output_labels_are_chain_specific() {
     assert_eq!(native_wrapped_output_labels(56), Some(("BNB", "WBNB")));
     assert_eq!(native_wrapped_output_labels(137), Some(("POL", "WPOL")));
     assert_eq!(native_wrapped_output_labels(42161), Some(("ETH", "WETH")));
+    assert_eq!(
+        native_wrapped_output_labels(11_155_111),
+        Some(("ETH", "WETH"))
+    );
     assert_eq!(native_wrapped_output_labels(999_999), None);
 }
 

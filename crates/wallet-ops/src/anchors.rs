@@ -357,6 +357,9 @@ impl TokenAnchorRateCache {
 
     #[must_use]
     pub fn cached_native_usd_rate(&self, chain_id: u64) -> Option<U256> {
+        if railgun_ui::is_testnet_chain(chain_id) {
+            return None;
+        }
         self.native_pricing
             .read()
             .ok()
@@ -388,6 +391,9 @@ impl TokenAnchorRateCache {
 
     #[must_use]
     pub fn cached_native_usd_micro_value(&self, chain_id: u64, amount: U256) -> Option<U256> {
+        if railgun_ui::is_testnet_chain(chain_id) {
+            return None;
+        }
         let native = self.native_pricing.read().ok()?;
         let &(rate, decimals) = native.rates.get(&chain_id)?;
         native_usd_micro_value(amount, rate, decimals)
@@ -1869,19 +1875,41 @@ mod tests {
     }
 
     #[test]
-    fn cache_stores_native_usd_rates_by_chain() {
+    fn cached_usd_values_exclude_testnets_even_with_populated_rates() {
         let cache = TokenAnchorRateCache::new();
+        let token = Address::repeat_byte(7);
+        let token_rate = uint!(1_000_000_000_000_000_000_U256);
+        let native_rate = uint!(3_000_000_000_U256);
+        let amount = uint!(1_000_000_000_000_000_000_U256);
 
         cache.store_native_usd_rate(1, U256::ZERO, 18);
         assert_eq!(cache.cached_native_usd_rate(1), None);
 
-        cache.store_native_usd_rate(1, uint!(3_000_000_000_U256), 18);
-
-        assert_eq!(
-            cache.cached_native_usd_rate(1),
-            Some(uint!(3_000_000_000_U256))
-        );
+        for chain_id in [1, 11_155_111] {
+            cache.store_native_usd_rate(chain_id, native_rate, 18);
+            cache.store_rate(chain_id, token, token_rate);
+            // Token-to-native rates remain available for broadcaster gas fees.
+            assert_eq!(cache.cached_rate(chain_id, token), Some(token_rate));
+        }
+        assert_eq!(cache.cached_native_usd_rate(1), Some(native_rate));
         assert_eq!(cache.cached_native_usd_rate(56), None);
+        assert_eq!(cache.cached_native_usd_rate(11_155_111), None);
+        assert_eq!(
+            cache.cached_native_usd_micro_value(1, amount),
+            Some(native_rate)
+        );
+        assert_eq!(
+            cache.cached_token_usd_micro_value(1, token, amount),
+            Some(native_rate)
+        );
+        assert_eq!(
+            cache.cached_native_usd_micro_value(11_155_111, amount),
+            None
+        );
+        assert_eq!(
+            cache.cached_token_usd_micro_value(11_155_111, token, amount),
+            None
+        );
     }
 
     #[test]

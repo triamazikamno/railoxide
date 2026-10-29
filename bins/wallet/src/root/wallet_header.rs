@@ -383,7 +383,7 @@ impl WalletRoot {
         div()
             .id("chain-selector")
             .h(px(24.0))
-            .w(px(130.0))
+            .w_48()
             .flex()
             .items_center()
             .tooltip(move |window, cx| {
@@ -399,7 +399,7 @@ impl WalletRoot {
                 ui::chain_select::chain_select(&self.chain_select)
                     .appearance(false)
                     .small()
-                    .w(px(130.0))
+                    .w_full()
                     .h(px(24.0))
                     .menu_width(px(240.0)),
             )

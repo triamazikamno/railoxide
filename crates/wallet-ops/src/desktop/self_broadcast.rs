@@ -1861,6 +1861,11 @@ pub async fn run_sponsored_self_broadcast_session(
     sensitive_route: ClassRoute,
     query_rpc_pool: Arc<QueryRpcPool>,
 ) -> Result<SponsoredSelfBroadcastSessionOutcome> {
+    if railgun_ui::is_testnet_chain(request.chain_id) {
+        return Err(eyre!(
+            "Sponsored self-broadcast is unavailable on testnets."
+        ));
+    }
     if request.session.chain_id != request.chain_id {
         return Err(eyre!(
             "selected wallet session is for chain {}, not {}",

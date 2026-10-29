@@ -203,7 +203,7 @@ pub(super) const fn native_wrapped_output_labels(
     chain_id: u64,
 ) -> Option<(&'static str, &'static str)> {
     match chain_id {
-        1 | 42161 | 8453 => Some(("ETH", "WETH")),
+        1 | 42161 | 8453 | 11_155_111 => Some(("ETH", "WETH")),
         56 => Some(("BNB", "WBNB")),
         137 => Some(("POL", "WPOL")),
         _ => None,

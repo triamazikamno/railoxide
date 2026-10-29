@@ -893,6 +893,8 @@ fn version_9_settings_migrate_with_unwrap_disabled_and_preserve_preferences() {
     })
     .expect("open db");
     let mut expected = WalletSettings::default();
+    // The released record has no entry for the newly added testnet.
+    expected.chains.per_chain.remove(&11_155_111);
     expected.privacy.mimic_railway_shields_by_default = true;
     expected.waku.direct_peers = Some(Vec::new());
     expected.waku.backup_peers = Some(vec![WakuDirectPeerSetting {
@@ -1627,7 +1629,7 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
     }
     // Protocol facts are built in on every Railgun chain.
     for &chain_id in railgun_ui::DEFAULT_CHAINS {
-        let private = configs.get(chain_id).unwrap().require_railgun().unwrap();
+        let private = configs.get(chain_id).unwrap().railgun.as_ref().unwrap();
         assert_eq!(
             private.deployment,
             broadcaster_core::deployment::RailgunDeployment::for_chain(chain_id).unwrap()
@@ -1690,6 +1692,115 @@ fn effective_chain_configs_use_supported_presets_without_overrides() {
             .map(|gateway| format!("{gateway}/"))
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn sepolia_requires_opt_in_and_reset_disables_it_again() {
+    use railgun_ui::chain_editor::ChainEditorCommand;
+    const SEPOLIA: u64 = 11_155_111;
+    let mut settings = WalletSettings::default();
+    let assert_disabled = |settings: &WalletSettings| {
+        assert!(!settings.chains.enabled_chain_ids().contains(&SEPOLIA));
+        let configs = build_effective_chain_configs(settings).unwrap();
+        assert!(!configs.get(SEPOLIA).unwrap().enabled);
+        assert!(configs.enabled(SEPOLIA).is_err());
+        assert!(configs.railgun(SEPOLIA).is_err());
+        for id in railgun_ui::built_in_chain_ids().filter(|id| !railgun_ui::is_testnet_chain(*id)) {
+            assert!(configs.enabled(id).is_ok(), "mainnet {id} stays enabled");
+        }
+        let snapshot = super::chain_editor_snapshot(settings, Some(SEPOLIA)).unwrap();
+        let summary = snapshot
+            .chains
+            .iter()
+            .find(|chain| chain.chain_id == SEPOLIA.to_string())
+            .unwrap();
+        assert!(!summary.enabled);
+        assert!(!summary.modified);
+        assert!(!snapshot.draft.unwrap().enabled);
+    };
+    assert_disabled(&settings);
+    // Released records with omitted chains must also leave testnets disabled.
+    for version in 1..=10 {
+        let payload = rmp_serde::to_vec_named(&json!({ "version": version })).unwrap();
+        assert_disabled(&decode_wallet_settings(&payload).unwrap());
+    }
+    // Saved settings from before the preset was added have no entry for Sepolia.
+    settings.chains.per_chain.remove(&SEPOLIA);
+    settings = decode_wallet_settings(&encode_wallet_settings(&settings).unwrap()).unwrap();
+    assert_disabled(&settings);
+
+    let mut draft = super::chain_editor_draft(&settings, SEPOLIA).unwrap();
+    draft.enabled = true;
+    settings = super::chain_editor_mutation(
+        &settings,
+        &ChainEditorCommand::Save {
+            draft,
+            existing: true,
+        },
+    )
+    .unwrap()
+    .prepare(&settings)
+    .unwrap();
+    // A stored oracle override must never give test ETH a USD valuation.
+    settings
+        .chains
+        .per_chain
+        .get_mut(&SEPOLIA)
+        .unwrap()
+        .native_usd_pricing = super::NativeUsdPricing::Oracle {
+        contract_address: Address::repeat_byte(1),
+    };
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .unwrap();
+    save_wallet_settings(&store, &settings).unwrap();
+    settings = load_wallet_settings(&store).unwrap();
+    assert!(settings.chains.enabled_chain_ids().contains(&SEPOLIA));
+    let configs = build_effective_chain_configs(&settings).unwrap();
+    let sepolia = configs.railgun(SEPOLIA).unwrap();
+    let private = sepolia.require_railgun().unwrap();
+    assert_eq!(private.sync.archive_until_block, 0);
+    assert_eq!(
+        private.deployment.relay_adapt_7702_contract,
+        alloy::primitives::address!("0x05aE73C5925d843864AE6f261f3175dE2ebCd963")
+    );
+    assert_eq!(
+        private.deployment.relay_adapt_7702_delegates[0].capability,
+        broadcaster_core::contracts::executor::ExecutorCapability::NonceBearingV1
+    );
+    assert!(sepolia.native_usd_oracle.is_none());
+    let weth = sepolia.wrapped_native_token.unwrap();
+    assert!(crate::is_wrapped_native_token(SEPOLIA, weth));
+    let token = railgun_ui::lookup_token(SEPOLIA, &weth).unwrap();
+    assert_eq!(
+        token.anchor_sources,
+        &[railgun_ui::TokenAnchorSource::Fixed {
+            token_fee_per_unit_gas: railgun_ui::WRAPPED_NATIVE_FEE_RATE,
+        }]
+    );
+    settings = super::chain_editor_mutation(
+        &settings,
+        &ChainEditorCommand::Reset {
+            chain_id: SEPOLIA.to_string(),
+        },
+    )
+    .unwrap()
+    .prepare(&settings)
+    .unwrap();
+    save_wallet_settings(&store, &settings).unwrap();
+    assert_disabled(&load_wallet_settings(&store).unwrap());
+    settings = super::ChainMutation::SetEnabled {
+        chain_id: SEPOLIA,
+        enabled: true,
+    }
+    .prepare(&settings)
+    .unwrap();
+    settings.reset_chains();
+    assert_disabled(&settings);
+    drop(store);
+    fs::remove_dir_all(root_dir).unwrap();
 }
 
 #[test]
@@ -3242,6 +3353,11 @@ fn custom_chains_fold_into_built_in_presets_on_load() {
     adopted.enabled = false;
     adopted.finality_depth = Some(32);
     saved.chains.custom.insert(8453, adopted);
+    // An explicitly enabled custom Sepolia entry is an opt-in and survives preset adoption.
+    let mut sepolia = custom_evm_chain();
+    sepolia.rpc_endpoints = vec!["https://sepolia.example".to_owned().into()];
+    saved.chains.custom.insert(11_155_111, sepolia);
+
     let payload = encode_wallet_settings(&saved).unwrap();
     let store = DbStore::open(DbConfig {
         root_dir: root_dir.clone(),
@@ -3262,6 +3378,16 @@ fn custom_chains_fold_into_built_in_presets_on_load() {
         .validate()
         .expect("a chain id covered by a preset no longer duplicates a custom chain");
     assert!(!migrated.chains.custom.contains_key(&8453));
+    assert!(!migrated.chains.custom.contains_key(&11_155_111));
+    let sepolia = &migrated.chains.per_chain[&11_155_111];
+    assert!(sepolia.enabled);
+    assert_eq!(
+        sepolia.rpc_endpoints,
+        vec![super::RpcEndpointSetting::from(
+            "https://sepolia.example".to_owned()
+        )]
+    );
+
     let adopted = migrated.chains.per_chain.get(&8453).expect("base override");
     assert_eq!(
         adopted.rpc_endpoints,

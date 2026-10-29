@@ -405,6 +405,8 @@ type TokenRow = (
 
 #[rustfmt::skip]
 const TOKENS: &[TokenRow] = &[
+    // Sepolia testnet WETH, shared-models BaseTokenWrappedAddress. Fixed anchor is for gas fees.
+    (11_155_111, address!("0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Shared("1-0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2.png")),
     // Ethereum (1)
     (1, address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), "WETH", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Own),
     (1, address!("0xdAC17F958D2ee523a2206206994597C13D831ec7"), "USDT", 6, ETH_USD_6_ANCHOR, TokenIcon::Own),
@@ -1230,9 +1232,9 @@ mod tests {
     #[test]
     fn lookup_misses_unknown_chain() {
         let weth = address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
-        // Sepolia (11155111) isn't in the registry.
-        assert!(lookup_token(11_155_111, &weth).is_none());
-        assert_eq!(token_icon_path(11_155_111, &weth), None);
+        // This chain has no built-in token metadata.
+        assert!(lookup_token(u64::MAX, &weth).is_none());
+        assert_eq!(token_icon_path(u64::MAX, &weth), None);
     }
 
     #[test]

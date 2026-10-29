@@ -1346,6 +1346,11 @@ fn quote_sponsored_authorization_limit(
     incentive: SponsoredIncentive,
     signer: Address,
 ) -> Result<SponsoredAuthorizationLimit> {
+    if railgun_ui::is_testnet_chain(chain_id) {
+        return Err(eyre!(
+            "Sponsored self-broadcast is unavailable on testnets."
+        ));
+    }
     if effective_chain.chain_id != chain_id {
         return Err(eyre!(
             "effective chain config is for chain {}, not {chain_id}",
@@ -1688,6 +1693,11 @@ fn sponsored_sensitive_route(
     http: &HttpContext,
     client: &OperationHttpClient,
 ) -> Result<(ClassRoute, Arc<QueryRpcPool>)> {
+    if railgun_ui::is_testnet_chain(chain_id) {
+        return Err(eyre!(
+            "Sponsored self-broadcast is unavailable on testnets."
+        ));
+    }
     let route = effective_desktop_chain_config(chain_id, effective_chain)?
         .rpc_route
         .for_class(RpcTrafficClass::Sensitive)?

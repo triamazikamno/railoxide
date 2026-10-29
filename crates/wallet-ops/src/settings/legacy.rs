@@ -250,6 +250,7 @@ pub(super) struct ReleasedChainSettings {
 impl Default for ReleasedChainSettings {
     fn default() -> Self {
         let per_chain = railgun_ui::built_in_chain_ids()
+            .filter(|chain_id| !railgun_ui::is_testnet_chain(*chain_id))
             .map(|chain_id| (chain_id, ReleasedChainSettingsOverride::default()))
             .collect();
         Self {

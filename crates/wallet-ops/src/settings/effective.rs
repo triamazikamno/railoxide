@@ -120,7 +120,7 @@ pub fn build_effective_chain_configs(
     let mut configs = BTreeMap::new();
     for &chain_id in railgun_ui::DEFAULT_CHAINS {
         let preset = super::presets::EvmPreset::for_chain(chain_id).expect("built-in EVM preset");
-        let defaults = super::ChainSettingsOverride::default();
+        let defaults = super::ChainSettingsOverride::for_chain(chain_id);
         let saved = settings
             .chains
             .per_chain
@@ -214,7 +214,7 @@ pub fn build_effective_chain_configs(
     }
     for &chain_id in railgun_ui::PUBLIC_CHAINS {
         let preset = super::presets::EvmPreset::for_chain(chain_id).expect("built-in EVM preset");
-        let defaults = super::ChainSettingsOverride::default();
+        let defaults = super::ChainSettingsOverride::for_chain(chain_id);
         let saved = settings
             .chains
             .per_chain
@@ -278,7 +278,11 @@ fn built_in_chain_config(
     };
     EffectiveChainConfig {
         chain_id,
-        native_usd_oracle: saved.native_usd_pricing.resolve(preset.native_usd_oracle),
+        native_usd_oracle: if railgun_ui::is_testnet_chain(chain_id) {
+            None
+        } else {
+            saved.native_usd_pricing.resolve(preset.native_usd_oracle)
+        },
         name: preset.name.to_owned(),
         native_currency: preset.native_currency,
         explorer_urls: preset

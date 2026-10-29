@@ -433,7 +433,8 @@ impl EffectiveChainConfig {
 
     #[must_use]
     pub fn has_sponsorship_prerequisites(&self) -> bool {
-        self.enabled
+        !railgun_ui::is_testnet_chain(self.chain_id)
+            && self.enabled
             && self.wrapped_native_token.is_some()
             && self.railgun.as_ref().is_some_and(|railgun| {
                 !railgun.sponsored_bundle_relays.is_empty()

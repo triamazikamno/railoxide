@@ -92,7 +92,11 @@ impl ChainMutation {
             }
             Self::SetEnabled { enabled, .. } => {
                 if railgun_ui::is_built_in_chain(id) {
-                    next.chains.per_chain.entry(id).or_default().enabled = *enabled;
+                    next.chains
+                        .per_chain
+                        .entry(id)
+                        .or_insert_with(|| ChainSettingsOverride::for_chain(id))
+                        .enabled = *enabled;
                 } else {
                     next.chains
                         .custom

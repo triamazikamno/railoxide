@@ -653,11 +653,14 @@ impl EffectiveChainConfig {
         })
     }
 
-    /// What a public Bridge delivery needs of this chain as its destination: an enabled chain
+    /// What a public Bridge delivery needs of this chain as its destination: an enabled mainnet
     /// with RPC endpoints, built in or added by the user, with or without Railgun. The 1Click
     /// name and the pinned `SpokePool` follow the chain id alone.
     #[must_use]
     pub fn bridge_destination(&self) -> Option<BridgeDestinationProfile> {
+        if railgun_ui::is_testnet_chain(self.chain_id) {
+            return None;
+        }
         resolve_effective_chain_rpc_route(self.chain_id, self).ok()?;
         Some(BridgeDestinationProfile {
             chain_id: self.chain_id,
@@ -695,6 +698,20 @@ mod tests {
         CustomTokenSettings, TokenKey, WalletSettings, build_effective_chain_configs,
         build_effective_token_registry,
     };
+
+    #[test]
+    fn enabled_sepolia_admits_private_executor_but_no_swaps_or_bridges() {
+        let mut chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
+        let chain = chains.get_mut(11_155_111).unwrap();
+        chain.enabled = true;
+        assert!(chain.require_railgun().is_ok());
+        assert!(chain.accepted_executor_profile().is_some());
+        assert!(chain.swap_profile().is_none());
+        assert!(chain.public_swap_profile().is_none());
+        assert!(chain.bridge_profile().is_none());
+        assert!(chain.bridge_origin_profile().is_none());
+        assert!(chain.bridge_destination().is_none());
+    }
 
     #[test]
     fn swap_profiles_require_accepted_built_in_executors() {

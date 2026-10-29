@@ -83,7 +83,7 @@ fn migrate_custom_chains_to_public_presets(settings: &mut WalletSettings) -> boo
             .chains
             .per_chain
             .get(&chain_id)
-            .is_some_and(|existing| *existing != ChainSettingsOverride::default())
+            .is_some_and(|existing| *existing != ChainSettingsOverride::for_chain(chain_id))
         {
             // An edited built-in override already owns this chain.
             continue;

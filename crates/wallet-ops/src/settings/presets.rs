@@ -17,6 +17,22 @@ pub(super) struct EvmPreset {
 impl EvmPreset {
     pub(super) fn for_chain(chain_id: u64) -> Option<Self> {
         match chain_id {
+            11_155_111 => Some(Self {
+                name: "Sepolia (testnet)",
+                native_currency: NativeCurrency {
+                    name: "Test Ether".into(),
+                    symbol: "ETH".into(),
+                    decimals: 18,
+                },
+                // PublicNode's Sepolia gateway: https://ethereum.publicnode.com/?sepolia
+                rpc_endpoints: vec!["https://ethereum-sepolia-rpc.publicnode.com".into()],
+                explorer_urls: &["https://sepolia.etherscan.io"],
+                multicall: Some(address!("0xcA11bde05977b3631167028862bE2a173976CA11")),
+                native_usd_oracle: None,
+                wrapped_native: crate::amounts::wrapped_native_token_for_chain(chain_id),
+                block_time: Duration::from_secs(12),
+                finality_depth: 12,
+            }),
             1 => Some(Self {
                 name: "Ethereum",
                 native_currency: NativeCurrency {

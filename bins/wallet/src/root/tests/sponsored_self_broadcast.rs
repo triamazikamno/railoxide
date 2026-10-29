@@ -57,6 +57,33 @@ fn sponsored_funding_choice_requires_a_configured_relay() {
 }
 
 #[test]
+fn sepolia_sponsorship_overrides_cannot_enable_or_retain_private_funding() {
+    let chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
+    let mainnet = chains.get(1).unwrap().clone();
+    assert!(mainnet.has_sponsorship_prerequisites());
+    let mainnet_private = mainnet.railgun.unwrap();
+    let mut chain = chains.get(11_155_111).unwrap().clone();
+    chain.enabled = true;
+    let private = chain.railgun.as_mut().unwrap();
+    private.sponsored_bundle_relays = mainnet_private.sponsored_bundle_relays;
+    private.coinbase_payer = mainnet_private.coinbase_payer;
+    private.deployment.relay_adapt_contract = mainnet_private.deployment.relay_adapt_contract;
+    assert!(chain.wrapped_native_token.is_some());
+
+    assert!(!chain.has_sponsorship_prerequisites());
+    assert!(sponsored_self_broadcast_availability_reason(Some(&chain)).is_some());
+    assert!(!sponsored_funding_choice_visible(Some(&chain)));
+    assert_eq!(
+        effective_delivery_funding_mode(
+            DeliveryMode::SelfBroadcast,
+            Some(&chain),
+            SelfBroadcastFundingMode::PrivateSponsorship,
+        ),
+        SelfBroadcastFundingMode::PublicBalance,
+    );
+}
+
+#[test]
 fn delivery_mode_isolates_sponsorship_funding() {
     let settings = WalletSettings::default();
     let chain = build_effective_chain_configs(&settings)

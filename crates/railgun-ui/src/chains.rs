@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 static CHAIN_ICON_DIR: LazyLock<PathBuf> =
     LazyLock::new(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/chains"));
 
-pub const DEFAULT_CHAINS: &[u64] = &[1, 56, 137, 42161, 8453];
+pub const DEFAULT_CHAINS: &[u64] = &[1, 56, 137, 42161, 8453, 11_155_111];
 
 /// Built-in presets without a Railgun deployment. Public EVM operations only.
 pub const PUBLIC_CHAINS: &[u64] = &[
@@ -18,6 +18,12 @@ pub fn is_built_in_chain(chain_id: u64) -> bool {
     DEFAULT_CHAINS.contains(&chain_id) || PUBLIC_CHAINS.contains(&chain_id)
 }
 
+/// Whether a built-in chain uses test funds without real-world value.
+#[must_use]
+pub const fn is_testnet_chain(chain_id: u64) -> bool {
+    chain_id == 11_155_111
+}
+
 /// Built-in chain ids, Railgun deployments first.
 pub fn built_in_chain_ids() -> impl Iterator<Item = u64> {
     DEFAULT_CHAINS
@@ -28,7 +34,7 @@ pub fn built_in_chain_ids() -> impl Iterator<Item = u64> {
 
 const fn chain_icon_file(chain_id: u64) -> Option<&'static str> {
     match chain_id {
-        1 => Some("ethereum.svg"),
+        1 | 11_155_111 => Some("ethereum.svg"),
         56 => Some("bsc.svg"),
         137 => Some("polygon.svg"),
         42161 => Some("arbitrum.svg"),
@@ -69,6 +75,7 @@ const fn chain_icon_file(chain_id: u64) -> Option<&'static str> {
 pub const fn chain_name(chain_id: u64) -> Option<&'static str> {
     match chain_id {
         1 => Some("Ethereum"),
+        11_155_111 => Some("Sepolia (testnet)"),
         56 => Some("BSC"),
         137 => Some("Polygon"),
         42161 => Some("Arbitrum"),
@@ -110,7 +117,7 @@ pub fn chain_icon_path(chain_id: u64) -> Option<PathBuf> {
 #[must_use]
 pub const fn chain_icon_asset_path(chain_id: u64) -> Option<&'static str> {
     match chain_id {
-        1 => Some("railgun-ui/chains/ethereum.svg"),
+        1 | 11_155_111 => Some("railgun-ui/chains/ethereum.svg"),
         56 => Some("railgun-ui/chains/bsc.svg"),
         137 => Some("railgun-ui/chains/polygon.svg"),
         42161 => Some("railgun-ui/chains/arbitrum.svg"),

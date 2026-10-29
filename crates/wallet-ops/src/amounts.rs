@@ -33,6 +33,7 @@ pub fn parse_railgun_recipient(input: &str) -> Result<AddressData> {
 pub(crate) const fn wrapped_native_token_for_chain(chain_id: u64) -> Option<Address> {
     match chain_id {
         1 => Some(address!("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")),
+        11_155_111 => Some(address!("0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14")),
         56 => Some(address!("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c")),
         137 => Some(address!("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270")),
         42161 => Some(address!("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1")),

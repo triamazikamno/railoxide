@@ -69,7 +69,7 @@ pub struct ChainSettings {
 impl Default for ChainSettings {
     fn default() -> Self {
         let per_chain = railgun_ui::built_in_chain_ids()
-            .map(|chain_id| (chain_id, ChainSettingsOverride::default()))
+            .map(|chain_id| (chain_id, ChainSettingsOverride::for_chain(chain_id)))
             .collect();
         Self {
             per_chain,
@@ -83,9 +83,10 @@ impl ChainSettings {
     pub fn enabled_chain_ids(&self) -> Vec<u64> {
         railgun_ui::built_in_chain_ids()
             .filter(|chain_id| {
-                self.per_chain
-                    .get(chain_id)
-                    .is_none_or(|settings| settings.enabled)
+                self.per_chain.get(chain_id).map_or_else(
+                    || ChainSettingsOverride::for_chain(*chain_id).enabled,
+                    |settings| settings.enabled,
+                )
             })
             .chain(
                 self.custom
@@ -231,6 +232,17 @@ pub struct ChainSettingsOverride {
     pub finality_depth: Option<u64>,
     pub gas: ChainGasSettings,
     pub railgun: RailgunSettingsOverride,
+}
+
+impl ChainSettingsOverride {
+    /// Built-in chain defaults. Testnets require an explicit opt-in.
+    #[must_use]
+    pub fn for_chain(chain_id: u64) -> Self {
+        Self {
+            enabled: !railgun_ui::is_testnet_chain(chain_id),
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for ChainSettingsOverride {

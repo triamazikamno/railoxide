@@ -1469,6 +1469,9 @@ pub(in crate::root) const fn sponsored_self_broadcast_availability_reason(
     let Some(chain) = chain else {
         return Some("Selected chain settings are unavailable.");
     };
+    if railgun_ui::is_testnet_chain(chain.chain_id) {
+        return Some("Sponsored self-broadcast is unavailable on testnets.");
+    }
     let Some(private) = &chain.railgun else {
         return Some("This chain does not support Railgun.");
     };
@@ -1491,10 +1494,11 @@ pub(in crate::root) fn sponsored_funding_choice_visible(
     chain: Option<&wallet_ops::settings::EffectiveChainConfig>,
 ) -> bool {
     chain.is_some_and(|chain| {
-        chain
-            .railgun
-            .as_ref()
-            .is_some_and(|private| !private.sponsored_bundle_relays.is_empty())
+        !railgun_ui::is_testnet_chain(chain.chain_id)
+            && chain
+                .railgun
+                .as_ref()
+                .is_some_and(|private| !private.sponsored_bundle_relays.is_empty())
     })
 }
 
