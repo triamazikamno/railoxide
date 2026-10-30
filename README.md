@@ -13,6 +13,7 @@
   <a href="https://github.com/triamazikamno/railoxide/releases">Releases</a> ·
   <a href="#flatpak">Install</a> ·
   <a href="#macos">macOS</a> ·
+  <a href="#windows">Windows</a> ·
   <a href="#build">Build</a> ·
   <a href="#privacy-model">Privacy Model</a>
 </p>
@@ -72,6 +73,19 @@ brew install --cask triamazikamno/tap/railoxide
 > RailOxide is ad-hoc signed and is not notarized by Apple. Our Homebrew cask removes the app's quarantine attribute to bypass the usual first-launch Gatekeeper assessment. Installing through this tap means trusting our published binaries and release process. Homebrew verifies the download checksum; it does not certify the app's safety.
 
 Intel Macs and older macOS versions can install from source. See the [`macOS install guide`](docs/install-macos.md) for upgrades, the DMG download, privacy details, and switching from a source install.
+
+## Windows
+
+Prebuilt releases support x64 Windows 11 and install through the project's Scoop bucket:
+
+```powershell
+scoop bucket add railoxide https://github.com/triamazikamno/scoop-bucket
+scoop install railoxide/railoxide
+```
+> [!NOTE]
+> RailOxide's Windows binaries are not code-signed. Installing through this bucket means trusting our published binaries and release process. Scoop verifies the download checksum; it does not certify the app's safety.
+
+Other Windows versions and architectures can install from source. See the [`Windows install guide`](docs/install-windows.md) for upgrades, the ZIP download, privacy details, and switching from a source install.
 
 ## Install From Source
 

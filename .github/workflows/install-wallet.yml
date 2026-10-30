@@ -204,3 +204,26 @@ jobs:
       - name: Dry run Windows ref installer
         shell: pwsh
         run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install-wallet.ps1 -DryRun -Ref test-ref -NoDeps -SourceDir "$env:RUNNER_TEMP\railoxide-src" -InstallDir "$env:RUNNER_TEMP\railoxide-bin"
+
+      - name: Check Windows installer Scoop warning
+        shell: pwsh
+        run: |
+          $warning = 'warning: RailOxide is also installed with Scoop.'
+          $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'scripts/install-wallet.ps1', '-DryRun', '-NoDeps', '-SourceDir', "$env:RUNNER_TEMP\railoxide-src", '-InstallDir', "$env:RUNNER_TEMP\railoxide-bin")
+          $originalPath = $env:Path
+          if (Get-Command scoop -ErrorAction SilentlyContinue) { throw 'the runner already has a scoop command' }
+          # No stub: no scoop command exists. Otherwise a stub scoop exits with the given status.
+          foreach ($status in @($null, 0, 1)) {
+            $env:Path = $originalPath
+            if ($null -ne $status) {
+              $stub = "$env:RUNNER_TEMP\scoop-stub-$status"
+              New-Item -ItemType Directory -Force -Path $stub | Out-Null
+              Set-Content -LiteralPath "$stub\scoop.cmd" -Value "@exit /b $status"
+              $env:Path = "$stub;$originalPath"
+            }
+            $output = powershell @arguments | Out-String
+            if ($LASTEXITCODE -ne 0) { throw "dry run failed with scoop status '$status':`n$output" }
+            if ($output.Contains($warning) -ne ($status -eq 0)) {
+              throw "unexpected Scoop warning result with scoop status '$status':`n$output"
+            }
+          }

@@ -362,6 +362,7 @@ jobs:
 
   notify:
     needs: deploy
+    if: ${{ !github.event.release.prerelease }}
     runs-on: ubuntu-24.04
     steps:
       - name: Prepare Telegram message

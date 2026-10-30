@@ -252,6 +252,22 @@ function Get-ManagedMarkerPath {
     return (Join-Path $SourceDir ".railoxide-installer-managed")
 }
 
+function Write-ScoopInstallWarning {
+    if (-not (Test-Command "scoop")) {
+        return
+    }
+    # Scoop resolves its own install roots. A child process keeps this script's StrictMode and
+    # ErrorActionPreference out of Scoop's scripts.
+    try {
+        & powershell -NoProfile -Command 'scoop prefix railoxide *> $null; exit $LASTEXITCODE'
+    } catch {
+        return
+    }
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "warning: RailOxide is also installed with Scoop. Both copies open the same wallet profile, and each has its own Start Menu shortcut. This installer leaves the Scoop installation in place."
+    }
+}
+
 function Initialize-SourceOptions {
     if ($Main -and -not [string]::IsNullOrWhiteSpace($Ref)) {
         Stop-Install "-Main and -Ref cannot be combined"
@@ -721,6 +737,7 @@ function Main {
     }
 
     Initialize-SourceOptions
+    Write-ScoopInstallWarning
 
     if ($DryRun) {
         Show-DryRunPlan
