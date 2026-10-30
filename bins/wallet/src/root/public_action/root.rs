@@ -188,6 +188,12 @@ impl WalletRoot {
                 };
                 input.read(cx).focus_handle(cx).focus(window, cx);
             }
+            PublicActionMode::Wrap | PublicActionMode::Unwrap => self
+                .public_form
+                .send_amount_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx),
         }
     }
 
@@ -257,7 +263,9 @@ impl WalletRoot {
         let fee_amount = selected_asset.and_then(|asset| {
             let input = match mode {
                 PublicActionMode::Shield => &self.public_form.shield_amount_input,
-                PublicActionMode::Send => &self.public_form.send_amount_input,
+                PublicActionMode::Send | PublicActionMode::Wrap | PublicActionMode::Unwrap => {
+                    &self.public_form.send_amount_input
+                }
             };
             let decimals = public_asset_decimals(
                 self.effective_chain_configs.get(self.selected_chain),
@@ -274,9 +282,14 @@ impl WalletRoot {
                 self.public_form.shield_gas_fee.refreshing
                     || (native_stealth && self.public_form.native_shield_preparation.pending)
             }
-            PublicActionMode::Send => self.public_form.send_gas_fee.refreshing,
+            PublicActionMode::Send | PublicActionMode::Wrap | PublicActionMode::Unwrap => {
+                self.public_form.gas_fee(mode).refreshing
+            }
         };
         let fee_ready = fee_display.expected_gas_cost.is_some();
+        let unwrap_gas_error = selected_asset
+            .filter(|_| mode == PublicActionMode::Unwrap)
+            .and_then(|asset| self.selected_public_unwrap_gas_error(asset, cx));
         let submit_disabled = disabled
             || match mode {
                 PublicActionMode::Shield => {
@@ -289,37 +302,49 @@ impl WalletRoot {
                         || self.public_form.advanced_send_estimate_pending
                         || self.public_form.advanced_send_estimate.is_none()
                 }
-                PublicActionMode::Send => self.public_form.sending || !fee_ready,
+                PublicActionMode::Send | PublicActionMode::Wrap => {
+                    self.public_form.sending || !fee_ready
+                }
+                PublicActionMode::Unwrap => {
+                    self.public_form.sending || !fee_ready || unwrap_gas_error.is_some()
+                }
             };
+        let wrap_mode = matches!(mode, PublicActionMode::Wrap | PublicActionMode::Unwrap);
         let mut content = public_action_form(content_width, submit_disabled, move |window, cx| {
             keyboard_submit_root.update(cx, |root, cx| match mode {
                 PublicActionMode::Shield => root.submit_public_shield_from_form(window, cx),
-                PublicActionMode::Send => root.submit_public_send_from_form(window, cx),
+                PublicActionMode::Send | PublicActionMode::Wrap | PublicActionMode::Unwrap => {
+                    root.submit_public_send_from_form(window, cx);
+                }
             });
         })
         .children(account.map(|account| {
             app_muted_text(format!("From {}", short_address(&account.address)))
                 .font_family(APP_MONO_FONT_FAMILY)
         }))
-        .child(ui::controls::public_action_mode_group(
-            "wallet-public-action-mode-toggle",
-            mode == PublicActionMode::Shield,
-            submitting || !self.selected_chain_has_railgun(),
-            move |shield, window, cx| {
-                let mode = if *shield {
-                    PublicActionMode::Shield
-                } else {
-                    PublicActionMode::Send
-                };
-                mode_root.update(cx, |root, cx| {
-                    root.set_public_action_mode(mode, window, cx);
-                });
-            },
-        ))
-        .when(!self.selected_chain_has_railgun(), |content| {
-            content.child(app_muted_text(
-                "Shield is unavailable: this chain has no Railgun deployment.",
-            ))
+        // Wrap and Unwrap are opened from their asset and never switch to Shield or Send.
+        .when(!wrap_mode, |content| {
+            content
+                .child(ui::controls::public_action_mode_group(
+                    "wallet-public-action-mode-toggle",
+                    mode == PublicActionMode::Shield,
+                    submitting || !self.selected_chain_has_railgun(),
+                    move |shield, window, cx| {
+                        let mode = if *shield {
+                            PublicActionMode::Shield
+                        } else {
+                            PublicActionMode::Send
+                        };
+                        mode_root.update(cx, |root, cx| {
+                            root.set_public_action_mode(mode, window, cx);
+                        });
+                    },
+                ))
+                .when(!self.selected_chain_has_railgun(), |content| {
+                    content.child(app_muted_text(
+                        "Shield is unavailable: this chain has no Railgun deployment.",
+                    ))
+                })
         });
 
         if account.is_some_and(|account| {
@@ -640,6 +665,58 @@ impl WalletRoot {
                         .child(Alert::error("wallet-public-send-error", error.to_string()).small());
                 }
             }
+            PublicActionMode::Wrap | PublicActionMode::Unwrap => {
+                let (button_id, label, pending_label) = if mode == PublicActionMode::Wrap {
+                    ("wallet-public-wrap", "Wrap", "Wrapping...")
+                } else {
+                    ("wallet-public-unwrap", "Unwrap", "Unwrapping...")
+                };
+                content = content
+                    .child(render_public_action_amount_input(
+                        max_root,
+                        mode,
+                        &self.public_form.send_amount_input,
+                        send_amount_hint,
+                        max_label,
+                        disabled || self.public_form.sending,
+                    ))
+                    .child(render_eip1559_gas_fee_editor(
+                        gas_fee_root,
+                        &Eip1559GasFeeTarget::Public { mode },
+                        self.public_form.gas_fee(mode),
+                        disabled || self.public_form.sending,
+                    ))
+                    .child(render_public_action_fee_estimate(&fee_display, gas_pending))
+                    .child(
+                        app_button(
+                            button_id,
+                            if self.public_form.sending {
+                                pending_label
+                            } else {
+                                label
+                            },
+                        )
+                        .primary()
+                        .small()
+                        .loading(self.public_form.sending)
+                        .disabled(submit_disabled)
+                        .on_click(move |_event, window, cx| {
+                            submit_root.update(cx, |root, cx| {
+                                root.submit_public_send_from_form(window, cx);
+                            });
+                        }),
+                    );
+                if show_form_errors
+                    && let Some(error) = self
+                        .public_form
+                        .send_error
+                        .as_deref()
+                        .or(unwrap_gas_error.as_deref())
+                {
+                    content = content
+                        .child(Alert::error("wallet-public-wrap-error", error.to_string()).small());
+                }
+            }
         }
 
         if !self.public_form.action_progress_dialog_open
@@ -888,6 +965,8 @@ impl WalletRoot {
         for gas_fee in [
             &mut self.public_form.send_gas_fee,
             &mut self.public_form.shield_gas_fee,
+            &mut self.public_form.wrap_gas_fee,
+            &mut self.public_form.unwrap_gas_fee,
         ] {
             gas_fee.refresh_id = gas_fee.refresh_id.wrapping_add(1);
             gas_fee.quote = None;
@@ -903,10 +982,7 @@ impl WalletRoot {
         &mut self,
         action_mode: PublicActionMode,
     ) {
-        let gas_fee = match action_mode {
-            PublicActionMode::Shield => &mut self.public_form.shield_gas_fee,
-            PublicActionMode::Send => &mut self.public_form.send_gas_fee,
-        };
+        let gas_fee = self.public_form.gas_fee_mut(action_mode);
         gas_fee.refresh_id = gas_fee.refresh_id.wrapping_add(1);
         gas_fee.refreshing = false;
         gas_fee.quote = None;
@@ -945,7 +1021,9 @@ impl WalletRoot {
                 self.public_form.shield_gas_fee_route,
                 self.public_action_quote_route(mode),
             ),
-            PublicActionMode::Send => self.public_form.send_gas_fee.quote,
+            PublicActionMode::Send | PublicActionMode::Wrap | PublicActionMode::Unwrap => {
+                self.public_form.gas_fee(mode).quote
+            }
         }
     }
 
@@ -1021,10 +1099,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let submitting = self.public_form.sending || self.public_form.shielding;
-        let gas_fee = match action_mode {
-            PublicActionMode::Shield => &mut self.public_form.shield_gas_fee,
-            PublicActionMode::Send => &mut self.public_form.send_gas_fee,
-        };
+        let gas_fee = self.public_form.gas_fee_mut(action_mode);
         if submitting || gas_fee.mode == mode {
             return;
         }
@@ -1049,10 +1124,7 @@ impl WalletRoot {
         if self.public_form.sending || self.public_form.shielding {
             return;
         }
-        let gas_fee = match action_mode {
-            PublicActionMode::Shield => &mut self.public_form.shield_gas_fee,
-            PublicActionMode::Send => &mut self.public_form.send_gas_fee,
-        };
+        let gas_fee = self.public_form.gas_fee_mut(action_mode);
         if !gas_fee.overwrite_custom_from_auto(window, cx) {
             return;
         }
@@ -1079,10 +1151,7 @@ impl WalletRoot {
             return;
         }
         let submitting = self.public_form.sending || self.public_form.shielding;
-        let gas_fee = match action_mode {
-            PublicActionMode::Shield => &mut self.public_form.shield_gas_fee,
-            PublicActionMode::Send => &mut self.public_form.send_gas_fee,
-        };
+        let gas_fee = self.public_form.gas_fee_mut(action_mode);
         if submitting || gas_fee.refreshing {
             return;
         }
@@ -1107,51 +1176,26 @@ impl WalletRoot {
             )
             .await;
             let _ = this.update(cx, |root, cx| {
-                let current_refresh_id = match action_mode {
-                    PublicActionMode::Shield => root.public_form.shield_gas_fee.refresh_id,
-                    PublicActionMode::Send => root.public_form.send_gas_fee.refresh_id,
-                };
-                if current_refresh_id != refresh_id {
+                if root.public_form.gas_fee(action_mode).refresh_id != refresh_id {
                     return;
                 }
                 // A quote for an earlier asset or profile never serves the current route.
                 if root.public_action_quote_route(action_mode) != route {
-                    match action_mode {
-                        PublicActionMode::Shield => {
-                            root.public_form.shield_gas_fee.refreshing = false;
-                        }
-                        PublicActionMode::Send => {
-                            root.public_form.send_gas_fee.refreshing = false;
-                        }
-                    }
+                    root.public_form.gas_fee_mut(action_mode).refreshing = false;
                     return;
                 }
                 match result {
                     Ok(bundle) => {
                         let standard = bundle.standard;
                         let authorization_ceiling = bundle.authorization_ceiling;
-                        match action_mode {
-                            PublicActionMode::Shield => {
-                                root.public_form.shield_gas_fee.refreshing = false;
-                                root.public_form.shield_gas_fee.quote = Some(standard);
-                            }
-                            PublicActionMode::Send => {
-                                root.public_form.send_gas_fee.refreshing = false;
-                                root.public_form.send_gas_fee.quote = Some(standard);
-                            }
-                        }
+                        let gas_fee = root.public_form.gas_fee_mut(action_mode);
+                        gas_fee.refreshing = false;
+                        gas_fee.quote = Some(standard);
+                        gas_fee.quote_error = None;
                         if action_mode == PublicActionMode::Shield {
                             root.public_form.shield_gas_fee_authorization_ceiling =
                                 Some(authorization_ceiling);
                             root.public_form.shield_gas_fee_route = Some(route);
-                        }
-                        match action_mode {
-                            PublicActionMode::Shield => {
-                                root.public_form.shield_gas_fee.quote_error = None;
-                            }
-                            PublicActionMode::Send => {
-                                root.public_form.send_gas_fee.quote_error = None;
-                            }
                         }
                         if action_mode == PublicActionMode::Send {
                             root.invalidate_advanced_public_send_estimate();
@@ -1159,28 +1203,14 @@ impl WalletRoot {
                         root.set_public_action_error(action_mode, None);
                     }
                     Err(_error) => {
-                        let quote_available = match action_mode {
-                            PublicActionMode::Shield => {
-                                root.public_form.shield_gas_fee.quote.is_some()
-                            }
-                            PublicActionMode::Send => root.public_form.send_gas_fee.quote.is_some(),
-                        };
-                        let error = if quote_available {
+                        let gas_fee = root.public_form.gas_fee_mut(action_mode);
+                        let error = if gas_fee.quote.is_some() {
                             "Gas quote refresh failed; using the last successful quote."
                         } else {
                             "Gas quote is unavailable."
                         };
-                        match action_mode {
-                            PublicActionMode::Shield => {
-                                root.public_form.shield_gas_fee.refreshing = false;
-                                root.public_form.shield_gas_fee.quote_error =
-                                    Some(Arc::from(error));
-                            }
-                            PublicActionMode::Send => {
-                                root.public_form.send_gas_fee.refreshing = false;
-                                root.public_form.send_gas_fee.quote_error = Some(Arc::from(error));
-                            }
-                        }
+                        gas_fee.refreshing = false;
+                        gas_fee.quote_error = Some(Arc::from(error));
                     }
                 }
                 cx.notify();
@@ -1604,7 +1634,9 @@ impl WalletRoot {
             .stopped(self.public_form.action_generation);
         match self.public_form.action_progress_mode {
             PublicActionMode::Shield => self.public_form.shielding = false,
-            PublicActionMode::Send => self.public_form.sending = false,
+            PublicActionMode::Send | PublicActionMode::Wrap | PublicActionMode::Unwrap => {
+                self.public_form.sending = false;
+            }
         }
         mark_public_action_active_step_stopped(&mut self.public_form.action_progress);
         // Submission consumed the native preparation and stopping bypasses the completion
@@ -1620,7 +1652,9 @@ impl WalletRoot {
         self.public_form.action_generation = self.public_form.action_generation.wrapping_add(1);
         match self.public_form.action_progress_mode {
             PublicActionMode::Shield => self.public_form.shielding = false,
-            PublicActionMode::Send => self.public_form.sending = false,
+            PublicActionMode::Send | PublicActionMode::Wrap | PublicActionMode::Unwrap => {
+                self.public_form.sending = false;
+            }
         }
         self.clear_public_action_progress_state();
         // Submission consumed the native preparation and discarding bypasses the completion
@@ -2014,7 +2048,9 @@ impl WalletRoot {
         let value = format_send_amount_input(amount, Some(decimals));
         let input = match mode {
             PublicActionMode::Shield => &self.public_form.shield_amount_input,
-            PublicActionMode::Send => &self.public_form.send_amount_input,
+            PublicActionMode::Send | PublicActionMode::Wrap | PublicActionMode::Unwrap => {
+                &self.public_form.send_amount_input
+            }
         };
         input.update(cx, |input, cx| input.set_value(value, window, cx));
     }
@@ -2026,7 +2062,9 @@ impl WalletRoot {
     ) {
         match mode {
             PublicActionMode::Shield => self.public_form.shield_error = message,
-            PublicActionMode::Send => self.public_form.send_error = message,
+            PublicActionMode::Send | PublicActionMode::Wrap | PublicActionMode::Unwrap => {
+                self.public_form.send_error = message;
+            }
         }
     }
 
@@ -2035,10 +2073,7 @@ impl WalletRoot {
         mode: PublicActionMode,
         cx: &Context<'_, Self>,
     ) -> Result<PublicActionGasFeeSelection, String> {
-        match mode {
-            PublicActionMode::Shield => self.public_form.shield_gas_fee.selection(cx),
-            PublicActionMode::Send => self.public_form.send_gas_fee.selection(cx),
-        }
+        self.public_form.gas_fee(mode).selection(cx)
     }
 
     pub(in crate::root) fn public_action_authorized_gas_fee_selection(
@@ -2048,10 +2083,7 @@ impl WalletRoot {
         asset: PublicAssetId,
         cx: &App,
     ) -> Result<PublicActionGasFeeSelection, String> {
-        let selection = match mode {
-            PublicActionMode::Shield => self.public_form.shield_gas_fee.selection(cx)?,
-            PublicActionMode::Send => self.public_form.send_gas_fee.selection(cx)?,
-        };
+        let selection = self.public_form.gas_fee(mode).selection(cx)?;
         let quote = self.public_action_quote(mode);
         authorized_public_action_gas_fee_selection(
             selection,
@@ -2100,12 +2132,13 @@ impl WalletRoot {
         asset: PublicAssetId,
         cx: &App,
     ) -> Option<Eip1559GasCostProjection> {
-        let (kind, gas_fee) = match mode {
-            PublicActionMode::Shield => {
-                (PublicActionKind::Shield, &self.public_form.shield_gas_fee)
-            }
-            PublicActionMode::Send => (PublicActionKind::Send, &self.public_form.send_gas_fee),
+        let kind = match mode {
+            PublicActionMode::Shield => PublicActionKind::Shield,
+            PublicActionMode::Send => PublicActionKind::Send,
+            PublicActionMode::Wrap => PublicActionKind::Wrap,
+            PublicActionMode::Unwrap => PublicActionKind::Unwrap,
         };
+        let gas_fee = self.public_form.gas_fee(mode);
         let quote = self.public_action_quote(mode);
         if self.native_shield_stealth_applies(mode) {
             let (raw_gas_limit, gas_limit) = self.native_shield_gas(cx)?;
@@ -2138,6 +2171,23 @@ impl WalletRoot {
             authorization_ceiling,
         )
         .ok()
+    }
+
+    /// The Unwrap gas guard for the selected account at the current quote.
+    fn selected_public_unwrap_gas_error(&self, asset: PublicAssetId, cx: &App) -> Option<String> {
+        let public_account_uuid = self.public_form.selected_account_uuid.as_deref()?;
+        let status = self
+            .public_account_for_uuid(Some(public_account_uuid))?
+            .status;
+        let native_balance = self
+            .public_balance_entry(public_account_uuid, PublicAssetId::Native, status)
+            .and_then(|entry| entry.amount.amount());
+        let maximum_gas_cost = self
+            .public_action_estimated_gas_cost(PublicActionMode::Unwrap, asset, cx)?
+            .maximum_cost;
+        public_unwrap_gas_error(native_balance, maximum_gas_cost, |cost| {
+            self.configured_native_amount_label(self.selected_chain, cost)
+        })
     }
 
     pub(in crate::root) fn public_action_initial_gas_values(
@@ -2228,8 +2278,12 @@ impl WalletRoot {
         let public_account_label = public_account_display_label(public_account)
             .unwrap_or_else(|| short_address(&public_account.address));
         let public_account_source = public_account.source;
+        let wrap_mode = matches!(
+            self.public_form.action_mode,
+            PublicActionMode::Wrap | PublicActionMode::Unwrap
+        );
         let (amount, recipient, intent, advanced_estimate, gas_fee, fee_display) =
-            if self.public_form.public_send_kind.is_advanced() {
+            if self.public_form.public_send_kind.is_advanced() && !wrap_mode {
                 if asset != PublicAssetId::Native {
                     self.public_form.send_error = Some(Arc::from(
                         "Advanced transactions are available only from the native asset",
@@ -2323,6 +2377,10 @@ impl WalletRoot {
                     fee_display,
                 )
             } else {
+                let mode = match self.public_form.action_mode {
+                    mode @ (PublicActionMode::Wrap | PublicActionMode::Unwrap) => mode,
+                    PublicActionMode::Shield | PublicActionMode::Send => PublicActionMode::Send,
+                };
                 let amount_input = self
                     .public_form
                     .send_amount_input
@@ -2343,20 +2401,47 @@ impl WalletRoot {
                         return None;
                     }
                 };
-                let Some(recipient) = parse_address(
-                    self.public_form
-                        .send_recipient_input
-                        .read(cx)
-                        .value()
-                        .as_ref(),
-                ) else {
+                // A wrap or unwrap calls the wrapped native token, recorded as its recipient.
+                let recipient = if mode == PublicActionMode::Send {
+                    parse_address(
+                        self.public_form
+                            .send_recipient_input
+                            .read(cx)
+                            .value()
+                            .as_ref(),
+                    )
+                } else {
+                    self.effective_chain_configs
+                        .get(chain_id)
+                        .and_then(|chain| chain.wrapped_native_token)
+                        .filter(|wrapped| {
+                            let expected = if mode == PublicActionMode::Wrap {
+                                PublicAssetId::Native
+                            } else {
+                                PublicAssetId::Erc20(*wrapped)
+                            };
+                            asset == expected
+                        })
+                };
+                let Some(recipient) = recipient else {
                     self.public_form.send_error =
-                        Some(Arc::from("Enter a valid EVM recipient address"));
+                        Some(Arc::from(if mode == PublicActionMode::Send {
+                            "Enter a valid EVM recipient address"
+                        } else {
+                            "This chain has no wrapped native token for this asset"
+                        }));
                     cx.notify();
                     return None;
                 };
+                if mode == PublicActionMode::Unwrap
+                    && let Some(error) = self.selected_public_unwrap_gas_error(asset, cx)
+                {
+                    self.public_form.send_error = Some(Arc::from(error));
+                    cx.notify();
+                    return None;
+                }
                 let gas_fee = match self.public_action_authorized_gas_fee_selection(
-                    PublicActionMode::Send,
+                    mode,
                     PublicShieldTransactionProfile::Railoxide,
                     PublicAssetId::Native,
                     cx,
@@ -2368,8 +2453,7 @@ impl WalletRoot {
                         return None;
                     }
                 };
-                let fee_display =
-                    self.public_action_fee_display(PublicActionMode::Send, Some(amount), cx);
+                let fee_display = self.public_action_fee_display(mode, Some(amount), cx);
                 if fee_display.expected_gas_cost.is_none() || fee_display.maximum_gas_cost.is_none()
                 {
                     self.public_form.send_error = Some(Arc::from(
@@ -2378,18 +2462,24 @@ impl WalletRoot {
                     cx.notify();
                     return None;
                 }
-                (
-                    amount,
-                    recipient,
-                    PublicTransactionIntent::Transfer {
-                        asset,
+                let intent = match mode {
+                    PublicActionMode::Wrap => PublicTransactionIntent::WrapNative {
+                        wrapped: recipient,
                         amount,
-                        recipient,
                     },
-                    None,
-                    gas_fee,
-                    fee_display,
-                )
+                    PublicActionMode::Unwrap => PublicTransactionIntent::UnwrapNative {
+                        wrapped: recipient,
+                        amount,
+                    },
+                    PublicActionMode::Shield | PublicActionMode::Send => {
+                        PublicTransactionIntent::Transfer {
+                            asset,
+                            amount,
+                            recipient,
+                        }
+                    }
+                };
+                (amount, recipient, intent, None, gas_fee, fee_display)
             };
         let operation = self.public_form_operation(&public_account_uuid);
         Some(PublicSendDraft {
@@ -2499,13 +2589,19 @@ impl WalletRoot {
         let active_wallet_id = self.selected_wallet_id.clone();
         let icon_path =
             public_asset_icon_path(chain_id, asset, Some(&self.effective_token_registry));
-        let initial_gas_fee =
-            self.public_action_initial_gas_values(PublicActionMode::Send, &gas_fee);
+        let mode = match intent {
+            PublicTransactionIntent::WrapNative { .. } => PublicActionMode::Wrap,
+            PublicTransactionIntent::UnwrapNative { .. } => PublicActionMode::Unwrap,
+            PublicTransactionIntent::Transfer { .. } | PublicTransactionIntent::Raw { .. } => {
+                PublicActionMode::Send
+            }
+        };
+        let initial_gas_fee = self.public_action_initial_gas_values(mode, &gas_fee);
         let advanced_submission = advanced_estimate.is_some();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let generation = self.start_public_action_progress(
-            PublicActionMode::Send,
+            mode,
             asset,
             asset_label,
             icon_path,

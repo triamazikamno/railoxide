@@ -500,24 +500,34 @@ pub(in crate::root) fn public_send_authorization_summary(
         }
         return SpendAuthorizationSummary::new(
             "Advanced public transaction",
-            public_send_authorization_detail(draft.public_account_source),
+            public_send_authorization_detail(draft.public_account_source, "public send"),
             rows,
         )
         .with_warnings(advanced_public_send_warnings(draft.public_account_source))
         .with_payload(payload_label, full_data)
         .requiring_explicit_review();
     }
+    let (title, action, address_label) = match draft.intent {
+        PublicTransactionIntent::WrapNative { .. } => ("Public wrap", "public wrap", "Contract"),
+        PublicTransactionIntent::UnwrapNative { .. } => {
+            ("Public unwrap", "public unwrap", "Contract")
+        }
+        PublicTransactionIntent::Transfer { .. } | PublicTransactionIntent::Raw { .. } => {
+            ("Public send", "public send", "Recipient")
+        }
+    };
+    // A wrap or unwrap draft's recipient is the wrapped native contract it calls.
     let mut rows = vec![
         SpendAuthorizationSummaryRow::new("Amount", public_action_amount_label(draft))
             .with_icon(draft.asset_icon_path.clone()),
         SpendAuthorizationSummaryRow::new("From", draft.public_account_label.clone()),
-        SpendAuthorizationSummaryRow::new("Recipient", draft.recipient.to_checksum(None))
+        SpendAuthorizationSummaryRow::new(address_label, draft.recipient.to_checksum(None))
             .with_shortened_copyable(),
     ];
     rows.extend(public_action_authorization_fee_rows(&draft.fee_display));
     SpendAuthorizationSummary::new(
-        "Public send",
-        public_send_authorization_detail(draft.public_account_source),
+        title,
+        public_send_authorization_detail(draft.public_account_source, action),
         rows,
     )
 }
@@ -645,17 +655,18 @@ fn public_action_authorization_fee_rows(
     rows
 }
 
-pub(in crate::root) const fn public_send_authorization_detail(
+pub(in crate::root) fn public_send_authorization_detail(
     source: PublicAccountSource,
-) -> &'static str {
+    action: &str,
+) -> String {
     match source {
-        PublicAccountSource::HardwareDerived => {
-            "Connect your hardware wallet and approve the public send transaction on the device. No EVM private key is stored in the vault."
-        }
+        PublicAccountSource::HardwareDerived => format!(
+            "Connect your hardware wallet and approve the {action} transaction on the device. No EVM private key is stored in the vault."
+        ),
         PublicAccountSource::Derived
         | PublicAccountSource::Imported
         | PublicAccountSource::ExecutorDerived(_) => {
-            "Enter your vault password to authorize this public send."
+            format!("Enter your vault password to authorize this {action}.")
         }
     }
 }
@@ -695,6 +706,8 @@ pub(in crate::root) fn public_shield_amount_label(draft: &PublicShieldDraft) -> 
 pub(in crate::root) enum PublicActionMode {
     Shield,
     Send,
+    Wrap,
+    Unwrap,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -819,6 +832,8 @@ pub(in crate::root) const fn public_action_step_is_final_handoff(
     ) || match mode {
         PublicActionMode::Shield => matches!(step, PublicActionProgressStep::Shield),
         PublicActionMode::Send => matches!(step, PublicActionProgressStep::Send),
+        PublicActionMode::Wrap => matches!(step, PublicActionProgressStep::Wrap),
+        PublicActionMode::Unwrap => matches!(step, PublicActionProgressStep::Unwrap),
     }
 }
 

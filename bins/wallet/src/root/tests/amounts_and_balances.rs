@@ -1,6 +1,8 @@
 use super::*;
 use crate::root::chain_load::SyncStatusContext;
-use crate::root::public_action::public_action_progress_steps_for_source;
+use crate::root::public_action::{
+    public_action_progress_steps_for_source, public_unwrap_gas_error,
+};
 use crate::root::public_balances::{
     public_account_usd_total_label_for_chain, public_balance_entry_for_chain,
 };
@@ -1543,7 +1545,7 @@ fn public_action_max_label_notes_native_gas_estimate() {
 }
 
 #[test]
-fn public_action_progress_steps_use_single_send_step() {
+fn public_action_progress_steps_use_single_send_wrap_or_unwrap_step() {
     assert_eq!(
         public_action_progress_steps_for_source(
             PublicActionMode::Send,
@@ -1552,6 +1554,42 @@ fn public_action_progress_steps_use_single_send_step() {
             false,
         ),
         vec![PublicActionProgressStep::Send],
+    );
+    // Wrap Max reserves gas with these steps, so a native wrap never adds Approve or Shield.
+    assert_eq!(
+        public_action_progress_steps_for_source(
+            PublicActionMode::Wrap,
+            PublicAssetId::Native,
+            wallet_ops::vault::PublicAccountSource::HardwareDerived,
+            true,
+        ),
+        vec![PublicActionProgressStep::Wrap],
+    );
+    assert_eq!(
+        public_action_progress_steps_for_source(
+            PublicActionMode::Unwrap,
+            PublicAssetId::Erc20(Address::from([0xef; 20])),
+            wallet_ops::vault::PublicAccountSource::HardwareDerived,
+            false,
+        ),
+        vec![PublicActionProgressStep::Unwrap],
+    );
+}
+
+#[test]
+fn public_unwrap_gas_error_blocks_only_a_known_short_native_balance() {
+    let label = |cost: U256| format!("{cost} wei");
+    assert_eq!(
+        public_unwrap_gas_error(Some(U256::from(99_u64)), U256::from(100_u64), label),
+        Some("Unwrap needs up to 100 wei for gas".to_string()),
+    );
+    assert_eq!(
+        public_unwrap_gas_error(Some(U256::from(100_u64)), U256::from(100_u64), label),
+        None,
+    );
+    assert_eq!(
+        public_unwrap_gas_error(None, U256::from(100_u64), label),
+        None
     );
 }
 

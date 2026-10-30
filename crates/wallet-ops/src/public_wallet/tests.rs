@@ -18,6 +18,7 @@ use reqwest::Url;
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
+use super::contracts::PublicWrappedNative;
 use super::types::PlannedPublicBalanceCall;
 use super::*;
 use crate::hardware::{
@@ -2727,6 +2728,41 @@ fn public_send_request_uses_native_value_or_erc20_transfer() {
 }
 
 #[test]
+fn public_send_request_wraps_with_deposit_value_and_unwraps_with_withdraw() {
+    let from = address!("0x1111111111111111111111111111111111111111");
+    let wrapped = address!("0x3333333333333333333333333333333333333333");
+    let amount = U256::from(5_u64);
+
+    let wrap = public_send_transaction_request(
+        1,
+        from,
+        &PublicTransactionIntent::WrapNative { wrapped, amount },
+    )
+    .expect("wrap request");
+    assert_eq!(wrap.to, Some(wrapped.into()));
+    assert_eq!(wrap.value, Some(amount));
+    assert_eq!(
+        wrap.input.input().expect("deposit input").as_ref(),
+        PublicWrappedNative::depositCall {}.abi_encode().as_slice()
+    );
+
+    let unwrap = public_send_transaction_request(
+        1,
+        from,
+        &PublicTransactionIntent::UnwrapNative { wrapped, amount },
+    )
+    .expect("unwrap request");
+    assert_eq!(unwrap.to, Some(wrapped.into()));
+    assert_eq!(unwrap.value.unwrap_or_default(), U256::ZERO);
+    assert_eq!(
+        unwrap.input.input().expect("withdraw input").as_ref(),
+        PublicWrappedNative::withdrawCall { amount }
+            .abi_encode()
+            .as_slice()
+    );
+}
+
+#[test]
 fn public_send_request_supports_raw_calls_and_contract_creation() {
     let from = address!("0x1111111111111111111111111111111111111111");
     let to = address!("0x2222222222222222222222222222222222222222");
@@ -3513,6 +3549,59 @@ fn public_actions_reject_zero_amount_and_public_only_shield_before_signing() {
     match send_result {
         Ok(_) => panic!("zero-value public send unexpectedly succeeded"),
         Err(error) => assert!(error.to_string().contains("amount is required")),
+    }
+
+    let wrapped = address!("0x3333333333333333333333333333333333333333");
+    for (configured, intent, expected) in [
+        (
+            Some(address!("0x4444444444444444444444444444444444444444")),
+            PublicTransactionIntent::WrapNative {
+                wrapped,
+                amount: U256::from(1),
+            },
+            "wrapped native token changed",
+        ),
+        (
+            None,
+            PublicTransactionIntent::UnwrapNative {
+                wrapped,
+                amount: U256::from(1),
+            },
+            "no wrapped native token",
+        ),
+    ] {
+        let mut chain = default_effective_chain(1);
+        chain.wrapped_native_token = configured;
+        let result = runtime.block_on(submit_public_send(
+            PublicSendRequest {
+                executor_owner: None,
+                transaction_tracking: None,
+                chain_id: 1,
+                effective_chain: chain,
+                view_session: Arc::clone(&view_session),
+                vault_store: Arc::clone(&store),
+                authorization: Some(
+                    crate::DesktopPrivateSpendAuthorization::from_software_credentials(
+                        Zeroizing::new(TEST_PASSWORD.to_string()),
+                        None,
+                    ),
+                ),
+                trezor_app_passphrase: None,
+                trezor_pin_matrix_provider: None,
+                public_account_uuid: "unused".to_string(),
+                intent,
+                advanced_authorization: None,
+                gas_fee: PublicActionGasFeeSelection::Auto,
+                command_rx: None,
+                event_tx: None,
+            },
+            &http,
+            &client,
+        ));
+        match result {
+            Ok(_) => panic!("wrap or unwrap to an unconfigured token unexpectedly succeeded"),
+            Err(error) => assert!(error.to_string().contains(expected), "{error}"),
+        }
     }
 
     for public_only in [false, true] {

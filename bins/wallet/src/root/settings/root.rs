@@ -312,6 +312,8 @@ impl WalletRoot {
                 self.invalidate_advanced_public_send_estimate();
                 self.invalidate_public_action_gas_fee_quote(PublicActionMode::Send);
                 self.invalidate_public_action_gas_fee_quote(PublicActionMode::Shield);
+                self.invalidate_public_action_gas_fee_quote(PublicActionMode::Wrap);
+                self.invalidate_public_action_gas_fee_quote(PublicActionMode::Unwrap);
                 self.schedule_automatic_public_balance_refresh(cx);
             }
             if !self.selected_chain_has_railgun() {

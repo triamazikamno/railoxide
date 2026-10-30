@@ -35,6 +35,8 @@ pub(in crate::root) struct PublicAccountFormState {
     pub(in crate::root) shield_amount_input: Entity<InputState>,
     pub(in crate::root) send_gas_fee: Eip1559GasFeeEditorState,
     pub(in crate::root) shield_gas_fee: Eip1559GasFeeEditorState,
+    pub(in crate::root) wrap_gas_fee: Eip1559GasFeeEditorState,
+    pub(in crate::root) unwrap_gas_fee: Eip1559GasFeeEditorState,
     pub(in crate::root) shield_gas_fee_authorization_ceiling: Option<PublicActionGasFeeSelection>,
     /// The route the Shield quote was admitted for.
     pub(in crate::root) shield_gas_fee_route: Option<PublicShieldRoute>,
@@ -104,4 +106,30 @@ pub(in crate::root) struct PublicAccountFormState {
     pub(in crate::root) refresh_help_open: bool,
     /// The Public action dialog's operation client and the account it was opened for.
     pub(in crate::root) operation: Option<(Arc<str>, wallet_ops::OperationHttpClientSlot)>,
+}
+
+impl PublicAccountFormState {
+    pub(in crate::root) const fn gas_fee(
+        &self,
+        mode: PublicActionMode,
+    ) -> &Eip1559GasFeeEditorState {
+        match mode {
+            PublicActionMode::Shield => &self.shield_gas_fee,
+            PublicActionMode::Send => &self.send_gas_fee,
+            PublicActionMode::Wrap => &self.wrap_gas_fee,
+            PublicActionMode::Unwrap => &self.unwrap_gas_fee,
+        }
+    }
+
+    pub(in crate::root) const fn gas_fee_mut(
+        &mut self,
+        mode: PublicActionMode,
+    ) -> &mut Eip1559GasFeeEditorState {
+        match mode {
+            PublicActionMode::Shield => &mut self.shield_gas_fee,
+            PublicActionMode::Send => &mut self.send_gas_fee,
+            PublicActionMode::Wrap => &mut self.wrap_gas_fee,
+            PublicActionMode::Unwrap => &mut self.unwrap_gas_fee,
+        }
+    }
 }

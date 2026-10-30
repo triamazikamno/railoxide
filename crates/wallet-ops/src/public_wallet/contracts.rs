@@ -3,6 +3,7 @@ use alloy::sol;
 sol! {
     interface PublicWrappedNative {
         function deposit() external payable;
+        function withdraw(uint256 amount) external;
     }
 
     interface PublicErc20 {

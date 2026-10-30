@@ -188,6 +188,14 @@ pub enum PublicTransactionIntent {
         value: U256,
         data: Bytes,
     },
+    WrapNative {
+        wrapped: Address,
+        amount: U256,
+    },
+    UnwrapNative {
+        wrapped: Address,
+        amount: U256,
+    },
 }
 
 impl PublicAssetId {
@@ -204,6 +212,8 @@ impl PublicAssetId {
 pub enum PublicActionKind {
     Shield,
     Send,
+    Wrap,
+    Unwrap,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -520,6 +530,7 @@ pub enum PublicActionProgressStep {
     ShieldKey,
     Send,
     Wrap,
+    Unwrap,
     Approve,
     Shield,
     Sponsor,

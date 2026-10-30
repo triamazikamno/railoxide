@@ -11,6 +11,7 @@ pub(in crate::root) const fn public_action_step_label(
         PublicActionProgressStep::ShieldKey => "Authorize shield key",
         PublicActionProgressStep::Send => "Send",
         PublicActionProgressStep::Wrap => "Wrap",
+        PublicActionProgressStep::Unwrap => "Unwrap",
         PublicActionProgressStep::Approve => "Approve",
         PublicActionProgressStep::Shield => "Shield",
         PublicActionProgressStep::Sponsor => "Sponsor proposal",
@@ -46,6 +47,7 @@ pub(in crate::root) const fn public_action_step_detail_for_context(
             PublicActionProgressStep::ShieldKey => "Waiting to authorize the shield key message.",
             PublicActionProgressStep::Send => "Waiting to broadcast the transfer.",
             PublicActionProgressStep::Wrap => "Waiting to wrap the native token.",
+            PublicActionProgressStep::Unwrap => "Waiting to unwrap the wrapped native token.",
             PublicActionProgressStep::Approve => "Waiting to approve the shield contract.",
             PublicActionProgressStep::Shield => "Waiting to shield into the Private wallet.",
             PublicActionProgressStep::Sponsor => "Waiting to sponsor the proposal.",
@@ -95,6 +97,9 @@ pub(in crate::root) fn public_action_error_summary(
             }
             PublicActionProgressStep::Wrap => {
                 format!("Wrapping {asset_label} was cancelled on the hardware wallet.")
+            }
+            PublicActionProgressStep::Unwrap => {
+                format!("Unwrapping {asset_label} was cancelled on the hardware wallet.")
             }
             PublicActionProgressStep::Approve => {
                 "Approval signing was cancelled on the hardware wallet.".to_string()
@@ -150,6 +155,9 @@ pub(in crate::root) fn public_action_error_summary(
             }
             PublicActionProgressStep::Wrap => format!(
                 "Could not estimate gas to wrap {asset_label}. Check amount and gas balance."
+            ),
+            PublicActionProgressStep::Unwrap => format!(
+                "Could not estimate gas to unwrap {asset_label}. Check amount and gas balance."
             ),
             PublicActionProgressStep::Approve => {
                 "Could not estimate gas for approval. Check token balance and try again."
@@ -211,6 +219,9 @@ pub(in crate::root) fn public_action_error_summary(
             }
             PublicActionProgressStep::Send => "Transfer reverted on-chain.".to_string(),
             PublicActionProgressStep::Wrap => format!("Wrapping {asset_label} reverted on-chain."),
+            PublicActionProgressStep::Unwrap => {
+                format!("Unwrapping {asset_label} reverted on-chain.")
+            }
             PublicActionProgressStep::Approve => "Approval reverted on-chain.".to_string(),
             PublicActionProgressStep::Shield => "Shielding reverted on-chain.".to_string(),
             PublicActionProgressStep::Sponsor => "Sponsorship reverted on-chain.".to_string(),
@@ -241,6 +252,9 @@ pub(in crate::root) fn public_action_error_summary(
         }
         PublicActionProgressStep::Wrap => {
             format!("Could not wrap {asset_label}. Check amount and gas balance.")
+        }
+        PublicActionProgressStep::Unwrap => {
+            format!("Could not unwrap {asset_label}. Check amount and gas balance.")
         }
         PublicActionProgressStep::Approve => {
             "Could not approve the shield contract. Check token balance and try again.".to_string()
@@ -320,6 +334,7 @@ pub(in crate::root) fn public_action_step_id(step: PublicActionProgressStep) -> 
         PublicActionProgressStep::ShieldKey => "shield-key".to_string(),
         PublicActionProgressStep::Send => "send".to_string(),
         PublicActionProgressStep::Wrap => "wrap".to_string(),
+        PublicActionProgressStep::Unwrap => "unwrap".to_string(),
         PublicActionProgressStep::Approve => "approve".to_string(),
         PublicActionProgressStep::Shield => "shield".to_string(),
         PublicActionProgressStep::Sponsor => "sponsor".to_string(),
@@ -367,6 +382,8 @@ pub(in crate::root) fn public_action_progress_steps_for_source(
     }
     match mode {
         PublicActionMode::Send => steps.push(PublicActionProgressStep::Send),
+        PublicActionMode::Wrap => steps.push(PublicActionProgressStep::Wrap),
+        PublicActionMode::Unwrap => steps.push(PublicActionProgressStep::Unwrap),
         PublicActionMode::Shield if asset == PublicAssetId::Native && !native_wrap_fallback => {
             steps.push(PublicActionProgressStep::Shield);
         }

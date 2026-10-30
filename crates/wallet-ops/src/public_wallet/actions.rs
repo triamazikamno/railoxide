@@ -52,6 +52,24 @@ pub async fn submit_public_send_with_progress(
     mut progress: impl FnMut(PublicActionProgressUpdate) + Send,
 ) -> Result<PublicSendResult> {
     validate_public_transaction_intent(&request.intent)?;
+    validate_public_wrapped_native_target(&request.intent, &request.effective_chain)?;
+    let (step, operation_label, revert_subject) = match request.intent {
+        PublicTransactionIntent::WrapNative { .. } => (
+            PublicActionProgressStep::Wrap,
+            "public-wrap",
+            "public wrap transaction",
+        ),
+        PublicTransactionIntent::UnwrapNative { .. } => (
+            PublicActionProgressStep::Unwrap,
+            "public-unwrap",
+            "public unwrap transaction",
+        ),
+        PublicTransactionIntent::Transfer { .. } | PublicTransactionIntent::Raw { .. } => (
+            PublicActionProgressStep::Send,
+            "public-send",
+            "public send transaction",
+        ),
+    };
     let signer = admitted_public_signer_authorized(
         &request.vault_store,
         &request.view_session,
@@ -68,9 +86,9 @@ pub async fn submit_public_send_with_progress(
         .while_active(async {
             let mut command_rx = request.command_rx;
             let tx = submit_public_action_step_with_signer(
-                PublicActionProgressStep::Send,
-                "public-send",
-                "public send transaction",
+                step,
+                operation_label,
+                revert_subject,
                 request.chain_id,
                 &request.effective_chain,
                 &request.intent,
@@ -188,7 +206,9 @@ pub(super) fn public_send_authorized_gas_limit(
     gas_fee: super::types::PublicActionGasFeeSelection,
 ) -> Result<Option<u64>> {
     match intent {
-        PublicTransactionIntent::Transfer { .. } => {
+        PublicTransactionIntent::Transfer { .. }
+        | PublicTransactionIntent::WrapNative { .. }
+        | PublicTransactionIntent::UnwrapNative { .. } => {
             if authorization.is_some() {
                 return Err(eyre!(
                     "advanced transaction authorization cannot be used for a transfer"
@@ -995,13 +1015,48 @@ pub(super) fn public_send_transaction_request(
             }
             tx_req = tx_req.with_value(*value).with_input(data.clone());
         }
+        PublicTransactionIntent::WrapNative { wrapped, amount } => {
+            tx_req = tx_req
+                .with_to(*wrapped)
+                .with_value(*amount)
+                .with_input(PublicWrappedNative::depositCall {}.abi_encode());
+        }
+        PublicTransactionIntent::UnwrapNative { wrapped, amount } => {
+            tx_req = tx_req
+                .with_to(*wrapped)
+                .with_input(PublicWrappedNative::withdrawCall { amount: *amount }.abi_encode());
+        }
     }
     Ok(tx_req)
 }
 
+/// A wrap or unwrap must call the chain's current wrapped native token, so a stale form can
+/// never send to a contract the chain no longer names.
+fn validate_public_wrapped_native_target(
+    intent: &PublicTransactionIntent,
+    effective_chain: &EffectiveChainConfig,
+) -> Result<()> {
+    let (PublicTransactionIntent::WrapNative { wrapped, .. }
+    | PublicTransactionIntent::UnwrapNative { wrapped, .. }) = intent
+    else {
+        return Ok(());
+    };
+    match effective_chain.wrapped_native_token {
+        Some(configured) if configured == *wrapped => Ok(()),
+        Some(_) => Err(eyre!(
+            "wrapped native token changed; reopen the form to use the chain's current token"
+        )),
+        None => Err(eyre!("chain has no wrapped native token configured")),
+    }
+}
+
 pub(super) fn validate_public_transaction_intent(intent: &PublicTransactionIntent) -> Result<()> {
     match intent {
-        PublicTransactionIntent::Transfer { amount, .. } if amount.is_zero() => {
+        PublicTransactionIntent::Transfer { amount, .. }
+        | PublicTransactionIntent::WrapNative { amount, .. }
+        | PublicTransactionIntent::UnwrapNative { amount, .. }
+            if amount.is_zero() =>
+        {
             Err(eyre!("amount is required"))
         }
         PublicTransactionIntent::Raw { to: None, data, .. } if data.is_empty() => {

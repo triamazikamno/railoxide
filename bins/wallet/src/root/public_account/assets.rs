@@ -15,8 +15,9 @@ use wallet_ops::{PublicAssetId, PublicBalanceEntry, vault::PublicAccountMetadata
 
 use super::list::{TILE_HEIGHT, TILE_WIDTH, dimension};
 use crate::root::{
-    WalletRoot,
+    WalletRoot, native_wrapped_output_labels,
     public_action::PublicActionMode,
+    public_asset_label,
     public_balances::{
         public_asset_icon_path, public_balance_compact_usd, public_balance_tile_amount,
         public_balance_usd_value,
@@ -161,6 +162,38 @@ impl WalletRoot {
                 wallet_ops::vault::PublicAccountSource::ExecutorDerived(_)
             );
         let bridge_disabled = account.is_global();
+        let chain = self.effective_chain_configs.get(self.selected_chain);
+        let labels = native_wrapped_output_labels(self.selected_chain);
+        let wrap_item = chain
+            .and_then(|chain| chain.wrapped_native_token)
+            .and_then(|wrapped| match asset {
+                PublicAssetId::Native => Some((
+                    PublicActionMode::Wrap,
+                    "Wrap",
+                    labels.map_or_else(
+                        || {
+                            public_asset_label(
+                                chain,
+                                PublicAssetId::Erc20(wrapped),
+                                Some(&self.effective_token_registry),
+                            )
+                        },
+                        |(_, symbol)| symbol.to_owned(),
+                    ),
+                )),
+                PublicAssetId::Erc20(token) if token == wrapped => Some((
+                    PublicActionMode::Unwrap,
+                    "Unwrap",
+                    labels.map_or_else(
+                        || {
+                            self.configured_native_symbol(self.selected_chain)
+                                .to_owned()
+                        },
+                        |(symbol, _)| symbol.to_owned(),
+                    ),
+                )),
+                PublicAssetId::Erc20(_) => None,
+            });
         let focus = self.public_form.list_focus.clone();
         let menu = PopupMenu::build(window, cx, move |menu, _, _| {
             let mut menu = menu.action_context(focus);
@@ -188,6 +221,24 @@ impl WalletRoot {
                         });
                     },
                 ));
+            }
+            if let Some((mode, verb, symbol)) = wrap_item {
+                let root = root.clone();
+                let uuid = uuid.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(format!("{verb} to {symbol}…"))
+                        .icon(Icon::new(IconName::ArrowRight))
+                        .on_click(move |_, window, cx| {
+                            root.update(cx, |root, cx| {
+                                root.public_form.asset_menu = None;
+                                root.public_form.list_focus.focus(window, cx);
+                                root.open_public_action_dialog(uuid.clone(), asset, window, cx);
+                                root.public_form.action_mode = mode;
+                                root.refresh_public_action_gas_fee_quote(mode, cx);
+                                cx.notify();
+                            });
+                        }),
+                );
             }
             if bridge {
                 menu = menu.item(

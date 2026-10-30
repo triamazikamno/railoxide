@@ -1342,6 +1342,8 @@ impl WalletRoot {
             shield_amount_input: new_text_input(window, cx, "amount"),
             send_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
             shield_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
+            wrap_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
+            unwrap_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
             shield_gas_fee_authorization_ceiling: None,
             shield_gas_fee_route: None,
             native_shield_preparation: public_action::NativeShieldPreparationState::default(),
@@ -1756,6 +1758,13 @@ impl WalletRoot {
             root.public_form.shield_gas_fee.max_fee_input.clone(),
             root.public_form
                 .shield_gas_fee
+                .max_priority_fee_input
+                .clone(),
+            root.public_form.wrap_gas_fee.max_fee_input.clone(),
+            root.public_form.wrap_gas_fee.max_priority_fee_input.clone(),
+            root.public_form.unwrap_gas_fee.max_fee_input.clone(),
+            root.public_form
+                .unwrap_gas_fee
                 .max_priority_fee_input
                 .clone(),
         ] {

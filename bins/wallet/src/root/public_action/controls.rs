@@ -251,6 +251,8 @@ pub(in crate::root) fn render_public_action_amount_input(
     let max_id = match mode {
         PublicActionMode::Shield => "wallet-public-shield-max",
         PublicActionMode::Send => "wallet-public-send-max",
+        PublicActionMode::Wrap => "wallet-public-wrap-max",
+        PublicActionMode::Unwrap => "wallet-public-unwrap-max",
     };
     div()
         .flex()
@@ -392,6 +394,8 @@ pub(in crate::root) fn render_public_action_active_status_notice(
         || match mode {
             PublicActionMode::Shield => "Public shield".to_owned(),
             PublicActionMode::Send => "Public send".to_owned(),
+            PublicActionMode::Wrap => "Public wrap".to_owned(),
+            PublicActionMode::Unwrap => "Public unwrap".to_owned(),
         },
         str::to_owned,
     );
@@ -531,6 +535,8 @@ pub(in crate::root) const fn public_action_mode_verb(mode: PublicActionMode) -> 
     match mode {
         PublicActionMode::Shield => "Shield",
         PublicActionMode::Send => "Send",
+        PublicActionMode::Wrap => "Wrap",
+        PublicActionMode::Unwrap => "Unwrap",
     }
 }
 
@@ -562,6 +568,21 @@ pub(in crate::root) fn public_action_max_amount_after_reserve(
     reserve: U256,
 ) -> Option<U256> {
     (amount > reserve).then_some(amount - reserve)
+}
+
+/// Blocks an Unwrap the account's native balance can't pay gas for. An unknown balance doesn't
+/// block; the submission preflight still rejects an under-funded account.
+pub(in crate::root) fn public_unwrap_gas_error(
+    native_balance: Option<U256>,
+    maximum_gas_cost: U256,
+    native_amount_label: impl FnOnce(U256) -> String,
+) -> Option<String> {
+    (native_balance? < maximum_gas_cost).then(|| {
+        format!(
+            "Unwrap needs up to {} for gas",
+            native_amount_label(maximum_gas_cost)
+        )
+    })
 }
 
 pub(in crate::root) fn public_action_asset_label(

@@ -1497,6 +1497,7 @@ fn hardware_public_account_copy_uses_device_signing_language() {
     assert!(
         crate::root::public_action::public_send_authorization_detail(
             wallet_ops::vault::PublicAccountSource::HardwareDerived,
+            "public send",
         )
         .contains("approve the public send transaction on the device")
     );

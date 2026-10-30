@@ -373,7 +373,7 @@ impl WalletRoot {
         self.public_balance_entry(public_account_uuid, asset, status)
     }
 
-    fn public_balance_entry(
+    pub(super) fn public_balance_entry(
         &self,
         public_account_uuid: &str,
         asset: PublicAssetId,

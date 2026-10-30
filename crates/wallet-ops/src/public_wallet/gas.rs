@@ -362,6 +362,12 @@ fn public_action_estimated_gas_units_with_buffer(
             };
             Some(gas_units.saturating_add(gas_limit_buffer))
         }
+        PublicActionKind::Wrap => {
+            Some(PUBLIC_NATIVE_WRAP_GAS_UNITS.saturating_add(gas_limit_buffer))
+        }
+        PublicActionKind::Unwrap => {
+            Some(PUBLIC_NATIVE_UNWRAP_GAS_UNITS.saturating_add(gas_limit_buffer))
+        }
         PublicActionKind::Shield => {
             let (wrap, approve, shield) =
                 public_shield_estimated_gas_units(model, asset, profile, gas_limit_buffer)?;
@@ -410,6 +416,8 @@ pub(super) const fn public_action_estimated_gas_usage_units(
             PublicAssetId::Native => PUBLIC_NATIVE_SEND_GAS_UNITS,
             PublicAssetId::Erc20(_) => PUBLIC_ERC20_SEND_GAS_UNITS,
         },
+        PublicActionKind::Wrap => PUBLIC_NATIVE_WRAP_GAS_UNITS,
+        PublicActionKind::Unwrap => PUBLIC_NATIVE_UNWRAP_GAS_UNITS,
         PublicActionKind::Shield => {
             let approve_and_shield = PUBLIC_NATIVE_APPROVE_GAS_UNITS
                 .saturating_add(public_shield_gas_units(model, GasEstimateMode::Expected));
@@ -1028,6 +1036,16 @@ pub(super) fn public_advanced_transaction_payload_fingerprint(
             encoded.extend_from_slice(&(data.len() as u64).to_be_bytes());
             encoded.extend_from_slice(data);
         }
+        PublicTransactionIntent::WrapNative { wrapped, amount } => {
+            encoded.push(2);
+            encoded.extend_from_slice(wrapped.as_slice());
+            encoded.extend_from_slice(&amount.to_be_bytes::<32>());
+        }
+        PublicTransactionIntent::UnwrapNative { wrapped, amount } => {
+            encoded.push(3);
+            encoded.extend_from_slice(wrapped.as_slice());
+            encoded.extend_from_slice(&amount.to_be_bytes::<32>());
+        }
     }
     encoded.extend_from_slice(&max_fee_per_gas.to_be_bytes());
     encoded.extend_from_slice(&max_priority_fee_per_gas.to_be_bytes());
@@ -1448,6 +1466,7 @@ const fn public_native_step_gas_units(
     match step {
         PublicActionProgressStep::Send => PUBLIC_NATIVE_SEND_GAS_UNITS,
         PublicActionProgressStep::Wrap => PUBLIC_NATIVE_WRAP_GAS_UNITS,
+        PublicActionProgressStep::Unwrap => PUBLIC_NATIVE_UNWRAP_GAS_UNITS,
         PublicActionProgressStep::Approve => PUBLIC_NATIVE_APPROVE_GAS_UNITS,
         PublicActionProgressStep::Shield => {
             public_shield_gas_units(model, GasEstimateMode::UpperBound)

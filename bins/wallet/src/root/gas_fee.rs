@@ -423,6 +423,8 @@ const fn public_action_mode_id(mode: PublicActionMode) -> &'static str {
     match mode {
         PublicActionMode::Shield => "shield",
         PublicActionMode::Send => "send",
+        PublicActionMode::Wrap => "wrap",
+        PublicActionMode::Unwrap => "unwrap",
     }
 }
 
