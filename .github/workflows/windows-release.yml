@@ -6,8 +6,10 @@ on:
       - scripts/windows-packaging.py
       - scripts/macos-packaging.py
       - scripts/release-assets
+      - scripts/promote-release
       - scripts/tests/test_windows_packaging.py
       - scripts/tests/test_release_assets.py
+      - scripts/tests/test_promote_release.py
       - scripts/*browser-extension*
       - bins/wallet/packaging/windows/**
       - bins/wallet/packaging/icons/windows/**
@@ -45,6 +47,9 @@ jobs:
 
       - name: Test release asset publication
         run: python3 -m unittest discover -s scripts/tests -p test_release_assets.py -v
+
+      - name: Test release promotion
+        run: python3 -m unittest discover -s scripts/tests -p test_promote_release.py -v
 
   source:
     if: github.event_name == 'release'

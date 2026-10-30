@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Promote the verified railoxide Homebrew cask and Scoop manifest of the latest release.
+
+`homebrew` commits the cask to triamazikamno/tap, `scoop` commits the manifest to
+triamazikamno/scoop-bucket, and no target promotes both in turn.
+Runs with the maintainer's own gh login and git credentials: `homebrew` on a Mac,
+`scoop` on macOS or Linux.
+See "Promoting the Homebrew cask" and "Promoting the Scoop manifest" in docs/releasing.md.
+"""
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+REPO = 'triamazikamno/railoxide'
+TAP = 'triamazikamno/tap'
+CASK = 'Casks/railoxide.rb'
+BUCKET = 'triamazikamno/scoop-bucket'
+MANIFEST = 'bucket/railoxide.json'
+DOWNLOAD = f'https://github.com/{REPO}/releases/download'
+PUBLIC_KEY = 'https://triamazikamno.github.io/railoxide/flatpak/flatpak-release-public.gpg'
+
+SCRIPTS = Path(__file__).resolve().parent
+
+# Reuse the version and checksum rules that rendered the cask and the manifest.
+_spec = importlib.util.spec_from_file_location('macos_packaging', SCRIPTS / 'macos-packaging.py')
+packaging = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(packaging)
+
+
+class Error(Exception):
+    pass
+
+
+def run(*args, cwd=None, capture=False):
+    try:
+        result = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE if capture else None, text=True)
+    except FileNotFoundError:
+        raise Error(f'{args[0]} is required') from None
+    if result.returncode != 0:
+        raise Error(f'{" ".join(args[:3])} failed with status {result.returncode}')
+    return result.stdout
+
+
+def version_key(version):
+    """SemVer precedence; build metadata after '+' is ignored."""
+    core, _, pre = version.split('+', 1)[0].partition('-')
+    numbers = tuple(int(part) for part in core.split('.'))
+    if not pre:
+        return numbers + (1, [])
+    return numbers + (0, [(0, int(p), '') if p.isdigit() else (1, 0, p) for p in pre.split('.')])
+
+
+def checked_version(version):
+    if packaging.VERSION_PATTERN.fullmatch(version) is None:
+        raise Error(f'unsupported version: {version!r}')
+    return version
+
+
+def latest_tag():
+    releases = json.loads(run('gh', 'api', f'repos/{REPO}/releases?per_page=100', capture=True))
+    published = [r for r in releases if not r['draft'] and r.get('published_at')]
+    if not published:
+        raise Error('no published release found')
+    return max(published, key=lambda r: (r['published_at'], r['id']))['tag_name']
+
+
+def release(tag):
+    latest = latest_tag()
+    if tag is None:
+        tag = latest
+    elif tag != latest:
+        raise Error(f'{tag} is not the latest release ({latest})')
+    if not tag.startswith('v'):
+        raise Error(f'unsupported release tag: {tag!r}')
+    return tag, checked_version(tag[1:])
+
+
+def verify_release(tag, workdir, asset_name, sums_name):
+    files = {name: workdir / name for name in (asset_name, sums_name, sums_name + '.asc')}
+    for name, path in files.items():
+        run('curl', '-fsSL', '-o', str(path), f'{DOWNLOAD}/{tag}/{name}')
+    key = workdir / 'release-public.gpg'
+    run('curl', '-fsSL', '-o', str(key), PUBLIC_KEY)
+    # Short path: gpg's sockets live in the homedir, and macOS's $TMPDIR exceeds the socket path limit.
+    homedir = tempfile.mkdtemp(prefix='roxgpg-', dir='/tmp')
+    try:
+        imported = subprocess.run(['gpg', '--batch', '--homedir', homedir, '--import', '--', str(key)],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if imported.returncode != 0:
+            raise Error(f'could not import the release public key:\n{imported.stderr.strip()}')
+        verified = subprocess.run(['gpg', '--batch', '--homedir', homedir, '--verify', '--',
+                                   str(files[sums_name + '.asc']), str(files[sums_name])],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if verified.returncode != 0:
+            raise Error(f'{sums_name}.asc is not a valid signature by the release key:\n'
+                        f'{verified.stderr.strip()}')
+    finally:
+        subprocess.run(['gpgconf', '--homedir', homedir, '--kill', 'all'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        shutil.rmtree(homedir, ignore_errors=True)
+    try:
+        digest = packaging.dmg_digest(files[sums_name], asset_name)
+    except packaging.PackagingError as error:
+        raise Error(str(error)) from None
+    sha = hashlib.sha256()
+    with open(files[asset_name], 'rb') as asset:
+        for chunk in iter(lambda: asset.read(1 << 20), b''):
+            sha.update(chunk)
+    if sha.hexdigest() != digest:
+        raise Error(f'{asset_name} does not match its signed checksum')
+    return digest
+
+
+def download_artifact(tag, workflow, artifact, name, workdir):
+    runs = json.loads(run('gh', 'run', 'list', '--repo', REPO, '--workflow', workflow,
+                          '--event', 'release', '--branch', tag, '--status', 'success',
+                          '--json', 'databaseId', '--limit', '1', capture=True))
+    if not runs:
+        raise Error(f'no successful {workflow} run for {tag}')
+    directory = workdir / artifact
+    run('gh', 'run', 'download', str(runs[0]['databaseId']), '--repo', REPO,
+        '--name', artifact, '--dir', str(directory))
+    return (directory / name).read_bytes()
+
+
+def fetch_verified(tag, version, workdir, sums_name, workflow, artifact, name, helper, command):
+    """Download the workflow artifact and require it to equal this checkout's render.
+
+    Rendering from the local template and the verified checksum file accounts for every byte,
+    so the artifact cannot add install hooks, scripts or other fields.
+    """
+    downloaded = download_artifact(tag, workflow, artifact, name, workdir)
+    expected = workdir / f'expected-{name}'
+    run(sys.executable, str(SCRIPTS / helper), command, '--version', version,
+        '--checksums', str(workdir / sums_name), '--output', str(expected))
+    if downloaded != expected.read_bytes():
+        raise Error(f'the {artifact} artifact differs from the {name} this checkout renders; '
+                    'run from a checkout of the release tag')
+    return downloaded
+
+
+def tap_version(cask):
+    match = re.search(r'^\s*version "([^"]+)"$', cask.decode(), re.MULTILINE)
+    if match is None:
+        raise Error('cannot read the version of the cask in the tap')
+    return checked_version(match.group(1))
+
+
+def bucket_version(manifest):
+    try:
+        return checked_version(json.loads(manifest)['version'])
+    except (ValueError, TypeError, KeyError):
+        raise Error('cannot read the version of the manifest in the bucket') from None
+
+
+def commit(checkout, path, content, version, current_version, repo, checks=()):
+    """Commit content as path once confirmed; False if already there. Restores the file unless committed."""
+    target = checkout / path
+    previous = target.read_bytes() if target.exists() else None
+    if previous == content:
+        print(f'railoxide {version} is already promoted to {repo}')
+        return False
+    if previous is not None:
+        current = current_version(previous)
+        if version_key(current) >= version_key(version):
+            raise Error(f'{repo} has railoxide {current}, which is not older than {version}')
+
+    created_dir = not target.parent.exists()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+    committed = False
+    try:
+        for check in checks:
+            run(*check)
+        if previous is None:
+            print(content.decode(), end='')
+        else:
+            run('git', '--no-pager', 'diff', '--', path, cwd=checkout)
+        try:
+            answer = input(f'Commit and push railoxide {version} to {repo}? [y/N] ')
+        except EOFError:
+            answer = ''
+        if answer.strip().lower() not in ('y', 'yes'):
+            raise Error('declined')
+        run('git', 'add', '--', path, cwd=checkout)
+        run('git', 'commit', '-q', '-m', f'railoxide {version}', cwd=checkout)
+        committed = True
+    finally:
+        if not committed:
+            subprocess.run(['git', 'reset', '-q', '--', path], cwd=checkout,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if previous is None:
+                target.unlink()
+                if created_dir:
+                    shutil.rmtree(target.parent, ignore_errors=True)
+            else:
+                target.write_bytes(previous)
+            print(f'nothing was promoted; {repo} is unchanged', file=sys.stderr)
+    return True
+
+
+def push(checkout, version, repo):
+    try:
+        run('git', 'push', '-q', cwd=checkout)
+    except Error:
+        raise Error(f'the commit is local in {checkout}; push it by hand') from None
+    print(f'promoted railoxide {version} to {repo}')
+
+
+def promote_homebrew(tag, version):
+    with tempfile.TemporaryDirectory(prefix='promote-release-') as temporary:
+        workdir = Path(temporary)
+        sums = f'RailOxide-{tag}-macos-SHA256SUMS'
+        digest = verify_release(tag, workdir, f'RailOxide-{tag}-macos-arm64.dmg', sums)
+        print(f'verified macOS release assets: sha256 {digest}')
+        cask = fetch_verified(tag, version, workdir, sums, 'macos-release.yml', 'railoxide-cask',
+                              'railoxide.rb', 'macos-packaging.py', 'render-cask')
+        print('downloaded the verified cask')
+
+    tap = Path(run('brew', '--repository', TAP, capture=True).strip())
+    if not tap.is_dir():
+        try:
+            run('brew', 'tap', TAP)
+        except Error:
+            raise Error(f'could not tap {TAP}; create triamazikamno/homebrew-tap as described '
+                        'in docs/releasing.md') from None
+    if run('git', 'status', '--porcelain', cwd=tap, capture=True):
+        raise Error(f'{tap} has uncommitted changes')
+    run('git', 'pull', '-q', '--ff-only', cwd=tap)
+    checks = [('brew', 'style', '--cask', f'{TAP}/railoxide'), ('brew', 'audit', '--cask', f'{TAP}/railoxide')]
+    if commit(tap, CASK, cask, version, tap_version, TAP, checks):
+        push(tap, version, TAP)
+
+
+def promote_scoop(tag, version):
+    with tempfile.TemporaryDirectory(prefix='promote-release-') as temporary:
+        workdir = Path(temporary)
+        sums = f'RailOxide-{tag}-windows-SHA256SUMS'
+        digest = verify_release(tag, workdir, f'RailOxide-{tag}-windows-x64.zip', sums)
+        print(f'verified Windows release assets: sha256 {digest}')
+        manifest = fetch_verified(tag, version, workdir, sums, 'windows-release.yml',
+                                  'railoxide-scoop-manifest', 'railoxide.json', 'windows-packaging.py',
+                                  'render-manifest')
+        print('downloaded the verified manifest')
+
+    clone = Path(tempfile.mkdtemp(prefix='promote-release-bucket-'))
+    try:
+        try:
+            run('gh', 'repo', 'clone', BUCKET, str(clone), '--', '-q')
+        except Error:
+            raise Error(f'could not clone {BUCKET}; create it as described in docs/releasing.md') from None
+        committed = commit(clone, MANIFEST, manifest, version, bucket_version, BUCKET)
+    except BaseException:
+        shutil.rmtree(clone, ignore_errors=True)
+        raise
+    if committed:
+        push(clone, version, BUCKET)  # A failed push keeps the clone that holds the commit.
+    shutil.rmtree(clone, ignore_errors=True)
+
+
+TARGETS = {'homebrew': promote_homebrew, 'scoop': promote_scoop}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('target', nargs='?', help='homebrew or scoop (default: both in turn)')
+    parser.add_argument('tag', nargs='?', help='release tag; must be the latest release (default)')
+    args = parser.parse_args()
+    if args.target not in (None, *TARGETS):
+        if args.tag is not None or not args.target.startswith('v'):
+            parser.error(f'unknown target: {args.target}')
+        args.target, args.tag = None, args.target
+    try:
+        tag, version = release(args.tag)
+        print(f'promoting {tag}')
+        for target in [args.target] if args.target else TARGETS:
+            TARGETS[target](tag, version)
+    except Error as error:
+        print(f'error: {error}', file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

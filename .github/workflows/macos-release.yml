@@ -6,10 +6,10 @@ on:
       - scripts/package-wallet-macos
       - scripts/macos-packaging.py
       - scripts/release-assets
-      - scripts/promote-homebrew-cask
+      - scripts/promote-release
       - scripts/tests/test_macos_packaging.py
       - scripts/tests/test_release_assets.py
-      - scripts/tests/test_promote_homebrew_cask.py
+      - scripts/tests/test_promote_release.py
       - scripts/*browser-extension*
       - bins/wallet/packaging/macos/**
       - bins/wallet/Cargo.toml
@@ -46,8 +46,8 @@ jobs:
       - name: Test release asset publication
         run: python3 -m unittest discover -s scripts/tests -p test_release_assets.py -v
 
-      - name: Test Homebrew cask promotion
-        run: python3 -m unittest discover -s scripts/tests -p test_promote_homebrew_cask.py -v
+      - name: Test release promotion
+        run: python3 -m unittest discover -s scripts/tests -p test_promote_release.py -v
 
   source:
     if: github.event_name == 'release'
