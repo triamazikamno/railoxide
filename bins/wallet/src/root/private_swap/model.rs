@@ -1206,7 +1206,11 @@ pub(in crate::root) fn swap_use_destination(
     };
     let delivery = swap_use_last_order(record, swap_use)
         .map(SwapOrderRecord::delivery)
-        .or_else(|| approval.as_deref().map(|approval| approval.delivery))?;
+        .or_else(|| {
+            approval
+                .as_deref()
+                .map(|approval| approval.delivery.clone())
+        })?;
     Some((delivery.private_bridge()?, (*destination_operation)?))
 }
 
@@ -1363,7 +1367,11 @@ pub(in crate::root) fn swap_delivery(record: &ExecutorRecord) -> SwapDelivery {
         .swap()
         .and_then(|swap| swap.orders().last())
         .map(SwapOrderRecord::delivery)
-        .or_else(|| record.swap_approval().map(|approval| approval.delivery))
+        .or_else(|| {
+            record
+                .swap_approval()
+                .map(|approval| approval.delivery.clone())
+        })
         .unwrap_or_default()
 }
 
@@ -1450,6 +1458,8 @@ pub(in crate::root) struct SwapBridgeLabels {
     pub(in crate::root) network: String,
     /// The token the receiver gets there, such as "POL". The swap is named after it.
     pub(in crate::root) token: String,
+    /// The destination is a non-EVM network, which the swap's name gives after `token`.
+    pub(in crate::root) non_evm: bool,
     /// The swap's own network, where a refund reaches the stealth account.
     pub(in crate::root) origin: String,
     /// The receiver's Public account or address-book label, or its short address.
@@ -1467,6 +1477,8 @@ pub(in crate::root) struct SwapBridgeLabels {
     pub(in crate::root) reported: bool,
     /// The transaction of the recorded delivery on the destination network, when it is known.
     pub(in crate::root) delivered_transaction: Option<B256>,
+    /// A non-EVM delivery's transaction there, as 1Click reports it. `None` for any other.
+    pub(in crate::root) destination_transaction: Option<String>,
     /// The hand-off's transaction on the swap's network, once observation recorded it.
     pub(in crate::root) handoff_transaction: Option<B256>,
     /// The transaction of Across's refund on the swap's network, once a refund is verified.
@@ -1512,6 +1524,16 @@ pub(in crate::root) enum SwapShieldSeen {
 }
 
 impl SwapBridgeLabels {
+    /// The token the swap is named after: "USDT on Tron" for a non-EVM destination, whose
+    /// symbol can match the sold token's, and "POL" otherwise.
+    pub(in crate::root) fn named_token(&self) -> String {
+        if self.non_evm {
+            format!("{} on {}", self.token, self.network)
+        } else {
+            self.token.clone()
+        }
+    }
+
     /// The shield of a private delivery the provider reports made before the wallet verified
     /// the settlement. `None` for a public delivery and without such a report.
     const fn reported_shield(&self) -> Option<&SwapShieldSeen> {
@@ -2146,6 +2168,9 @@ pub(in crate::root) struct SwapStep {
     /// hand-off or its fill on the destination network, or the shield of a swap back to the
     /// private balance, once the reported trade block or verified delivery shows it.
     pub(in crate::root) transaction: Option<B256>,
+    /// A non-EVM delivery's transaction on its network, as 1Click reports it, which no EVM
+    /// hash can hold. Only that delivery's step carries one.
+    pub(in crate::root) destination_transaction: Option<String>,
     /// The block the step completed in, shown at its trailing edge. Only a Public-paid swap's
     /// steps carry one.
     pub(in crate::root) block: Option<u64>,
@@ -2165,8 +2190,14 @@ impl SwapStep {
             account: None,
             order: None,
             transaction: None,
+            destination_transaction: None,
             block: None,
         }
+    }
+
+    fn with_destination_transaction(mut self, transaction: Option<String>) -> Self {
+        self.destination_transaction = transaction;
+        self
     }
 
     const fn in_block(mut self, block: Option<u64>) -> Self {
@@ -2824,7 +2855,8 @@ fn bridge_steps(stage: SwapStage, labels: &SwapLabels, bridge: &SwapBridgeLabels
                 },
                 Done,
             )
-            .with_transaction(bridge.delivered_transaction),
+            .with_transaction(bridge.delivered_transaction)
+            .with_destination_transaction(bridge.destination_transaction.clone()),
         ],
         SwapStage::Order(SwapOrderState::HeldOnDestination) => vec![
             handed_off(),
@@ -2944,7 +2976,7 @@ pub(in crate::root) struct SwapOutcomeGas {
 pub(in crate::root) fn swap_outcome(
     bounds: &SwapApprovedBounds,
     observed: &SwapOrderObservations,
-    delivery: SwapDelivery,
+    delivery: &SwapDelivery,
 ) -> Option<SwapOutcome> {
     let traded = observed.traded?;
     let trade = observed.trade_amounts;
@@ -2956,7 +2988,7 @@ pub(in crate::root) fn swap_outcome(
         SwapDelivery::Reshield => received_privately.map(|(amount, _)| amount),
         // The trade paid the receiver directly.
         SwapDelivery::External { .. } => trade.map(|trade| trade.buy_amount),
-        SwapDelivery::Bridge(_) => None,
+        SwapDelivery::Bridge(_) | SwapDelivery::NonEvmBridge(_) => None,
     };
     let gas = trade.and_then(|trade| {
         Some(SwapOutcomeGas {
@@ -2988,7 +3020,7 @@ pub(in crate::root) fn swap_outcome(
 /// before the gas cost was kept can't show the row, so their fee isn't asked for.
 pub(in crate::root) fn needs_executed_fee(order: &SwapOrderRecord) -> bool {
     let observed = order.observations();
-    !matches!(order.delivery(), SwapDelivery::Bridge(_))
+    !order.delivery().is_bridge()
         && observed.traded.is_some()
         && observed.trade_amounts.is_some_and(|amounts| {
             amounts.executed_fee.is_none()
@@ -3302,7 +3334,7 @@ pub(in crate::root) fn swap_order_status(
 /// and NEAR Intents orders pay elsewhere, so their trade leaves only the sell token to recover.
 pub(in crate::root) const fn swap_recovery_token(
     stage: SwapStage,
-    delivery: SwapDelivery,
+    delivery: &SwapDelivery,
     sell: Address,
     buy: Address,
 ) -> Address {
@@ -3460,6 +3492,7 @@ pub(super) mod tests {
                 provider: BridgeProvider::Across,
                 network: "Polygon".into(),
                 token: "USDC".into(),
+                non_evm: false,
                 origin: "Arbitrum One".into(),
                 receiver: "Treasury".into(),
                 sent: None,
@@ -3467,6 +3500,7 @@ pub(super) mod tests {
                 private: None,
                 reported: false,
                 delivered_transaction: None,
+                destination_transaction: None,
                 handoff_transaction: None,
                 refund_transaction: None,
                 deposit: SwapSeen::Looking,
@@ -3656,7 +3690,7 @@ pub(super) mod tests {
             Address::repeat_byte(2),
             Address::repeat_byte(3),
         );
-        let reshield = SwapDelivery::Reshield;
+        let reshield = || SwapDelivery::Reshield;
         let external = SwapDelivery::External {
             receiver: Address::repeat_byte(4),
         };
@@ -3671,12 +3705,12 @@ pub(super) mod tests {
         assert_eq!(
             swap_order_ranges([
                 // Expired, then retried with the same pair: one swap.
-                (weth, usdc, reshield, false, funding(1)),
-                (weth, usdc, reshield, true, funding(2)),
+                (weth, usdc, reshield(), false, funding(1)),
+                (weth, usdc, reshield(), true, funding(2)),
                 // After the trade, the same pair on the reused account is a new swap.
-                (weth, usdc, reshield, false, funding(3)),
+                (weth, usdc, reshield(), false, funding(3)),
                 // A different pair is a new swap even after an attempt without a trade.
-                (dai, usdc, reshield, false, funding(4)),
+                (dai, usdc, reshield(), false, funding(4)),
                 // So is another delivery for the same pair.
                 (dai, usdc, external, false, funding(5)),
             ]),
@@ -3687,9 +3721,9 @@ pub(super) mod tests {
         for (original, speed_up) in [(false, false), (true, false), (false, true)] {
             assert_eq!(
                 swap_order_ranges([
-                    (weth, usdc, reshield, original, funding(1)),
-                    (weth, usdc, reshield, speed_up, funding(1)),
-                    (weth, usdc, reshield, false, funding(2)),
+                    (weth, usdc, reshield(), original, funding(1)),
+                    (weth, usdc, reshield(), speed_up, funding(1)),
+                    (weth, usdc, reshield(), false, funding(2)),
                 ]),
                 if original || speed_up {
                     vec![0..2, 2..3]
@@ -3840,8 +3874,8 @@ pub(super) mod tests {
                 private: None,
             })
         };
-        let across = bridge(BridgeProvider::Across, BridgeSurplus::KeepInAccount);
-        let near = bridge(
+        let across = &bridge(BridgeProvider::Across, BridgeSurplus::KeepInAccount);
+        let near = &bridge(
             BridgeProvider::NearIntents,
             BridgeSurplus::BridgedByProvider,
         );
@@ -3932,6 +3966,7 @@ pub(super) mod tests {
                 provider,
                 network: "Polygon".into(),
                 token: "USDC".into(),
+                non_evm: false,
                 origin: "Arbitrum One".into(),
                 receiver: "Treasury".into(),
                 sent: Some("248.82 USDC".into()),
@@ -3939,6 +3974,7 @@ pub(super) mod tests {
                 private: None,
                 reported,
                 delivered_transaction: None,
+                destination_transaction: None,
                 handoff_transaction: None,
                 refund_transaction: None,
                 deposit: SwapSeen::Looking,
@@ -4098,6 +4134,75 @@ pub(super) mod tests {
         );
     }
 
+    /// A non-EVM delivery's steps name its network and receiver as its record holds them. A
+    /// reported delivery carries 1Click's transaction in the network's own form, in place of
+    /// an EVM hash, and a failed deposit needs attention.
+    #[test]
+    fn non_evm_steps_carry_the_destination_transaction_as_reported() {
+        use PublicActionStepStatus::{Done, Pending, Warning};
+        const SIGNATURE: &str = "2zf1D3JpcScRk9TTCWSQmbKr8hB9nfiLK9iA7mHvNuxqSrDDLCRFY7mb48txGysNHWns8autYb6meqyhRAPs23qT";
+        let solana = |destination_transaction: Option<&str>| SwapLabels {
+            received: Some("181.25 JUP".into()),
+            bridge: Some(SwapBridgeLabels {
+                provider: BridgeProvider::NearIntents,
+                network: "Solana".into(),
+                token: "JUP".into(),
+                non_evm: true,
+                origin: "Ethereum".into(),
+                receiver: "9jQtwH…Vkkv".into(),
+                sent: Some("100.46 USDC".into()),
+                minimum: Some("180.42 JUP".into()),
+                private: None,
+                reported: destination_transaction.is_some(),
+                delivered_transaction: None,
+                destination_transaction: destination_transaction.map(str::to_owned),
+                handoff_transaction: None,
+                refund_transaction: None,
+                deposit: SwapSeen::Looking,
+                report: None,
+            }),
+            ..labels()
+        };
+        let order = SwapStage::Order;
+        let last = |stage, labels: &SwapLabels| swap_steps(order(stage), labels).pop().unwrap();
+        let bridging = last(SwapOrderState::Bridging, &solana(None));
+        assert_eq!(
+            (bridging.label.as_str(), bridging.status),
+            ("Delivered on Solana", Pending)
+        );
+        assert!(
+            bridging
+                .detail
+                .starts_with("At least 180.42 JUP to 9jQtwH…Vkkv")
+        );
+        let delivered = last(SwapOrderState::Done, &solana(Some(SIGNATURE)));
+        assert_eq!(
+            (
+                delivered.label.as_str(),
+                delivered.detail.as_str(),
+                delivered.status,
+            ),
+            (
+                "Delivered on Solana · reported by NEAR Intents",
+                "181.25 JUP to 9jQtwH…Vkkv",
+                Done
+            )
+        );
+        assert_eq!(
+            (
+                delivered.transaction,
+                delivered.destination_transaction.as_deref()
+            ),
+            (None, Some(SIGNATURE))
+        );
+        let attention = last(SwapOrderState::NeedsAttention, &solana(None));
+        assert_eq!(
+            (attention.label.as_str(), attention.status),
+            ("Needs attention", Warning)
+        );
+        assert_eq!(attention.destination_transaction, None);
+    }
+
     #[test]
     fn private_bridge_steps_follow_both_setups_then_the_shield_on_the_destination() {
         use PublicActionStepStatus::{Done, Error, NotStarted, Pending, Warning};
@@ -4121,6 +4226,7 @@ pub(super) mod tests {
                     provider: BridgeProvider::Across,
                     network: "Arbitrum One".into(),
                     token: "USDC".into(),
+                    non_evm: false,
                     origin: "Ethereum".into(),
                     receiver: RECEIVER.into(),
                     sent: Some("993.05 USDC".into()),
@@ -4134,6 +4240,7 @@ pub(super) mod tests {
                     }),
                     reported: false,
                     delivered_transaction: None,
+                    destination_transaction: None,
                     handoff_transaction: None,
                     refund_transaction: None,
                     deposit: SwapSeen::Looking,
@@ -4364,6 +4471,7 @@ pub(super) mod tests {
                 provider,
                 network: "Polygon".into(),
                 token: "USDC".into(),
+                non_evm: false,
                 origin: "Ethereum".into(),
                 receiver: "Treasury".into(),
                 sent: None,
@@ -4371,6 +4479,7 @@ pub(super) mod tests {
                 private: None,
                 reported: false,
                 delivered_transaction: None,
+                destination_transaction: None,
                 handoff_transaction: None,
                 refund_transaction: None,
                 deposit: SwapSeen::Looking,
@@ -4868,7 +4977,7 @@ pub(super) mod tests {
             ..SwapOrderObservations::default()
         };
         let reshield = SwapDelivery::Reshield;
-        let outcome = swap_outcome(&bounds, &observed, reshield).expect("traded");
+        let outcome = swap_outcome(&bounds, &observed, &reshield).expect("traded");
         assert_eq!(
             (outcome.spent, outcome.unshield_fee),
             (U256::from(50_000_000u64), U256::from(125_000u64))
@@ -4881,7 +4990,7 @@ pub(super) mod tests {
         let external = SwapDelivery::External {
             receiver: Address::repeat_byte(7),
         };
-        let paid = swap_outcome(&bounds, &observed, external).expect("traded");
+        let paid = swap_outcome(&bounds, &observed, &external).expect("traded");
         assert_eq!(
             (paid.private_minimum, paid.received, paid.above_minimum),
             (
@@ -4902,9 +5011,9 @@ pub(super) mod tests {
                     }))
                     .unwrap(),
                 ),
-                ..observed
+                ..observed.clone()
             },
-            reshield,
+            &reshield,
         )
         .expect("traded");
         assert_eq!(
@@ -4929,9 +5038,9 @@ pub(super) mod tests {
                 &bounds,
                 &SwapOrderObservations {
                     trade_amounts: Some(amounts),
-                    ..observed
+                    ..observed.clone()
                 },
-                reshield,
+                &reshield,
             )
             .expect("traded")
             .gas
@@ -4978,9 +5087,9 @@ pub(super) mod tests {
                 &bounds,
                 &SwapOrderObservations {
                     shielded: Some(shield),
-                    ..observed
+                    ..observed.clone()
                 },
-                reshield,
+                &reshield,
             )
             .expect("traded")
             .received_privately
@@ -4997,7 +5106,7 @@ pub(super) mod tests {
                 trade_amounts: None,
                 ..observed
             },
-            external,
+            &external,
         )
         .expect("traded");
         assert_eq!(
@@ -5006,7 +5115,7 @@ pub(super) mod tests {
         );
         assert_eq!(legacy.minimum, bounds.buy_amount);
         assert_eq!(
-            swap_outcome(&bounds, &SwapOrderObservations::default(), reshield),
+            swap_outcome(&bounds, &SwapOrderObservations::default(), &reshield),
             None
         );
     }
@@ -5401,7 +5510,7 @@ pub(super) mod tests {
             ),
             (
                 PublicSwapStage::HeldByProxy,
-                order(held),
+                order(held.clone()),
                 &full,
                 101,
                 vec![
@@ -5618,6 +5727,7 @@ pub(super) mod tests {
                 outcome(SwapBridgeOutcome::DeliveredReported {
                     amount_out: None,
                     transaction_hash: None,
+                    destination_transaction: None,
                 }),
                 PublicSwapStage::DeliveredReported,
                 PublicActionStepStatus::Warning,
@@ -5798,14 +5908,14 @@ pub(super) mod tests {
         };
         for (observed, expected, group) in [
             (
-                held,
+                held.clone(),
                 PublicSwapStage::HeldByProxy,
                 SwapOrderGroup::NeedsRecovery,
             ),
             (
                 PublicSwapObservations {
                     withdrawn: Some(observation),
-                    ..held
+                    ..held.clone()
                 },
                 PublicSwapStage::WithdrawnPendingCheck,
                 SwapOrderGroup::Open,
@@ -5814,7 +5924,7 @@ pub(super) mod tests {
                 PublicSwapObservations {
                     withdrawn: Some(observation),
                     deposit_ruled_out: Some(observation),
-                    ..held
+                    ..held.clone()
                 },
                 PublicSwapStage::SwappedNotBridged,
                 SwapOrderGroup::Ended,

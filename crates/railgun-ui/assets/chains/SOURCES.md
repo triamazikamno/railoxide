@@ -30,3 +30,6 @@ Chain icon sources:
 - `worldchain.svg`: `https://worldcoin-company-website.cdn.prismic.io/worldcoin-company-website/agMW8KYofJOwHH3v_Logomark.zip` (`Logomark (Digital _ RGB)/Logomark-Black/SVG/[World] Logomark-Black-RGB.svg`)
 - `pharosmainnet.png`: `https://cdn.prod.website-files.com/67dbfb55a03319f79c3c7c12/68c299c220615696c95a3ba2_Webclip%20_symbol%20icon_blue.png`
 - `hyperevm.svg`: `https://hyperliquid.gitbook.io/hyperliquid-docs/brand-kit` (`Hyperliquid SVG format.zip`, `Hyperliquid_Blob_Green.svg`; official brand kit, no stated licence)
+- `bitcoin.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/networks/branded/bitcoin.svg` (MIT, `0xa3k5/web3icons`)
+- `solana.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/networks/branded/solana.svg` (MIT, `0xa3k5/web3icons`)
+- `tron.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/networks/branded/tron.svg` (MIT, `0xa3k5/web3icons`)

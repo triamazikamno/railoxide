@@ -19,6 +19,8 @@ const ACROSS_DEPOSIT_FILLED: &str = include_str!("fixtures/across_deposit_filled
 const ONE_CLICK_DRY_QUOTE: &str = include_str!("fixtures/oneclick_dry_quote.json");
 const ONE_CLICK_QUOTE: &str = include_str!("fixtures/oneclick_quote.json");
 const ONE_CLICK_STATUS_PENDING: &str = include_str!("fixtures/oneclick_status_pending.json");
+/// A 1Click token list with an EVM token, native BTC, a Solana mint and a Tron contract.
+const ONE_CLICK_TOKENS: &str = include_str!("fixtures/oneclick_tokens.json");
 
 /// The recipient, refund address and deposit address of the captured 1Click quotes.
 const FIXTURE_RECIPIENT: Address = address!("513f28158bf181fb17ac6c349d21c3b763f8a508");
@@ -459,16 +461,26 @@ async fn near_dry_quotes_send_fresh_placeholder_addresses() {
     let client = NearIntentsClient::new(test_http(), base_url, &quote_key).unwrap();
 
     for _ in 0..2 {
-        let quote = client.dry_quote(&fixture_params()).await.unwrap();
+        let quote = client.dry_quote(&fixture_params(), None).await.unwrap();
         assert_eq!(
             quote.min_amount_out,
             U256::from_str_radix("168087553224089770016", 10).unwrap()
         );
     }
+    client
+        .dry_quote(&fixture_params(), Some(NonEvmNetwork::Tron))
+        .await
+        .unwrap();
 
     let recorded = recorded.lock().expect("recorded requests");
+    let (tron, evm) = recorded.split_last().expect("recorded requests");
+    let recipient = tron.body["recipient"].as_str().unwrap();
+    assert_eq!(
+        NonEvmNetwork::Tron.parse_receiver(recipient).as_deref(),
+        Ok(recipient)
+    );
     let mut placeholders = Vec::new();
-    for request in recorded.iter() {
+    for request in evm {
         assert_eq!(
             (request.method.as_str(), request.path.as_str()),
             ("POST", "/api/v0/quote")
@@ -516,7 +528,7 @@ fn quote_verification_accepts_captured_quotes_and_rejects_tampering() {
     let sent = SentQuote::new(
         &params,
         false,
-        FIXTURE_RECIPIENT,
+        OneClickRecipient::Evm(FIXTURE_RECIPIENT),
         FIXTURE_REFUND_TO,
         Some(EXECUTOR),
     );
@@ -533,10 +545,19 @@ fn quote_verification_accepts_captured_quotes_and_rejects_tampering() {
         terms.min_amount_out,
         U256::from_str_radix("167953443098610286739", 10).unwrap()
     );
-    let dry_sent = SentQuote::new(&params, true, FIXTURE_RECIPIENT, FIXTURE_REFUND_TO, None);
+    // "19.970253070003" dollars, to the micro-dollar.
+    assert_eq!(terms.amount_out_usd, Some(U256::from(19_970_253_u32)));
+    let dry_sent = SentQuote::new(
+        &params,
+        true,
+        OneClickRecipient::Evm(FIXTURE_RECIPIENT),
+        FIXTURE_REFUND_TO,
+        None,
+    );
     let dry_terms =
         verify_quote(ONE_CLICK_DRY_QUOTE, &pinned, &dry_sent).expect("captured dry quote verifies");
     assert_eq!(dry_terms.deposit, None);
+    assert_eq!(dry_terms.amount_out_usd, Some(U256::from(19_982_768_u32)));
 
     let signing_key = test_signing_key();
     let test_key = signing_key.verifying_key();
@@ -552,14 +573,14 @@ fn quote_verification_accepts_captured_quotes_and_rejects_tampering() {
     let other_recipient = SentQuote::new(
         &params,
         false,
-        Address::repeat_byte(0x51),
+        OneClickRecipient::Evm(Address::repeat_byte(0x51)),
         FIXTURE_REFUND_TO,
         Some(EXECUTOR),
     );
     let deposit_to_executor = SentQuote::new(
         &params,
         false,
-        FIXTURE_RECIPIENT,
+        OneClickRecipient::Evm(FIXTURE_RECIPIENT),
         FIXTURE_REFUND_TO,
         Some(FIXTURE_DEPOSIT_ADDRESS),
     );
@@ -613,6 +634,64 @@ fn quote_verification_accepts_captured_quotes_and_rejects_tampering() {
             "{case}"
         );
     }
+}
+
+#[test]
+fn quote_verification_compares_a_non_evm_recipient_exactly() {
+    const SOLANA: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    let signing_key = test_signing_key();
+    let mut response: Value = serde_json::from_str(ONE_CLICK_QUOTE).unwrap();
+    response["quoteRequest"]["recipient"] = Value::from(SOLANA);
+    let body = sign_quote_response_for_tests(response, &signing_key);
+    let params = fixture_params();
+    let sent = |recipient: &str| {
+        SentQuote::new(
+            &params,
+            false,
+            OneClickRecipient::NonEvm(recipient.to_owned()),
+            FIXTURE_REFUND_TO,
+            Some(EXECUTOR),
+        )
+    };
+
+    let key = signing_key.verifying_key();
+    assert!(verify_quote(&body, &key, &sent(SOLANA)).is_ok());
+    assert_eq!(
+        verify_quote(&body, &key, &sent(&SOLANA.to_ascii_lowercase())).err(),
+        Some(OneClickVerifyError::TermsMismatch("recipient"))
+    );
+}
+
+#[tokio::test]
+async fn near_tokens_keep_non_evm_contracts_as_listed() {
+    let (base_url, _) = spawn_fixed(200, ONE_CLICK_TOKENS).await;
+    let client =
+        NearIntentsClient::new(test_http(), base_url, &key_string(&pinned_quote_key())).unwrap();
+    let tokens = client.tokens().await.unwrap();
+    assert_eq!(
+        tokens
+            .iter()
+            .map(|token| (
+                token.blockchain.as_str(),
+                token.contract_address,
+                token.contract.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "arb",
+                Some(address!("af88d065e77c8cc2239327c5edb3a432268e5831")),
+                Some("0xaf88d065e77c8cc2239327c5edb3a432268e5831")
+            ),
+            ("btc", None, None),
+            (
+                "sol",
+                None,
+                Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+            ),
+            ("tron", None, Some("TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t")),
+        ]
+    );
 }
 
 #[tokio::test]

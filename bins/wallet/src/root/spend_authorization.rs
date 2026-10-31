@@ -858,6 +858,14 @@ impl SpendAuthorizationSummary {
             .map(|[send, _]| (send.label.text(), send.amount.to_string()))
     }
 
+    /// The Receive card's USD value.
+    #[cfg(test)]
+    pub(in crate::root) fn receive_usd_for_test(&self) -> Option<String> {
+        self.cards
+            .as_ref()
+            .and_then(|[_, receive]| receive.usd.as_deref().map(str::to_owned))
+    }
+
     /// The networks whose badges the Send and Receive cards' icons carry.
     #[cfg(test)]
     pub(in crate::root) fn card_networks_for_test(&self) -> Option<[Option<u64>; 2]> {
@@ -947,7 +955,7 @@ impl SpendAuthorizationSummary {
     pub(in crate::root) fn receiver_for_test(&self) -> Option<(String, Option<String>)> {
         self.cards.as_ref().and_then(|[_, receive]| {
             receive.lines.iter().find_map(|line| match line {
-                SpendAuthorizationCardLine::Receiver { address, label } => {
+                SpendAuthorizationCardLine::Receiver { address, label, .. } => {
                     Some((address.to_string(), label.as_deref().map(str::to_owned)))
                 }
                 SpendAuthorizationCardLine::Text { .. }
@@ -1133,10 +1141,11 @@ enum SpendAuthorizationCardLine {
         strong: Arc<str>,
         after: Arc<str>,
     },
-    /// "to" and the shortened `address`, with a copy button for the full address. Hovering
-    /// shows the full address, after `label` when it has one.
+    /// "to" and the `short` form of `address`, with a copy button for the full address.
+    /// Hovering shows the full address, after `label` when it has one.
     Receiver {
         address: Arc<str>,
+        short: Arc<str>,
         label: Option<Arc<str>>,
     },
     /// "from", the account's `name` and its shortened `address`, with a copy button for the
@@ -1210,13 +1219,23 @@ impl SpendAuthorizationCard {
 
     /// A line naming the receiver by its shortened `address`, which it copies and shows on
     /// hover in full. `label` is the wallet's name for the address, when it has one.
-    pub(super) fn with_receiver(
+    pub(super) fn with_receiver(self, address: impl Into<Arc<str>>, label: Option<String>) -> Self {
+        let address = address.into();
+        let short = spend_authorization_recipient_display(&address);
+        self.with_short_receiver(address, short, label)
+    }
+
+    /// [`Self::with_receiver`] showing `short` as the shortened address, such as a non-EVM
+    /// receiver in the form the swap's order detail gives it.
+    pub(super) fn with_short_receiver(
         mut self,
         address: impl Into<Arc<str>>,
+        short: impl Into<Arc<str>>,
         label: Option<String>,
     ) -> Self {
         self.lines.push(SpendAuthorizationCardLine::Receiver {
             address: address.into(),
+            short: short.into(),
             label: label.map(Arc::from),
         });
         self
@@ -1324,6 +1343,8 @@ pub(super) struct SpendAuthorizationSummaryRow {
     value_network: Option<SpendAuthorizationLabel>,
     icon_path: Option<WalletIconSource>,
     shortened_copyable: bool,
+    /// The shortened form a shortened, copyable value shows, when it isn't the default one.
+    short: Option<Arc<str>>,
     /// What a shortened, copyable value follows and what its copy control calls it, such as an
     /// account's number and "stealth account address".
     copyable_account: Option<(Arc<str>, Arc<str>)>,
@@ -1410,6 +1431,7 @@ impl SpendAuthorizationSummaryRow {
             value_network: None,
             icon_path: None,
             shortened_copyable: false,
+            short: None,
             copyable_account: None,
             delta: None,
             hint: None,
@@ -1446,6 +1468,14 @@ impl SpendAuthorizationSummaryRow {
         self
     }
 
+    /// [`Self::with_shortened_copyable`] showing `short` as the shortened value, such as a
+    /// non-EVM mint in the form the swap's form and order detail give it.
+    pub(super) fn with_short_copyable(mut self, short: impl Into<Arc<str>>) -> Self {
+        self.shortened_copyable = true;
+        self.short = Some(short.into());
+        self
+    }
+
     /// The value is an account's address: shortened after `prefix`, such as "#35 · ", with a
     /// control that copies it in full and is named `name`.
     pub(super) fn with_copyable_account(
@@ -1460,7 +1490,10 @@ impl SpendAuthorizationSummaryRow {
 
     /// What a shortened, copyable row shows: its value, shortened, after its prefix.
     fn shortened_value(&self) -> String {
-        let short = spend_authorization_recipient_display(self.value.as_ref());
+        let short = self.short.as_deref().map_or_else(
+            || spend_authorization_recipient_display(self.value.as_ref()),
+            str::to_owned,
+        );
         match &self.copyable_account {
             Some((prefix, _)) => format!("{prefix}{short}"),
             None => short,
@@ -2588,22 +2621,26 @@ fn render_spend_authorization_card(
                     .when(!after.is_empty(), |this| {
                         this.child(app_muted_text(after.to_string()).text_xs())
                     }),
-                SpendAuthorizationCardLine::Receiver { address, label } => {
-                    spend_authorization_card_address_line(
-                        card_index,
-                        "to",
-                        None,
-                        address,
-                        label.clone(),
-                        "Copy receiver",
-                    )
-                }
+                SpendAuthorizationCardLine::Receiver {
+                    address,
+                    short,
+                    label,
+                } => spend_authorization_card_address_line(
+                    card_index,
+                    "to",
+                    None,
+                    address,
+                    short,
+                    label.clone(),
+                    "Copy receiver",
+                ),
                 SpendAuthorizationCardLine::Account { name, address } => {
                     spend_authorization_card_address_line(
                         card_index,
                         "from",
                         Some(name),
                         address,
+                        &spend_authorization_recipient_display(address),
                         None,
                         "Copy address",
                     )
@@ -2612,14 +2649,15 @@ fn render_spend_authorization_card(
         }))
 }
 
-/// A card's address line: `lead`, the account's `name` when the line shows it, and the
-/// shortened `address` with a copy button. Hovering the address shows it in full, after
+/// A card's address line: `lead`, the account's `name` when the line shows it, and `address`
+/// in its `short` form with a copy button. Hovering the address shows it in full, after
 /// `hover_label` when it has one.
 fn spend_authorization_card_address_line(
     card_index: usize,
     lead: &'static str,
     name: Option<&Arc<str>>,
     address: &Arc<str>,
+    short: &str,
     hover_label: Option<Arc<str>>,
     copy_tooltip: &'static str,
 ) -> gpui::Div {
@@ -2656,7 +2694,7 @@ fn spend_authorization_card_address_line(
                     .build(window, cx)
                 })
                 .child(
-                    app_text(spend_authorization_recipient_display(address))
+                    app_text(short.to_owned())
                         .text_xs()
                         .text_color(rgb(theme::TEXT))
                         .font_family(APP_MONO_FONT_FAMILY),

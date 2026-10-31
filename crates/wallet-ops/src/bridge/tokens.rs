@@ -1,15 +1,16 @@
 //! What a Bridge swap can deliver on its destination chain, and the token it buys on its own
 //! chain to hand to the provider.
 //!
-//! Both lists are limited to the destination chain's configured tokens, plus the native asset
-//! where NEAR Intents delivers it. A provider's route never adds a token. A swap paid from the
-//! private balance leaves out a destination that is the same asset as the sell token:
-//! same-token bridging isn't supported there. A swap paid from a Public account keeps it as a
-//! direct deposit.
+//! On an EVM chain both lists are limited to the destination chain's configured tokens, plus the
+//! native asset where NEAR Intents delivers it. A provider's route never adds a token there. A
+//! swap paid from the private balance leaves out a destination that is the same asset as the
+//! sell token: same-token bridging isn't supported there. A swap paid from a Public account
+//! keeps it as a direct deposit. On a [`NonEvmNetwork`] every token 1Click lists is offered,
+//! including the sell token's own asset.
 
 use alloy::primitives::Address;
 
-use super::{AcrossRoute, OneClickToken};
+use super::{AcrossRoute, NonEvmNetwork, OneClickToken};
 use crate::settings::{BridgeDestinationProfile, BridgeProfile, EffectiveTokenRegistry};
 
 /// A token the provider can deliver on the destination chain.
@@ -25,6 +26,22 @@ pub struct BridgeDestination {
     pub same_asset: bool,
     /// 1Click's assets for a NEAR Intents destination, `None` for Across.
     pub near: Option<NearAssets>,
+}
+
+/// A token NEAR Intents can deliver on a [`NonEvmNetwork`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NonEvmBridgeDestination {
+    /// The mint or contract as 1Click lists it, `None` for the network's native asset.
+    pub contract: Option<String>,
+    /// The ERC-20 the order buys on the swap's chain and hands to 1Click.
+    pub intermediate: Address,
+    /// 1Click's symbol.
+    pub symbol: String,
+    /// Whether the intermediate is the destination token's own asset.
+    pub same_asset: bool,
+    /// The assets the quote converts between. The destination asset and decimals are the
+    /// token's.
+    pub near: NearAssets,
 }
 
 /// The 1Click assets a NEAR Intents quote converts between.
@@ -179,6 +196,9 @@ pub fn public_across_destination_tokens(
 /// chain, so WETH never carries a swap, not even to ETH.
 const NEAR_INTERMEDIATES: [&str; 2] = ["USDC", "USDT"];
 
+/// The prefix of 1Click's newer asset id scheme.
+const NEWER_ASSET_ID_PREFIX: &str = "1cs_v1:";
+
 /// Destinations 1Click lists on `destination`'s chain: its configured ERC-20s and its native
 /// asset. Each takes as intermediate the first token 1Click lists on `origin`'s chain with a
 /// configured ERC-20 contract other than `sell_token`, preferring a token with the
@@ -201,17 +221,7 @@ pub fn near_destination_tokens(
         .filter(on_origin)
         .find(|token| token.contract_address == Some(sell_token))
         .map(|token| token.symbol.as_str());
-    let intermediates = tokens
-        .iter()
-        .filter(on_origin)
-        .filter(|token| {
-            token.contract_address.is_some_and(|contract| {
-                contract != sell_token
-                    && contract != Address::ZERO
-                    && registry.get(origin.chain_id(), &contract).is_some()
-            })
-        })
-        .collect::<Vec<_>>();
+    let intermediates = near_intermediates(tokens, origin, sell_token, registry);
     let mut destinations: Vec<BridgeDestination> = Vec::new();
     for token in tokens
         .iter()
@@ -233,19 +243,7 @@ pub fn near_destination_tokens(
         {
             continue;
         }
-        let chosen = intermediates
-            .iter()
-            .find(|candidate| candidate.symbol.eq_ignore_ascii_case(&token.symbol))
-            .map(|candidate| (candidate, true))
-            .or_else(|| {
-                NEAR_INTERMEDIATES.iter().find_map(|preferred| {
-                    intermediates
-                        .iter()
-                        .find(|candidate| candidate.symbol == *preferred)
-                        .map(|candidate| (candidate, false))
-                })
-            });
-        if let Some((candidate, matched)) = chosen
+        if let Some((candidate, matched)) = near_intermediate(&intermediates, &token.symbol)
             && let Some(intermediate) = candidate.contract_address
         {
             destinations.push(BridgeDestination {
@@ -263,6 +261,103 @@ pub fn near_destination_tokens(
         }
     }
     destinations
+}
+
+/// Destinations 1Click lists on `network`: every token there, whether or not the wallet knows
+/// it. Intermediates are chosen as in [`near_destination_tokens`]. A destination that is the
+/// sell token's own asset, such as BTC when selling WBTC, is kept: its intermediate is never the
+/// sell token. An asset 1Click lists more than once, by contract and `None` for the native
+/// asset, is shown once with its first listing's symbol, and quoted under its newer `1cs_v1:`
+/// asset id when it has one: 1Click's quotes for `nep141:btc.omft.near` carry signatures that
+/// don't verify, while those for `1cs_v1:btc:native:coin` do.
+#[must_use]
+pub fn near_non_evm_destination_tokens(
+    tokens: &[OneClickToken],
+    origin: &BridgeProfile,
+    network: NonEvmNetwork,
+    sell_token: Address,
+    registry: &EffectiveTokenRegistry,
+) -> Vec<NonEvmBridgeDestination> {
+    let intermediates = near_intermediates(tokens, origin, sell_token, registry);
+    let mut destinations: Vec<NonEvmBridgeDestination> = Vec::new();
+    for token in tokens
+        .iter()
+        .filter(|token| token.blockchain == network.one_click_blockchain())
+    {
+        if let Some(known) = destinations
+            .iter_mut()
+            .find(|known| known.contract == token.contract)
+        {
+            if token.asset_id.starts_with(NEWER_ASSET_ID_PREFIX)
+                && !known
+                    .near
+                    .destination_asset
+                    .starts_with(NEWER_ASSET_ID_PREFIX)
+            {
+                known.near.destination_asset.clone_from(&token.asset_id);
+                known.near.destination_decimals = token.decimals;
+            }
+            continue;
+        }
+        if let Some((candidate, matched)) = near_intermediate(&intermediates, &token.symbol)
+            && let Some(intermediate) = candidate.contract_address
+        {
+            destinations.push(NonEvmBridgeDestination {
+                contract: token.contract.clone(),
+                intermediate,
+                symbol: token.symbol.clone(),
+                same_asset: matched,
+                near: NearAssets {
+                    origin_asset: candidate.asset_id.clone(),
+                    destination_asset: token.asset_id.clone(),
+                    origin_decimals: candidate.decimals,
+                    destination_decimals: token.decimals,
+                },
+            });
+        }
+    }
+    destinations
+}
+
+/// Tokens 1Click lists on `origin`'s chain with a configured ERC-20 contract other than
+/// `sell_token`.
+fn near_intermediates<'a>(
+    tokens: &'a [OneClickToken],
+    origin: &BridgeProfile,
+    sell_token: Address,
+    registry: &EffectiveTokenRegistry,
+) -> Vec<&'a OneClickToken> {
+    tokens
+        .iter()
+        .filter(|token| token.blockchain == origin.one_click_blockchain())
+        .filter(|token| {
+            token.contract_address.is_some_and(|contract| {
+                contract != sell_token
+                    && contract != Address::ZERO
+                    && registry.get(origin.chain_id(), &contract).is_some()
+            })
+        })
+        .collect()
+}
+
+/// The intermediate for a destination with 1Click `symbol`, and whether it is the same asset:
+/// one with that symbol, then USDC, then USDT.
+fn near_intermediate<'a>(
+    intermediates: &[&'a OneClickToken],
+    symbol: &str,
+) -> Option<(&'a OneClickToken, bool)> {
+    intermediates
+        .iter()
+        .find(|candidate| candidate.symbol.eq_ignore_ascii_case(symbol))
+        .map(|candidate| (*candidate, true))
+        .or_else(|| {
+            NEAR_INTERMEDIATES.iter().find_map(|preferred| {
+                intermediates
+                    .iter()
+                    .find(|candidate| candidate.symbol == *preferred)
+                    .map(|candidate| (*candidate, false))
+            })
+        })
 }
 
 /// Equal 1Click symbols, with a native symbol `X` the same asset as `WX`: ETH and WETH, BNB and
@@ -312,6 +407,7 @@ mod tests {
             symbol: symbol.into(),
             decimals: 18,
             contract_address: contract,
+            contract: contract.as_ref().map(ToString::to_string),
             price: None,
         }
     }
@@ -487,6 +583,90 @@ mod tests {
             across_destination_tokens(&across, ARB_WETH, &registry, 56)
                 .iter()
                 .all(|destination| destination.destination_token != Address::ZERO)
+        );
+    }
+
+    #[test]
+    fn near_non_evm_offers_every_listed_token_once_with_the_sell_tokens_asset() {
+        const ARB_WBTC: Address = address!("2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f");
+        let registry = build_effective_token_registry(&WalletSettings::default()).unwrap();
+        let chains = build_effective_chain_configs(&WalletSettings::default()).unwrap();
+        let arbitrum = chains.get(42161).unwrap().bridge_profile().unwrap();
+        let listed = |blockchain: &str, symbol: &str, asset_id: &str, contract: Option<&str>| {
+            OneClickToken {
+                asset_id: asset_id.into(),
+                contract: contract.map(str::to_owned),
+                ..one_click(blockchain, symbol, None)
+            }
+        };
+        let tokens = [
+            one_click("arb", "WBTC", Some(ARB_WBTC)),
+            one_click("arb", "USDC", Some(ARB_USDC)),
+            one_click("arb", "USDT", Some(ARB_USDT)),
+            // 1Click lists native BTC under two asset ids.
+            listed("btc", "BTC", "nep141:btc.omft.near", None),
+            listed("btc", "BTC(OMNI)", "1cs_v1:btc:native:coin", None),
+            listed(
+                "sol",
+                "USDC",
+                "sol:USDC",
+                Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+            ),
+            // In no token registry.
+            listed(
+                "sol",
+                "BONK",
+                "sol:BONK",
+                Some("DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"),
+            ),
+        ];
+        let offered = |network| {
+            near_non_evm_destination_tokens(&tokens, &arbitrum, network, ARB_WBTC, &registry)
+                .into_iter()
+                .map(|destination| {
+                    (
+                        destination.contract,
+                        destination.intermediate,
+                        destination.same_asset,
+                        destination.near.destination_asset,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Selling WBTC: BTC is offered once through USDC, under the first listing's symbol and
+        // quoted under the `1cs_v1:` id, whose quotes 1Click signs verifiably.
+        assert_eq!(
+            offered(NonEvmNetwork::Bitcoin),
+            [(None, ARB_USDC, false, "1cs_v1:btc:native:coin".to_owned())]
+        );
+        assert_eq!(
+            near_non_evm_destination_tokens(
+                &tokens,
+                &arbitrum,
+                NonEvmNetwork::Bitcoin,
+                ARB_WBTC,
+                &registry
+            )[0]
+            .symbol,
+            "BTC"
+        );
+        assert_eq!(
+            offered(NonEvmNetwork::Solana),
+            [
+                (
+                    Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_owned()),
+                    ARB_USDC,
+                    true,
+                    "sol:USDC".to_owned()
+                ),
+                (
+                    Some("DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263".to_owned()),
+                    ARB_USDC,
+                    false,
+                    "sol:BONK".to_owned()
+                ),
+            ]
         );
     }
 

@@ -34,8 +34,9 @@ use wallet_ops::{
     subscribe_prover_cache_build,
     vault::{
         BroadcasterPreferences, DesktopVaultStore, DesktopViewSession, DeviceAuthStatus,
-        GeneratedSeedMaterial, PrivateAddressBookEntry, ProtectedSoftwareSeedSession,
-        PublicAccountMetadata, PublicAddressBookEntry, ViewUnlock, WalletMetadataBundle,
+        GeneratedSeedMaterial, NonEvmAddressBookEntry, PrivateAddressBookEntry,
+        ProtectedSoftwareSeedSession, PublicAccountMetadata, PublicAddressBookEntry, ViewUnlock,
+        WalletMetadataBundle,
     },
 };
 use zeroize::Zeroizing;
@@ -497,6 +498,7 @@ pub(crate) struct WalletRoot {
     proposal_detail_focus: FocusHandle,
     private_address_book: Vec<PrivateAddressBookEntry>,
     public_address_book: Vec<PublicAddressBookEntry>,
+    non_evm_address_book: Vec<NonEvmAddressBookEntry>,
     broadcaster_preferences: BroadcasterPreferences,
     broadcaster_preference_snapshot: Arc<RwLock<BroadcasterPreferences>>,
     broadcaster_preference_error: Option<Arc<str>>,
@@ -1315,7 +1317,11 @@ impl WalletRoot {
         let address_book = AddressBookState {
             search_input: address_book_search_input,
             add_label_input: new_text_input(window, cx, "recipient label"),
-            add_address_input: new_text_input(window, cx, "0zk or 0x recipient"),
+            add_address_input: new_text_input(
+                window,
+                cx,
+                "0zk, 0x, Bitcoin, Solana or Tron recipient",
+            ),
             edit_label_input: new_text_input(window, cx, "recipient label"),
             edit_address_input: new_text_input(window, cx, "recipient address"),
             search_query: Arc::from(""),
@@ -1627,6 +1633,7 @@ impl WalletRoot {
             proposal_detail_focus: cx.focus_handle(),
             private_address_book: Vec::new(),
             public_address_book: Vec::new(),
+            non_evm_address_book: Vec::new(),
             broadcaster_preferences: BroadcasterPreferences::default(),
             broadcaster_preference_snapshot,
             broadcaster_preference_error: None,

@@ -7,6 +7,7 @@ pub(in crate::root) use ui::recipient_picker::{
     RecipientSuggestionDirection,
     suggestion_index_after_move as recipient_suggestion_index_after_move,
 };
+use wallet_ops::{bridge::NonEvmNetwork, vault::NonEvmAddressBookEntry};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::root) enum RecipientOptionSource {
@@ -14,6 +15,37 @@ pub(in crate::root) enum RecipientOptionSource {
     PrivateAddressBook,
     PublicAccount,
     PublicAddressBook,
+    NonEvmAddressBook,
+}
+
+/// The address rules a recipient picker follows: a delivery form's, or for a swap receiver on
+/// a non-EVM network, that network's own format, with its non-EVM address-book entries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::root) enum RecipientRules {
+    Form(DeliveryFormKind),
+    NonEvm(NonEvmNetwork),
+}
+
+impl From<DeliveryFormKind> for RecipientRules {
+    fn from(kind: DeliveryFormKind) -> Self {
+        Self::Form(kind)
+    }
+}
+
+/// The non-EVM address-book entries of `network`, as a swap receiver's suggestions there.
+pub(in crate::root) fn non_evm_recipient_options(
+    address_book: &[NonEvmAddressBookEntry],
+    network: NonEvmNetwork,
+) -> Vec<RecipientOption> {
+    address_book
+        .iter()
+        .filter(|entry| entry.network == network)
+        .map(|entry| RecipientOption {
+            label: Arc::from(entry.label.as_str()),
+            address: Arc::from(entry.address.as_str()),
+            source: RecipientOptionSource::NonEvmAddressBook,
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,7 +140,7 @@ pub(in crate::root) fn filtered_recipient_options(
 }
 
 pub(in crate::root) fn recipient_suggestion_filter_query(
-    kind: DeliveryFormKind,
+    kind: impl Into<RecipientRules>,
     recipient: &str,
 ) -> String {
     if recipient_query_is_valid(kind, recipient) {
@@ -118,12 +150,18 @@ pub(in crate::root) fn recipient_suggestion_filter_query(
     }
 }
 
-pub(in crate::root) fn recipient_query_is_valid(kind: DeliveryFormKind, recipient: &str) -> bool {
+pub(in crate::root) fn recipient_query_is_valid(
+    kind: impl Into<RecipientRules>,
+    recipient: &str,
+) -> bool {
     let recipient = recipient.trim();
     !recipient.is_empty()
-        && match kind {
-            DeliveryFormKind::Send => parse_railgun_recipient(recipient).is_ok(),
-            DeliveryFormKind::Unshield => parse_address(recipient).is_some(),
+        && match kind.into() {
+            RecipientRules::Form(DeliveryFormKind::Send) => {
+                parse_railgun_recipient(recipient).is_ok()
+            }
+            RecipientRules::Form(DeliveryFormKind::Unshield) => parse_address(recipient).is_some(),
+            RecipientRules::NonEvm(network) => network.parse_receiver(recipient).is_ok(),
         }
 }
 
@@ -136,7 +174,7 @@ fn first_recipient_suggestion_index(len: usize) -> Option<usize> {
 
 /// The list after the user opens or closes it. An open list highlights its first row.
 pub(in crate::root) fn recipient_suggestions_toggled(
-    kind: DeliveryFormKind,
+    kind: impl Into<RecipientRules>,
     options: &[RecipientOption],
     query: &str,
     open: bool,
@@ -153,7 +191,7 @@ pub(in crate::root) fn recipient_suggestions_toggled(
 
 /// The list after the input changed: open while a partial entry searches the options.
 pub(in crate::root) fn recipient_suggestions_for_input(
-    kind: DeliveryFormKind,
+    kind: impl Into<RecipientRules>,
     options: &[RecipientOption],
     query: &str,
 ) -> (bool, Option<usize>) {
@@ -170,12 +208,13 @@ pub(in crate::root) fn recipient_suggestions_for_input(
 /// The open list after an arrow key moved its highlight, or `None` when the key doesn't move
 /// it: there is nothing to suggest, or the input holds a new recipient to save.
 pub(in crate::root) fn recipient_suggestion_moved(
-    kind: DeliveryFormKind,
+    kind: impl Into<RecipientRules>,
     options: &[RecipientOption],
     query: &str,
     current: Option<usize>,
     direction: RecipientSuggestionDirection,
 ) -> Option<(bool, Option<usize>)> {
+    let kind = kind.into();
     if options.is_empty() || can_save_recipient(kind, query, options) {
         return None;
     }
@@ -189,7 +228,7 @@ pub(in crate::root) fn recipient_suggestion_moved(
 
 /// The address Enter selects: the highlighted row, or the only one.
 pub(in crate::root) fn recipient_suggestion_to_confirm(
-    kind: DeliveryFormKind,
+    kind: impl Into<RecipientRules>,
     options: &[RecipientOption],
     query: &str,
     current: Option<usize>,
@@ -204,13 +243,21 @@ pub(in crate::root) fn recipient_suggestion_to_confirm(
 
 /// Whether the input holds a valid recipient that no option already names.
 pub(in crate::root) fn can_save_recipient(
-    kind: DeliveryFormKind,
+    kind: impl Into<RecipientRules>,
     recipient: &str,
     options: &[RecipientOption],
 ) -> bool {
-    match kind {
-        DeliveryFormKind::Send => can_save_private_recipient(recipient, options),
-        DeliveryFormKind::Unshield => can_save_public_recipient(recipient, options),
+    match kind.into() {
+        RecipientRules::Form(DeliveryFormKind::Send) => {
+            can_save_private_recipient(recipient, options)
+        }
+        RecipientRules::Form(DeliveryFormKind::Unshield) => {
+            can_save_public_recipient(recipient, options)
+        }
+        // Options hold canonical receivers, which the entry is compared in.
+        RecipientRules::NonEvm(network) => network
+            .parse_receiver(recipient)
+            .is_ok_and(|receiver| !options.iter().any(|option| *option.address == *receiver)),
     }
 }
 
@@ -223,9 +270,9 @@ pub(in crate::root) fn recipient_option_display_address(option: &RecipientOption
         RecipientOptionSource::PrivateWallet | RecipientOptionSource::PrivateAddressBook => {
             short_hash(&option.address)
         }
-        RecipientOptionSource::PublicAccount | RecipientOptionSource::PublicAddressBook => {
-            option.address.to_string()
-        }
+        RecipientOptionSource::PublicAccount
+        | RecipientOptionSource::PublicAddressBook
+        | RecipientOptionSource::NonEvmAddressBook => option.address.to_string(),
     }
 }
 
@@ -319,7 +366,7 @@ pub(in crate::root) fn render_recipient_picker(
 pub(in crate::root) fn form_recipient_picker(
     id: impl Into<ElementId>,
     save_id: SharedString,
-    kind: DeliveryFormKind,
+    kind: impl Into<RecipientRules>,
     input: &Entity<InputState>,
     current_value: &str,
     suggestions_open: bool,
@@ -330,6 +377,7 @@ pub(in crate::root) fn form_recipient_picker(
     on_event: impl Fn(&RecipientPickerEvent, &mut Window, &mut App) + 'static,
     on_save: impl Fn(String, &mut Window, &mut App) + 'static,
 ) -> RecipientPicker {
+    let kind = kind.into();
     let save_visible = can_save_recipient(kind, current_value, options);
     let options = options
         .iter()
@@ -369,26 +417,33 @@ pub(in crate::root) fn form_recipient_picker(
 }
 
 impl WalletRoot {
+    /// Forget the loaded private, public and non-EVM address books.
+    pub(in crate::root) fn clear_address_books(&mut self) {
+        self.private_address_book.clear();
+        self.public_address_book.clear();
+        self.non_evm_address_book.clear();
+    }
+
     pub(in crate::root) fn reload_address_books(&mut self, cx: &mut Context<'_, Self>) {
         let Some(store) = self.vault_store.as_ref() else {
-            self.private_address_book.clear();
-            self.public_address_book.clear();
+            self.clear_address_books();
             return;
         };
         let Some(view_session) = self.view_session.as_ref() else {
-            self.private_address_book.clear();
-            self.public_address_book.clear();
+            self.clear_address_books();
             return;
         };
         match (
             store.list_private_address_book_entries_for_session(view_session.as_ref()),
             store.list_public_address_book_entries_for_session(view_session.as_ref()),
+            store.list_non_evm_address_book_entries_for_session(view_session.as_ref()),
         ) {
-            (Ok(private_entries), Ok(public_entries)) => {
+            (Ok(private_entries), Ok(public_entries), Ok(non_evm_entries)) => {
                 self.private_address_book = private_entries;
                 self.public_address_book = public_entries;
+                self.non_evm_address_book = non_evm_entries;
             }
-            (private_result, public_result) => {
+            (private_result, public_result, non_evm_result) => {
                 if let Err(error) = private_result {
                     tracing::warn!(
                         error_kind = vault_error_kind(&error),
@@ -401,8 +456,13 @@ impl WalletRoot {
                         "load public address book failed"
                     );
                 }
-                self.private_address_book.clear();
-                self.public_address_book.clear();
+                if let Err(error) = non_evm_result {
+                    tracing::warn!(
+                        error_kind = vault_error_kind(&error),
+                        "load non-EVM address book failed"
+                    );
+                }
+                self.clear_address_books();
             }
         }
         cx.notify();
@@ -747,11 +807,12 @@ impl WalletRoot {
 
     pub(in crate::root) fn open_save_recipient_dialog(
         &mut self,
-        kind: DeliveryFormKind,
+        kind: impl Into<RecipientRules>,
         recipient: String,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let kind = kind.into();
         self.address_book_save_error = None;
         self.address_book_label_input
             .update(cx, |input, cx| input.set_value("", window, cx));
@@ -836,7 +897,7 @@ impl WalletRoot {
 
     fn save_recipient_to_address_book(
         &mut self,
-        kind: DeliveryFormKind,
+        kind: RecipientRules,
         label: &str,
         recipient: &str,
         _window: &mut Window,
@@ -858,15 +919,23 @@ impl WalletRoot {
             return false;
         };
         let result = match kind {
-            DeliveryFormKind::Send => store
+            RecipientRules::Form(DeliveryFormKind::Send) => store
                 .add_private_address_book_entry_for_session(
                     view_session.as_ref(),
                     &label,
                     recipient,
                 )
                 .map(|_| ()),
-            DeliveryFormKind::Unshield => store
+            RecipientRules::Form(DeliveryFormKind::Unshield) => store
                 .add_public_address_book_entry_for_session(view_session.as_ref(), &label, recipient)
+                .map(|_| ()),
+            RecipientRules::NonEvm(network) => store
+                .add_non_evm_address_book_entry_for_session(
+                    view_session.as_ref(),
+                    &label,
+                    network,
+                    recipient,
+                )
                 .map(|_| ()),
         };
         match result {

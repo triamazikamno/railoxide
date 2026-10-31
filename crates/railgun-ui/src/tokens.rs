@@ -758,6 +758,19 @@ pub fn token_icon_asset_path(chain_id: u64, addr: &Address) -> Option<String> {
     token_icon_file_name(chain_id, addr).map(|file| format!("railgun-ui/tokens/{file}"))
 }
 
+/// The icon of a known token with exactly `symbol`, for a token outside the registry such as
+/// USDT on Tron: the Ethereum token's, otherwise the first known one's that ships an icon.
+/// `None` for a symbol no known token has.
+#[must_use]
+pub fn symbol_token_icon_asset_path(symbol: &str) -> Option<String> {
+    let rows = || TOKENS.iter().filter(|row| row.2 == symbol);
+    let icon = |row: &TokenRow| token_icon_asset_path(row.0, &row.1);
+    rows()
+        .filter(|row| row.0 == 1)
+        .find_map(icon)
+        .or_else(|| rows().find_map(icon))
+}
+
 fn token_icon_file_name(chain_id: u64, addr: &Address) -> Option<String> {
     let (_, _, _, _, _, icon) = TOKENS
         .iter()

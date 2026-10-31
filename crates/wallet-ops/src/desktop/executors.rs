@@ -69,11 +69,11 @@ pub use swap::{
 };
 pub use swap::{
     BridgeLegPrice, DelegatedSwapExecutor, SwapAccountCandidate, SwapAmountPlan, SwapAmountRequest,
-    SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapDestinationContext, SwapExecutor,
-    SwapInputPlan, SwapOrderOutcome, SwapOrderRequest, SwapOrderState, SwapPlacementReadiness,
-    SwapPrice, SwapPrivateBridgeQuote, SwapQuoteAnchor, SwapQuoteDiagnostics, SwapReview,
-    SwapReviewChange, SwapReviewRequest, SwapSetupInclusion, SwapSetupObservation,
-    SwapSetupRequest, SwapSetupStatus, SwapSpeedUpRefusal, SwapUseClaim,
+    SwapBridgeClients, SwapBridgeDestination, SwapBridgeQuote, SwapBridgeRoute,
+    SwapDestinationContext, SwapExecutor, SwapInputPlan, SwapOrderOutcome, SwapOrderRequest,
+    SwapOrderState, SwapPlacementReadiness, SwapPrice, SwapPrivateBridgeQuote, SwapQuoteAnchor,
+    SwapQuoteDiagnostics, SwapReview, SwapReviewChange, SwapReviewRequest, SwapSetupInclusion,
+    SwapSetupObservation, SwapSetupRequest, SwapSetupStatus, SwapSpeedUpRefusal, SwapUseClaim,
     delivery_shortfall_allowance, is_swap_record, own_pending_setup as own_pending_swap_setup,
     swap_attempt_state, swap_order_state, swap_setup_recorded_executed, swap_setup_status,
     swap_speed_up_relaxes, swap_submission_outcome,

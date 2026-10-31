@@ -422,7 +422,7 @@ impl Wallet {
             .prepare_swap_setup(
                 operation,
                 candidate,
-                setup_approval(self.weth(), self.pair.0, self.pair.1),
+                setup_approval(self.weth(), self.pair.0, self.pair.1.clone()),
                 None,
                 &authorization,
                 crate::OperationHttpClient::direct_for_tests(),
@@ -764,7 +764,7 @@ impl Wallet {
             .prepare_swap_setup(
                 operation,
                 broadcaster(delegate),
-                setup_approval(self.weth(), self.pair.0, self.pair.1),
+                setup_approval(self.weth(), self.pair.0, self.pair.1.clone()),
                 None,
                 &authorization,
                 crate::OperationHttpClient::direct_for_tests(),
@@ -925,7 +925,7 @@ impl Wallet {
                 sell_token: self.weth(),
                 buy_token: self.pair.0,
                 amount,
-                delivery: self.pair.1,
+                delivery: self.pair.1.clone(),
                 byte_budget: None,
             },
             swap_profile.app_data_byte_budget(),
@@ -1025,6 +1025,7 @@ impl Wallet {
                 provider: BridgeProvider::Across,
                 destination_minimum: terms.destination_minimum,
                 expected_output: terms.destination_minimum,
+                expected_output_usd: None,
                 fee: Some(U256::ZERO),
                 leg: crate::BridgeLegPrice::SameAsset,
                 fill_time_sec: None,
@@ -1074,8 +1075,10 @@ impl Wallet {
             .as_ref()
             .map(|(clients, destination_chain, _)| crate::SwapBridgeRoute {
                 clients,
-                destination: &destination,
-                destination_chain,
+                destination: crate::SwapBridgeDestination::Chain {
+                    destination: &destination,
+                    chain: destination_chain,
+                },
             });
         let destination_authorization = authorization.for_destination().unwrap();
         let destination_signing = private.then(|| crate::SwapDestinationSigning {
@@ -1949,7 +1952,7 @@ fn assert_shared_funding(record: &ExecutorRecord, orders: [&Swap; 2], funded: B2
 async fn swap_fork_early_pre_hook_then_speed_up_fill_completes() {
     let fork = ForkChain::start().await;
     let wallet = Wallet::open(&fork);
-    let (first, second) = wallet.overlap(&fork).await;
+    let (first, second) = Box::pin(wallet.overlap(&fork)).await;
     let (operation, executor) = (first.operation, first.executor);
     let sell_amount = first.order.sellAmount;
 
@@ -2063,7 +2066,7 @@ async fn swap_fork_early_pre_hook_then_speed_up_fill_completes() {
 async fn speed_up_fill_scenario(speed_up_trades: bool, speed_up_shields: bool) {
     let fork = ForkChain::start().await;
     let wallet = Wallet::open(&fork);
-    let (first, second) = wallet.overlap(&fork).await;
+    let (first, second) = Box::pin(wallet.overlap(&fork)).await;
     let (operation, executor) = (first.operation, first.executor);
     let shared_nonce = pre_hook_nonce(&wallet.record(operation));
     let (traded, unfilled) = if speed_up_trades {
@@ -2884,7 +2887,7 @@ async fn swap_fork_speed_up_orders_expire_funded_and_recovery_shields_the_sell_t
     let mut wallet = Wallet::open(&fork);
     let profile = wallet.chain.swap_profile().unwrap();
     let finality = wallet.chain.finality_depth;
-    let (first, second) = wallet.overlap(&fork).await;
+    let (first, second) = Box::pin(wallet.overlap(&fork)).await;
     let (operation, executor) = (first.operation, first.executor);
 
     // The open order's pre-hook runs alone, and no solver fills either order.
@@ -2976,7 +2979,7 @@ async fn swap_fork_one_cancellation_invalidates_both_overlapping_orders() {
     let fork = ForkChain::start().await;
     let wallet = Wallet::open(&fork);
     let profile = wallet.chain.swap_profile().unwrap();
-    let (first, second) = wallet.overlap(&fork).await;
+    let (first, second) = Box::pin(wallet.overlap(&fork)).await;
     let (operation, executor) = (first.operation, first.executor);
     let shared_nonce = pre_hook_nonce(&wallet.record(operation));
 
@@ -3530,7 +3533,7 @@ async fn swap_fork_open_order_settlement_deposits_its_speed_ups_across_terms() {
     let spoke_pool = wallet.chain.bridge_profile().unwrap().spoke_pool();
     let finality = wallet.chain.finality_depth;
     wallet.pair = (USDC, across_delivery(BridgeSurplus::Reshield));
-    let (first, second) = wallet.overlap(&fork).await;
+    let (first, second) = Box::pin(wallet.overlap(&fork)).await;
     let (operation, executor) = (first.operation, first.executor);
 
     // Both attempts are live, at the same hook nonces. The speed-up deposits less for the same
@@ -3790,7 +3793,7 @@ async fn swap_fork_spoke_pool_rejects_a_deposit_past_its_quote_age() {
     // An Across attempt whose quote is dated at the fork's latest block. Its pre-hook never
     // runs, so the account's nonce stays below its post-hook's.
     let delivery = across_delivery(BridgeSurplus::KeepInAccount);
-    wallet.pair = (USDC, delivery);
+    wallet.pair = (USDC, delivery.clone());
     let swap = wallet.swap(&fork).await;
     let record = wallet.record(swap.operation);
     let terms = across_terms(&record, swap.uid);
@@ -3855,7 +3858,7 @@ async fn swap_fork_spoke_pool_rejects_a_deposit_past_its_quote_age() {
             .swap_continuing_approvals(
                 swap.operation,
                 swap.swap_use,
-                delivery,
+                &delivery,
                 Some(pre_nonce),
                 crate::OperationHttpClient::direct_for_tests(),
             )
@@ -4388,7 +4391,7 @@ async fn verify_fill(
             placed.swap.operation,
             placed.swap.uid,
             &clients,
-            &destination.chain,
+            Some(&destination.chain),
             crate::OperationHttpClient::direct_for_tests(),
         )
         .await

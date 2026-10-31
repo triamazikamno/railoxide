@@ -86,7 +86,7 @@ impl SwapContinuingApprovals {
 
 /// Whether `delivery` is an Across delivery to a public receiver, the only kind whose earlier
 /// approvals continue.
-pub(super) fn is_public_across(delivery: SwapDelivery) -> bool {
+pub(super) fn is_public_across(delivery: &SwapDelivery) -> bool {
     matches!(
         delivery,
         SwapDelivery::Bridge(bridge)
@@ -104,7 +104,7 @@ pub(super) fn is_public_across(delivery: SwapDelivery) -> bool {
 pub fn swap_continuing_approvals(
     record: &ExecutorRecord,
     swap_use: SwapUseId,
-    delivery: SwapDelivery,
+    delivery: &SwapDelivery,
     pre_hook_nonce: Option<U256>,
     evidence: Option<&SwapQuoteAgeEvidence>,
 ) -> SwapContinuingApprovals {
@@ -113,7 +113,7 @@ pub fn swap_continuing_approvals(
     }
     let approvals = record
         .swap_use_orders(swap_use)
-        .filter(|order| order.delivery() == delivery)
+        .filter(|order| order.delivery() == *delivery)
         .filter_map(|order| {
             let post_hook_nonce = order.post_hook()?.nonce();
             let Some(BridgeOrderTerms::Across(terms)) = order.bridge() else {
@@ -152,7 +152,7 @@ impl ExecutorOwner {
         &self,
         operation: ExecutorOperationId,
         swap_use: SwapUseId,
-        delivery: SwapDelivery,
+        delivery: &SwapDelivery,
         pre_hook_nonce: Option<U256>,
         client: &OperationHttpClient,
     ) -> Result<SwapContinuingApprovals> {

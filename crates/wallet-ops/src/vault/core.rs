@@ -3,6 +3,7 @@ use super::{
     RailgunSpendSigner, Serialize, Sha256, SpendUnlock, U256, ViewUnlock, ViewingKeyData,
     WalletChainMetadataBundle, WalletKeys, Zeroize, Zeroizing, fill,
 };
+use crate::bridge::NonEvmReceiverError;
 
 pub(super) const VAULT_VERSION: u32 = 2;
 pub(super) const KEY_LEN: usize = 32;
@@ -27,6 +28,7 @@ pub(super) const PUBLIC_ACCOUNT_METADATA_PREFIX: &str = "public-account-meta|";
 pub(super) const PUBLIC_ACCOUNT_SECRET_PREFIX: &str = "public-account-secret|";
 pub(super) const PRIVATE_ADDRESS_BOOK_PREFIX: &str = "private-address-book|";
 pub(super) const PUBLIC_ADDRESS_BOOK_PREFIX: &str = "public-address-book|";
+pub(super) const NON_EVM_ADDRESS_BOOK_PREFIX: &str = "non-evm-address-book|";
 pub(super) const BROADCASTER_FAVORITE_PREFIX: &str = "broadcaster-favorite|";
 pub(super) const BROADCASTER_BANNED_PREFIX: &str = "broadcaster-banned|";
 pub(super) const WALLETCONNECT_RELAY_IDENTITY_PREFIX: &str = "walletconnect-relay-identity|";
@@ -159,6 +161,14 @@ pub enum VaultError {
     PublicAddressBookEntryNotFound,
     #[error("public address book display order overflow")]
     PublicAddressBookDisplayOrderOverflow,
+    #[error("invalid non-EVM address book recipient: {0}")]
+    InvalidNonEvmAddressBookAddress(NonEvmReceiverError),
+    #[error("non-EVM address book recipient already exists")]
+    DuplicateNonEvmAddressBookAddress,
+    #[error("non-EVM address book entry not found")]
+    NonEvmAddressBookEntryNotFound,
+    #[error("non-EVM address book display order overflow")]
+    NonEvmAddressBookDisplayOrderOverflow,
     #[error("invalid broadcaster preference address")]
     InvalidBroadcasterPreferenceAddress,
     #[error("invalid hardware wallet descriptor")]
@@ -250,6 +260,7 @@ pub enum RecordKind {
     PublicAccountSecret,
     PrivateAddressBookEntry,
     PublicAddressBookEntry,
+    NonEvmAddressBookEntry,
     BroadcasterFavoriteEntry,
     BroadcasterBannedEntry,
     WalletConnectRelayIdentity,
@@ -282,6 +293,7 @@ impl RecordKind {
             Self::PublicAccountSecret => "public-account-secret",
             Self::PrivateAddressBookEntry => "private-address-book-entry",
             Self::PublicAddressBookEntry => "public-address-book-entry",
+            Self::NonEvmAddressBookEntry => "non-evm-address-book-entry",
             Self::BroadcasterFavoriteEntry => "broadcaster-favorite-entry",
             Self::BroadcasterBannedEntry => "broadcaster-banned-entry",
             Self::WalletConnectRelayIdentity => "walletconnect-relay-identity",

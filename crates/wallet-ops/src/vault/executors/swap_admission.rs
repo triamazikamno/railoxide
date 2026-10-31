@@ -5,7 +5,7 @@
 use broadcaster_core::contracts::cow::OrderUid;
 
 use super::{
-    Address, B256, ExecutorPayloadPurpose, ExecutorRecord, SwapBridgeOutcome, SwapDelivery,
+    Address, B256, ExecutorPayloadPurpose, ExecutorRecord, SwapBridgeOutcome,
     SwapDestinationOutcome, SwapOperationRecord, SwapOrderRecord, SwapUseId, SwapUseRole, U256,
 };
 use crate::settings::ExecutorProfile;
@@ -512,7 +512,7 @@ fn bridge_refusal(
 ) -> Option<SwapAccountRefusal> {
     let observed = order.observations();
     if observed.delivered.is_none()
-        || !matches!(order.delivery(), SwapDelivery::Bridge(_))
+        || !order.delivery().is_bridge()
         || observed.traded.is_none() && swap.trade_order(order).is_none()
     {
         return None;

@@ -1,12 +1,13 @@
 use super::{
     BroadcasterPreferenceEntry, DecodedWalletMetadata, EncryptedRecord, HardwareProfileMetadata,
     HardwareViewAccessKey, HardwareWalletAccountIndexReservation, HmacKeyInit, HmacSha256, KEY_LEN,
-    Mac, PrivateAddressBookEntry, ProtectedSoftwareSeedSession, PublicAccountMetadata,
-    PublicAccountSecret, PublicAddressBookEntry, RecordKind, SOFTWARE_CONTEXT_SEED_LEN, SecretKey,
-    SoftwareSeedSessionBinding, VaultError, WalletChainMetadataBundle, WalletConnectRelayIdentity,
-    WalletConnectSessionRecord, WalletMetadataBundle, WalletMetadataWire, WalletPrivateRecordKind,
-    WalletSpendBundle, WalletViewBundle, Zeroizing, decrypt_payload, decrypt_serialized,
-    derive_context_key, encrypt_payload, encrypt_serialized,
+    Mac, NonEvmAddressBookEntry, PrivateAddressBookEntry, ProtectedSoftwareSeedSession,
+    PublicAccountMetadata, PublicAccountSecret, PublicAddressBookEntry, RecordKind,
+    SOFTWARE_CONTEXT_SEED_LEN, SecretKey, SoftwareSeedSessionBinding, VaultError,
+    WalletChainMetadataBundle, WalletConnectRelayIdentity, WalletConnectSessionRecord,
+    WalletMetadataBundle, WalletMetadataWire, WalletPrivateRecordKind, WalletSpendBundle,
+    WalletViewBundle, Zeroizing, decrypt_payload, decrypt_serialized, derive_context_key,
+    encrypt_payload, encrypt_serialized,
 };
 
 pub struct ViewUnlock {
@@ -293,6 +294,32 @@ impl ViewUnlock {
         decrypt_serialized(
             &self.view_dek,
             RecordKind::PublicAddressBookEntry,
+            entry_uuid,
+            record,
+        )
+    }
+
+    pub fn encrypt_non_evm_address_book_entry(
+        &self,
+        entry_uuid: &str,
+        entry: &NonEvmAddressBookEntry,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.view_dek,
+            RecordKind::NonEvmAddressBookEntry,
+            entry_uuid,
+            entry,
+        )
+    }
+
+    pub fn decrypt_non_evm_address_book_entry(
+        &self,
+        entry_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<NonEvmAddressBookEntry, VaultError> {
+        decrypt_serialized(
+            &self.view_dek,
+            RecordKind::NonEvmAddressBookEntry,
             entry_uuid,
             record,
         )

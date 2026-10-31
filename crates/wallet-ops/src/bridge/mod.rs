@@ -26,6 +26,7 @@ use crate::http::{OperationHttpClient, OperationNetworkIsolation, redact_url_for
 
 mod across;
 mod near_intents;
+mod non_evm;
 #[cfg(test)]
 mod tests;
 mod tokens;
@@ -38,13 +39,15 @@ pub use across::{
 pub(crate) use near_intents::sign_quote_response_for_tests;
 pub use near_intents::{
     NearIntentsClient, OneClickDryQuote, OneClickExecutionStatus, OneClickQuoteParams,
-    OneClickStatus, OneClickToken, OneClickVerifyError, VerifiedOneClickQuote,
+    OneClickRecipient, OneClickStatus, OneClickToken, OneClickVerifyError, VerifiedOneClickQuote,
 };
 #[cfg(feature = "test-support")]
 pub use near_intents::{sign_quote_response_with_stand_in, stand_in_quote_key};
+pub use non_evm::{NonEvmNetwork, NonEvmReceiverError};
 pub use tokens::{
-    BridgeDestination, NearAssets, PublicBridgeDestination, PublicBridgePath, PublicSellAsset,
-    across_destination_tokens, near_destination_tokens, public_across_destination_tokens,
+    BridgeDestination, NearAssets, NonEvmBridgeDestination, PublicBridgeDestination,
+    PublicBridgePath, PublicSellAsset, across_destination_tokens, near_destination_tokens,
+    near_non_evm_destination_tokens, public_across_destination_tokens,
 };
 
 const BRIDGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);

@@ -1792,7 +1792,8 @@ fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut Test
     use alloy::primitives::{B256, Bytes};
     use wallet_ops::vault::{
         ExecutorNonceObservation, ExecutorPayloadContext, ExecutorPayloadPurpose,
-        IssuedExecutorPayload, SwapAccountChoice, SwapPairClaim,
+        IssuedExecutorPayload, NonEvmDelivery, SwapAccountChoice, SwapApprovalTokens,
+        SwapPairClaim,
     };
     with_approved_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
         let issued = pending_setup(executors, operation);
@@ -1969,10 +1970,23 @@ fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut Test
                 assert!(!swaps.cancelled_use(identity, cx).unwrap().needs_attention());
             });
         });
-        // A new swap takes the account and is shown while it is prepared.
+        // A new swap takes the account and is shown while it is prepared. It bridges to
+        // Bitcoin, which its title names rather than the intermediate it buys here.
         let second = SwapUseId::random().unwrap();
         let mut later = test_approval();
         later.bounds.sell_amount = U256::from(200);
+        later.tokens = Some(SwapApprovalTokens {
+            sell: Address::repeat_byte(1),
+            buy: Address::repeat_byte(2),
+        });
+        later.delivery = SwapDelivery::NonEvmBridge(NonEvmDelivery {
+            network: NonEvmNetwork::Bitcoin,
+            receiver: "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq".to_owned(),
+            asset_id: "nep141:btc.omft.near".to_owned(),
+            contract: None,
+            symbol: "BTC".to_owned(),
+            decimals: 8,
+        });
         executors
             .claim_swap_pair(SwapPairClaim {
                 id: second,
@@ -2001,6 +2015,17 @@ fn pending_setup_can_retry_and_stop_without_losing_its_reservation(cx: &mut Test
             assert!(!swaps.has_shown_swaps());
             assert_eq!(swaps.open_order_count(cx), 0);
             assert_eq!(swaps.order_rows_for_test(cx).len(), 2);
+            let title = swaps
+                .cancelled_use(
+                    model::SwapIdentity {
+                        operation,
+                        swap_use: second,
+                    },
+                    cx,
+                )
+                .unwrap()
+                .title;
+            assert!(title.ends_with("→ BTC on Bitcoin"), "{title}");
         };
         cx.update(|_, cx| {
             swaps.update(cx, |swaps, cx| {
@@ -4509,6 +4534,21 @@ fn placed_order(
                 }
             }
         }
+        // 1Click converts the whole payout, which needs no post-hook.
+        SwapDelivery::NonEvmBridge(_) => {
+            bounds.destination_minimum = Some(BRIDGE_MINIMUM);
+            bounds.post_hook_gas_limit = None;
+            (
+                None,
+                Some(BridgeOrderTerms::NearIntents(NearIntentsOrderTerms {
+                    deposit_address: NEAR_DEPOSIT_ADDRESS,
+                    min_amount_out: BRIDGE_MINIMUM,
+                    amount_out: BRIDGE_MINIMUM,
+                    deadline: "2026-09-30T01:00:00.000Z".into(),
+                    signed_quote: "{}".into(),
+                })),
+            )
+        }
     };
     edit(&mut bounds);
     executors
@@ -4584,7 +4624,7 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
         cx.update(|_, cx| {
             swaps.update(cx, |swaps, _| {
                 swaps.reload_records();
-                swaps.tracking.entry(operation).or_default().pending_order = Some(pending);
+                swaps.tracking.entry(operation).or_default().pending_order = Some(pending.clone());
                 let record = swaps.record(operation).unwrap();
                 assert!(swaps.stage(record).needs_recovery());
                 assert_eq!(swaps.recovery_token(record), Some(Address::repeat_byte(1)));
@@ -4630,7 +4670,7 @@ fn reused_account_progress_keeps_the_new_swap_separate_from_its_history(cx: &mut
                 let labels = swaps.labels(swaps.record(operation).unwrap(), cx);
                 let completed = (labels.pair, labels.received);
                 assert!(completed.1.is_some());
-                swaps.tracking.entry(operation).or_default().pending_order = Some(pending);
+                swaps.tracking.entry(operation).or_default().pending_order = Some(pending.clone());
                 swaps.start_job(
                     operation,
                     SwapJobKind::Order,
@@ -5791,7 +5831,7 @@ fn external_swaps_show_their_delivery_and_recover_only_the_sell_token(cx: &mut T
             });
         });
         let delivery = SwapDelivery::External { receiver };
-        let (uid, observed) = placed_swap(executors, operation, delivery);
+        let (uid, observed) = placed_swap(executors, operation, delivery.clone());
         let seen = SwapObservation {
             block: observed.block(),
             transaction_hash: Some(alloy::primitives::B256::repeat_byte(40)),
@@ -5834,7 +5874,7 @@ fn external_swaps_show_their_delivery_and_recover_only_the_sell_token(cx: &mut T
                     SwapStage::Order(SwapOrderState::NotDelivered),
                 ] {
                     assert_eq!(
-                        swap_recovery_token(stage, delivery, sell, buy),
+                        swap_recovery_token(stage, &delivery, sell, buy),
                         sell,
                         "the stealth account never holds the bought token: {stage:?}"
                     );
@@ -6633,7 +6673,8 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
                 .network_items(receive_to, cx)
                 .into_iter()
                 .filter(|network| !network.this_network)
-                .map(|network| (network.chain_id, network.availability))
+                // The chains; the non-EVM networks after them have tests of their own.
+                .filter_map(|network| Some((network.key.chain_id()?, network.availability)))
                 .collect::<Vec<_>>()
         };
         let unavailable = NetworkAvailability::Unavailable;
@@ -6684,25 +6725,33 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
                     swaps
                         .network_items(receive_to, cx)
                         .into_iter()
-                        .map(|network| network.chain_id)
+                        .map(|network| network.key)
                         .collect::<Vec<_>>()
                 };
+                let chain = BuyNetworkKey::Chain;
+                let non_evm = NonEvmNetwork::ALL.map(BuyNetworkKey::NonEvm);
                 assert_eq!(
                     chains(swaps, ReceiveTo::PrivateBalance, cx),
-                    [1, 42161],
-                    "only the chains with a private balance, and disabled Optimism isn't listed"
+                    [chain(1), chain(42161)],
+                    "only the chains with a private balance, and disabled Optimism and the \
+                     non-EVM networks aren't listed"
                 );
                 assert_eq!(
                     chains(swaps, ReceiveTo::PublicAddress, cx),
-                    [1, 42161, 100, ADDED],
-                    "the same order, with the Public-address-only chains after"
+                    [chain(1), chain(42161), chain(100), chain(ADDED)]
+                        .into_iter()
+                        .chain(non_evm)
+                        .collect::<Vec<_>>(),
+                    "the same order, with the Public-address-only chains after, then Bitcoin, \
+                     Solana and Tron last"
                 );
                 let content = swaps.buy_picker_content(swaps.form.as_ref().unwrap(), cx);
                 assert_eq!(content.receive_to, ReceiveTo::PrivateBalance);
                 assert_eq!(
                     content.network_counts,
-                    (2, 4),
-                    "Gnosis and the added chain take a Public address only"
+                    (2, 7),
+                    "Gnosis, the added chain and the three non-EVM networks take a Public \
+                     address only"
                 );
             });
             let states = &root.read(cx).chain_states;
@@ -6725,23 +6774,45 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
                 let content = swaps.buy_picker_content(swaps.form.as_ref().unwrap(), cx);
                 assert_eq!(
                     content.network_counts,
-                    (2, 4),
+                    (2, 7),
                     "the counts don't depend on the delivery kind"
                 );
 
                 // The network search filters what the picker lists, by name or by the start
                 // of the chain id, and leaves the form's own list alone.
+                let chain = BuyNetworkKey::Chain;
+                let non_evm = NonEvmNetwork::ALL.map(BuyNetworkKey::NonEvm);
                 let networks = swaps.form.as_ref().unwrap().picker.networks.clone();
                 let mut matches = |query: &'static str, cx: &mut Context<'_, PrivateSwapsView>| {
                     networks.update(cx, |list, cx| {
                         list.set_query(query, window, cx);
-                        list.delegate().listed().collect::<Vec<_>>()
+                        let delegate = list.delegate();
+                        (
+                            delegate.listed().collect::<Vec<_>>(),
+                            delegate.heading_row(),
+                        )
                     })
                 };
-                assert_eq!(matches(" ARBITRUM ", cx), [42161]);
-                assert_eq!(matches("7777", cx), [ADDED]);
+                assert_eq!(matches(" ARBITRUM ", cx), (vec![chain(42161)], None));
+                assert_eq!(matches("7777", cx), (vec![chain(ADDED)], None));
                 assert_eq!(listed(swaps, ReceiveTo::PublicAddress, cx).len(), 3);
-                assert_eq!(matches("", cx), [1, 42161, 100, ADDED]);
+                // The non-EVM networks follow the chains under their heading, which only
+                // parts them from the chains: a search matching none of the chains lists no
+                // heading, which would take the row-0 selection and leave Enter doing nothing.
+                assert_eq!(
+                    matches("", cx),
+                    (
+                        [chain(1), chain(42161), chain(100), chain(ADDED)]
+                            .into_iter()
+                            .chain(non_evm)
+                            .collect(),
+                        Some(4)
+                    )
+                );
+                assert_eq!(
+                    matches("sol", cx),
+                    (vec![BuyNetworkKey::NonEvm(NonEvmNetwork::Solana)], None)
+                );
             });
         });
 
@@ -7180,7 +7251,7 @@ fn private_bridge_accounts_are_chosen_independently(cx: &mut TestAppContext) {
                     swaps.open_buy_picker(window, cx);
                     assert_eq!(picker_polygon(swaps, cx), NetworkAvailability::ReuseOnly);
                     let form = swaps.form.as_ref().unwrap();
-                    assert_eq!(form.picker.network, 137);
+                    assert_eq!(form.picker.network, BuyNetworkKey::Chain(137));
                     let content = swaps.buy_picker_content(form, cx);
                     assert!(matches!(
                         &content.tokens,
@@ -7253,7 +7324,10 @@ fn private_bridge_accounts_are_chosen_independently(cx: &mut TestAppContext) {
                     assert_eq!(picker_polygon(swaps, cx), NetworkAvailability::CheckingFee);
                     swaps.show_buy_picker_network(1, window, cx);
                     swaps.show_buy_picker_network(137, window, cx);
-                    assert_eq!(swaps.form.as_ref().unwrap().picker.network, 137);
+                    assert_eq!(
+                        swaps.form.as_ref().unwrap().picker.network,
+                        BuyNetworkKey::Chain(137)
+                    );
                     swaps.close_buy_picker(cx);
                     window.close_dialog(cx);
                     assert!(swaps.form.as_ref().unwrap().quote_delivery().is_none());
@@ -7286,7 +7360,10 @@ fn private_bridge_accounts_are_chosen_independently(cx: &mut TestAppContext) {
                     );
                     swaps.show_buy_picker_network(1, window, cx);
                     swaps.show_buy_picker_network(137, window, cx);
-                    assert_eq!(swaps.form.as_ref().unwrap().picker.network, 137);
+                    assert_eq!(
+                        swaps.form.as_ref().unwrap().picker.network,
+                        BuyNetworkKey::Chain(137)
+                    );
                     swaps.close_buy_picker(cx);
                     window.close_dialog(cx);
                     let select = swaps
@@ -8006,7 +8083,7 @@ fn reused_source_places_its_approved_order_once_the_new_destination_is_set_up(
                 previous_order: None,
                 sell: review.plan().sell_token(),
                 buy: review.plan().buy_token(),
-                delivery: approval.delivery,
+                delivery: approval.delivery.clone(),
                 amount: approval.bounds.spend_amount(),
                 private_minimum: approval.bounds.private_minimum,
                 slippage_bps: review.slippage_bps(),
@@ -8037,7 +8114,8 @@ fn reused_source_places_its_approved_order_once_the_new_destination_is_set_up(
             cx.update(|_, cx| {
                 swaps.update(cx, |swaps, cx| {
                     swaps.reload_records();
-                    swaps.tracking.entry(operation).or_default().pending_order = Some(draft);
+                    swaps.tracking.entry(operation).or_default().pending_order =
+                        Some(draft.clone());
                     let account = swaps
                         .labels(swaps.record(operation).unwrap(), cx)
                         .bridge
@@ -8080,7 +8158,7 @@ fn reused_source_places_its_approved_order_once_the_new_destination_is_set_up(
                     swaps.reload_destinations(cx);
                     // What the approved setup's submission leaves in this session.
                     let tracking = swaps.tracking.entry(operation).or_default();
-                    tracking.pending_order = Some(draft);
+                    tracking.pending_order = Some(draft.clone());
                     tracking.auto_place = true;
                     tracking.bridge_clients = Some(stub_bridge_clients(&stubs, &orderbook));
                     tracking.orderbook = Some(orderbook);
@@ -8152,7 +8230,7 @@ fn reused_source_places_its_approved_order_once_the_new_destination_is_set_up(
                     swaps.tracking.entry(operation).or_default().pending_order =
                         Some(PendingSwapOrder {
                             swap_use: SwapUseId::random().unwrap(),
-                            ..draft
+                            ..draft.clone()
                         });
                     let account = swaps
                         .labels(swaps.record(operation).unwrap(), cx)
@@ -9616,7 +9694,7 @@ fn picker_polygon(swaps: &PrivateSwapsView, cx: &App) -> NetworkAvailability {
     content
         .networks
         .iter()
-        .find(|network| network.chain_id == 137)
+        .find(|network| network.key == BuyNetworkKey::Chain(137))
         .unwrap()
         .availability
 }
@@ -9680,7 +9758,10 @@ fn buy_picker_switch_is_receive_to_and_a_kept_network_explains_itself(cx: &mut T
         });
         swaps.read_with(cx, |swaps, _| {
             let form = swaps.form.as_ref().unwrap();
-            assert_eq!((form.picker.network, form.network), (137, None));
+            assert_eq!(
+                (form.picker.network, form.network),
+                (BuyNetworkKey::Chain(137), None)
+            );
         });
         cx.update(|window, cx| {
             swaps.update(cx, |swaps, cx| {
@@ -9719,7 +9800,10 @@ fn buy_picker_switch_is_receive_to_and_a_kept_network_explains_itself(cx: &mut T
                 let form = swaps.form.as_ref().unwrap();
                 let content = swaps.buy_picker_content(form, cx);
                 assert_eq!(content.receive_to, ReceiveTo::PrivateBalance);
-                assert_eq!((content.network, form.network), (137, Some(137)));
+                assert_eq!(
+                    (content.network, form.network),
+                    (BuyNetworkKey::Chain(137), Some(137))
+                );
                 assert_eq!(
                     picker_polygon(swaps, cx),
                     NetworkAvailability::Syncing(Some(92))
@@ -9746,11 +9830,25 @@ fn buy_picker_lists_pick_their_selection(cx: &mut TestAppContext) {
             cx.update(|window, cx| window.draw(cx).clear(cx));
         };
         let shown = |cx: &mut gpui::VisualTestContext| {
-            swaps.read_with(cx, |swaps, _| swaps.form.as_ref().unwrap().picker.network)
+            swaps.read_with(cx, |swaps, _| {
+                swaps
+                    .form
+                    .as_ref()
+                    .unwrap()
+                    .picker
+                    .network
+                    .chain_id()
+                    .unwrap()
+            })
         };
         let listed = |cx: &mut gpui::VisualTestContext| {
             draw(cx);
-            networks.read_with(cx, |list, _| list.delegate().listed().collect::<Vec<_>>())
+            networks.read_with(cx, |list, _| {
+                list.delegate()
+                    .listed()
+                    .filter_map(BuyNetworkKey::chain_id)
+                    .collect::<Vec<_>>()
+            })
         };
         draw(cx);
         cx.update(|window, cx| networks.read(cx).focus_handle(cx).focus(window, cx));
@@ -9781,7 +9879,23 @@ fn buy_picker_lists_pick_their_selection(cx: &mut TestAppContext) {
         cx.simulate_keystrokes("enter");
         assert_eq!(shown(cx), 137);
 
+        // A search matching a non-EVM network alone selects it, not a heading, so Enter shows it.
+        cx.update(|window, cx| {
+            networks.update(cx, |list, cx| list.set_query("sol", window, cx));
+        });
+        draw(cx);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            swaps.read_with(cx, |swaps, _| swaps.form.as_ref().unwrap().picker.network),
+            BuyNetworkKey::NonEvm(NonEvmNetwork::Solana)
+        );
+
         // POL, USDC, then USDT.
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.show_buy_picker_network(137, window, cx);
+            });
+        });
         draw(cx);
         cx.update(|window, cx| {
             tokens.update(cx, |list, cx| {
@@ -10817,7 +10931,7 @@ fn competing_orders_follow_the_one_that_traded(cx: &mut TestAppContext, original
             ..Default::default()
         };
         executors
-            .record_swap_observations(operation, winner, traded)
+            .record_swap_observations(operation, winner, traded.clone())
             .unwrap();
         cx.update(|_, cx| {
             swaps.update(cx, |swaps, cx| {
@@ -11777,6 +11891,449 @@ fn near_intents_review_shows_the_estimate_and_what_1click_learns(cx: &mut TestAp
         });
         },
     );
+}
+
+fn non_evm_entry(
+    label: &str,
+    network: NonEvmNetwork,
+    address: &str,
+) -> wallet_ops::vault::NonEvmAddressBookEntry {
+    wallet_ops::vault::NonEvmAddressBookEntry {
+        entry_uuid: format!("{label}-entry"),
+        label: label.into(),
+        network,
+        address: address.into(),
+        display_order: 0,
+    }
+}
+
+/// Show the open Buy picker's `network` and wait for 1Click's tokens there.
+fn show_non_evm_network(
+    swaps: &Entity<PrivateSwapsView>,
+    network: NonEvmNetwork,
+    runtime: &tokio::runtime::Runtime,
+    cx: &mut gpui::VisualTestContext,
+) {
+    cx.update(|window, cx| {
+        swaps.update(cx, |swaps, cx| {
+            swaps.show_buy_picker_network(network, window, cx);
+        });
+    });
+    drive_until(cx, runtime, |cx| {
+        swaps.read_with(cx, |swaps, _| {
+            let form = swaps.form.as_ref().unwrap();
+            form.bridge
+                .non_evm_routes
+                .contains_key(&(STUB_USDC, network))
+        })
+    });
+}
+
+/// Showing and picking a non-EVM network starts no chain session. Solana lists 1Click's tokens
+/// there with their mints, so look-alike symbols each show their own, and a pasted mint finds
+/// its token. The receiver must then be a Solana address, its suggestions are the saved Solana
+/// entries alone, and Private balance isn't available there.
+#[gpui::test]
+fn non_evm_networks_list_1click_tokens_and_take_their_own_receivers(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_bridge_form(root, swaps, &stubs, runtime, cx);
+        let sessions = |cx: &mut gpui::VisualTestContext| {
+            root.read_with(cx, |root, _| {
+                let mut chains = root.chain_states.keys().copied().collect::<Vec<_>>();
+                chains.sort_unstable();
+                chains
+            })
+        };
+        let before = sessions(cx);
+        cx.update(|_, cx| {
+            root.update(cx, |root, _| {
+                root.public_address_book = vec![cold_wallet_entry(Address::repeat_byte(0x51))];
+                root.non_evm_address_book = vec![
+                    non_evm_entry("Phantom", NonEvmNetwork::Solana, SOLANA_RECEIVER),
+                    non_evm_entry(
+                        "Cold storage",
+                        NonEvmNetwork::Bitcoin,
+                        "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq",
+                    ),
+                ];
+            });
+        });
+        show_non_evm_network(swaps, NonEvmNetwork::Solana, runtime, cx);
+        let tokens = swaps.read_with(cx, |swaps, _| {
+            swaps.form.as_ref().unwrap().picker.tokens.clone()
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.update(|window, cx| {
+            tokens.update(cx, |list, cx| {
+                assert_eq!(
+                    list.delegate().listed_contracts(),
+                    [
+                        ("SOL".to_owned(), None),
+                        ("sUSDC".to_owned(), Some(STUB_SOLANA_SUSDC.to_owned())),
+                        ("USDC".to_owned(), Some(STUB_SOLANA_USDC.to_owned())),
+                    ],
+                    "the native asset first, and each look-alike with its own mint"
+                );
+                list.set_query(STUB_SOLANA_SUSDC, window, cx);
+                assert_eq!(
+                    list.delegate().listed_contracts(),
+                    [("sUSDC".to_owned(), Some(STUB_SOLANA_SUSDC.to_owned()))]
+                );
+            });
+            swaps.update(cx, |swaps, cx| {
+                swaps.pick_non_evm_token(Some(STUB_SOLANA_USDC.to_owned()), window, cx);
+                let form = swaps.form.as_ref().unwrap();
+                assert_eq!(
+                    (form.network, form.non_evm, form.buy),
+                    (None, Some(NonEvmNetwork::Solana), None)
+                );
+                // The Polygon swap's 0x receiver isn't a Solana address.
+                assert_eq!(
+                    form.delivery,
+                    Err(DeliveryProblem::Receiver(
+                        "The receiver must be a Solana address.".into()
+                    ))
+                );
+                let options = swaps.receiver_options(cx);
+                assert_eq!(
+                    options
+                        .iter()
+                        .map(|option| (option.label.as_ref(), option.address.as_ref()))
+                        .collect::<Vec<_>>(),
+                    [("Phantom", SOLANA_RECEIVER)],
+                    "no public account, EVM entry or other network's entry is suggested"
+                );
+                set_receiver_text(swaps, SOLANA_RECEIVER, window, cx);
+                assert!(matches!(
+                    &swaps.form.as_ref().unwrap().delivery,
+                    Ok(SwapDelivery::NonEvmBridge(delivery))
+                        if delivery.receiver == SOLANA_RECEIVER
+                            && delivery.contract.as_deref() == Some(STUB_SOLANA_USDC)
+                ));
+                swaps.set_receive_to(ReceiveTo::PrivateBalance, window, cx);
+                let form = swaps.form.as_ref().unwrap();
+                assert!(
+                    matches!(
+                        &form.delivery,
+                        Err(DeliveryProblem::Network { problem, syncing: false })
+                            if problem.starts_with("Private balance isn't available on Solana.")
+                    ),
+                    "{:?}",
+                    form.delivery
+                );
+                assert!(form.quote_delivery().is_none(), "nothing is quoted");
+            });
+            window.draw(cx).clear(cx);
+        });
+        assert!(cx.debug_bounds("swap-receive-to-problem").is_some());
+        assert_eq!(
+            sessions(cx),
+            before,
+            "a non-EVM network has no chain session"
+        );
+    });
+}
+
+/// A Bitcoin receiver is checked as a mainnet address, and a new one is saved to the non-EVM
+/// address book with network Bitcoin while the field keeps it.
+#[gpui::test]
+fn new_bitcoin_receiver_saves_to_the_non_evm_address_book(cx: &mut TestAppContext) {
+    const RECEIVER: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_bridge_form(root, swaps, &stubs, runtime, cx);
+        show_non_evm_network(swaps, NonEvmNetwork::Bitcoin, runtime, cx);
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.pick_non_evm_token(None, window, cx);
+                set_receiver_text(
+                    swaps,
+                    "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+                    window,
+                    cx,
+                );
+                assert_eq!(
+                    swaps.form.as_ref().unwrap().delivery,
+                    Err(DeliveryProblem::Receiver(
+                        "Only mainnet addresses can receive the swap. Enter a mainnet address."
+                            .into()
+                    ))
+                );
+                set_receiver_text(swaps, RECEIVER, window, cx);
+                assert!(matches!(
+                    &swaps.form.as_ref().unwrap().delivery,
+                    Ok(SwapDelivery::NonEvmBridge(delivery))
+                        if delivery.network == NonEvmNetwork::Bitcoin && delivery.contract.is_none()
+                ));
+            });
+            window.draw(cx).clear(cx);
+        });
+        let save = cx.debug_bounds("swap-save-receiver").unwrap();
+        cx.simulate_click(save.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_input("Cold storage");
+        cx.dispatch_action(gpui_component::dialog::Confirm { secondary: false });
+        cx.run_until_parked();
+        root.read_with(cx, |root, _| {
+            assert_eq!(
+                root.non_evm_address_book
+                    .iter()
+                    .map(|entry| (entry.label.as_str(), entry.network, entry.address.as_str()))
+                    .collect::<Vec<_>>(),
+                [("Cold storage", NonEvmNetwork::Bitcoin, RECEIVER)]
+            );
+            assert!(
+                root.public_address_book
+                    .iter()
+                    .all(|entry| entry.label != "Cold storage"),
+                "nothing is saved to the public address book"
+            );
+        });
+        swaps.read_with(cx, |swaps, cx| {
+            let form = swaps.form.as_ref().unwrap();
+            assert_eq!(form.receiver_input.read(cx).value().to_string(), RECEIVER);
+        });
+    });
+}
+
+/// A Solana review names the network, the receiver with its saved Solana label, and the
+/// token's mint, with NEAR Intents as its bridge and the only provider the form shows. No
+/// anchor prices the look-alike sUSDC, so the review asks for the unverified-price
+/// acknowledgement, names the token without one, and values it only by 1Click's estimate.
+#[gpui::test]
+fn non_evm_review_names_the_network_receiver_and_mint(cx: &mut TestAppContext) {
+    let stubs = SwapStubs::start();
+    with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
+        open_bridge_form(root, swaps, &stubs, runtime, cx);
+        cx.update(|_, cx| {
+            root.update(cx, |root, _| {
+                root.non_evm_address_book = vec![non_evm_entry(
+                    "Phantom",
+                    NonEvmNetwork::Solana,
+                    SOLANA_RECEIVER,
+                )];
+            });
+        });
+        show_non_evm_network(swaps, NonEvmNetwork::Solana, runtime, cx);
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.pick_non_evm_token(Some(STUB_SOLANA_SUSDC.to_owned()), window, cx);
+                set_receiver_text(swaps, SOLANA_RECEIVER, window, cx);
+            });
+        });
+        let review = ready_review(swaps, runtime, cx);
+        swaps.read_with(cx, |swaps, cx| {
+            let SwapDelivery::NonEvmBridge(delivery) = review.plan().delivery() else {
+                panic!("a non-EVM review");
+            };
+            assert_eq!(
+                (delivery.symbol.as_str(), delivery.contract.as_deref()),
+                ("sUSDC", Some(STUB_SOLANA_SUSDC))
+            );
+            let summary = swaps.swap_summary(&review, None, None, None, None, cx);
+            let (label, amount, _) = summary.receive_card_for_test().unwrap();
+            assert_eq!(
+                (label, amount),
+                (
+                    "Receive on Solana, at least".to_owned(),
+                    non_evm_amount(&delivery, review.bridge().unwrap().destination_minimum)
+                )
+            );
+            // Only 1Click's quote values the token, at its expected output's rate.
+            assert_eq!(
+                summary.receive_usd_for_test().as_deref(),
+                Some("≈ $12.50 · 1Click estimate")
+            );
+            assert_eq!(
+                summary.receiver_for_test(),
+                Some((SOLANA_RECEIVER.to_owned(), Some("Phantom".to_owned())))
+            );
+            let rows = summary.rows_for_test();
+            for row in [
+                ("Bridge", "NEAR Intents · fee included"),
+                ("Mint", STUB_SOLANA_SUSDC),
+            ] {
+                assert!(
+                    rows.contains(&(row.0.to_owned(), row.1.to_owned())),
+                    "{row:?} in {rows:?}"
+                );
+            }
+            // The mint shows in the short form the form and the order detail give it.
+            let mint = ("Mint".to_owned(), short_non_evm(STUB_SOLANA_SUSDC));
+            let shown = summary.shown_rows_for_test();
+            assert!(shown.contains(&mint), "{mint:?} in {shown:?}");
+            let warnings = summary.warnings_for_test();
+            assert!(
+                warnings.contains(&format!(
+                    "{UNVERIFIED_PRICE_WARNING} No independent price is known for sUSDC on Solana."
+                )) && warnings
+                    .iter()
+                    .any(|warning| warning == NEAR_INTENTS_DISCLAIMER),
+                "{warnings:?}"
+            );
+            assert_eq!(
+                swaps.form.as_ref().unwrap().review_problem(&review),
+                Some("Accept the unverified price before you review the swap.".into())
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("swap-provider-near-intents").is_some());
+        assert!(cx.debug_bounds("swap-buy-contract").is_some());
+    });
+}
+
+/// A non-EVM swap's history comes from its record: no 1Click client is set up, so no token
+/// list can be fetched, and My orders and the detail still name the network, the receiver by
+/// its saved label, the token and its amounts, and 1Click's Solana transaction as it reported
+/// it.
+#[gpui::test]
+fn non_evm_history_renders_from_the_record_without_the_token_list(cx: &mut TestAppContext) {
+    const SIGNATURE: &str =
+        "2zf1D3JpcScRk9TTCWSQmbKr8hB9nfiLK9iA7mHvNuxqSrDDLCRFY7mb48txGysNHWns8autYb6meqyhRAPs23qT";
+    use wallet_ops::vault::{NonEvmDelivery, SwapBridgeOutcome};
+    with_approved_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+        cx.update(|_, cx| {
+            root.update(cx, |root, _| {
+                root.non_evm_address_book = vec![non_evm_entry(
+                    "Phantom",
+                    NonEvmNetwork::Solana,
+                    SOLANA_RECEIVER,
+                )];
+            });
+        });
+        let delivery = NonEvmDelivery {
+            network: NonEvmNetwork::Solana,
+            receiver: SOLANA_RECEIVER.to_owned(),
+            asset_id: "nep141:sol-JUP".to_owned(),
+            contract: Some("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN".to_owned()),
+            symbol: "JUP".to_owned(),
+            decimals: 6,
+        };
+        let (uid, observed) = placed_swap(
+            executors,
+            operation,
+            SwapDelivery::NonEvmBridge(delivery.clone()),
+        );
+        executors
+            .record_swap_observations(
+                operation,
+                uid,
+                bridge_observations(
+                    observed,
+                    None,
+                    Some(SwapBridgeOutcome::DeliveredReported {
+                        amount_out: Some(U256::from(181_250_000_u32)),
+                        transaction_hash: None,
+                        destination_transaction: Some(SIGNATURE.to_owned()),
+                    }),
+                ),
+            )
+            .unwrap();
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                let record = swaps.record(operation).unwrap();
+                let stage = swaps.stage(record);
+                assert_eq!(stage, SwapStage::Order(SwapOrderState::Done));
+                let labels = swaps.labels(record, cx);
+                // Its name gives the network, as its symbol can match the sold token's.
+                assert!(
+                    labels.pair.ends_with(" for JUP on Solana"),
+                    "{}",
+                    labels.pair
+                );
+                let bridge = labels.bridge.clone().unwrap();
+                assert_eq!(
+                    (
+                        bridge.network.as_str(),
+                        bridge.token.as_str(),
+                        bridge.receiver.as_str(),
+                        bridge.minimum.clone(),
+                        labels.received,
+                        bridge.destination_transaction.as_deref(),
+                    ),
+                    (
+                        "Solana",
+                        "JUP",
+                        "Phantom",
+                        Some(non_evm_amount(&delivery, BRIDGE_MINIMUM)),
+                        // Amounts of 100 or more show no decimals.
+                        Some("181 JUP".to_owned()),
+                        Some(SIGNATURE),
+                    )
+                );
+                let rows = swaps.order_rows_for_test(cx);
+                assert!(
+                    rows.iter().any(|(meta, shown)| {
+                        // NEAR Intents' deliveries are all reported, so the status needn't say.
+                        meta.ends_with(" · to Phantom on Solana · NEAR Intents")
+                            && shown == "Delivered"
+                    }),
+                    "{rows:?}"
+                );
+                swaps.show_detail(operation, window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        for selector in [
+            "swap-bridge-facts",
+            "swap-detail-receiver",
+            "swap-destination-transaction",
+            "swap-step-destination-transaction",
+        ] {
+            assert!(cx.debug_bounds(selector).is_some(), "{selector}");
+        }
+    });
+}
+
+/// Each attempt of a non-EVM swap shows its own approved minimum in the destination token, not
+/// the intermediate the order buys.
+#[gpui::test]
+fn non_evm_attempts_show_their_destination_minimums(cx: &mut TestAppContext) {
+    use wallet_ops::vault::{
+        NonEvmDelivery, SwapObservation, SwapPreHookDeath, SwapPreHookDeathCause,
+    };
+    with_approved_swap_view(cx, |_, swaps, executors, operation, _, cx| {
+        let delivery = NonEvmDelivery {
+            network: NonEvmNetwork::Solana,
+            receiver: SOLANA_RECEIVER.to_owned(),
+            asset_id: "nep141:sol.omft.near".to_owned(),
+            contract: None,
+            symbol: "SOL".to_owned(),
+            decimals: 9,
+        };
+        let (uid, observed) = placed_swap(
+            executors,
+            operation,
+            SwapDelivery::NonEvmBridge(delivery.clone()),
+        );
+        let higher = BRIDGE_MINIMUM + U256::from(10_000_000);
+        let expired = SwapPreHookDeath {
+            cause: SwapPreHookDeathCause::Expired,
+            observation: SwapObservation {
+                block: observed.block(),
+                transaction_hash: None,
+            },
+        };
+        retried_and_traded(executors, operation, uid, observed, expired, |bounds| {
+            bounds.destination_minimum = Some(higher);
+        });
+        cx.update(|_, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.reload_records();
+                let record = swaps.record(operation).unwrap();
+                let latest = record.swap().unwrap().orders().last().unwrap();
+                let attempts = model::SwapAttempts::ending_at(record, latest);
+                let rows = swaps.attempt_rows(record, &attempts, cx);
+                for (row, minimum) in rows.iter().zip([BRIDGE_MINIMUM, higher]) {
+                    let expected = format!("Minimum {} · ", non_evm_amount(&delivery, minimum));
+                    assert!(row.detail.starts_with(&expected), "{}", row.detail);
+                }
+                assert_eq!(rows.len(), 2);
+            });
+        });
+    });
 }
 
 /// Provider fees or private destination costs can each push the approved costs above 20%.
@@ -13472,7 +14029,7 @@ fn across_bridge_swaps_show_the_hand_off_and_each_outcome(cx: &mut TestAppContex
         // The settlement showed no deposit, and no account read has found the payout yet.
         let unverified = SwapOrderObservations {
             undelivered: None,
-            ..not_sent
+            ..not_sent.clone()
         };
         for (observations, state, last, status) in [
             (
@@ -13486,13 +14043,14 @@ fn across_bridge_swaps_show_the_hand_off_and_each_outcome(cx: &mut TestAppContex
                 handed_off(Some(SwapBridgeOutcome::DeliveredReported {
                     amount_out: None,
                     transaction_hash: None,
+                    destination_transaction: None,
                 })),
                 SwapOrderState::Done,
                 ("Delivered on Polygon · reported by Across", Done),
                 "Delivered · reported by Across",
             ),
             (
-                handed_off(Some(verified)),
+                handed_off(Some(verified.clone())),
                 SwapOrderState::Done,
                 ("Delivered on Polygon · verified", Done),
                 "Delivered",
@@ -13727,12 +14285,10 @@ fn retried_and_traded(
                 bounds,
                 invalidates: None,
                 pre_hook: hook(1, 0x21, ExecutorPayloadPurpose::SwapPreHook, inputs),
-                post_hook: Some(hook(
-                    2,
-                    0x22,
-                    ExecutorPayloadPurpose::SwapPostHook,
-                    Vec::new(),
-                )),
+                post_hook: order
+                    .delivery()
+                    .has_post_hook()
+                    .then(|| hook(2, 0x22, ExecutorPayloadPurpose::SwapPostHook, Vec::new())),
                 bridge: order.bridge().cloned(),
                 speed_up: None,
             },
@@ -13764,7 +14320,7 @@ fn deposit_of_a_later_trade(
         traded: None,
         trade_amounts: None,
         pre_hook_dead: Some(expired),
-        ..*handed_off
+        ..handed_off.clone()
     }
 }
 
@@ -13962,7 +14518,7 @@ fn a_trade_delivered_by_its_speed_ups_deposit_follows_that_deposit(cx: &mut Test
             private: None,
         });
         let lower = BRIDGE_MINIMUM - U256::from(1_000_000);
-        let (original, observed) = placed_swap(executors, operation, delivery);
+        let (original, observed) = placed_swap(executors, operation, delivery.clone());
         let (speed_up, _) = placed_order(
             executors,
             operation,
@@ -14190,7 +14746,7 @@ fn across_refund_recovery(cx: &mut TestAppContext, split: bool) {
         );
         let refunding = Some(SwapBridgeOutcome::Refunding);
         executors
-            .record_swap_observations(operation, uid, handed_off(refunding, None))
+            .record_swap_observations(operation, uid, handed_off(refunding.clone(), None))
             .unwrap();
         assert_eq!(
             stage(cx, &shields),
@@ -14412,7 +14968,7 @@ fn manual_checks_reconcile_destination_payloads_even_after_a_later_error(cx: &mu
                 )
                 .unwrap();
             let placed = origin
-                .record_swap_bridge_outcome(operation, earlier_uid, earlier_delivery)
+                .record_swap_bridge_outcome(operation, earlier_uid, earlier_delivery.clone())
                 .unwrap();
             assert!(destination.reconcile_swap_destinations().unwrap());
 
@@ -14440,7 +14996,7 @@ fn manual_checks_reconcile_destination_payloads_even_after_a_later_error(cx: &mu
                     purpose_summary: None,
                     assets: Vec::new(),
                     approval: SwapApproval {
-                        delivery,
+                        delivery: delivery.clone(),
                         ..test_approval()
                     },
                     destination: Some(SwapDestinationClaim {
@@ -15583,9 +16139,15 @@ const STUB_ARBITRUM_WETH: Address =
 const STUB_BASE_WETH: Address =
     alloy::primitives::address!("4200000000000000000000000000000000000006");
 
+/// The mints 1Click's stub lists on Solana: USDC's, and a look-alike sUSDC's.
+const STUB_SOLANA_USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const STUB_SOLANA_SUSDC: &str = "FiNPw48pLZgbwmFiaYdTyJDvQCsefYx3CsBy4iVZFpBz";
+/// A Solana receiver: 32 bytes in base58, which no wallet holds.
+const SOLANA_RECEIVER: &str = "9jQtwHhZT1H2TYSMt74msmBmy8UPen4GUysNynPUVkkv";
+
 /// The stub providers' lists from Ethereum. Across bridges USDC and USDT to Polygon, and WETH
 /// to Arbitrum One and Base. 1Click lists both stablecoins on Ethereum and Polygon, native POL on
-/// Polygon, and native ETH on Arbitrum One.
+/// Polygon, native ETH on Arbitrum One, SOL, USDC and sUSDC on Solana, and BTC on Bitcoin.
 fn stub_bridge_list(path: &str) -> serde_json::Value {
     let route = |chain: u64, origin: Address, destination: Address, symbol: &str| {
         serde_json::json!({
@@ -15608,6 +16170,13 @@ fn stub_bridge_list(path: &str) -> serde_json::Value {
             route(8453, STUB_WETH, STUB_BASE_WETH, "WETH"),
         ])
     } else if path.starts_with("/near/v0/tokens") {
+        // Non-EVM contracts are 1Click's strings, such as a Solana mint.
+        let non_evm = |blockchain: &str, symbol: &str, contract: Option<&str>, decimals: u8| {
+            serde_json::json!({
+                "assetId": format!("nep141:{blockchain}-{symbol}"), "decimals": decimals,
+                "blockchain": blockchain, "symbol": symbol, "contractAddress": contract
+            })
+        };
         serde_json::json!([
             token("eth", "USDC", Some(STUB_USDC)),
             token("eth", "USDT", Some(STUB_USDT)),
@@ -15615,6 +16184,10 @@ fn stub_bridge_list(path: &str) -> serde_json::Value {
             token("pol", "USDC", Some(STUB_POLYGON_USDC)),
             token("pol", "USDT", Some(STUB_POLYGON_USDT)),
             token("arb", "ETH", None),
+            non_evm("sol", "SOL", None, 9),
+            non_evm("sol", "USDC", Some(STUB_SOLANA_USDC), 6),
+            non_evm("sol", "sUSDC", Some(STUB_SOLANA_SUSDC), 6),
+            non_evm("btc", "BTC", None, 8),
         ])
     } else {
         serde_json::json!({})
@@ -15627,6 +16200,8 @@ const STUB_QUOTE_SEED: u8 = 7;
 /// at least 12.5 of an 18-decimal token.
 const STUB_NEAR_EXPECTED: &str = "12600000000000000000";
 const STUB_NEAR_MINIMUM: &str = "12500000000000000000";
+/// 1Click's USD value of the expected output, $12.60, which values the minimum at $12.50.
+const STUB_NEAR_EXPECTED_USD: &str = "12.6";
 
 /// A stub provider's answer. Across quotes a fee of the configured share of the amount; 1Click
 /// signs a dry quote of [`STUB_NEAR_EXPECTED`] and [`STUB_NEAR_MINIMUM`] for the request it was
@@ -15672,7 +16247,7 @@ fn stub_bridge_reply(
             "quote": {
                 "amountIn": body["amount"], "minAmountIn": body["amount"],
                 "amountOut": STUB_NEAR_EXPECTED, "minAmountOut": STUB_NEAR_MINIMUM,
-                "timeEstimate": 20
+                "amountOutUsd": STUB_NEAR_EXPECTED_USD, "timeEstimate": 20
             },
             "quoteRequest": body,
             "timestamp": "2026-09-30T00:00:00.000Z"
@@ -18114,7 +18689,7 @@ fn public_form_and_review_follow_the_path_and_name_the_paying_account(cx: &mut T
                         swaps.stub_public_orders_for_tests(true, cx);
                         let fresh = swaps.form.as_ref().unwrap();
                         assert!(
-                            receive_to_problem(fresh, cx).is_none()
+                            receive_to_problem(fresh).is_none()
                                 && swaps.public_form_reason(fresh, cx).is_none(),
                             "an untouched form prompts for a network without an error"
                         );
@@ -18794,7 +19369,7 @@ fn public_buy_picker_keeps_same_asset_routes_and_refuses_own_chain_and_unfunded_
                         .unwrap()
                         .routes
                         .insert((sell, 137), routes);
-                    form.picker.network = 137;
+                    form.picker.network = BuyNetworkKey::Chain(137);
                     form.picker.open = true;
                     let form = swaps.form.as_ref().unwrap();
                     let items = swaps.buy_picker_items(form, cx);
@@ -18815,7 +19390,7 @@ fn public_buy_picker_keeps_same_asset_routes_and_refuses_own_chain_and_unfunded_
                     swaps.show_buy_picker_network(1, window, cx);
                     assert_eq!(
                         swaps.form.as_ref().unwrap().picker.network,
-                        137,
+                        BuyNetworkKey::Chain(137),
                         "the own-chain Shield pointer cannot become a bridge destination"
                     );
                     let content = swaps.buy_picker_content(swaps.form.as_ref().unwrap(), cx);

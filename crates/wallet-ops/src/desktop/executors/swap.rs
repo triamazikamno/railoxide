@@ -55,7 +55,8 @@ pub use admission::SwapShieldNotes;
 #[cfg(test)]
 pub(crate) use admission::notes_of_shield;
 pub use bridge::{
-    BridgeLegPrice, SwapBridgeClients, SwapBridgeQuote, SwapBridgeRoute, SwapPrivateBridgeQuote,
+    BridgeLegPrice, SwapBridgeClients, SwapBridgeDestination, SwapBridgeQuote, SwapBridgeRoute,
+    SwapPrivateBridgeQuote,
 };
 pub use continuing::{
     SwapContinuingApproval, SwapContinuingApprovals, SwapQuoteAgeEvidence,
@@ -2167,7 +2168,7 @@ impl ExecutorOwner {
         let tokens = approval
             .tokens
             .ok_or_else(|| eyre!("the swap's approval has no token pair"))?;
-        if swap.pair_eligibility(tokens.sell, tokens.buy, approval.delivery)
+        if swap.pair_eligibility(tokens.sell, tokens.buy, &approval.delivery)
             != SwapTokenEligibility::Eligible
         {
             return Err(eyre!("this token pair is not eligible for private swaps"));

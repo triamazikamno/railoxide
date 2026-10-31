@@ -24,7 +24,7 @@ use crate::hardware_typed_data::{HardwareEip712Model, HardwareEip712Type, Hardwa
 use crate::settings::{BridgeReceiverRejection, PublicSwapProfile};
 use crate::vault::{
     AcrossOrderTerms, BridgePrivateDelivery, BridgeShieldFailure, ExecutorNonceObservation,
-    PublicSwapPermit,
+    NonEvmDelivery, PublicSwapPermit,
 };
 use broadcaster_core::contracts::cow_shed::{
     COWShedFactory, decode_deposit_hook_calls, execute_hooks_calldata, execute_hooks_digest,
@@ -345,6 +345,11 @@ fn bridge_review() -> SwapReview {
 
 /// A review of `delivery` whose `CoW` price is verified, without its bridge quote.
 fn bridge_review_for(delivery: BridgeDelivery) -> SwapReview {
+    review_of(SwapDelivery::Bridge(delivery))
+}
+
+/// [`bridge_review_for`] of any delivery.
+fn review_of(delivery: SwapDelivery) -> SwapReview {
     let quote: CowQuote = serde_json::from_value(serde_json::json!({
         "quote": {
             "sellToken": WETH, "buyToken": USDC,
@@ -356,7 +361,7 @@ fn bridge_review_for(delivery: BridgeDelivery) -> SwapReview {
     }))
     .unwrap();
     price_swap_review(
-        plan_for(SwapDelivery::Bridge(delivery)),
+        plan_for(delivery),
         quote,
         SwapPrice::Verified {
             rate: PairAnchorRate {
@@ -402,6 +407,7 @@ fn dry_quote(amount_out: U256, min_amount_out: U256) -> OneClickDryQuote {
         amount_out,
         min_amount_out,
         time_estimate_sec: Some(20),
+        amount_out_usd: None,
     }
 }
 
@@ -704,7 +710,7 @@ fn private_delivery_placeholder_has_the_signed_post_hooks_length() {
         )
         .unwrap();
         let placeholder =
-            placeholder_post_hook_calls(executor, USDC, SwapDelivery::Bridge(delivery)).unwrap();
+            placeholder_post_hook_calls(executor, USDC, &SwapDelivery::Bridge(delivery)).unwrap();
         assert_eq!(
             placeholder.abi_encode().len(),
             signed.abi_encode().len(),
@@ -808,7 +814,7 @@ fn review_prices_the_gas_share_once_and_reprices_without_requests() {
         across(BridgeSurplus::Reshield),
         across(BridgeSurplus::KeepInAccount),
     ] {
-        let plan = plan_for(delivery);
+        let plan = plan_for(delivery.clone());
         let review = price(&plan, GAS_SHARE_BALANCED_BPS);
         // 1 wei + 25%, rounded up to a whole wei, for swap and hook gas, plus the data cost.
         let gas_estimate = U256::from((100_000 + plan.hook_gas_estimate()) * 2 + 100_000);
@@ -858,6 +864,7 @@ fn review_prices_the_gas_share_once_and_reprices_without_requests() {
             provider: BridgeProvider::Across,
             destination_minimum: minimum,
             expected_output: minimum,
+            expected_output_usd: None,
             fee: Some(U256::ZERO),
             leg: BridgeLegPrice::SameAsset,
             fill_time_sec: None,
@@ -875,12 +882,14 @@ fn review_prices_the_gas_share_once_and_reprices_without_requests() {
         // that receiver, and the limit, the validity and the bridge leg stay as quoted.
         let receiver = Address::repeat_byte(0x78);
         let moved = bridged.with_receiver(receiver);
-        let delivered = match delivery {
-            SwapDelivery::Reshield => delivery,
+        let delivered = match &delivery {
+            SwapDelivery::Reshield => SwapDelivery::Reshield,
             SwapDelivery::External { .. } => SwapDelivery::External { receiver },
-            SwapDelivery::Bridge(bridge) => {
-                SwapDelivery::Bridge(BridgeDelivery { receiver, ..bridge })
-            }
+            SwapDelivery::Bridge(bridge) => SwapDelivery::Bridge(BridgeDelivery {
+                receiver,
+                ..*bridge
+            }),
+            SwapDelivery::NonEvmBridge(non_evm) => SwapDelivery::NonEvmBridge(non_evm.clone()),
         };
         // Each fresh plan reserves its own operation.
         let mut expected = plan_for(delivered);
@@ -934,7 +943,8 @@ fn near_quote_prices_its_minimum_through_the_cross_chain_anchor() {
             BRIDGED,
             &dry_quote(uint!(1_660_000_000_000_000_000_U256), min_amount_out),
             Some(USDC_TO_BNB),
-            &destination,
+            destination.near.as_ref().unwrap(),
+            destination.same_asset,
             300,
         )
     };
@@ -969,7 +979,8 @@ fn near_leg_without_anchors_is_same_asset_or_needs_acknowledgement() {
             uint!(995_000_000_000_000_000_000_U256),
         ),
         None,
-        &near_destination(true, 18),
+        near_destination(true, 18).near.as_ref().unwrap(),
+        true,
         300,
     )
     .unwrap();
@@ -983,7 +994,8 @@ fn near_leg_without_anchors_is_same_asset_or_needs_acknowledgement() {
         BRIDGED,
         &dry_quote(minimum, minimum),
         None,
-        &near_destination(false, 18),
+        near_destination(false, 18).near.as_ref().unwrap(),
+        false,
         300,
     )
     .unwrap();
@@ -1009,6 +1021,7 @@ fn a_lower_destination_minimum_needs_a_new_review() {
         provider: BridgeProvider::NearIntents,
         destination_minimum: U256::from(minimum),
         expected_output: U256::from(minimum),
+        expected_output_usd: None,
         fee: Some(U256::ZERO),
         leg: BridgeLegPrice::SameAsset,
         fill_time_sec: None,
@@ -1044,6 +1057,42 @@ fn a_lower_destination_minimum_needs_a_new_review() {
     );
 }
 
+// A non-EVM delivery's approval binds its receiver as stored, so a review for another
+// receiver needs a full review that names the delivery.
+#[test]
+fn a_changed_non_evm_receiver_needs_a_new_review() {
+    let reviewed = |receiver: &str| {
+        let mut review = review_of(SwapDelivery::NonEvmBridge(NonEvmDelivery {
+            network: crate::bridge::NonEvmNetwork::Solana,
+            receiver: receiver.to_owned(),
+            asset_id: "nep141:sol.omft.near".into(),
+            contract: None,
+            symbol: "SOL".into(),
+            decimals: 9,
+        }));
+        review.bridge = Some(SwapBridgeQuote {
+            provider: BridgeProvider::NearIntents,
+            destination_minimum: U256::from(1_000),
+            expected_output: U256::from(1_010),
+            expected_output_usd: None,
+            fee: None,
+            leg: BridgeLegPrice::Unverified,
+            fill_time_sec: None,
+            private: None,
+        });
+        review
+    };
+    let first = reviewed("So11111111111111111111111111111111111111112");
+    let approval = first
+        .approval(first.suggested_private_minimum(), true)
+        .unwrap();
+    assert_eq!(first.approval_change(&approval), None);
+    assert_eq!(
+        reviewed("11111111111111111111111111111111").approval_change(&approval),
+        Some(SwapReviewChange::Delivery)
+    );
+}
+
 // A private delivery's approval also binds the destination account, the failure choice and the
 // destination shield fee, and records the delivery allowance. Each difference needs a review
 // that names it. The approved allowed gas is one unit here, so the cushion is zero.
@@ -1055,6 +1104,7 @@ fn a_private_deliverys_destination_terms_need_a_new_review() {
         provider: BridgeProvider::Across,
         destination_minimum: U256::from(output - allowance),
         expected_output: U256::from(output - allowance),
+        expected_output_usd: None,
         fee: Some(U256::ZERO),
         leg: BridgeLegPrice::SameAsset,
         fill_time_sec: None,
@@ -1172,39 +1222,42 @@ fn a_private_deliverys_destination_terms_need_a_new_review() {
 // wei is one buy unit here, so the rollup data cost sets the gas estimate directly.
 #[test]
 fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
-    let price_at = |delivery, buy_amount: U256, data_cost: U256, gas_price_wei: u128| {
-        let quote: CowQuote = serde_json::from_value(serde_json::json!({
-            "quote": {
-                "sellToken": WETH, "buyToken": USDC,
-                "sellAmount": "997500", "buyAmount": buy_amount.to_string(),
-                "validTo": 1, "feeAmount": "2500", "gasAmount": "0", "gasPrice": "0",
-                "sellTokenPrice": "1", "kind": "sell", "partiallyFillable": false
-            },
-            "expiration": "", "id": 7, "verified": true
-        }))
-        .unwrap();
-        price_swap_review(
-            plan_for(delivery),
-            quote,
-            SwapPrice::Verified {
-                rate: PairAnchorRate {
-                    sell_rate: U256::ONE,
-                    buy_rate: uint!(1_000_000_000_000_000_000_U256),
+    let price_at =
+        |delivery: &SwapDelivery, buy_amount: U256, data_cost: U256, gas_price_wei: u128| {
+            let quote: CowQuote = serde_json::from_value(serde_json::json!({
+                "quote": {
+                    "sellToken": WETH, "buyToken": USDC,
+                    "sellAmount": "997500", "buyAmount": buy_amount.to_string(),
+                    "validTo": 1, "feeAmount": "2500", "gasAmount": "0", "gasPrice": "0",
+                    "sellTokenPrice": "1", "kind": "sell", "partiallyFillable": false
                 },
-                observations: Vec::new(),
-            },
-            U256::from(25),
-            U256::from(25),
-            100,
-            GAS_SHARE_BALANCED_BPS,
-            Duration::from_mins(30),
-            gas_price_wei,
-            data_cost,
-            OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Direct),
-        )
-        .unwrap()
+                "expiration": "", "id": 7, "verified": true
+            }))
+            .unwrap();
+            price_swap_review(
+                plan_for(delivery.clone()),
+                quote,
+                SwapPrice::Verified {
+                    rate: PairAnchorRate {
+                        sell_rate: U256::ONE,
+                        buy_rate: uint!(1_000_000_000_000_000_000_U256),
+                    },
+                    observations: Vec::new(),
+                },
+                U256::from(25),
+                U256::from(25),
+                100,
+                GAS_SHARE_BALANCED_BPS,
+                Duration::from_mins(30),
+                gas_price_wei,
+                data_cost,
+                OperationNetworkIsolation::Unavailable(crate::WalletNetworkMode::Direct),
+            )
+            .unwrap()
+        };
+    let price = |delivery: &SwapDelivery, buy_amount, data_cost| {
+        price_at(delivery, buy_amount, data_cost, 1)
     };
-    let price = |delivery, buy_amount, data_cost| price_at(delivery, buy_amount, data_cost, 1);
     let (bought, data_cost) = (U256::from(10_000_000), U256::from(4_000_000));
     // Balanced deducts a quarter of the gas estimate, so four more wei allow one more unit.
     let gas_up = |allowance: U256| data_cost + U256::from(4) * allowance;
@@ -1215,7 +1268,7 @@ fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
             receiver: Address::repeat_byte(0x77),
         },
     ] {
-        let reviewed = price(delivery, bought, data_cost);
+        let reviewed = price(&delivery, bought, data_cost);
         let approval = reviewed
             .approval(reviewed.suggested_private_minimum(), false)
             .unwrap();
@@ -1225,13 +1278,13 @@ fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
         assert_eq!(reviewed.gas_allowance_for(minimum).unwrap(), allowance);
 
         // More gas, one unit inside the cushion: the order keeps the approved minimum.
-        let fresh = price(delivery, bought, gas_up(cushion - U256::ONE));
+        let fresh = price(&delivery, bought, gas_up(cushion - U256::ONE));
         assert_eq!(fresh.gas_allowance(), allowance + cushion - U256::ONE);
         assert!(fresh.suggested_private_minimum() < minimum);
         assert_eq!(fresh.approval_change(&approval), None, "{delivery:?}");
         assert_eq!(fresh.approved_order_minimum(&approval), Ok(minimum));
         // Two units beyond it, which the shield fee's rounding can't cover.
-        let fresh = price(delivery, bought, gas_up(cushion + U256::from(2)));
+        let fresh = price(&delivery, bought, gas_up(cushion + U256::from(2)));
         assert_eq!(
             fresh.approval_change(&approval),
             Some(SwapReviewChange::GasAllowance {
@@ -1241,7 +1294,7 @@ fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
             "{delivery:?}"
         );
         // More gas within the cushion and a lower quote together go past it: the quote names it.
-        let fresh = price(delivery, bought - cushion, gas_up(cushion / U256::from(2)));
+        let fresh = price(&delivery, bought - cushion, gas_up(cushion / U256::from(2)));
         assert!(fresh.gas_allowance() > allowance);
         assert_eq!(
             fresh.approval_change(&approval),
@@ -1253,7 +1306,7 @@ fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
         );
 
         // A lower quote at the same gas is taken from the allowed gas the same way.
-        let fresh = price(delivery, bought - cushion / U256::from(2), data_cost);
+        let fresh = price(&delivery, bought - cushion / U256::from(2), data_cost);
         assert!(fresh.suggested_private_minimum() < minimum);
         assert_eq!(fresh.approved_order_minimum(&approval), Ok(minimum));
         // The order then leaves room for that much less gas.
@@ -1263,7 +1316,7 @@ fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
             fresh.gas_allowance() - shortfall,
             "{delivery:?}"
         );
-        let fresh = price(delivery, bought - cushion * U256::from(2), data_cost);
+        let fresh = price(&delivery, bought - cushion * U256::from(2), data_cost);
         assert_eq!(
             fresh.approval_change(&approval),
             Some(SwapReviewChange::Minimum {
@@ -1276,9 +1329,9 @@ fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
         // The shortfall must also fit the fresh allowed gas. With gas far lower, a quote lower
         // by the gas saved and half the cushion falls short by more than is allowed now.
         let low_gas = data_cost / U256::from(100);
-        let saved = allowance - price_at(delivery, bought, low_gas, 0).gas_allowance();
+        let saved = allowance - price_at(&delivery, bought, low_gas, 0).gas_allowance();
         let fresh = price_at(
-            delivery,
+            &delivery,
             bought - saved - cushion / U256::from(2),
             low_gas,
             0,
@@ -1299,7 +1352,7 @@ fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
 
         // A better quote at lower gas keeps the approved minimum, and the order leaves room
         // for the allowed gas and the gain, here more than the whole gas estimate.
-        let fresh = price_at(delivery, bought * U256::from(2), low_gas, 0);
+        let fresh = price_at(&delivery, bought * U256::from(2), low_gas, 0);
         assert_eq!(fresh.approved_order_minimum(&approval), Ok(minimum));
         let gain = fresh.limit.buy_amount - fresh.buy_amount_for(minimum).unwrap();
         let room = fresh.gas_allowance_for(minimum).unwrap();
@@ -1316,6 +1369,7 @@ fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
             provider: BridgeProvider::NearIntents,
             destination_minimum: U256::from(destination_minimum),
             expected_output: U256::from(destination_minimum),
+            expected_output_usd: None,
             fee: Some(U256::ZERO),
             leg: BridgeLegPrice::SameAsset,
             fill_time_sec: None,
@@ -1323,7 +1377,7 @@ fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
         });
         review
     };
-    let reviewed = bridged(&price(delivery, bought, data_cost), 1_000_000);
+    let reviewed = bridged(&price(&delivery, bought, data_cost), 1_000_000);
     let deposit = reviewed.suggested_private_minimum();
     let approval = reviewed.approval(deposit, false).unwrap();
     let cushion = reviewed.gas_allowance() / U256::from(5);
@@ -1338,7 +1392,7 @@ fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
     // A margin beyond the cushion is left out: a small drift still keeps the approved deposit.
     let small = |buy_amount: u64| {
         bridged(
-            &price_at(delivery, U256::from(buy_amount), U256::from(4_000), 0),
+            &price_at(&delivery, U256::from(buy_amount), U256::from(4_000), 0),
             1_000_000,
         )
     };
@@ -1362,7 +1416,7 @@ fn drift_within_a_fifth_of_the_approved_gas_keeps_the_approval() {
     assert_eq!(fresh.approved_order_minimum(&approval), Ok(raised));
     // With more gas as well, the scaled deposit is below the approved one, which is kept.
     let fresh = bridged(
-        &price(delivery, bought, gas_up(cushion / U256::from(2))),
+        &price(&delivery, bought, gas_up(cushion / U256::from(2))),
         999_000,
     );
     assert!(fresh.suggested_private_minimum() < deposit);
@@ -1557,6 +1611,7 @@ fn a_public_orders_review_shows_what_a_private_bridge_review_of_its_quote_shows(
         provider: BridgeProvider::Across,
         destination_minimum: deposit - U256::from(2_000),
         expected_output: deposit - U256::from(2_000),
+        expected_output_usd: None,
         fee: Some(U256::from(1_500)),
         leg: BridgeLegPrice::SameAsset,
         fill_time_sec: None,

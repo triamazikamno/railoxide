@@ -220,11 +220,68 @@ mod tests {
                 },
                 "Couldn't reach Across through the swap's network route.",
             ),
+            (
+                BridgeApiError::Unavailable {
+                    api: BridgeApi::NearIntents,
+                    operation: "dry quote",
+                    endpoint: "https://example.invalid/v0/quote".to_owned(),
+                    status: 500,
+                },
+                "NEAR Intents is having a temporary problem. Retry in a few minutes.",
+            ),
         ] {
             let failure = map(&eyre::Report::from(error).wrap_err("Could not quote the bridge"));
             assert_eq!(failure.message, message);
             assert_eq!(failure.details, None);
         }
+    }
+
+    #[test]
+    fn one_click_outage_refusals_ask_for_a_retry_and_others_show_as_sent() {
+        let rejection = |message: &str| {
+            eyre::Report::from(BridgeApiError::Rejected {
+                api: BridgeApi::NearIntents,
+                operation: "dry quote",
+                endpoint: "https://example.invalid/v0/quote".to_owned(),
+                status: 400,
+                code: "Bad Request".to_owned(),
+                message: message.to_owned(),
+            })
+        };
+        for (sent, shown, outage) in [
+            (
+                "Quoting for this pair is not available",
+                "NEAR Intents can't quote this pair right now. This is usually temporary. Retry in a few minutes.",
+                true,
+            ),
+            (
+                "No liquidity available",
+                "NEAR Intents has no liquidity for this pair right now. This is usually temporary. Retry in a few minutes.",
+                true,
+            ),
+            (
+                "Amount is too low for bridge, try at least 1000000",
+                "NEAR Intents: Amount is too low for bridge, try at least 1000000",
+                false,
+            ),
+        ] {
+            let error = rejection(sent);
+            assert_eq!(
+                super::super::bridge_rejection(&error).as_deref(),
+                Some(shown)
+            );
+            assert_eq!(super::super::near_intents_status(&error).is_some(), outage);
+        }
+        let unavailable = |api| {
+            eyre::Report::from(BridgeApiError::Unavailable {
+                api,
+                operation: "quote",
+                endpoint: "https://example.invalid/quote".to_owned(),
+                status: 500,
+            })
+        };
+        assert!(super::super::near_intents_status(&unavailable(BridgeApi::NearIntents)).is_some());
+        assert!(super::super::near_intents_status(&unavailable(BridgeApi::Across)).is_none());
     }
 
     #[test]

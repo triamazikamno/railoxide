@@ -45,7 +45,7 @@ pub enum SwapTokenEligibility {
 
 /// A token's side in a swap. The Buy side depends on delivery: only an External order pays
 /// its receiver directly, so only it can buy the native asset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SwapTokenRole {
     Sell,
     Buy(SwapDelivery),
@@ -532,7 +532,7 @@ impl SwapProfile {
     /// ERC-20 compatibility is the user's responsibility; there is no swap-specific allowlist.
     /// The native asset, `Address::ZERO`, is eligible only as the Buy asset of External delivery.
     #[must_use]
-    pub fn token_eligibility(&self, token: Address, role: SwapTokenRole) -> SwapTokenEligibility {
+    pub fn token_eligibility(&self, token: Address, role: &SwapTokenRole) -> SwapTokenEligibility {
         if token == Address::ZERO
             && !matches!(role, SwapTokenRole::Buy(SwapDelivery::External { .. }))
         {
@@ -547,13 +547,13 @@ impl SwapProfile {
         &self,
         sell: Address,
         buy: Address,
-        delivery: SwapDelivery,
+        delivery: &SwapDelivery,
     ) -> SwapTokenEligibility {
         for (token, role) in [
             (sell, SwapTokenRole::Sell),
-            (buy, SwapTokenRole::Buy(delivery)),
+            (buy, SwapTokenRole::Buy(delivery.clone())),
         ] {
-            let eligibility = self.token_eligibility(token, role);
+            let eligibility = self.token_eligibility(token, &role);
             if eligibility != SwapTokenEligibility::Eligible {
                 return eligibility;
             }
@@ -684,7 +684,7 @@ pub fn swap_destination_tokens<'a>(
         .filter(|token| token.chain_id == profile.chain_id)
         .filter(|token| {
             Address::from_str(&token.token_address).is_ok_and(|address| {
-                profile.token_eligibility(address, SwapTokenRole::Buy(SwapDelivery::Reshield))
+                profile.token_eligibility(address, &SwapTokenRole::Buy(SwapDelivery::Reshield))
                     == SwapTokenEligibility::Eligible
             })
         })
@@ -1043,19 +1043,19 @@ mod tests {
         // The backend admits the same tokens in either direction, without a second list.
         for (sell, buy) in [(weth, custom), (custom, weth), (steth, weth)] {
             assert_eq!(
-                profile.pair_eligibility(sell, buy, reshield),
+                profile.pair_eligibility(sell, buy, &reshield),
                 SwapTokenEligibility::Eligible
             );
         }
         let ineligible = SwapTokenEligibility::Ineligible;
         assert_eq!(
-            profile.pair_eligibility(usdc, Address::ZERO, external),
+            profile.pair_eligibility(usdc, Address::ZERO, &external),
             SwapTokenEligibility::Eligible
         );
         for (sell, buy, delivery) in [
-            (usdc, Address::ZERO, reshield),
-            (Address::ZERO, usdc, reshield),
-            (Address::ZERO, usdc, external),
+            (usdc, Address::ZERO, &reshield),
+            (Address::ZERO, usdc, &reshield),
+            (Address::ZERO, usdc, &external),
         ] {
             assert_eq!(
                 profile.pair_eligibility(sell, buy, delivery),
@@ -1063,7 +1063,7 @@ mod tests {
             );
         }
         assert_eq!(
-            profile.pair_eligibility(weth, weth, reshield),
+            profile.pair_eligibility(weth, weth, &reshield),
             ineligible(SwapIneligibility::SameToken)
         );
     }

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::SystemTime;
 
+use alloy::primitives::utils::{ParseUnits, parse_units};
 use alloy::primitives::{Address, U256};
 use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
 use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
 
-use super::{BridgeApi, BridgeApiError, BridgeHttp};
+use super::{BridgeApi, BridgeApiError, BridgeHttp, NonEvmNetwork};
 use crate::http::{OperationHttpClient, OperationNetworkIsolation};
 
 const ED25519_PREFIX: &str = "ed25519:";
@@ -99,8 +100,20 @@ pub struct OneClickToken {
     pub decimals: u8,
     /// The EVM contract. `None` for native assets and non-EVM contract ids.
     pub contract_address: Option<Address>,
+    /// The raw `contractAddress`, such as a Solana mint or a Tron `T...` address. `None` for
+    /// native assets.
+    pub contract: Option<String>,
     /// USD price, for display only.
     pub price: Option<f64>,
+}
+
+/// Who a quote pays on the destination chain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum OneClickRecipient {
+    Evm(Address),
+    /// A receiver on a [`NonEvmNetwork`], in the canonical form its parser returns.
+    NonEvm(String),
 }
 
 /// Terms of a quote request. The type has no recipient or refund field: dry quotes send
@@ -122,6 +135,8 @@ pub struct OneClickDryQuote {
     pub amount_out: U256,
     pub min_amount_out: U256,
     pub time_estimate_sec: Option<u64>,
+    /// 1Click's signed `amountOutUsd`, in micro-dollars. For display only: never a price anchor.
+    pub amount_out_usd: Option<U256>,
 }
 
 /// A verified signing-time quote.
@@ -132,6 +147,8 @@ pub struct VerifiedOneClickQuote {
     pub min_amount_in: U256,
     pub amount_out: U256,
     pub min_amount_out: U256,
+    /// 1Click's signed `amountOutUsd`, in micro-dollars. For display only: never a price anchor.
+    pub amount_out_usd: Option<U256>,
     /// The signed `quote.deadline`, as returned.
     pub deadline: String,
     /// The exact response body, which holds the request, quote, signature and timestamp, so
@@ -231,25 +248,31 @@ impl NearIntentsClient {
                 decimals: token.decimals,
                 contract_address: token
                     .contract_address
+                    .as_deref()
                     .and_then(|contract| contract.parse().ok()),
+                contract: token.contract_address,
                 price: token.price,
             })
             .collect())
     }
 
     /// `POST /v0/quote` with `dry: true` and fresh random placeholder recipient and refund
-    /// addresses. No deposit address is created.
+    /// addresses. The recipient is a `non_evm` network's receiver when the destination is one.
+    /// No deposit address is created.
     pub async fn dry_quote(
         &self,
         params: &OneClickQuoteParams,
+        non_evm: Option<NonEvmNetwork>,
     ) -> Result<OneClickDryQuote, BridgeApiError> {
-        let sent = SentQuote::new(
-            params,
-            true,
-            random_placeholder()?,
-            random_placeholder()?,
-            None,
-        );
+        let recipient = match non_evm {
+            None => OneClickRecipient::Evm(random_placeholder()?),
+            Some(network) => OneClickRecipient::NonEvm(
+                network
+                    .random_placeholder()
+                    .ok_or(BridgeApiError::Randomness)?,
+            ),
+        };
+        let sent = SentQuote::new(params, true, recipient, random_placeholder()?, None);
         let (terms, _) = self.request_quote("dry quote", &sent).await?;
         Ok(OneClickDryQuote {
             amount_in: terms.amount_in,
@@ -257,6 +280,7 @@ impl NearIntentsClient {
             amount_out: terms.amount_out,
             min_amount_out: terms.min_amount_out,
             time_estimate_sec: terms.time_estimate_sec,
+            amount_out_usd: terms.amount_out_usd,
         })
     }
 
@@ -265,7 +289,7 @@ impl NearIntentsClient {
     pub async fn quote(
         &self,
         params: &OneClickQuoteParams,
-        recipient: Address,
+        recipient: OneClickRecipient,
         refund_to: Address,
         executor: Address,
     ) -> Result<VerifiedOneClickQuote, BridgeApiError> {
@@ -282,6 +306,7 @@ impl NearIntentsClient {
             min_amount_in: terms.min_amount_in,
             amount_out: terms.amount_out,
             min_amount_out: terms.min_amount_out,
+            amount_out_usd: terms.amount_out_usd,
             deadline,
             signed_response,
         })
@@ -326,7 +351,7 @@ impl NearIntentsClient {
             amount: sent.params.amount,
             refund_to: sent.refund_to,
             refund_type: REFUND_TYPE,
-            recipient: sent.recipient,
+            recipient: &sent.recipient,
             recipient_type: RECIPIENT_TYPE,
             deadline: &sent.deadline,
         };
@@ -349,7 +374,7 @@ impl NearIntentsClient {
 pub(super) struct SentQuote<'a> {
     params: &'a OneClickQuoteParams,
     dry: bool,
-    recipient: Address,
+    recipient: OneClickRecipient,
     refund_to: Address,
     /// The swap's stealth account, which must not be the deposit address.
     executor: Option<Address>,
@@ -361,7 +386,7 @@ impl<'a> SentQuote<'a> {
     pub(super) fn new(
         params: &'a OneClickQuoteParams,
         dry: bool,
-        recipient: Address,
+        recipient: OneClickRecipient,
         refund_to: Address,
         executor: Option<Address>,
     ) -> Self {
@@ -385,6 +410,7 @@ pub(super) struct QuoteTerms {
     pub(super) amount_out: U256,
     pub(super) min_amount_out: U256,
     pub(super) time_estimate_sec: Option<u64>,
+    pub(super) amount_out_usd: Option<U256>,
     pub(super) deposit: Option<(Address, String)>,
 }
 
@@ -558,7 +584,14 @@ fn check_terms(
         request.get("slippageTolerance").and_then(Value::as_u64)
             == Some(u64::from(sent.params.slippage_bps)),
     )?;
-    expect("recipient", address("recipient") == Some(sent.recipient))?;
+    let recipient = match &sent.recipient {
+        OneClickRecipient::Evm(recipient) => address("recipient") == Some(*recipient),
+        // 1Click echoes a non-EVM recipient byte for byte.
+        OneClickRecipient::NonEvm(recipient) => {
+            text(request, "recipient").as_ref() == Some(recipient)
+        }
+    };
+    expect("recipient", recipient)?;
     expect("refundTo", address("refundTo") == Some(sent.refund_to))?;
     // The request's deadline is signed only for a dry quote. A non-dry quote signs its own
     // `quote.deadline` instead, which bounds how long the deposit address stays active.
@@ -581,7 +614,7 @@ fn check_terms(
             .and_then(|value| value.parse::<Address>().ok())
             .filter(|address| {
                 *address != Address::ZERO
-                    && *address != sent.recipient
+                    && sent.recipient != OneClickRecipient::Evm(*address)
                     && Some(*address) != sent.executor
             })
             .ok_or(OneClickVerifyError::DepositAddress)?;
@@ -599,6 +632,13 @@ fn check_terms(
         amount_out: amount("amountOut")?,
         min_amount_out: amount("minAmountOut")?,
         time_estimate_sec: quote.get("timeEstimate").and_then(Value::as_u64),
+        // A decimal dollar string, kept to the micro-dollar the wallet's USD values use.
+        amount_out_usd: text(quote, "amountOutUsd")
+            .and_then(|usd| parse_units(&usd, 6).ok())
+            .and_then(|usd| match usd {
+                ParseUnits::U256(usd) => Some(usd),
+                ParseUnits::I256(_) => None,
+            }),
         deposit,
     })
 }
@@ -636,7 +676,7 @@ struct QuoteRequestBody<'a> {
     amount: U256,
     refund_to: Address,
     refund_type: &'static str,
-    recipient: Address,
+    recipient: &'a OneClickRecipient,
     recipient_type: &'static str,
     deadline: &'a str,
 }

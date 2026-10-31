@@ -2,11 +2,12 @@ use super::{
     ADDITIONAL_WALLET_LABEL_PREFIX, Address, BROADCASTER_BANNED_PREFIX,
     BROADCASTER_FAVORITE_PREFIX, BTreeSet, BroadcasterPreferenceEntry, HARDWARE_PROFILE_PREFIX,
     HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX, HardwareProfileMetadata,
-    HardwareWalletAccountIndexReservation, KEY_LEN, KeyError, PRIMARY_WALLET_LABEL,
-    PRIVATE_ADDRESS_BOOK_PREFIX, PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ACCOUNT_SECRET_PREFIX,
-    PUBLIC_ADDRESS_BOOK_PREFIX, PrivateAddressBookEntry, PrivateKeySigner, PublicAccountMetadata,
-    PublicAccountScope, PublicAccountSecret, PublicAccountSource, PublicAccountStatus,
-    PublicAddressBookEntry, RecordKind, SigningKey, SpendUnlock, U256, VaultError, ViewUnlock,
+    HardwareWalletAccountIndexReservation, KEY_LEN, KeyError, NON_EVM_ADDRESS_BOOK_PREFIX,
+    NonEvmAddressBookEntry, PRIMARY_WALLET_LABEL, PRIVATE_ADDRESS_BOOK_PREFIX,
+    PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ACCOUNT_SECRET_PREFIX, PUBLIC_ADDRESS_BOOK_PREFIX,
+    PrivateAddressBookEntry, PrivateKeySigner, PublicAccountMetadata, PublicAccountScope,
+    PublicAccountSecret, PublicAccountSource, PublicAccountStatus, PublicAddressBookEntry,
+    RecordKind, SigningKey, SpendUnlock, U256, VaultError, ViewUnlock,
     WALLET_CHAIN_INDEX_COMPLETE_PREFIX, WALLET_CHAIN_INDEX_COMPLETE_VERSION,
     WALLET_CHAIN_INDEX_PREFIX, WALLET_CHAIN_METADATA_PREFIX, WALLET_METADATA_PREFIX,
     WALLET_SPEND_PREFIX, WALLET_VIEW_PREFIX, WALLETCONNECT_RELAY_IDENTITY_PREFIX,
@@ -17,6 +18,7 @@ use super::{
 
 use coins_bip32::prelude::{ChainCode, Hint, KeyFingerprint, Parent, XKeyInfo, XPriv, XPub};
 
+use crate::bridge::NonEvmNetwork;
 use crate::parse_railgun_recipient;
 
 pub fn bip39_seed_from_mnemonic(
@@ -127,6 +129,10 @@ pub(super) fn public_address_book_record_key(entry_uuid: &str) -> String {
     format!("{PUBLIC_ADDRESS_BOOK_PREFIX}{entry_uuid}")
 }
 
+pub(super) fn non_evm_address_book_record_key(entry_uuid: &str) -> String {
+    format!("{NON_EVM_ADDRESS_BOOK_PREFIX}{entry_uuid}")
+}
+
 pub(super) fn walletconnect_relay_identity_record_key(wallet_uuid: &str) -> String {
     format!("{WALLETCONNECT_RELAY_IDENTITY_PREFIX}{wallet_uuid}")
 }
@@ -228,6 +234,15 @@ pub(super) fn public_address_book_record_entry(
 ) -> Result<(String, Vec<u8>), VaultError> {
     let key = public_address_book_record_key(&entry.entry_uuid);
     let record = view.encrypt_public_address_book_entry(&entry.entry_uuid, entry)?;
+    record.to_record_entry(key)
+}
+
+pub(super) fn non_evm_address_book_record_entry(
+    view: &ViewUnlock,
+    entry: &NonEvmAddressBookEntry,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = non_evm_address_book_record_key(&entry.entry_uuid);
+    let record = view.encrypt_non_evm_address_book_entry(&entry.entry_uuid, entry)?;
     record.to_record_entry(key)
 }
 
@@ -467,6 +482,15 @@ pub fn sort_public_address_book_entries(entries: &mut [PublicAddressBookEntry]) 
     });
 }
 
+pub fn sort_non_evm_address_book_entries(entries: &mut [NonEvmAddressBookEntry]) {
+    entries.sort_by(|left, right| {
+        left.display_order
+            .cmp(&right.display_order)
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.entry_uuid.cmp(&right.entry_uuid))
+    });
+}
+
 pub fn sort_walletconnect_sessions(sessions: &mut [WalletConnectSessionRecord]) {
     sessions.sort_by(|left, right| {
         left.peer_metadata
@@ -511,6 +535,20 @@ pub(super) fn next_public_address_book_display_order(
             max_display_order
                 .checked_add(1)
                 .ok_or(VaultError::PublicAddressBookDisplayOrderOverflow)
+        })
+}
+
+pub(super) fn next_non_evm_address_book_display_order(
+    entries: &[NonEvmAddressBookEntry],
+) -> Result<u32, VaultError> {
+    entries
+        .iter()
+        .map(|entry| entry.display_order)
+        .max()
+        .map_or(Ok(0), |max_display_order| {
+            max_display_order
+                .checked_add(1)
+                .ok_or(VaultError::NonEvmAddressBookDisplayOrderOverflow)
         })
 }
 
@@ -640,6 +678,24 @@ fn ensure_public_address_book_address_available_except(
         .any(|account| account.status == PublicAccountStatus::Active && account.address == address)
     {
         Err(VaultError::DuplicatePublicAddressBookAddress)
+    } else {
+        Ok(())
+    }
+}
+
+/// `address` is canonical, so equal receivers on one network are equal strings.
+pub(super) fn ensure_non_evm_address_book_address_available(
+    entries: &[NonEvmAddressBookEntry],
+    current_entry_uuid: Option<&str>,
+    network: NonEvmNetwork,
+    address: &str,
+) -> Result<(), VaultError> {
+    if entries.iter().any(|entry| {
+        current_entry_uuid != Some(entry.entry_uuid.as_str())
+            && entry.network == network
+            && entry.address == address
+    }) {
+        Err(VaultError::DuplicateNonEvmAddressBookAddress)
     } else {
         Ok(())
     }

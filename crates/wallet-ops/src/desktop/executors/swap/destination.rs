@@ -13,7 +13,8 @@
 //! no such fill or no endpoint of the destination chain serves whole-block receipts. Routine
 //! polling stops there. An explicit status check asks Across again, and replaces the report
 //! with a verified fill or with the refund Across then reports. NEAR Intents delivery is
-//! 1Click's report and isn't verified on chain.
+//! 1Click's report and isn't verified on chain. A delivery to a non-EVM network reads no
+//! destination chain at all.
 //!
 //! An explicit status check of a refunding Across order also verifies the refund on this chain.
 //! The refund transaction Across names is looked up only for its block number, and the refund
@@ -92,13 +93,14 @@ impl ExecutorOwner {
     /// after the poll, persisting a new one. Orders without a hand-off, or with an outcome,
     /// are left alone: `NeedsAttention` and a delivery Across only reported wait for
     /// [`Self::check_swap_bridge`].
-    /// `destination` is the delivery's destination chain. Its RPC reads go over `client`.
+    /// `destination` is the delivery's destination chain, `None` for a non-EVM network, whose
+    /// delivery reads no chain. Its RPC reads go over `client`.
     pub async fn observe_swap_bridge(
         &self,
         operation: ExecutorOperationId,
         uid: OrderUid,
         clients: &SwapBridgeClients,
-        destination: &EffectiveChainConfig,
+        destination: Option<&EffectiveChainConfig>,
         client: &OperationHttpClient,
     ) -> Result<Option<SwapBridgeOutcome>> {
         self.track_swap_bridge(operation, uid, clients, destination, false, client)
@@ -114,7 +116,7 @@ impl ExecutorOwner {
         operation: ExecutorOperationId,
         uid: OrderUid,
         clients: &SwapBridgeClients,
-        destination: &EffectiveChainConfig,
+        destination: Option<&EffectiveChainConfig>,
         client: &OperationHttpClient,
     ) -> Result<Option<SwapBridgeOutcome>> {
         self.track_swap_bridge(operation, uid, clients, destination, true, client)
@@ -126,7 +128,7 @@ impl ExecutorOwner {
         operation: ExecutorOperationId,
         uid: OrderUid,
         clients: &SwapBridgeClients,
-        destination: &EffectiveChainConfig,
+        destination: Option<&EffectiveChainConfig>,
         explicit: bool,
         client: &OperationHttpClient,
     ) -> Result<Option<SwapBridgeOutcome>> {
@@ -139,15 +141,11 @@ impl ExecutorOwner {
             .ok_or_else(|| eyre!("swap order is unavailable"))?;
         let observations = order.observations();
         let known = observations.bridge_outcome;
-        let (SwapDelivery::Bridge(delivery), Some(terms), Some(handoff)) = (
-            order.delivery(),
-            order.bridge(),
-            observations.bridge_handoff,
-        ) else {
+        let (Some(terms), Some(handoff)) = (order.bridge(), observations.bridge_handoff) else {
             return Ok(known);
         };
         if !asks_again(
-            known,
+            known.as_ref(),
             explicit,
             matches!(terms, BridgeOrderTerms::Across(_)),
             observations.bridge_refund.is_some(),
@@ -155,8 +153,11 @@ impl ExecutorOwner {
             return Ok(known);
         }
         let target = OutcomeTarget::Order(uid);
-        let (current, refund_tx) = match terms {
-            BridgeOrderTerms::Across(across) => {
+        let (current, refund_tx) = match (order.delivery(), terms) {
+            (SwapDelivery::Bridge(delivery), BridgeOrderTerms::Across(across)) => {
+                let destination = destination.ok_or_else(|| {
+                    eyre!("the destination network is needed to check this delivery")
+                })?;
                 let deposit_id = handoff
                     .deposit_id
                     .ok_or_else(|| eyre!("the Across deposit is unknown"))?;
@@ -182,15 +183,22 @@ impl ExecutorOwner {
                 ))
                 .await?
             }
-            BridgeOrderTerms::NearIntents(near) => {
+            // The destination chain isn't read: 1Click's report is the outcome.
+            (delivery, BridgeOrderTerms::NearIntents(near)) => {
+                let non_evm = matches!(delivery, SwapDelivery::NonEvmBridge(_));
                 let outcome = self
-                    .while_active(Box::pin(near_outcome(&clients.near, near.deposit_address)))
+                    .while_active(Box::pin(near_outcome(
+                        &clients.near,
+                        near.deposit_address,
+                        non_evm,
+                    )))
                     .await?;
                 let current = self
                     .record_bridge_outcome(&record, target, terms.provider(), known, outcome)
                     .await?;
                 (current, None)
             }
+            _ => return Ok(known),
         };
         // Only an explicit check looks the refund up, since the lookup names it to the RPC.
         if explicit
@@ -226,12 +234,8 @@ impl ExecutorOwner {
             .swap()
             .and_then(|swap| swap.orders().iter().find(|order| order.uid() == uid))
             .ok_or_else(|| eyre!("swap order is unavailable"))?;
-        let (SwapDelivery::Bridge(delivery), Some(terms)) = (order.delivery(), order.bridge())
-        else {
-            return Err(eyre!("swap order isn't delivered through a bridge"));
-        };
-        let report = match terms {
-            BridgeOrderTerms::Across(across) => {
+        let report = match (order.delivery(), order.bridge()) {
+            (SwapDelivery::Bridge(delivery), Some(BridgeOrderTerms::Across(across))) => {
                 let Some(deposit_id) = handoff.and_then(|handoff| handoff.deposit_id) else {
                     return Ok(SwapBridgeReport::Pending);
                 };
@@ -280,15 +284,24 @@ impl ExecutorOwner {
                     _ => SwapBridgeReport::Pending,
                 }
             }
-            BridgeOrderTerms::NearIntents(near) => {
+            (
+                delivery @ (SwapDelivery::Bridge(_) | SwapDelivery::NonEvmBridge(_)),
+                Some(BridgeOrderTerms::NearIntents(near)),
+            ) => {
+                let non_evm = matches!(delivery, SwapDelivery::NonEvmBridge(_));
                 let outcome = self
-                    .while_active(Box::pin(near_outcome(&clients.near, near.deposit_address)))
+                    .while_active(Box::pin(near_outcome(
+                        &clients.near,
+                        near.deposit_address,
+                        non_evm,
+                    )))
                     .await?;
                 // 1Click's word is never one of the outcomes verified on a chain.
                 match outcome {
                     Some(SwapBridgeOutcome::DeliveredReported {
                         amount_out,
                         transaction_hash,
+                        ..
                     }) => SwapBridgeReport::Delivered {
                         amount_out,
                         seen: None,
@@ -299,6 +312,7 @@ impl ExecutorOwner {
                     _ => SwapBridgeReport::Pending,
                 }
             }
+            _ => return Err(eyre!("swap order isn't delivered through a bridge")),
         };
         Ok(report)
     }
@@ -402,10 +416,10 @@ impl ExecutorOwner {
             target: "executor_observation",
             provider = ?provider,
             step = "swap_bridge",
-            result = outcome_label(outcome),
+            result = outcome_label(outcome.as_ref()),
             "finished"
         );
-        let Some(outcome) = outcome.filter(|outcome| Some(*outcome) != known) else {
+        let Some(outcome) = outcome.filter(|outcome| known.as_ref() != Some(outcome)) else {
             return Ok(known);
         };
         let _guard = self.lock_activity().await;
@@ -414,11 +428,14 @@ impl ExecutorOwner {
         match target {
             OutcomeTarget::Order(uid) => {
                 self.store
-                    .record_swap_bridge_outcome(operation, uid, outcome)?;
+                    .record_swap_bridge_outcome(operation, uid, outcome.clone())?;
             }
             OutcomeTarget::PublicSwap(swap_use) => {
-                self.store
-                    .record_public_swap_bridge_outcome(operation, swap_use, outcome)?;
+                self.store.record_public_swap_bridge_outcome(
+                    operation,
+                    swap_use,
+                    outcome.clone(),
+                )?;
             }
         }
         self.notify_change();
@@ -487,6 +504,7 @@ impl ExecutorOwner {
             (!fill.delivery.is_private()).then_some(SwapBridgeOutcome::DeliveredReported {
                 amount_out: Some(deposit.output_amount),
                 transaction_hash: deposit.fill_tx,
+                destination_transaction: None,
             });
         let endpoints =
             ObservationEndpoints::new(destination, &self.http, RpcTrafficClass::Sensitive, client)?;
@@ -669,7 +687,12 @@ impl ExecutorOwner {
         ) else {
             return Ok(known);
         };
-        if !asks_again(known, explicit, true, observations.bridge_refund.is_some()) {
+        if !asks_again(
+            known.as_ref(),
+            explicit,
+            true,
+            observations.bridge_refund.is_some(),
+        ) {
             return Ok(known);
         }
         let fill = ExpectedFill {
@@ -798,7 +821,7 @@ impl ExecutorOwner {
 /// `NeedsAttention`, after an Across `Refunding` until its refund is verified, and after an
 /// Across `DeliveredReported`, which nothing on the destination chain backs.
 const fn asks_again(
-    known: Option<SwapBridgeOutcome>,
+    known: Option<&SwapBridgeOutcome>,
     explicit: bool,
     across: bool,
     refund_verified: bool,
@@ -837,10 +860,12 @@ enum OutcomeTarget {
     PublicSwap(SwapUseId),
 }
 
-/// 1Click's report. Unknown deposit addresses and unfinished states leave no outcome.
+/// 1Click's report. Unknown deposit addresses and unfinished states leave no outcome. A
+/// `non_evm` delivery keeps 1Click's destination transaction as it reports it.
 async fn near_outcome(
     near: &NearIntentsClient,
     deposit_address: Address,
+    non_evm: bool,
 ) -> Result<Option<SwapBridgeOutcome>> {
     let status = match trace_step("swap_bridge_near_status", near.status(deposit_address)).await {
         Ok(status) => status,
@@ -848,12 +873,18 @@ async fn near_outcome(
         Err(error) => return Err(error.into()),
     };
     Ok(match status.status {
+        OneClickExecutionStatus::Success if non_evm => Some(SwapBridgeOutcome::DeliveredReported {
+            amount_out: status.amount_out,
+            transaction_hash: None,
+            destination_transaction: status.destination_tx_hashes.into_iter().next(),
+        }),
         OneClickExecutionStatus::Success => Some(SwapBridgeOutcome::DeliveredReported {
             amount_out: status.amount_out,
             transaction_hash: status
                 .destination_tx_hashes
                 .iter()
                 .find_map(|hash| hash.parse().ok()),
+            destination_transaction: None,
         }),
         OneClickExecutionStatus::Refunded => Some(SwapBridgeOutcome::Refunding),
         OneClickExecutionStatus::Failed | OneClickExecutionStatus::IncompleteDeposit => {
@@ -1299,7 +1330,7 @@ pub(super) async fn still_canonical(
 }
 
 /// The outcome's kind, without its amounts or hashes.
-const fn outcome_label(outcome: Option<SwapBridgeOutcome>) -> &'static str {
+const fn outcome_label(outcome: Option<&SwapBridgeOutcome>) -> &'static str {
     match outcome {
         None => "pending",
         Some(SwapBridgeOutcome::DeliveredVerified { .. }) => "delivered_verified",

@@ -30,15 +30,15 @@ use ui::controls::{
     app_muted_shimmer_text, app_muted_text, app_segment_button, app_strong_text, app_text,
 };
 use ui::theme;
-use wallet_ops::{PublicBroadcasterCandidate, WalletSession};
+use wallet_ops::{PublicBroadcasterCandidate, WalletSession, bridge::NonEvmNetwork};
 
 use super::{
     AbortOnDrop, BridgeProvider, BridgeRoutes, PrivateSwapsView, ReceiveTo, SwapBuyItem, SwapForm,
-    action_alert, bridge_routes_retry_button, error_alert, network_name, same_offer,
+    action_alert, bridge_routes_retry_button, error_alert, network_name, same_offer, short_non_evm,
 };
 use crate::root::private_swap::dialog::provider_mark;
 use crate::root::shell::WalletTab;
-use crate::root::ui_helpers::network_token_icon;
+use crate::root::ui_helpers::badged_token_icon;
 use crate::root::{PRIVATE_ASSET_LIST_WIDTH, dialog_max_height};
 
 /// Let Enter and Space activate the focused picker button instead of the dialog's `Confirm`.
@@ -270,12 +270,67 @@ pub(super) const fn public_network_availability(rpc: bool) -> NetworkAvailabilit
     }
 }
 
+/// A network the picker lists: a chain, or a network outside the chain registry that only
+/// NEAR Intents reaches and that has no chain session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum BuyNetworkKey {
+    Chain(u64),
+    NonEvm(NonEvmNetwork),
+}
+
+impl BuyNetworkKey {
+    pub(super) fn name(self) -> String {
+        match self {
+            Self::Chain(chain_id) => network_name(chain_id),
+            Self::NonEvm(network) => network.display_name().to_owned(),
+        }
+    }
+
+    pub(super) const fn icon_path(self) -> Option<&'static str> {
+        match self {
+            Self::Chain(chain_id) => railgun_ui::chain_icon_asset_path(chain_id),
+            Self::NonEvm(network) => Some(network.icon_asset_path()),
+        }
+    }
+
+    pub(super) const fn chain_id(self) -> Option<u64> {
+        match self {
+            Self::Chain(chain_id) => Some(chain_id),
+            Self::NonEvm(_) => None,
+        }
+    }
+
+    /// The row's selector: the chain id, or the network's name in lowercase.
+    fn selector(self) -> String {
+        match self {
+            Self::Chain(chain_id) => format!("swap-buy-picker-network-{chain_id}"),
+            Self::NonEvm(network) => format!(
+                "swap-buy-picker-network-{}",
+                network.display_name().to_lowercase()
+            ),
+        }
+    }
+}
+
+impl From<u64> for BuyNetworkKey {
+    fn from(chain_id: u64) -> Self {
+        Self::Chain(chain_id)
+    }
+}
+
+impl From<NonEvmNetwork> for BuyNetworkKey {
+    fn from(network: NonEvmNetwork) -> Self {
+        Self::NonEvm(network)
+    }
+}
+
 /// A network in the picker's list: the swap's own first, then the other chains a bridge could
-/// deliver on, in the network selector's order. One that can't take the delivery kind is listed
-/// with the reason, except that Private balance leaves out the chains without one.
+/// deliver on, in the network selector's order, then for a Public address the non-EVM
+/// networks. One that can't take the delivery kind is listed with the reason, except that
+/// Private balance leaves out the chains without one and the non-EVM networks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BuyNetwork {
-    pub(super) chain_id: u64,
+    pub(super) key: BuyNetworkKey,
     pub(super) label: SharedString,
     pub(super) this_network: bool,
     pub(super) availability: NetworkAvailability,
@@ -287,7 +342,7 @@ pub(super) struct BuyNetwork {
 pub(super) struct BuyPicker {
     pub(super) open: bool,
     /// The network whose tokens are listed. Picking a token makes it the form's.
-    pub(super) network: u64,
+    pub(super) network: BuyNetworkKey,
     /// The shown network's tokens under their search. Enter or a click picks the selected one.
     pub(super) tokens: Entity<ListState<BuyTokensDelegate>>,
     /// The networks under their search, which doesn't change the shown one. Enter or a click
@@ -298,7 +353,7 @@ pub(super) struct BuyPicker {
 
 /// The picker's two lists, with empty searches and nothing selected.
 fn buy_picker_lists(
-    network: u64,
+    network: BuyNetworkKey,
     window: &mut Window,
     cx: &mut Context<'_, PrivateSwapsView>,
 ) -> (
@@ -356,7 +411,7 @@ impl BuyPicker {
     }
 
     pub(super) fn new(
-        network: u64,
+        network: BuyNetworkKey,
         window: &mut Window,
         cx: &mut Context<'_, PrivateSwapsView>,
     ) -> Self {
@@ -500,9 +555,9 @@ impl PrivateSwapsView {
             .filter(|network| {
                 !network.this_network
                     && network.availability.is_pickable()
-                    && (form.picker.open || form.network == Some(network.chain_id))
+                    && (form.picker.open || form.network == network.key.chain_id())
             })
-            .map(|network| network.chain_id)
+            .filter_map(|network| network.key.chain_id())
             .collect::<Vec<_>>();
         let Some(http) = self.http(cx) else {
             return;
@@ -597,7 +652,7 @@ pub(super) struct BuyPickerContent {
     pub(super) receive_to_locked: bool,
     pub(super) token_list: Entity<ListState<BuyTokensDelegate>>,
     pub(super) network_list: Entity<ListState<BuyNetworksDelegate>>,
-    pub(super) network: u64,
+    pub(super) network: BuyNetworkKey,
     /// Every token of the shown network. The token list's search filters them.
     pub(super) tokens: BuyPickerTokens,
     /// Every network the delivery kind lists. The network list's search filters them.
@@ -645,7 +700,7 @@ fn select_row<D: ListDelegate>(
 /// none, the list shows where the network's routes stand.
 pub(super) struct BuyTokensDelegate {
     view: WeakEntity<PrivateSwapsView>,
-    network: u64,
+    network: BuyNetworkKey,
     tokens: BuyPickerTokens,
     /// The listed tokens the search matches, as indexes into them.
     rows: Vec<usize>,
@@ -655,7 +710,7 @@ pub(super) struct BuyTokensDelegate {
 }
 
 impl BuyTokensDelegate {
-    fn set_content(&mut self, network: u64, tokens: BuyPickerTokens, busy: bool) {
+    fn set_content(&mut self, network: BuyNetworkKey, tokens: BuyPickerTokens, busy: bool) {
         self.network = network;
         self.tokens = tokens;
         self.busy = busy;
@@ -667,7 +722,13 @@ impl BuyTokensDelegate {
             BuyPickerTokens::Listed(tokens) => tokens
                 .iter()
                 .enumerate()
-                .filter(|(_, token)| token.item.asset.matches(&self.query))
+                .filter(|(_, token)| {
+                    // A pasted mint or contract finds its token.
+                    token.item.asset.matches(&self.query)
+                        || token.item.contract.as_deref().is_some_and(|contract| {
+                            !self.query.is_empty() && contract.contains(self.query.as_str())
+                        })
+                })
                 .map(|(index, _)| index)
                 .collect(),
             BuyPickerTokens::Shield(_) | BuyPickerTokens::Loading | BuyPickerTokens::Failed(_) => {
@@ -688,6 +749,24 @@ impl BuyTokensDelegate {
         (0..self.rows.len())
             .filter_map(|row| self.row(row))
             .map(|row| row.item.asset.token)
+    }
+
+    /// The row of a non-EVM network's token by its mint or contract, `None` for the native
+    /// asset.
+    pub(super) fn contract_row(&self, contract: Option<&str>) -> Option<usize> {
+        (0..self.rows.len()).find(|row| {
+            self.row(*row)
+                .is_some_and(|token| token.item.contract.as_deref() == contract)
+        })
+    }
+
+    /// The listed tokens' symbols with their mint or contract, in the list's order.
+    #[cfg(test)]
+    pub(super) fn listed_contracts(&self) -> Vec<(String, Option<String>)> {
+        (0..self.rows.len())
+            .filter_map(|row| self.row(row))
+            .map(|row| (row.item.asset.label.to_string(), row.item.contract.clone()))
+            .collect()
     }
 }
 
@@ -717,49 +796,63 @@ impl ListDelegate for BuyTokensDelegate {
         cx: &mut Context<'_, ListState<Self>>,
     ) -> Option<Self::Item> {
         let row = self.row(ix.row)?;
+        // A non-EVM token is told apart by its mint or contract, the native asset by none.
+        let id = match (self.network, &row.item.contract) {
+            (BuyNetworkKey::NonEvm(_), Some(contract)) => {
+                format!("swap-buy-picker-token-{contract}")
+            }
+            (BuyNetworkKey::NonEvm(_), None) => "swap-buy-picker-token-native".to_owned(),
+            (BuyNetworkKey::Chain(_), _) => {
+                format!("swap-buy-picker-token-{:#x}", row.item.asset.token)
+            }
+        };
         Some(
-            ListItem::new(SharedString::from(format!(
-                "swap-buy-picker-token-{:#x}",
-                row.item.asset.token
-            )))
-            .h(rems(TOKEN_ROW_HEIGHT))
-            // The right side leaves room for the list's scrollbar, which overlays the rows.
-            .pl_2()
-            .pr_4()
-            .py_0()
-            .rounded(cx.theme().radius)
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(network_token_icon(
-                        row.item.asset.icon_path.clone(),
-                        self.network,
-                        1.5,
-                    ))
-                    .child(
-                        app_text(row.item.asset.label.to_string())
-                            .flex_1()
-                            .min_w_0()
-                            .truncate(),
-                    )
-                    .children(
-                        row.balance
-                            .clone()
-                            .map(|balance| app_muted_text(balance).text_xs().flex_none()),
-                    )
-                    // The value the list is ordered by, quieter than the balance beside it.
-                    .children(row.usd.clone().map(|usd| {
-                        app_muted_text(format!("({usd})"))
-                            .text_xs()
-                            .flex_none()
-                            .text_color(rgb(theme::TEXT_SUBTLE))
-                    }))
-                    .when(row.item.near_only, |row| row.child(near_tag())),
-            ),
+            ListItem::new(SharedString::from(id))
+                .h(rems(TOKEN_ROW_HEIGHT))
+                // The right side leaves room for the list's scrollbar, which overlays the rows.
+                .pl_2()
+                .pr_4()
+                .py_0()
+                .rounded(cx.theme().radius)
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(badged_token_icon(
+                            row.item.asset.icon_path.clone(),
+                            self.network.icon_path(),
+                            1.5,
+                        ))
+                        .child(
+                            app_text(row.item.asset.label.to_string())
+                                .flex_1()
+                                .min_w_0()
+                                .truncate(),
+                        )
+                        // Look-alike symbols are told apart by their mint or contract.
+                        .children(row.item.contract.as_deref().map(|contract| {
+                            app_muted_text(short_non_evm(contract))
+                                .text_xs()
+                                .flex_none()
+                                .font_family(theme::APP_MONO_FONT_FAMILY)
+                        }))
+                        .children(
+                            row.balance
+                                .clone()
+                                .map(|balance| app_muted_text(balance).text_xs().flex_none()),
+                        )
+                        // The value the list is ordered by, quieter than the balance beside it.
+                        .children(row.usd.clone().map(|usd| {
+                            app_muted_text(format!("({usd})"))
+                                .text_xs()
+                                .flex_none()
+                                .text_color(rgb(theme::TEXT_SUBTLE))
+                        }))
+                        .when(row.item.near_only, |row| row.child(near_tag())),
+                ),
         )
     }
 
@@ -769,7 +862,7 @@ impl ListDelegate for BuyTokensDelegate {
         _window: &mut Window,
         cx: &mut Context<'_, ListState<Self>>,
     ) -> impl IntoElement {
-        let network = network_name(self.network);
+        let network = self.network.name();
         let status = match &self.tokens {
             BuyPickerTokens::Shield(true) => app_muted_text(format!(
                 "To shield on {network} itself, use Shield on the Public tab. To shield elsewhere, choose another network."
@@ -828,62 +921,94 @@ impl ListDelegate for BuyTokensDelegate {
         window: &mut Window,
         cx: &mut Context<'_, ListState<Self>>,
     ) {
-        let Some(token) = self
+        let Some(item) = self
             .selected
             .and_then(|ix| self.row(ix.row))
-            .map(|row| row.item.asset.token)
+            .map(|row| row.item.clone())
         else {
             return;
         };
-        let _ = self.view.update(cx, |view, cx| {
-            view.pick_buy_token(token, window, cx);
+        let network = self.network;
+        let _ = self.view.update(cx, |view, cx| match network {
+            BuyNetworkKey::Chain(_) => view.pick_buy_token(item.asset.token, window, cx),
+            BuyNetworkKey::NonEvm(_) => view.pick_non_evm_token(item.contract, window, cx),
         });
     }
 }
 
 /// The network list's rows: the networks the search matches, by name or by the start of the
-/// chain id. One that can't be picked is disabled with the reason.
+/// chain id, with the non-EVM ones under their heading. One that can't be picked is disabled
+/// with the reason.
 pub(super) struct BuyNetworksDelegate {
     view: WeakEntity<PrivateSwapsView>,
     /// The network whose tokens the picker shows, which its row marks.
-    shown: u64,
+    shown: BuyNetworkKey,
     networks: Vec<BuyNetwork>,
-    /// The networks the search matches, as indexes into them.
-    rows: Vec<usize>,
+    /// The networks the search matches, as indexes into them. `None` is the "Non-EVM"
+    /// heading, a row as the kit's list sizes every section header from the first.
+    rows: Vec<Option<usize>>,
     query: String,
     selected: Option<IndexPath>,
 }
 
+/// The heading over the non-EVM networks.
+pub(super) const NON_EVM_HEADING: &str = "Non-EVM";
+
 impl BuyNetworksDelegate {
-    fn set_content(&mut self, shown: u64, networks: Vec<BuyNetwork>) {
+    fn set_content(&mut self, shown: BuyNetworkKey, networks: Vec<BuyNetwork>) {
         self.shown = shown;
         self.networks = networks;
         self.filter();
     }
 
     fn filter(&mut self) {
-        self.rows = self
-            .networks
-            .iter()
-            .enumerate()
-            .filter(|(_, network)| {
-                network.label.to_lowercase().contains(&self.query)
-                    || (!self.query.is_empty()
-                        && network.chain_id.to_string().starts_with(&self.query))
-            })
-            .map(|(index, _)| index)
-            .collect();
+        let mut rows: Vec<Option<usize>> = Vec::new();
+        for (index, network) in self.networks.iter().enumerate() {
+            let matched = network.label.to_lowercase().contains(&self.query)
+                || (!self.query.is_empty()
+                    && network
+                        .key
+                        .chain_id()
+                        .is_some_and(|chain_id| chain_id.to_string().starts_with(&self.query)));
+            if !matched {
+                continue;
+            }
+            // The non-EVM networks come last, and the heading only parts them from the EVM
+            // chains: as row 0 it would take the selection a search makes, and Enter on it does
+            // nothing.
+            if matches!(network.key, BuyNetworkKey::NonEvm(_))
+                && rows.last().copied().flatten().is_some_and(|previous| {
+                    matches!(self.networks[previous].key, BuyNetworkKey::Chain(_))
+                })
+            {
+                rows.push(None);
+            }
+            rows.push(Some(index));
+        }
+        self.rows = rows;
     }
 
     fn row(&self, row: usize) -> Option<&BuyNetwork> {
-        self.networks.get(*self.rows.get(row)?)
+        self.networks.get((*self.rows.get(row)?)?)
     }
 
-    /// The networks the search matches, in the list's order.
-    pub(super) fn listed(&self) -> impl Iterator<Item = u64> {
+    /// The networks the search matches, in the list's order, without the heading.
+    #[cfg(test)]
+    pub(super) fn listed(&self) -> impl Iterator<Item = BuyNetworkKey> {
         (0..self.rows.len())
             .filter_map(|row| self.row(row))
-            .map(|row| row.chain_id)
+            .map(|row| row.key)
+    }
+
+    /// The row of `key`, the heading counted.
+    pub(super) fn position(&self, key: BuyNetworkKey) -> Option<usize> {
+        (0..self.rows.len()).find(|row| self.row(*row).is_some_and(|network| network.key == key))
+    }
+
+    /// The row of the "Non-EVM" heading, while it is listed.
+    #[cfg(test)]
+    pub(super) fn heading_row(&self) -> Option<usize> {
+        self.rows.iter().position(Option::is_none)
     }
 }
 
@@ -912,8 +1037,29 @@ impl ListDelegate for BuyNetworksDelegate {
         _window: &mut Window,
         cx: &mut Context<'_, ListState<Self>>,
     ) -> Option<Self::Item> {
+        // The heading is a row that can't be picked, at a row's height like every row.
+        if self.rows.get(ix.row) == Some(&None) {
+            return Some(
+                ListItem::new("swap-buy-picker-non-evm-heading")
+                    .debug_selector(|| "swap-buy-picker-non-evm-heading".into())
+                    .h(rems(NETWORK_ROW_HEIGHT))
+                    .px_2()
+                    .py_0()
+                    .disabled(true)
+                    .child(
+                        div()
+                            .w_full()
+                            .h_full()
+                            .flex()
+                            .items_end()
+                            .pb_1()
+                            .child(app_muted_text(NON_EVM_HEADING).text_xs().truncate()),
+                    ),
+            );
+        }
         let network = self.row(ix.row)?;
-        let chain_id = network.chain_id;
+        let key = network.key;
+        let selector = key.selector();
         let available = network.availability.is_pickable();
         // The sync or the setup-fee check is still under way.
         let waiting = matches!(
@@ -922,7 +1068,7 @@ impl ListDelegate for BuyNetworksDelegate {
                 | NetworkAvailability::CheckingFee
                 | NetworkAvailability::Unavailable(NetworkUnavailable::SetupFee)
         );
-        let shown = self.shown == chain_id;
+        let shown = self.shown == key;
         let note = if network.this_network {
             Some("Current network".to_owned())
         } else {
@@ -933,79 +1079,76 @@ impl ListDelegate for BuyNetworksDelegate {
         // The reason is cut to the row's one line, so the pointer shows it whole.
         let tooltip = note.clone().filter(|_| !network.this_network);
         Some(
-            ListItem::new(SharedString::from(format!(
-                "swap-buy-picker-network-{chain_id}"
-            )))
-            .debug_selector(move || format!("swap-buy-picker-network-{chain_id}"))
-            .h(rems(NETWORK_ROW_HEIGHT))
-            .px_2()
-            .py_0()
-            .rounded(cx.theme().radius)
-            .disabled(!available)
-            // The shown network keeps the selected segment's fill and color, and no hover.
-            .confirmed(shown)
-            .when(shown, |row| row.bg(rgb(theme::SURFACE_HOVER)))
-            .when_some(tooltip, |row, tooltip| {
-                row.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-            })
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .size_4()
-                                    .flex_none()
-                                    .when(!available, |icon| icon.opacity(0.45))
-                                    .children(
-                                        railgun_ui::chain_icon_asset_path(chain_id)
-                                            .map(|path| gpui::img(path).size_full()),
-                                    ),
-                            )
-                            .child(
-                                app_text(network.label.clone())
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .when(shown, |label| label.text_color(rgb(theme::PRIMARY))),
-                            )
-                            .when(shown, |row| {
-                                row.child(
-                                    Icon::new(IconName::Check)
-                                        .small()
+            ListItem::new(SharedString::from(selector.clone()))
+                .debug_selector(move || selector)
+                .h(rems(NETWORK_ROW_HEIGHT))
+                .px_2()
+                .py_0()
+                .rounded(cx.theme().radius)
+                .disabled(!available)
+                // The shown network keeps the selected segment's fill and color, and no hover.
+                .confirmed(shown)
+                .when(shown, |row| row.bg(rgb(theme::SURFACE_HOVER)))
+                .when_some(tooltip, |row, tooltip| {
+                    row.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                })
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .size_4()
                                         .flex_none()
-                                        .text_color(rgb(theme::PRIMARY)),
+                                        .when(!available, |icon| icon.opacity(0.45))
+                                        .children(
+                                            key.icon_path().map(|path| gpui::img(path).size_full()),
+                                        ),
                                 )
-                            }),
-                    )
-                    // Under the label, past the icon and the row's gap. A wait under way shimmers.
-                    .children(note.map(|note| {
-                        if waiting {
-                            // The id keeps one animation as the note's text changes.
-                            ShimmerText::new(note)
-                                .id("waiting")
-                                .text_xs()
-                                .line_height(relative(theme::APP_TEXT_LINE_HEIGHT))
-                                .text_color(rgb(theme::TEXT_MUTED))
-                                .pl_6()
-                                .truncate()
-                                .into_any_element()
-                        } else {
-                            app_muted_text(note)
-                                .text_xs()
-                                .pl_6()
-                                .truncate()
-                                .into_any_element()
-                        }
-                    })),
-            ),
+                                .child(
+                                    app_text(network.label.clone())
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .when(shown, |label| label.text_color(rgb(theme::PRIMARY))),
+                                )
+                                .when(shown, |row| {
+                                    row.child(
+                                        Icon::new(IconName::Check)
+                                            .small()
+                                            .flex_none()
+                                            .text_color(rgb(theme::PRIMARY)),
+                                    )
+                                }),
+                        )
+                        // Under the label, past the icon and the row's gap. A wait under way shimmers.
+                        .children(note.map(|note| {
+                            if waiting {
+                                // The id keeps one animation as the note's text changes.
+                                ShimmerText::new(note)
+                                    .id("waiting")
+                                    .text_xs()
+                                    .line_height(relative(theme::APP_TEXT_LINE_HEIGHT))
+                                    .text_color(rgb(theme::TEXT_MUTED))
+                                    .pl_6()
+                                    .truncate()
+                                    .into_any_element()
+                            } else {
+                                app_muted_text(note)
+                                    .text_xs()
+                                    .pl_6()
+                                    .truncate()
+                                    .into_any_element()
+                            }
+                        })),
+                ),
         )
     }
 
@@ -1036,15 +1179,15 @@ impl ListDelegate for BuyNetworksDelegate {
         window: &mut Window,
         cx: &mut Context<'_, ListState<Self>>,
     ) {
-        let Some(chain_id) = self
+        let Some(key) = self
             .selected
             .and_then(|ix| self.row(ix.row))
-            .map(|row| row.chain_id)
+            .map(|row| row.key)
         else {
             return;
         };
         let _ = self.view.update(cx, |view, cx| {
-            view.show_buy_picker_network(chain_id, window, cx);
+            view.show_buy_picker_network(key, window, cx);
         });
     }
 }
@@ -1061,20 +1204,25 @@ impl PrivateSwapsView {
             return;
         }
         let buy = form.order_buy();
+        let non_evm_token = form.non_evm_token.clone();
+        let network = form.network_key(own);
         let picker = &mut form.picker;
         picker.open = true;
-        picker.network = form.network.unwrap_or(own);
+        picker.network = network;
         (picker.tokens, picker.networks) = buy_picker_lists(picker.network, window, cx);
         let tokens = picker.tokens.clone();
         self.settle_buy_picker(window, cx);
         // The form's Buy asset is the selected token.
-        let row = buy.and_then(|buy| {
-            tokens
-                .read(cx)
-                .delegate()
-                .listed()
-                .position(|token| token == buy)
-        });
+        let row = match non_evm_token {
+            Some(contract) => tokens.read(cx).delegate().contract_row(contract.as_deref()),
+            None => buy.and_then(|buy| {
+                tokens
+                    .read(cx)
+                    .delegate()
+                    .listed()
+                    .position(|token| token == buy)
+            }),
+        };
         if let Some(row) = row {
             select_row(&tokens, row, window, cx);
         }
@@ -1133,12 +1281,12 @@ impl PrivateSwapsView {
         let selectable = self
             .network_items(receive_to, cx)
             .iter()
-            .any(|network| network.chain_id == shown && network.availability.is_pickable());
+            .any(|network| network.key == shown && network.availability.is_pickable());
         let Some(form) = self.form.as_mut() else {
             return;
         };
         if !selectable {
-            form.picker.network = own;
+            form.picker.network = BuyNetworkKey::Chain(own);
         }
         if receive_to == ReceiveTo::PrivateBalance {
             self.load_private_networks(None, cx);
@@ -1152,38 +1300,36 @@ impl PrivateSwapsView {
         let shown = content.network;
         content.sync_lists(cx);
         select_row(&tokens, 0, window, cx);
-        let row = networks
-            .read(cx)
-            .delegate()
-            .listed()
-            .position(|chain_id| chain_id == shown);
+        let row = networks.read(cx).delegate().position(shown);
         if let Some(row) = row {
             select_row(&networks, row, window, cx);
         }
         cx.notify();
     }
 
-    /// List `chain_id`'s tokens, when it can be picked for the delivery kind.
+    /// List `key`'s tokens, when it can be picked for the delivery kind. A non-EVM network
+    /// has no chain, so nothing starts a session for it.
     pub(super) fn show_buy_picker_network(
         &mut self,
-        chain_id: u64,
+        key: impl Into<BuyNetworkKey>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        let key = key.into();
         let Some(form) = self.form.as_ref().filter(|form| form.picker.open) else {
             return;
         };
         if !self
             .network_items(form.receive_to, cx)
             .iter()
-            .any(|network| network.chain_id == chain_id && network.availability.is_pickable())
+            .any(|network| network.key == key && network.availability.is_pickable())
         {
             return;
         }
         let Some(form) = self.form.as_mut() else {
             return;
         };
-        form.picker.network = chain_id;
+        form.picker.network = key;
         let tokens = form.picker.tokens.clone();
         select_row(&tokens, 0, window, cx);
         self.load_bridge_routes(window, cx);
@@ -1203,12 +1349,18 @@ impl PrivateSwapsView {
         let Some(form) = self.form.as_mut().filter(|form| form.picker.open) else {
             return;
         };
-        if form.public.is_some() && form.picker.network == own {
+        let BuyNetworkKey::Chain(shown) = form.picker.network else {
+            return;
+        };
+        if form.public.is_some() && shown == own {
             return;
         }
         form.picker.open = false;
         window.close_dialog(cx);
-        let network = (form.picker.network != own).then_some(form.picker.network);
+        let network = (shown != own).then_some(shown);
+        // A chain's token replaces a non-EVM network's.
+        let left_non_evm = form.non_evm.take().is_some();
+        form.non_evm_token = None;
         // This network's native entry is its wrapped native token paid out as the native asset,
         // as a restored form holds it.
         let (token, native_output) = match (network, wrapped) {
@@ -1220,7 +1372,7 @@ impl PrivateSwapsView {
             cx.notify();
             return;
         }
-        let network_changed = form.network != network;
+        let network_changed = left_non_evm || form.network != network;
         if network_changed {
             form.network = network;
             form.blocked_shield_delivery_changed();
@@ -1234,6 +1386,9 @@ impl PrivateSwapsView {
             // An account chosen on the old network doesn't follow to the new one.
             form.clear_destination();
         }
+        if left_non_evm {
+            self.sync_receiver_placeholder(window, cx);
+        }
         if let Some(root) = self.root.upgrade() {
             root.update(cx, |root, _| {
                 root.activate_chain_background(network.unwrap_or(own));
@@ -1243,10 +1398,54 @@ impl PrivateSwapsView {
         self.bridge_choices_changed(window, cx);
     }
 
+    /// Pick the token of the shown non-EVM network by its mint or contract, `None` for the
+    /// native asset: the picker closes, and the form takes the network and the token together
+    /// and quotes them through NEAR Intents. The network has no chain, so no session starts.
+    pub(super) fn pick_non_evm_token(
+        &mut self,
+        contract: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(form) = self.form.as_mut().filter(|form| form.picker.open) else {
+            return;
+        };
+        let BuyNetworkKey::NonEvm(network) = form.picker.network else {
+            return;
+        };
+        if form.public.is_some() {
+            return;
+        }
+        form.picker.open = false;
+        window.close_dialog(cx);
+        if form.non_evm == Some(network) && form.non_evm_token.as_ref() == Some(&contract) {
+            cx.notify();
+            return;
+        }
+        if form.non_evm != Some(network) {
+            form.network = None;
+            form.non_evm = Some(network);
+            form.blocked_shield_delivery_changed();
+            form.bridge.chosen = None;
+            form.clear_destination();
+        }
+        form.buy = None;
+        form.non_evm_token = Some(contract);
+        form.native_output = false;
+        form.error = None;
+        self.sync_receiver_placeholder(window, cx);
+        self.load_bridge_routes(window, cx);
+        self.bridge_choices_changed(window, cx);
+    }
+
     /// The tokens the picker lists: what the delivery kind can deliver on the shown network.
     pub(super) fn buy_picker_items(&self, form: &SwapForm, cx: &App) -> Vec<SwapBuyItem> {
-        let shown = form.picker.network;
-        self.buy_items_on(form, (shown != self.origin_chain_id).then_some(shown), cx)
+        match form.picker.network {
+            BuyNetworkKey::Chain(shown) => {
+                self.buy_items_on(form, (shown != self.origin_chain_id).then_some(shown), cx)
+            }
+            BuyNetworkKey::NonEvm(network) => form.non_evm_buy_items(network),
+        }
     }
 
     /// The picker's rows for `items` on `network`, each with the wallet's private balance from
@@ -1308,7 +1507,41 @@ impl PrivateSwapsView {
     pub(super) fn buy_picker_content(&self, form: &SwapForm, cx: &App) -> BuyPickerContent {
         let own = self.origin_chain_id;
         let picker = &form.picker;
-        let shown = picker.network;
+        let key = picker.network;
+        // A non-EVM network lists 1Click's tokens there, without balances or USD values.
+        let shown = match key {
+            BuyNetworkKey::Chain(shown) => shown,
+            BuyNetworkKey::NonEvm(network) => {
+                let tokens = match form.bridge.non_evm_routes.get(&(form.sell, network)) {
+                    None => BuyPickerTokens::Loading,
+                    Some(Err(error)) => {
+                        BuyPickerTokens::Failed(self.quote_error_message(error, cx))
+                    }
+                    Some(Ok(_)) => BuyPickerTokens::Listed(
+                        self.buy_picker_items(form, cx)
+                            .into_iter()
+                            .map(|item| BuyPickerToken {
+                                item,
+                                balance: None,
+                                usd: None,
+                            })
+                            .collect(),
+                    ),
+                };
+                let (networks, network_counts) = self.network_list(form.receive_to, cx);
+                return BuyPickerContent {
+                    receive_to: form.receive_to,
+                    receive_to_locked: self.receive_to_locked(form),
+                    token_list: picker.tokens.clone(),
+                    network_list: picker.networks.clone(),
+                    network: key,
+                    tokens,
+                    networks,
+                    network_counts,
+                    busy: self.busy(),
+                };
+            }
+        };
         let private = form.receive_to == ReceiveTo::PrivateBalance;
         let routes = (shown != own).then(|| form.bridge.routes.get(&(form.sell, shown)));
         let tokens = if let Some(public) = &form.public {
@@ -1356,7 +1589,7 @@ impl PrivateSwapsView {
             receive_to_locked: self.receive_to_locked(form),
             token_list: picker.tokens.clone(),
             network_list: picker.networks.clone(),
-            network: shown,
+            network: key,
             tokens,
             networks,
             network_counts,

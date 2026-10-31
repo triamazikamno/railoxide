@@ -1,5 +1,6 @@
 use super::super::*;
 use super::helpers::*;
+use crate::bridge::{NonEvmNetwork, NonEvmReceiverError};
 use std::fs;
 
 #[test]
@@ -54,6 +55,7 @@ fn address_books_persist_encrypted_and_load_without_spend_unlock() {
     let view_session = import_wallet_with_metadata(&store, "address-book-wallet", "Address Book");
     let private_address = railgun_recipient_for_derivation(7);
     let public_address = "0x1111111111111111111111111111111111111111";
+    let solana_address = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
     assert_eq!(
         store
@@ -66,6 +68,12 @@ fn address_books_persist_encrypted_and_load_without_spend_unlock() {
             .list_public_address_book_entries_for_session(&view_session)
             .expect("empty public address book"),
         [] as [PublicAddressBookEntry; 0]
+    );
+    assert_eq!(
+        store
+            .list_non_evm_address_book_entries_for_session(&view_session)
+            .expect("empty non-EVM address book"),
+        [] as [NonEvmAddressBookEntry; 0]
     );
 
     let private_entry = store
@@ -82,6 +90,14 @@ fn address_books_persist_encrypted_and_load_without_spend_unlock() {
             public_address,
         )
         .expect("save public address book entry");
+    let non_evm_entry = store
+        .add_non_evm_address_book_entry_for_session(
+            &view_session,
+            "Solana friend",
+            NonEvmNetwork::Solana,
+            solana_address,
+        )
+        .expect("save non-EVM address book entry");
     let private_payload = db
         .get_desktop_wallet_vault_record(&private_address_book_record_key(
             &private_entry.entry_uuid,
@@ -92,6 +108,12 @@ fn address_books_persist_encrypted_and_load_without_spend_unlock() {
         .get_desktop_wallet_vault_record(&public_address_book_record_key(&public_entry.entry_uuid))
         .expect("load public address book record")
         .expect("public address book record present");
+    let non_evm_payload = db
+        .get_desktop_wallet_vault_record(&non_evm_address_book_record_key(
+            &non_evm_entry.entry_uuid,
+        ))
+        .expect("load non-EVM address book record")
+        .expect("non-EVM address book record present");
 
     assert_eq!(private_entry.label, "Private friend");
     assert_eq!(private_entry.address, private_address);
@@ -106,6 +128,10 @@ fn address_books_persist_encrypted_and_load_without_spend_unlock() {
     ));
     assert!(!contains_subsequence(&public_payload, b"Public friend"));
     assert!(!contains_subsequence(&public_payload, b"1111111111111111"));
+    assert!(!contains_subsequence(
+        &non_evm_payload,
+        solana_address.as_bytes()
+    ));
 
     drop(store);
     drop(db);
@@ -120,9 +146,13 @@ fn address_books_persist_encrypted_and_load_without_spend_unlock() {
     let public_entries = reopened
         .list_public_address_book_entries_for_session(&reloaded_session)
         .expect("reload public address book without spend unlock");
+    let non_evm_entries = reopened
+        .list_non_evm_address_book_entries_for_session(&reloaded_session)
+        .expect("reload non-EVM address book without spend unlock");
 
     assert_eq!(private_entries, vec![private_entry]);
     assert_eq!(public_entries, vec![public_entry]);
+    assert_eq!(non_evm_entries, vec![non_evm_entry]);
 
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
@@ -380,6 +410,62 @@ fn address_book_entries_update_delete_and_allow_same_entry_address() {
         store.delete_public_address_book_entry_for_session(&view_session, &public_entry.entry_uuid),
         Err(VaultError::PublicAddressBookEntryNotFound)
     ));
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+#[test]
+fn non_evm_address_book_validates_receivers_and_keeps_the_network_on_edit() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let view_session = import_wallet_with_metadata(&store, "address-book-non-evm", "Address Book");
+    let bitcoin_address = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+
+    assert!(matches!(
+        store.add_non_evm_address_book_entry_for_session(
+            &view_session,
+            "Testnet",
+            NonEvmNetwork::Bitcoin,
+            "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
+        ),
+        Err(VaultError::InvalidNonEvmAddressBookAddress(
+            NonEvmReceiverError::Testnet
+        ))
+    ));
+    let entry = store
+        .add_non_evm_address_book_entry_for_session(
+            &view_session,
+            "Cold BTC",
+            NonEvmNetwork::Bitcoin,
+            bitcoin_address,
+        )
+        .expect("save Bitcoin entry");
+    assert!(matches!(
+        store.add_non_evm_address_book_entry_for_session(
+            &view_session,
+            "Cold BTC uppercase",
+            NonEvmNetwork::Bitcoin,
+            &bitcoin_address.to_ascii_uppercase(),
+        ),
+        Err(VaultError::DuplicateNonEvmAddressBookAddress)
+    ));
+    assert!(matches!(
+        store.update_non_evm_address_book_entry_for_session(
+            &view_session,
+            &entry.entry_uuid,
+            "Moved to Solana",
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        ),
+        Err(VaultError::InvalidNonEvmAddressBookAddress(
+            NonEvmReceiverError::OtherNetwork(NonEvmNetwork::Bitcoin)
+        ))
+    ));
+    assert_eq!(
+        store
+            .list_non_evm_address_book_entries_for_session(&view_session)
+            .expect("list non-EVM address book"),
+        vec![entry]
+    );
 
     drop(store);
     drop(db);

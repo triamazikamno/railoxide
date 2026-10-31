@@ -89,8 +89,8 @@ impl PublicSwapRecord {
         self.bridge.as_ref()
     }
     #[must_use]
-    pub const fn observations(&self) -> PublicSwapObservations {
-        self.observations
+    pub fn observations(&self) -> PublicSwapObservations {
+        self.observations.clone()
     }
     /// The deposits this swap handed off to the network that were not ruled out, oldest first.
     pub fn live_deposits(&self) -> impl Iterator<Item = &PublicSwapTransaction> {
@@ -211,8 +211,8 @@ impl ExecutorRecord {
 /// `ExecutorRecord::swap_destination_outcome` reads it from a private Bridge order's: a
 /// shielded fill ran it, a held fill left its token in the account, and a refund left it
 /// unfilled. Across's report, `NeedsAttention` and a fill without the shield say nothing of it.
-const fn destination_outcome(outcome: SwapBridgeOutcome) -> Option<SwapDestinationOutcome> {
-    match outcome {
+const fn destination_outcome(outcome: &SwapBridgeOutcome) -> Option<SwapDestinationOutcome> {
+    match *outcome {
         SwapBridgeOutcome::DeliveredVerified {
             shielded: true,
             block,
@@ -520,7 +520,7 @@ impl PublicSwapHookBatch {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicSwapObservations {
     /// The order's trade. Order path only.
     #[serde(default)]
@@ -1062,20 +1062,20 @@ impl ExecutorStore {
             else {
                 return Err(ExecutorStoreError::OperationMismatch);
             };
-            let observed = swap.observations;
+            let observed = &swap.observations;
             let rules = BridgeOutcomeRules {
                 handed_off: observed.bridge_handoff.is_some(),
                 private: true,
                 destination_minimum: swap.approval.bounds.destination_minimum,
                 across: true,
-                known: observed.bridge_outcome,
+                known: observed.bridge_outcome.clone(),
                 refund_verified: observed.bridge_refund.is_some(),
             };
-            if !rules.admits(outcome) {
+            if !rules.admits(&outcome) {
                 return Err(ExecutorStoreError::InvalidRecord);
             }
+            let next = next_destination_outcome(*delivered, destination_outcome(&outcome));
             swap.observations.bridge_outcome = Some(outcome);
-            let next = next_destination_outcome(*delivered, destination_outcome(outcome));
             // A fill can only have run, or left funds for, a shield this use signed.
             let filled = matches!(
                 next,
@@ -1102,7 +1102,7 @@ impl ExecutorStore {
             let observations = &mut public_swap_mut(record, id)?.observations;
             if !bridge_refund_admitted(
                 true,
-                observations.bridge_outcome,
+                observations.bridge_outcome.as_ref(),
                 observations.bridge_handoff,
                 observations.bridge_refund,
                 refund,

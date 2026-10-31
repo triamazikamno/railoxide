@@ -358,6 +358,16 @@ pub(super) fn network_token_icon(
     chain_id: u64,
     size: f32,
 ) -> gpui::Div {
+    badged_token_icon(icon, railgun_ui::chain_icon_asset_path(chain_id), size)
+}
+
+/// [`network_token_icon`] with the network icon at `badge`, for a network outside the chain
+/// registry too.
+pub(super) fn badged_token_icon(
+    icon: Option<WalletIconSource>,
+    badge_path: Option<&'static str>,
+    size: f32,
+) -> gpui::Div {
     // The badge is a chip over the icon's corner, ringed in the surface colour so the two
     // marks stay apart, at about the proportion `CoW` Swap draws it.
     let badge = size * 0.6;
@@ -368,7 +378,7 @@ pub(super) fn network_token_icon(
         .h(rems(size))
         .flex_none()
         .children(icon.map(|icon| img(icon).size_full().rounded_full()))
-        .children(railgun_ui::chain_icon_asset_path(chain_id).map(|path| {
+        .children(badge_path.map(|path| {
             div()
                 .absolute()
                 .right(-rems(size * 0.15))

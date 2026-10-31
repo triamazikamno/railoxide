@@ -15923,6 +15923,7 @@ dependencies = [
  "arti-client",
  "async-trait",
  "base64 0.22.1",
+ "bech32 0.12.0",
  "bip39",
  "block2 0.6.2",
  "broadcaster-core",

@@ -343,17 +343,17 @@ impl ExecutorRecord {
             return None;
         };
         let destination = (*destination_operation)?;
-        let private_chain = |delivery: SwapDelivery| {
+        let private_chain = |delivery: &SwapDelivery| {
             delivery
                 .private_bridge()
                 .map(|bridge| bridge.destination_chain)
         };
         let chain = approval
             .as_deref()
-            .and_then(|approval| private_chain(approval.delivery))
+            .and_then(|approval| private_chain(&approval.delivery))
             .or_else(|| {
                 self.swap_use_orders(id)
-                    .find_map(|order| private_chain(order.delivery()))
+                    .find_map(|order| private_chain(&order.delivery()))
             })?;
         Some((chain, destination))
     }

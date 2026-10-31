@@ -848,7 +848,7 @@ impl Fixture {
                         bounds: bounds.clone(),
                         price_verified: None,
                         price_acknowledged: false,
-                        delivery,
+                        delivery: delivery.clone(),
                         tokens: Some(SwapApprovalTokens { sell: SELL, buy }),
                         accounts: None,
                     },
@@ -1744,7 +1744,7 @@ async fn speed_up_admission_follows_the_delivery_the_binding_and_the_shared_nonc
                 )
             }
         };
-        fixture.record_delivery_attempt(1, 100, BUY, delivery, bridge);
+        fixture.record_delivery_attempt(1, 100, BUY, delivery.clone(), bridge);
         let record = fixture.record();
         let open = &record.swap().unwrap().orders()[0];
         let binding = |order: &SwapOrderRecord| SwapSpeedUp {
@@ -4959,7 +4959,7 @@ async fn continuing_approvals_read_the_quote_age_from_one_finalized_block() {
             .swap_continuing_approvals(
                 operation,
                 swap_use,
-                SwapDelivery::Bridge(delivery),
+                &SwapDelivery::Bridge(delivery),
                 Some(U256::from(nonce)),
                 crate::OperationHttpClient::direct_for_tests(),
             )
@@ -5586,7 +5586,7 @@ async fn a_split_swaps_bridge_outcome_follows_the_expired_attempts_deposit() {
                         fixture.operation,
                         uid(1, 20),
                         &clients,
-                        &config,
+                        Some(&config),
                         crate::OperationHttpClient::direct_for_tests()
                     )
                     .await
@@ -5656,7 +5656,7 @@ async fn a_split_swaps_bridge_outcome_follows_the_expired_attempts_deposit() {
             let clients = bridge_clients(&fixture, &url);
             assert_eq!(
                 observe_bridge(&fixture, &clients, &config).await,
-                Some(expected),
+                Some(expected.clone()),
                 "{variant}"
             );
             assert!(
@@ -5667,7 +5667,11 @@ async fn a_split_swaps_bridge_outcome_follows_the_expired_attempts_deposit() {
                     .all(|(path, _)| path == "/api/deposit?originChainId=1&depositId=42")
             );
             let record = fixture.record();
-            assert_eq!(outcomes(&record), (Some(expected), None), "{variant}");
+            assert_eq!(
+                outcomes(&record),
+                (Some(expected.clone()), None),
+                "{variant}"
+            );
             assert_eq!(
                 states(&record),
                 (SwapOrderState::Done, SwapOrderState::Done),
@@ -5748,7 +5752,7 @@ async fn track_across_fill(
             fixture.operation,
             order,
             &clients,
-            &config,
+            Some(&config),
             crate::OperationHttpClient::direct_for_tests(),
         )
         .await
@@ -5841,7 +5845,7 @@ async fn a_live_orders_trade_hands_off_with_the_speed_ups_across_deposit() {
     // A relayer fills the deposit under the speed-up's terms.
     let (tracked, expected) =
         track_across_fill(&fixture, speed_up_uid, delivery, &replacement).await;
-    assert_eq!(tracked, Some(expected));
+    assert_eq!(tracked, Some(expected.clone()));
     let record = stored(&fixture);
     let orders = record.swap().unwrap().orders();
     assert_eq!(
@@ -5972,10 +5976,8 @@ async fn a_speed_ups_trade_delivers_under_the_expired_attempts_lower_across_term
 
 /// Record a NEAR Intents order to BNB Chain whose trade pays `deposit_address`.
 fn record_near_order(fixture: &Fixture, deposit_address: Address) {
-    fixture.record_delivery_attempt(
-        1,
-        20,
-        BUY,
+    record_near_delivery(
+        fixture,
         SwapDelivery::Bridge(BridgeDelivery {
             provider: BridgeProvider::NearIntents,
             destination_chain: 56,
@@ -5984,6 +5986,17 @@ fn record_near_order(fixture: &Fixture, deposit_address: Address) {
             surplus: BridgeSurplus::BridgedByProvider,
             private: None,
         }),
+        deposit_address,
+    );
+}
+
+/// [`record_near_order`] for another `delivery` that 1Click delivers.
+fn record_near_delivery(fixture: &Fixture, delivery: SwapDelivery, deposit_address: Address) {
+    fixture.record_delivery_attempt(
+        1,
+        20,
+        BUY,
+        delivery,
         Some(BridgeOrderTerms::NearIntents(NearIntentsOrderTerms {
             deposit_address,
             min_amount_out: U256::from(15),
@@ -5998,6 +6011,12 @@ fn record_near_order(fixture: &Fixture, deposit_address: Address) {
 /// trade's observation.
 async fn near_handoff(fixture: &Fixture, deposit_address: Address) -> SwapObservation {
     record_near_order(fixture, deposit_address);
+    settle_near_order(fixture, deposit_address).await
+}
+
+/// Confirm in block 15 the settlement of the recorded NEAR Intents order that pays
+/// `deposit_address`. Returns the trade's observation.
+async fn settle_near_order(fixture: &Fixture, deposit_address: Address) -> SwapObservation {
     // The order's UID commits to the deposit address the settlement pays.
     let logs = vec![
         (fixture.settlement, trade_log(uid(1, 20))),
@@ -6132,6 +6151,7 @@ fn across_reported() -> SwapBridgeOutcome {
     SwapBridgeOutcome::DeliveredReported {
         amount_out: Some(U256::from(REPORTED_AMOUNT)),
         transaction_hash: Some(REPORTED_FILL),
+        destination_transaction: None,
     }
 }
 
@@ -6195,7 +6215,7 @@ async fn observe_bridge(
             fixture.operation,
             uid(1, 20),
             clients,
-            destination,
+            Some(destination),
             crate::OperationHttpClient::direct_for_tests(),
         )
         .await
@@ -6326,6 +6346,7 @@ async fn across_delivery_is_verified_from_finalized_destination_receipts() {
                 1 | 5 => Some(SwapBridgeOutcome::DeliveredReported {
                     amount_out: Some(U256::ONE),
                     transaction_hash: Some(B256::repeat_byte(0xf1)),
+                    destination_transaction: None,
                 }),
                 // A private delivery is never reported.
                 _ => None,
@@ -6344,7 +6365,7 @@ async fn across_delivery_is_verified_from_finalized_destination_receipts() {
                         fixture.operation,
                         uid(1, 20),
                         &clients,
-                        &config,
+                        Some(&config),
                         crate::OperationHttpClient::direct_for_tests()
                     )
                     .await
@@ -6446,7 +6467,7 @@ async fn an_explicit_check_corrects_an_across_refund_with_a_verified_fill() {
             fixture.operation,
             uid(1, 20),
             &clients,
-            &config,
+            Some(&config),
             crate::OperationHttpClient::direct_for_tests(),
         )
         .await
@@ -6461,7 +6482,7 @@ async fn an_explicit_check_corrects_an_across_refund_with_a_verified_fill() {
             shielded: false,
         }
     };
-    assert_eq!(outcome, Some(expected));
+    assert_eq!(outcome, Some(expected.clone()));
     let record = fixture.record();
     assert_eq!(
         record.swap().unwrap().orders()[0]
@@ -6572,7 +6593,7 @@ async fn an_explicit_check_verifies_an_across_refund_on_this_chain() {
                     fixture.operation,
                     uid(1, 20),
                     &clients,
-                    &arbitrum,
+                    Some(&arbitrum),
                     crate::OperationHttpClient::direct_for_tests()
                 )
                 .await
@@ -6800,7 +6821,7 @@ async fn across_fills_need_the_pinned_pool_or_the_token_transfer_and_are_otherwi
                 fixture.operation,
                 uid(1, 20),
                 &clients,
-                &config,
+                Some(&config),
                 crate::OperationHttpClient::direct_for_tests(),
             )
             .await;
@@ -6971,7 +6992,7 @@ async fn across_reports_a_delivery_only_when_no_later_read_could_verify_it() {
                 fixture.operation,
                 uid(1, 20),
                 &clients,
-                &config,
+                Some(&config),
                 crate::OperationHttpClient::direct_for_tests(),
             )
             .await;
@@ -7044,14 +7065,14 @@ async fn an_explicit_check_of_an_across_report_verifies_it_or_finds_its_refund()
         };
         assert_eq!(
             observe_bridge(&fixture, &clients, &config).await,
-            Some(known),
+            Some(known.clone()),
             "scenario {scenario}"
         );
         // Routine polling asks neither Across nor the destination chain again.
         destination.lock().unwrap().rpc_requests.clear();
         assert_eq!(
             observe_bridge(&fixture, &clients, &config).await,
-            Some(known)
+            Some(known.clone())
         );
         assert_eq!(lookups.lock().unwrap().len(), 1);
         assert_eq!(destination.lock().unwrap().rpc_requests, [] as [Value; 0]);
@@ -7078,7 +7099,7 @@ async fn an_explicit_check_of_an_across_report_verifies_it_or_finds_its_refund()
                 fixture.operation,
                 uid(1, 20),
                 &clients,
-                &config,
+                Some(&config),
                 crate::OperationHttpClient::direct_for_tests(),
             )
             .await
@@ -7092,7 +7113,7 @@ async fn an_explicit_check_of_an_across_report_verifies_it_or_finds_its_refund()
             1 | 3 => (SwapBridgeOutcome::Refunding, SwapOrderState::Refunding),
             _ => (known, SwapOrderState::Done),
         };
-        assert_eq!(checked, Some(expected), "scenario {scenario}");
+        assert_eq!(checked, Some(expected.clone()), "scenario {scenario}");
         let record = fixture.record();
         assert_eq!(
             bridge_outcome(&record),
@@ -7121,6 +7142,7 @@ async fn near_intents_reports_set_the_outcome_and_final_ones_stop_tracking() {
             Some(SwapBridgeOutcome::DeliveredReported {
                 amount_out: Some(U256::from(16)),
                 transaction_hash: Some(destination_tx),
+                destination_transaction: None,
             }),
             SwapOrderState::Done,
         ),
@@ -7202,7 +7224,7 @@ async fn near_intents_reports_set_the_outcome_and_final_ones_stop_tracking() {
                         fixture.operation,
                         uid(1, 20),
                         &clients,
-                        &bnb,
+                        Some(&bnb),
                         crate::OperationHttpClient::direct_for_tests()
                     )
                     .await
@@ -7211,6 +7233,89 @@ async fn near_intents_reports_set_the_outcome_and_final_ones_stop_tracking() {
             );
             assert_eq!(requests.lock().unwrap().len(), 2);
         }
+        stub.abort();
+        fixture.finish().await;
+    }
+}
+
+// A non-EVM delivery is tracked as a NEAR Intents one, by its deposit address alone, and
+// without a destination chain: 1Click's success keeps the destination transaction as 1Click
+// reports it, a refund returns the deposit to the stealth account, and a failure needs
+// attention. No RPC request is made for any of them.
+#[tokio::test]
+async fn non_evm_reports_set_the_outcome_without_reading_a_chain() {
+    let signature =
+        "5VERv8NMvzbJMEkV8xnrLkEaWRtSz9CosKDYjCJjBRnbJLgp8uirBgmQpjKhoR4tjF3ZpRzrFmBV6UjKdiSZkQUW";
+    for (status, expected, expected_state) in [
+        (
+            "SUCCESS",
+            Some(SwapBridgeOutcome::DeliveredReported {
+                amount_out: Some(U256::from(16)),
+                transaction_hash: None,
+                destination_transaction: Some(signature.to_owned()),
+            }),
+            SwapOrderState::Done,
+        ),
+        (
+            "REFUNDED",
+            Some(SwapBridgeOutcome::Refunding),
+            SwapOrderState::Refunding,
+        ),
+        (
+            "FAILED",
+            Some(SwapBridgeOutcome::NeedsAttention),
+            SwapOrderState::NeedsAttention,
+        ),
+    ] {
+        let fixture = Fixture::start().await;
+        let deposit_address = Address::repeat_byte(0x79);
+        record_near_delivery(
+            &fixture,
+            SwapDelivery::NonEvmBridge(crate::vault::NonEvmDelivery {
+                network: crate::bridge::NonEvmNetwork::Solana,
+                receiver: "So11111111111111111111111111111111111111112".to_owned(),
+                asset_id: "nep141:sol.omft.near".to_owned(),
+                contract: None,
+                symbol: "SOL".to_owned(),
+                decimals: 9,
+            }),
+            deposit_address,
+        );
+        settle_near_order(&fixture, deposit_address).await;
+        let report = format!(
+            r#"{{"status":"{status}","swapDetails":{{"amountOut":"16","destinationChainTxHashes":[{{"hash":"{signature}","explorerUrl":"https://solscan.io/tx/{signature}"}}]}}}}"#
+        );
+        let (url, requests, stub) =
+            super::swap_order::spawn_bridge_stub(move |_| report.clone()).await;
+        let clients = bridge_clients(&fixture, &url);
+        fixture.chain.lock().unwrap().rpc_requests.clear();
+        let outcome = fixture
+            .owner
+            .observe_swap_bridge(
+                fixture.operation,
+                uid(1, 20),
+                &clients,
+                None,
+                crate::OperationHttpClient::direct_for_tests(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, expected, "{status}");
+        let record = fixture.record();
+        assert_eq!(
+            record.swap().unwrap().orders()[0]
+                .observations()
+                .bridge_outcome,
+            expected,
+            "{status}"
+        );
+        assert_eq!(state(&record, 0), expected_state, "{status}");
+        assert_eq!(requests.lock().unwrap().len(), 1, "{status}");
+        assert_eq!(
+            fixture.chain.lock().unwrap().rpc_requests,
+            [] as [Value; 0],
+            "{status}"
+        );
         stub.abort();
         fixture.finish().await;
     }
@@ -7424,7 +7529,7 @@ async fn near_intents_tracking_follows_the_traded_attempts_deposit_address() {
     let (traded_uid, newer_uid) = (uid(1, 20), uid(2, 40));
 
     // The first attempt expires unfilled, and the retry signs another deposit address.
-    fixture.record_delivery_attempt(1, 20, BUY, delivery, Some(older.clone()));
+    fixture.record_delivery_attempt(1, 20, BUY, delivery.clone(), Some(older.clone()));
     let record = fixture.observe(23, 21).await;
     assert_eq!(
         state(&record, 0),
@@ -7513,9 +7618,10 @@ async fn near_intents_tracking_follows_the_traded_attempts_deposit_address() {
     let expected = Some(SwapBridgeOutcome::DeliveredReported {
         amount_out: Some(U256::from(16)),
         transaction_hash: Some(destination_tx),
+        destination_transaction: None,
     });
     assert_eq!(observe_bridge(&fixture, &clients, &bnb).await, expected);
-    assert_eq!(outcomes(&fixture.record()), (expected, None));
+    assert_eq!(outcomes(&fixture.record()), (expected.clone(), None));
     // Only the first attempt's address was asked about.
     let only_older_asked = || {
         let requests = requests.lock().unwrap();
@@ -7542,7 +7648,7 @@ async fn near_intents_tracking_follows_the_traded_attempts_deposit_address() {
                 fixture.operation,
                 newer_uid,
                 &clients,
-                &bnb,
+                Some(&bnb),
                 crate::OperationHttpClient::direct_for_tests()
             )
             .await
@@ -7561,7 +7667,7 @@ async fn near_intents_tracking_follows_the_traded_attempts_deposit_address() {
         .find(|record| record.operation() == fixture.operation)
         .unwrap();
     assert_eq!(pairing(&record), (Some(traded_uid), Some(traded_uid)));
-    assert_eq!(outcomes(&record), (expected, None));
+    assert_eq!(outcomes(&record), (expected.clone(), None));
     assert_eq!(record.swap_bridges_to_track().count(), 0);
     assert_eq!(
         swap_attempt_state(&record, &record.swap().unwrap().orders()[0]),
@@ -7574,13 +7680,13 @@ async fn near_intents_tracking_follows_the_traded_attempts_deposit_address() {
                     fixture.operation,
                     attempt,
                     &clients,
-                    &bnb,
+                    Some(&bnb),
                     crate::OperationHttpClient::direct_for_tests()
                 )
                 .await
                 .unwrap(),
             if attempt == traded_uid {
-                expected
+                expected.clone()
             } else {
                 None
             }
@@ -7605,7 +7711,7 @@ async fn track_bridge(
             operation,
             order,
             clients,
-            destination,
+            Some(destination),
             crate::OperationHttpClient::direct_for_tests(),
         )
         .await
@@ -7647,7 +7753,7 @@ async fn near_intents_tracking_follows_whichever_live_order_fills() {
     for filled in [0_usize, 1] {
         let unfilled = 1 - filled;
         let fixture = Fixture::start().await;
-        fixture.record_delivery_attempt(1, 100, BUY, delivery, Some(terms(0)));
+        fixture.record_delivery_attempt(1, 100, BUY, delivery.clone(), Some(terms(0)));
         record_bridge_speed_up(&fixture, 2, 110, uids[0], terms(1));
 
         // A finalized settlement holds the filled order's trade, which pays its address.
@@ -7729,6 +7835,7 @@ async fn near_intents_tracking_follows_whichever_live_order_fills() {
         let expected = Some(SwapBridgeOutcome::DeliveredReported {
             amount_out: Some(U256::from(delivered)),
             transaction_hash: Some(destination_tx),
+            destination_transaction: None,
         });
         let operation = fixture.operation;
         assert_eq!(
@@ -7738,7 +7845,7 @@ async fn near_intents_tracking_follows_whichever_live_order_fills() {
         );
         assert_eq!(
             outcomes(&fixture.record()),
-            (expected, None),
+            (expected.clone(), None),
             "filled {filled}"
         );
         let only_filled_asked = || {
@@ -7774,7 +7881,11 @@ async fn near_intents_tracking_follows_whichever_live_order_fills() {
         // nothing more.
         let restarted = restarted_owner(&fixture);
         let record = stored(&fixture);
-        assert_eq!(outcomes(&record), (expected, None), "filled {filled}");
+        assert_eq!(
+            outcomes(&record),
+            (expected.clone(), None),
+            "filled {filled}"
+        );
         assert_eq!(record.swap_bridges_to_track().count(), 0, "filled {filled}");
         assert_eq!(
             swap_attempt_state(&record, &record.swap().unwrap().orders()[filled]),

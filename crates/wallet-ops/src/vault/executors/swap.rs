@@ -1,5 +1,7 @@
 use broadcaster_core::contracts::cow::OrderUid;
 
+use crate::bridge::NonEvmNetwork;
+
 use super::{
     Address, B256, BlockNumHash, Deserialize, ExecutorInputIdentity, ExecutorOperationId,
     ExecutorPayloadPurpose, ExecutorRecord, ExecutorStore, ExecutorStoreError, FixedBytes,
@@ -245,7 +247,7 @@ impl SwapOperationRecord {
             return Some(SwapAccountRefusal::SpeedUpNonceUsed);
         }
         let admitted = self.orders.iter().all(|order| {
-            let observed = order.observations;
+            let observed = &order.observations;
             if order.uid == open.uid {
                 observed.traded.is_none()
                     && observed.pre_hook_dead.is_none()
@@ -339,7 +341,7 @@ impl SwapOperationRecord {
 
 /// Serialized with serde's external tag, so later kinds such as keeping the
 /// output in the executor decode additively. Approvals without one are Reshield.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SwapDelivery {
     /// The executor receives the bought token and the post-hook shields it.
     #[default]
@@ -349,15 +351,34 @@ pub enum SwapDelivery {
     /// The order buys an intermediate token on this chain and hands it to a bridge provider,
     /// which delivers the destination token to the receiver on another chain.
     Bridge(BridgeDelivery),
+    /// The order pays an intermediate token on this chain to a NEAR Intents deposit address,
+    /// which delivers to a receiver on a non-EVM network. Surplus is bridged with it.
+    NonEvmBridge(NonEvmDelivery),
 }
 
 impl SwapDelivery {
     /// The Bridge delivery of a swap that shields its proceeds on the destination chain.
     #[must_use]
-    pub const fn private_bridge(self) -> Option<BridgeDelivery> {
+    pub const fn private_bridge(&self) -> Option<BridgeDelivery> {
         match self {
-            Self::Bridge(bridge) if bridge.is_private() => Some(bridge),
+            Self::Bridge(bridge) if bridge.is_private() => Some(*bridge),
             _ => None,
+        }
+    }
+
+    /// Whether a bridge provider delivers the swap on another chain or network.
+    #[must_use]
+    pub const fn is_bridge(&self) -> bool {
+        matches!(self, Self::Bridge(_) | Self::NonEvmBridge(_))
+    }
+
+    /// The bridge provider of a Bridge delivery: always NEAR Intents for a non-EVM one.
+    #[must_use]
+    pub const fn bridge_provider(&self) -> Option<BridgeProvider> {
+        match self {
+            Self::Bridge(bridge) => Some(bridge.provider),
+            Self::NonEvmBridge(_) => Some(BridgeProvider::NearIntents),
+            Self::Reshield | Self::External { .. } => None,
         }
     }
 
@@ -456,6 +477,21 @@ impl BridgeDelivery {
             )
         )
     }
+}
+
+/// The destination terms of a NEAR Intents delivery to a non-EVM network, all bound by its
+/// approval. Symbol and decimals are kept so the swap is shown without 1Click's token list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NonEvmDelivery {
+    pub network: NonEvmNetwork,
+    /// In the canonical form of [`NonEvmNetwork::parse_receiver`].
+    pub receiver: String,
+    /// 1Click's `destinationAsset`.
+    pub asset_id: String,
+    /// The mint or contract as 1Click lists it, `None` for the network's native asset.
+    pub contract: Option<String>,
+    pub symbol: String,
+    pub decimals: u8,
 }
 
 /// A Bridge order's provider terms, persisted with the order before it is submitted.
@@ -827,7 +863,7 @@ pub struct SwapPreHookDeath {
 /// Canonical observations, each recorded with its own block evidence. None of
 /// them implies another. Observations established from state at a finalized
 /// block carry that block and no transaction hash.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapOrderObservations {
     pub pre_hook_executed: Option<SwapObservation>,
     pub traded: Option<SwapObservation>,
@@ -931,7 +967,7 @@ pub struct SwapBridgeHandoff {
 /// `HeldOnDestination` once it verifies the matching fill, and an Across `DeliveredReported`
 /// with `DeliveredVerified` once it verifies the fill or with `Refunding` when Across then
 /// reports the deposit expired or refunded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SwapBridgeOutcome {
     /// Across's fill, checked in the destination chain's finalized receipts. `output_amount` is
     /// the fill's executed amount, at least the signed one. `shielded` is set when the fill's
@@ -949,6 +985,10 @@ pub enum SwapBridgeOutcome {
     DeliveredReported {
         amount_out: Option<U256>,
         transaction_hash: Option<B256>,
+        /// 1Click's destination transaction on a non-EVM network, as it reports it. `None`
+        /// for other deliveries, whose transaction is `transaction_hash`.
+        #[serde(default)]
+        destination_transaction: Option<String>,
     },
     /// The bridge expired or refunded the deposit, which returns to the executor on this chain.
     Refunding,
@@ -998,13 +1038,13 @@ impl BridgeOutcomeRules {
     /// an Across `DeliveredReported`, which a verified fill or a refund replaces. A verified
     /// delivery must meet the approved destination minimum. A private delivery's fill is a
     /// shielded delivery or held on the destination chain, and no other delivery is either.
-    pub(super) fn admits(&self, outcome: SwapBridgeOutcome) -> bool {
-        let private_fits = match outcome {
+    pub(super) fn admits(&self, outcome: &SwapBridgeOutcome) -> bool {
+        let private_fits = match *outcome {
             SwapBridgeOutcome::DeliveredVerified { shielded, .. } => shielded == self.private,
             SwapBridgeOutcome::HeldOnDestination { .. } => self.private,
             _ => true,
         };
-        let below_minimum = match outcome {
+        let below_minimum = match *outcome {
             SwapBridgeOutcome::DeliveredVerified { output_amount, .. } => self
                 .destination_minimum
                 .is_none_or(|minimum| output_amount < minimum),
@@ -1032,7 +1072,7 @@ impl BridgeOutcomeRules {
         self.handed_off
             && private_fits
             && !below_minimum
-            && !self.known.is_some_and(|known| {
+            && !self.known.as_ref().is_some_and(|known| {
                 known.is_final() && known != outcome && !corrects_refund && !corrects_report
             })
     }
@@ -1043,13 +1083,13 @@ impl BridgeOutcomeRules {
 /// never replaced, though recording it again is accepted.
 pub(super) fn bridge_refund_admitted(
     across: bool,
-    outcome: Option<SwapBridgeOutcome>,
+    outcome: Option<&SwapBridgeOutcome>,
     handoff: Option<SwapBridgeHandoff>,
     known: Option<SwapObservation>,
     refund: SwapObservation,
 ) -> bool {
     across
-        && outcome == Some(SwapBridgeOutcome::Refunding)
+        && outcome == Some(&SwapBridgeOutcome::Refunding)
         && refund.transaction_hash.is_some()
         && handoff.is_some_and(|handoff| refund.block.number > handoff.observation.block.number)
         && known.is_none_or(|known| known == refund)
@@ -1131,11 +1171,12 @@ impl SwapOrderRecord {
     /// A Bridge order's outcome on the destination chain is a delivery. Other orders have no
     /// destination outcome to wait for.
     pub(super) fn destination_delivered(&self) -> bool {
-        !matches!(self.delivery, SwapDelivery::Bridge(_))
+        !self.delivery.is_bridge()
             || self
                 .observations
                 .bridge_outcome
-                .is_some_and(|outcome| outcome.is_delivered())
+                .as_ref()
+                .is_some_and(SwapBridgeOutcome::is_delivered)
     }
 
     /// A Bridge order's provider terms.
@@ -1167,8 +1208,8 @@ impl SwapOrderRecord {
         self.uid().valid_to()
     }
     #[must_use]
-    pub const fn delivery(&self) -> SwapDelivery {
-        self.delivery
+    pub fn delivery(&self) -> SwapDelivery {
+        self.delivery.clone()
     }
     #[must_use]
     pub const fn bounds(&self) -> &SwapApprovedBounds {
@@ -1188,8 +1229,8 @@ impl SwapOrderRecord {
         self.invalidates.map(OrderUid)
     }
     #[must_use]
-    pub const fn observations(&self) -> SwapOrderObservations {
-        self.observations
+    pub fn observations(&self) -> SwapOrderObservations {
+        self.observations.clone()
     }
 
     /// The attempt has ended once its pre-hook can never run.
@@ -1289,7 +1330,7 @@ impl ExecutorRecord {
             .iter()
             .flat_map(|swap| &swap.orders)
             .filter(|order| {
-                matches!(order.delivery, SwapDelivery::Bridge(_))
+                order.delivery.is_bridge()
                     && order.observations.bridge_handoff.is_some()
                     && order.observations.bridge_outcome.is_none()
             })
@@ -1307,7 +1348,7 @@ impl ExecutorRecord {
         id: SwapUseId,
         sell_token: Address,
         buy_token: Address,
-        delivery: SwapDelivery,
+        delivery: &SwapDelivery,
     ) -> bool {
         let Some(swap) = &self.swap else {
             return true;
@@ -1317,7 +1358,7 @@ impl ExecutorRecord {
                 let terms = swap.order_terms(order);
                 terms.sell_token == sell_token
                     && terms.buy_token == buy_token
-                    && order.delivery == delivery
+                    && order.delivery == *delivery
             })
     }
 
@@ -1587,7 +1628,7 @@ impl ExecutorRecord {
 /// A Bridge order carries its own provider's terms and a surplus that provider supports. Across
 /// terms name a recipient and a message hash exactly for a private delivery, which only Across
 /// offers. Other orders carry none.
-fn bridge_terms_fit(delivery: SwapDelivery, bridge: Option<&BridgeOrderTerms>) -> bool {
+fn bridge_terms_fit(delivery: &SwapDelivery, bridge: Option<&BridgeOrderTerms>) -> bool {
     match (delivery, bridge) {
         (SwapDelivery::Bridge(delivery), Some(terms)) => {
             terms.provider() == delivery.provider
@@ -1601,7 +1642,10 @@ fn bridge_terms_fit(delivery: SwapDelivery, bridge: Option<&BridgeOrderTerms>) -
                     BridgeOrderTerms::NearIntents(_) => true,
                 }
         }
-        (SwapDelivery::Bridge(_), None) => false,
+        (SwapDelivery::NonEvmBridge(_), Some(terms)) => {
+            matches!(terms, BridgeOrderTerms::NearIntents(_))
+        }
+        (SwapDelivery::Bridge(_) | SwapDelivery::NonEvmBridge(_), None) => false,
         (SwapDelivery::Reshield | SwapDelivery::External { .. }, bridge) => bridge.is_none(),
     }
 }
@@ -1771,7 +1815,7 @@ impl ExecutorStore {
                     .iter()
                     .any(|issued| issued.hash == pre_hook.hash)
                 || post_hook.is_some() != delivery.has_post_hook()
-                || !bridge_terms_fit(delivery, bridge.as_ref())
+                || !bridge_terms_fit(&delivery, bridge.as_ref())
                 || post_hook.as_ref().is_some_and(|post_hook| {
                     post_hook.delegate != record.delegate
                         || post_hook.purpose != ExecutorPayloadPurpose::SwapPostHook
@@ -1793,7 +1837,7 @@ impl ExecutorStore {
             {
                 return Err(ExecutorStoreError::OperationMismatch);
             }
-            if !record.swap_use_keeps_terms(use_id, terms.sell_token, terms.buy_token, delivery) {
+            if !record.swap_use_keeps_terms(use_id, terms.sell_token, terms.buy_token, &delivery) {
                 return Err(ExecutorStoreError::SwapUseTermsChanged);
             }
             match speed_up {
@@ -1915,6 +1959,12 @@ impl ExecutorStore {
             {
                 return Err(ExecutorStoreError::OutstandingNonce);
             }
+            // A Reshield order pays the bought token to the executor. A Bridge order's bought
+            // token can end up there too: a skipped Across post-hook leaves it, and a bridge
+            // refunds to the executor. An External order pays its receiver. Earlier attempts'
+            // assets stay. The wallet's native marker is not an ERC-20 asset.
+            let bought = (matches!(delivery, SwapDelivery::Reshield) || delivery.is_bridge())
+                .then_some(terms.buy_token);
             let order = SwapOrderRecord {
                 terms: Some(terms),
                 attempt: orders.last().map_or(0, |order| order.attempt + 1),
@@ -1943,12 +1993,6 @@ impl ExecutorStore {
             }
             record.issued.push(pre_hook);
             record.issued.extend(post_hook);
-            // A Reshield order pays the bought token to the executor. A Bridge order's bought
-            // token can end up there too: a skipped Across post-hook leaves it, and a bridge
-            // refunds to the executor. An External order pays its receiver. Earlier attempts'
-            // assets stay. The wallet's native marker is not an ERC-20 asset.
-            let bought = matches!(delivery, SwapDelivery::Reshield | SwapDelivery::Bridge(_))
-                .then_some(terms.buy_token);
             for token in std::iter::once(terms.sell_token).chain(bought) {
                 if token == Address::ZERO {
                     continue;
@@ -2044,7 +2088,7 @@ impl ExecutorStore {
                     // Cancellation resolves the linked destination through this delivery's chain.
                     if destination_operation.is_some()
                         && !matches!(
-                            (known.as_deref().map(|known| known.delivery), approval.delivery),
+                            (known.as_deref().map(|known| &known.delivery), &approval.delivery),
                             (Some(SwapDelivery::Bridge(previous)), SwapDelivery::Bridge(replacement))
                                 if previous.is_private()
                                     && replacement.is_private()
@@ -2191,6 +2235,14 @@ impl ExecutorStore {
                             && handoff.is_some();
                     (credit_fits, handoff_fits, handoff.is_some())
                 }
+                // Like a NEAR Intents Bridge order: the trade pays the deposit address.
+                SwapDelivery::NonEvmBridge(_) => (
+                    credit.is_none(),
+                    handoff.is_none_or(|handoff| {
+                        handoff.observation == traded && handoff.deposit_id.is_none()
+                    }),
+                    handoff.is_some(),
+                ),
             };
             if traded.transaction_hash.is_none()
                 || !credit_fits
@@ -2277,18 +2329,22 @@ impl ExecutorStore {
                 .as_mut()
                 .and_then(|swap| swap.orders.iter_mut().find(|order| order.uid == uid.0))
                 .ok_or(ExecutorStoreError::OperationMismatch)?;
-            let SwapDelivery::Bridge(delivery) = order.delivery else {
-                return Err(ExecutorStoreError::OperationMismatch);
+            let private = match &order.delivery {
+                SwapDelivery::Bridge(delivery) => delivery.is_private(),
+                SwapDelivery::NonEvmBridge(_) => false,
+                SwapDelivery::Reshield | SwapDelivery::External { .. } => {
+                    return Err(ExecutorStoreError::OperationMismatch);
+                }
             };
             let rules = BridgeOutcomeRules {
                 handed_off: order.observations.bridge_handoff.is_some(),
-                private: delivery.is_private(),
+                private,
                 destination_minimum: order.bounds.destination_minimum,
                 across: matches!(order.bridge, Some(BridgeOrderTerms::Across(_))),
-                known: order.observations.bridge_outcome,
+                known: order.observations.bridge_outcome.clone(),
                 refund_verified: order.observations.bridge_refund.is_some(),
             };
-            if !rules.admits(outcome) {
+            if !rules.admits(&outcome) {
                 return Err(ExecutorStoreError::InvalidRecord);
             }
             order.observations.bridge_outcome = Some(outcome);
@@ -2310,10 +2366,10 @@ impl ExecutorStore {
                 .as_mut()
                 .and_then(|swap| swap.orders.iter_mut().find(|order| order.uid == uid.0))
                 .ok_or(ExecutorStoreError::OperationMismatch)?;
-            let observed = order.observations;
+            let observed = &order.observations;
             if !bridge_refund_admitted(
                 matches!(order.bridge, Some(BridgeOrderTerms::Across(_))),
-                observed.bridge_outcome,
+                observed.bridge_outcome.as_ref(),
                 observed.bridge_handoff,
                 observed.bridge_refund,
                 refund,

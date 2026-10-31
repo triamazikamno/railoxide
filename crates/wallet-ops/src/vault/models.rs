@@ -8,6 +8,7 @@ use super::{
 use serde::{Deserializer, Serializer, de};
 use sha2::Digest;
 
+use crate::bridge::NonEvmNetwork;
 use crate::hardware::HardwareTypedDataSigningMode;
 
 #[derive(Serialize, Deserialize, Zeroize)]
@@ -1068,6 +1069,17 @@ pub struct PublicAddressBookEntry {
     pub entry_uuid: String,
     pub label: String,
     pub address: Address,
+    pub display_order: u32,
+}
+
+/// A receiver on a [`NonEvmNetwork`], in the canonical form of
+/// [`NonEvmNetwork::parse_receiver`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NonEvmAddressBookEntry {
+    pub entry_uuid: String,
+    pub label: String,
+    pub network: NonEvmNetwork,
+    pub address: String,
     pub display_order: u32,
 }
 

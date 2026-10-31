@@ -1,6 +1,6 @@
 //! A debug-only fixture for looking at the Public account swap screens, at a private swap's
-//! retry review, failed quote, speed-up, split outcome, reported fill, setup progress and
-//! cancelled preparation, at the Stealth accounts inspector, at the refund dialog of a blocked
+//! retry review, failed quote, speed-up, split outcome, reported fill, setup progress,
+//! cancelled preparation and delivery to a non-EVM network, at the Stealth accounts inspector, at the refund dialog of a blocked
 //! Shield, at a private Send's broadcaster progress, at the rows of the UTXO table and at a
 //! hardware wallet's Derive from private dialog without a device: it opens
 //! them on a scratch wallet without private
@@ -248,6 +248,24 @@
 //!   in `reused`, and that #12 isn't used for another swap. On the later swap's detail,
 //!   Cancel preparation… ends in an error, as the wallet's store holds no such swap, and the
 //!   other actions do nothing.
+//! - `non-evm:<state>` shows a synthesized swap of 0.05 WETH that NEAR Intents delivers as JUP
+//!   to a receiver on Solana, through 100.46 USDC on Ethereum, in place of a Public account's
+//!   form, on Ethereum with its private session started. The Private tab's Swap opens it too,
+//!   and is offered there without private funds. `review` opens the form of the swap's retry,
+//!   whose first order expired, holding a synthesized quote of at least 180.42 JUP, about
+//!   182.10, which 1Click values at $100.73. No anchor prices JUP, so the form asks for the
+//!   unverified-price acknowledgement before Review… opens the review, whose Receive card names
+//!   Solana and the receiver with 1Click's estimate of the minimum, $99.80, and
+//!   whose rows show NEAR Intents, JUP's mint and Deposit to 1Click. The form's Provider row
+//!   reads NEAR Intents with its warning hint, and the Buy panel shows JUP's mint with its copy
+//!   button. The retry locks the Buy select, so 1Click's synthesized Solana tokens (SOL, USDC,
+//!   the look-alike sUSDC with a stand-in mint, and JUP) only back the quote; a fresh form's
+//!   Buy picker shows 1Click's live list with its mints. Approving the
+//!   review takes the vault password and ends in an error on the form. The other states open
+//!   the swap dialog on the detail of that swap's one order, traded and handed to 1Click:
+//!   `in-progress` has no report yet, `delivered` 1Click's report of 181.25 JUP with a stand-in
+//!   Solana signature as its destination transaction, and `needs-attention` 1Click's report of
+//!   a failed deposit. The detail's actions do nothing, and no provider is asked.
 //! - `unshield` lets the Private tab's Unshield open a stand-in 1.0 of the network's wrapped
 //!   native token when the wallet holds nothing it can unshield, so the form's Output toggle
 //!   and gas top-up can be looked at. The network's private session must be started. Nothing
@@ -290,7 +308,8 @@
 //!
 //! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
-//! only, and nothing reads, tracks or acts on them. A `retry-review` or speed-up mode, and the
+//! only, and nothing reads, tracks or acts on them. A `retry-review`, `non-evm:review` or
+//! speed-up mode, and the
 //! Speed up… of `setup:included-order-open`, opens the route its orderbook client would use,
 //! and sends nothing on it. A `quote-error`, `native-buy` or `cancelled:` mode opens no route. A `reported:`
 //! mode asks no orderbook, chain or bridge provider about its swap. The review of a
@@ -308,18 +327,19 @@ use railgun_ui::{
     KnownTokenInfo, format_scaled_amount, format_token_amount, known_tokens_for_chain,
     token_icon_asset_path,
 };
+use wallet_ops::bridge::{NearAssets, NonEvmBridgeDestination, NonEvmNetwork};
 use wallet_ops::cow::{CowOrderStatusHint, CowOrderStatusReport, OrderLimitError, OrderUid};
 use wallet_ops::settings::SwapProfile;
 use wallet_ops::vault::{
     AcrossOrderTerms, BridgeDelivery, BridgeOrderTerms, BridgePrivateDelivery, BridgeProvider,
     BridgeShieldFailure, BridgeSurplus, ExecutorNonceObservation, ExecutorNonceWatermark,
     ExecutorOperationId, ExecutorPayloadContext, ExecutorPayloadPurpose, ExecutorRecord,
-    IssuedExecutorPayload, PublicSwapApproval, PublicSwapDeposited, PublicSwapIntent,
-    PublicSwapObservations, PublicSwapRecord, SwapApproval, SwapApprovalTokens,
-    SwapApprovedAccount, SwapApprovedAccounts, SwapApprovedBounds, SwapBridgeHandoff,
-    SwapBridgeOutcome, SwapDelivery, SwapObservation, SwapOrderObservations, SwapPreHookDeath,
-    SwapPreHookDeathCause, SwapProof, SwapRecipient, SwapSetupFeeLimit, SwapTerms,
-    SwapTradeAmounts, SwapUseId,
+    IssuedExecutorPayload, NearIntentsOrderTerms, NonEvmDelivery, PublicSwapApproval,
+    PublicSwapDeposited, PublicSwapIntent, PublicSwapObservations, PublicSwapRecord, SwapApproval,
+    SwapApprovalTokens, SwapApprovedAccount, SwapApprovedAccounts, SwapApprovedBounds,
+    SwapBridgeHandoff, SwapBridgeOutcome, SwapDelivery, SwapObservation, SwapOrderObservations,
+    SwapPreHookDeath, SwapPreHookDeathCause, SwapProof, SwapRecipient, SwapSetupFeeLimit,
+    SwapTerms, SwapTradeAmounts, SwapUseId,
 };
 use wallet_ops::{
     BlockedShieldRescueBlocker, BlockedShieldRescueInfo, BlockedShieldRescueUtxoId,
@@ -381,6 +401,21 @@ enum Mode {
     Cancelled(Cancelled),
     BroadcasterProgress(BroadcasterProgress),
     HardwareDerive,
+    NonEvm(NonEvm),
+}
+
+/// What a `non-evm:` mode shows of the synthesized swap delivered by NEAR Intents to a
+/// receiver on Solana.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NonEvm {
+    /// The retry's form, holding a synthesized quote to review.
+    Review,
+    /// Handed off to 1Click, which hasn't reported the delivery yet.
+    InProgress,
+    /// 1Click reports the delivery, with its Solana transaction.
+    Delivered,
+    /// 1Click reports the deposit as failed or incomplete.
+    NeedsAttention,
 }
 
 /// Where a `broadcaster-progress:` mode holds its synthesized Send via broadcaster.
@@ -674,6 +709,15 @@ fn parse(value: &str) -> Option<Mode> {
             _ => return None,
         }));
     }
+    if let Some(state) = value.strip_prefix("non-evm:") {
+        return Some(Mode::NonEvm(match state {
+            "review" => NonEvm::Review,
+            "in-progress" => NonEvm::InProgress,
+            "delivered" => NonEvm::Delivered,
+            "needs-attention" => NonEvm::NeedsAttention,
+            _ => return None,
+        }));
+    }
     if let Some(state) = value.strip_prefix("cancelled:") {
         return Some(Mode::Cancelled(match state {
             "confirmed" => Cancelled::Confirmed,
@@ -789,6 +833,7 @@ pub(super) fn holds_swaps() -> bool {
                 | Mode::SetupUnderOrder(_)
                 | Mode::Reported(_)
                 | Mode::Cancelled(_)
+                | Mode::NonEvm(_)
         )
     )
 }
@@ -1303,6 +1348,151 @@ fn staged_reported(reported: Reported) -> Option<ExecutorRecord> {
     staged_swap_record(&[order], 1, signed)
 }
 
+/// The Solana receiver of a `non-evm:` mode's swap: 32 bytes no wallet holds, in base58.
+const NON_EVM_RECEIVER: &str = "9jQtwHhZT1H2TYSMt74msmBmy8UPen4GUysNynPUVkkv";
+/// 1Click's Solana transaction of a `non-evm:delivered` mode's delivery, a stand-in signature.
+const NON_EVM_TRANSACTION: &str =
+    "2zf1D3JpcScRk9TTCWSQmbKr8hB9nfiLK9iA7mHvNuxqSrDDLCRFY7mb48txGysNHWns8autYb6meqyhRAPs23qT";
+/// The JUP a `non-evm:` mode's deposit is quoted to deliver, at least 180.42 and about 182.10,
+/// and the 181.25 a delivery reports.
+const NON_EVM_MINIMUM: u64 = 180_420_000;
+const NON_EVM_EXPECTED: u64 = 182_100_000;
+const NON_EVM_REPORTED: u64 = 181_250_000;
+
+/// What 1Click lists on Solana for a `non-evm:review` mode's Buy picker, bought through USDC on
+/// Ethereum: SOL, USDC and the look-alike sUSDC, each with its own mint, and JUP, which the swap
+/// delivers. The sUSDC mint is a stand-in.
+fn non_evm_tokens() -> Vec<NonEvmBridgeDestination> {
+    let token =
+        |contract: Option<&str>, symbol: &str, asset: &str, decimals| NonEvmBridgeDestination {
+            contract: contract.map(str::to_owned),
+            intermediate: USDC,
+            symbol: symbol.to_owned(),
+            same_asset: symbol == "USDC",
+            near: NearAssets {
+                origin_asset: "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near"
+                    .to_owned(),
+                destination_asset: asset.to_owned(),
+                origin_decimals: 6,
+                destination_decimals: decimals,
+            },
+        };
+    vec![
+        token(None, "SOL", "nep141:sol.omft.near", 9),
+        token(
+            Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+            "USDC",
+            "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+            6,
+        ),
+        token(
+            Some("FiNPw48pLZgbwmFiaYdTyJDvQCsefYx3CsBy4iVZFpBz"),
+            "sUSDC",
+            "1cs_v1:sol:spl:FiNPw48pLZgbwmFiaYdTyJDvQCsefYx3CsBy4iVZFpBz",
+            6,
+        ),
+        token(
+            Some("JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"),
+            "JUP",
+            "nep141:sol-bb27241c87aa401cc963c360c175dd7ca7035873.omft.near",
+            6,
+        ),
+    ]
+}
+
+/// The delivery of a `non-evm:` mode's swap: JUP to the Solana receiver.
+fn non_evm_delivery() -> Option<NonEvmDelivery> {
+    let jup = non_evm_tokens().pop()?;
+    Some(NonEvmDelivery {
+        network: NonEvmNetwork::Solana,
+        receiver: NON_EVM_RECEIVER.to_owned(),
+        asset_id: jup.near.destination_asset,
+        contract: jup.contract,
+        symbol: jup.symbol,
+        decimals: jup.near.destination_decimals,
+    })
+}
+
+/// The network and tokens a `non-evm:review` mode's form lists. `None` in every other mode.
+pub(super) fn non_evm_routes() -> Option<(NonEvmNetwork, Vec<NonEvmBridgeDestination>)> {
+    matches!(mode()?, Mode::NonEvm(NonEvm::Review))
+        .then(|| (NonEvmNetwork::Solana, non_evm_tokens()))
+}
+
+/// The record of a `non-evm:` mode's swap: one order of 0.05 WETH for 100.46 USDC handed to
+/// 1Click for JUP on Solana. `None` stages it expired, as the swap a `non-evm:review` mode
+/// retries. The other states traded it 40 blocks after it was signed, 50 minutes ago, and
+/// handed it off, with 1Click's report as `state` names it.
+fn staged_non_evm(state: Option<NonEvm>) -> Option<ExecutorRecord> {
+    let signed = now_unix().saturating_sub(3_000);
+    let at = |block: u64, transaction: Option<&str>| SwapObservation {
+        block: BlockNumHash::new(SWAP_ORIGIN_BLOCK + block, keccak256(block.to_be_bytes())),
+        transaction_hash: transaction.map(keccak256),
+    };
+    let observed = match state {
+        None | Some(NonEvm::Review) => {
+            let expired = SwapPreHookDeath {
+                cause: SwapPreHookDeathCause::Expired,
+                observation: at(110, None),
+            };
+            SwapOrderObservations {
+                pre_hook_dead: Some(expired),
+                expired: Some(expired.observation),
+                ..Default::default()
+            }
+        }
+        Some(state) => {
+            let settlement = at(40, Some("settlement"));
+            SwapOrderObservations {
+                traded: Some(settlement),
+                pre_hook_executed: Some(settlement),
+                delivered: Some(settlement),
+                trade_amounts: Some(SwapTradeAmounts {
+                    sell_amount: U256::from(SWAP_SELL),
+                    buy_amount: U256::from(RETRY.0),
+                    fee_amount: U256::ZERO,
+                    settlement_gas_used: Some(1_386_204),
+                    settlement_effective_gas_price: Some(410_000_000),
+                    executed_fee: Some(U256::from(11_400_000_000_000_u64)),
+                    executed_fee_token: Some(WETH),
+                }),
+                bridge_handoff: Some(SwapBridgeHandoff {
+                    observation: settlement,
+                    deposit_id: None,
+                }),
+                bridge_outcome: match state {
+                    NonEvm::Delivered => Some(SwapBridgeOutcome::DeliveredReported {
+                        amount_out: Some(U256::from(NON_EVM_REPORTED)),
+                        transaction_hash: None,
+                        destination_transaction: Some(NON_EVM_TRANSACTION.to_owned()),
+                    }),
+                    NonEvm::NeedsAttention => Some(SwapBridgeOutcome::NeedsAttention),
+                    NonEvm::Review | NonEvm::InProgress => None,
+                },
+                ..Default::default()
+            }
+        }
+    };
+    let mut order = staged_order(
+        0,
+        signed,
+        (RETRY.0, NON_EVM_MINIMUM),
+        0xa1,
+        &serde_json::to_value(observed).ok()?,
+    )?;
+    order["delivery"] =
+        serde_json::to_value(SwapDelivery::NonEvmBridge(non_evm_delivery()?)).ok()?;
+    order["bridge"] = serde_json::to_value(BridgeOrderTerms::NearIntents(NearIntentsOrderTerms {
+        deposit_address: address!("3e4b8c1d27a95f60e8d4c2b71a09f5d36c8e2b14"),
+        min_amount_out: U256::from(NON_EVM_MINIMUM),
+        amount_out: U256::from(NON_EVM_EXPECTED),
+        deadline: "2026-10-30T13:20:00.000Z".to_owned(),
+        signed_quote: "{}".to_owned(),
+    }))
+    .ok()?;
+    staged_swap_record(&[order], if state.is_some() { 3 } else { 1 }, signed)
+}
+
 /// Order `attempt` of the synthesized private swap, as its record stores it: signed at `signed`
 /// for 20 minutes, with a deposit that Across has four hours to fill. `hash` tells its ID and
 /// its hooks, at nonces 1 and 2, apart from another order's.
@@ -1496,7 +1686,7 @@ fn staged_overlap(
             output_amount: U256::from(terms.1),
             shielded: false,
         }),
-        ..*traded
+        ..traded.clone()
     })
     .ok()?;
     // The settlement shielded everything a private swap bought, and for a Bridge swap what
@@ -1671,6 +1861,38 @@ pub(super) fn retry_review(
         Mode::SpeedUp(SpeedUp::Review | SpeedUp::Open | SpeedUp::JustPlaced) => {
             Some(SpeedUp::Review)
         }
+        // The retry of the swap to Solana, quoted for 101.18 USDC, whose expected JUP 1Click
+        // values at $100.73. No anchor prices JUP, so the review asks for the unverified-price
+        // acknowledgement.
+        Mode::NonEvm(NonEvm::Review) => {
+            let record = staged_non_evm(None)?;
+            let review = SwapReview::for_ui_fixture(
+                profile,
+                &record,
+                WETH,
+                USDC,
+                U256::from(SWAP_SPEND),
+                U256::from(101_180_000_u32),
+                PairAnchorRate {
+                    sell_rate: U256::from(1_000_000_000_000_000_000_u64),
+                    buy_rate: U256::from(2_030_000_000_u32),
+                },
+                120_000_000,
+                &SwapDelivery::NonEvmBridge(non_evm_delivery()?),
+                U256::from(NON_EVM_MINIMUM),
+                U256::from(NON_EVM_EXPECTED),
+                Some(U256::from(100_730_000_u32)),
+                Vec::new(),
+                isolation,
+            );
+            return match review {
+                Ok(review) => Some((record, review, None)),
+                Err(error) => {
+                    tracing::warn!(%error, "the debug UI fixture couldn't synthesize its review");
+                    None
+                }
+            };
+        }
         _ => return None,
     };
     let record = staged_swap(None, speed_up)?;
@@ -1713,9 +1935,10 @@ pub(super) fn retry_review(
             buy_rate: U256::from(2_030_000_000_u32),
         },
         120_000_000,
-        SWAP_DELIVERY,
+        &SwapDelivery::Bridge(SWAP_DELIVERY),
         U256::from(delivered),
         U256::from(delivered),
+        None,
         continuing,
         isolation,
     );
@@ -2427,7 +2650,8 @@ impl PrivateSwapsView {
                 | Mode::Setup(_)
                 | Mode::SetupUnderOrder(_)
                 | Mode::Reported(_)
-                | Mode::Cancelled(_),
+                | Mode::Cancelled(_)
+                | Mode::NonEvm(_),
             ) => None,
             Some(Mode::Split(split)) => Some((Some(split), None)),
             Some(Mode::SpeedUp(speed_up)) => Some((None, Some(speed_up))),
@@ -2458,6 +2682,18 @@ impl PrivateSwapsView {
         }
         if let Some(Mode::Cancelled(cancelled)) = mode() {
             self.open_ui_fixture_cancelled(cancelled, window, cx);
+            return true;
+        }
+        if let Some(Mode::NonEvm(state)) = mode()
+            && state != NonEvm::Review
+        {
+            let Some(record) = staged_non_evm(Some(state)) else {
+                tracing::warn!("the debug UI fixture couldn't synthesize its swap record");
+                return true;
+            };
+            let operation = record.operation();
+            self.records = vec![record];
+            self.show_detail(operation, window, cx);
             return true;
         }
         if matches!(mode(), Some(Mode::QuoteError)) {
@@ -2882,7 +3118,7 @@ pub(in crate::root) fn send_asset(
 pub(in crate::root) fn setup_swap_token(wrapped_native: Address) -> Option<Address> {
     matches!(
         mode(),
-        Some(Mode::Setup(_) | Mode::RetryReview | Mode::NativeBuy | Mode::Max(_))
+        Some(Mode::Setup(_) | Mode::RetryReview | Mode::NativeBuy | Mode::Max(_) | Mode::NonEvm(_))
     )
     .then_some(wrapped_native)
 }

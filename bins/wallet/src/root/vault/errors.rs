@@ -67,6 +67,12 @@ pub(in crate::root) const fn vault_error_kind(error: &VaultError) -> &'static st
         VaultError::PublicAddressBookDisplayOrderOverflow => {
             "public_address_book_display_order_overflow"
         }
+        VaultError::InvalidNonEvmAddressBookAddress(_) => "invalid_non_evm_address_book_address",
+        VaultError::DuplicateNonEvmAddressBookAddress => "duplicate_non_evm_address_book_address",
+        VaultError::NonEvmAddressBookEntryNotFound => "non_evm_address_book_entry_not_found",
+        VaultError::NonEvmAddressBookDisplayOrderOverflow => {
+            "non_evm_address_book_display_order_overflow"
+        }
         VaultError::InvalidBroadcasterPreferenceAddress => "invalid_broadcaster_preference_address",
         VaultError::InvalidHardwareWalletDescriptor => "invalid_hardware_wallet_descriptor",
         VaultError::HardwareWalletAccountIndexOverflow => "hardware_wallet_account_index_overflow",

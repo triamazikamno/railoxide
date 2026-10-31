@@ -619,8 +619,7 @@ impl WalletRoot {
         self.clear_hardware_wallet_restore_account_index(window, cx);
         self.vault_error = None;
         self.reset_wallet_scoped_state(cx);
-        self.private_address_book.clear();
-        self.public_address_book.clear();
+        self.clear_address_books();
         self.sync_wallet_select(window, cx);
         cx.notify();
 
@@ -904,8 +903,7 @@ impl WalletRoot {
             &mut self.public_accounts,
         );
         self.vault_view_unlock = None;
-        self.private_address_book.clear();
-        self.public_address_book.clear();
+        self.clear_address_books();
         self.reset_wallet_scoped_state(cx);
         self.setup_password = None;
         self.generated_seed = None;
@@ -1108,8 +1106,7 @@ impl WalletRoot {
             &mut self.public_accounts,
         );
         self.vault_view_unlock = None;
-        self.private_address_book.clear();
-        self.public_address_book.clear();
+        self.clear_address_books();
         self.set_broadcaster_preferences(wallet_ops::vault::BroadcasterPreferences::default(), cx);
         self.broadcaster_preference_error = None;
         self.reset_wallet_scoped_state(cx);
@@ -1206,8 +1203,7 @@ impl WalletRoot {
             &mut self.public_accounts,
         );
         self.vault_view_unlock = None;
-        self.private_address_book.clear();
-        self.public_address_book.clear();
+        self.clear_address_books();
         self.set_broadcaster_preferences(wallet_ops::vault::BroadcasterPreferences::default(), cx);
         self.broadcaster_preference_error = None;
         self.reset_wallet_scoped_state(cx);
@@ -1259,8 +1255,7 @@ impl WalletRoot {
             &mut self.wallet_options,
             &mut self.public_accounts,
         );
-        self.private_address_book.clear();
-        self.public_address_book.clear();
+        self.clear_address_books();
         self.set_broadcaster_preferences(wallet_ops::vault::BroadcasterPreferences::default(), cx);
         self.broadcaster_preference_error = None;
         self.address_book.search_query = Arc::from("");

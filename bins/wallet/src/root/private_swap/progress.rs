@@ -30,7 +30,7 @@ use wallet_ops::{
     cow::OrderUid,
     vault::{
         BridgeDelivery, BridgeOrderTerms, BridgeProvider, ExecutorOperationId,
-        ExecutorPayloadState, ExecutorRecord, SwapAccountRole, SwapAccountUse,
+        ExecutorPayloadState, ExecutorRecord, NonEvmDelivery, SwapAccountRole, SwapAccountUse,
         SwapAdmissionEvidence, SwapBridgeOutcome, SwapDelivery, SwapOrderRecord,
         SwapPreHookDeathCause, SwapSubmissionStatus, SwapUseId, SwapUseRecord, SwapUseRelease,
         SwapUseRole, swap_account_refusal,
@@ -54,7 +54,8 @@ use super::setup_progress::{SetupProgress, SetupProgressEnd};
 use super::{
     PrivateSwapsView, SWAP_BROADCASTER_REPUBLISH_INTERVAL, SWAP_BROADCASTER_RESPONSE_TIMEOUT,
     SetupRetryAvailability, SwapAction, SwapJobKind, local_date_time_label, local_time_label,
-    now_unix, sets_up_destination, short_receiver, swap_delivery, swap_recovery_token, swap_tokens,
+    non_evm_amount, now_unix, sets_up_destination, short_non_evm, short_receiver, swap_delivery,
+    swap_recovery_token, swap_tokens,
 };
 use crate::assets::WalletIconSource;
 use crate::root::broadcaster_picker::broadcaster_candidate_label;
@@ -586,6 +587,7 @@ impl PrivateSwapsView {
             });
         let group = swap_order_group(stage, stopped, record.is_hidden());
         let minimum = pending
+            .as_ref()
             .map(|pending| (pending.buy, pending.private_minimum))
             .or_else(|| {
                 swap_tokens(record)
@@ -594,6 +596,7 @@ impl PrivateSwapsView {
                     .map(|((_, buy), minimum)| (buy, minimum))
             });
         let started = pending
+            .as_ref()
             .map(|pending| ("Started", pending.started(record)))
             .or_else(|| self.swap_started(record, latest.as_ref(), cx));
         let delivery = pending.map_or_else(|| swap_delivery(record), |pending| pending.delivery);
@@ -604,11 +607,14 @@ impl PrivateSwapsView {
             followed.and_then(|order| self.render_outcome(record, order, stage, started, cx));
         let not_filled =
             followed.and_then(|order| self.render_not_filled(record, order, stage, cx));
-        let facts = match delivery {
+        let facts = match &delivery {
             SwapDelivery::Bridge(bridge) => {
-                Some(self.render_bridge_facts(record, order, bridge, stage, started, cx))
+                Some(self.render_bridge_facts(record, order, *bridge, stage, started, cx))
             }
-            _ if outcome.is_none() => self.render_facts(order, delivery, minimum, started, cx),
+            SwapDelivery::NonEvmBridge(non_evm) => {
+                Some(self.render_non_evm_facts(record, order, non_evm, stage, started, cx))
+            }
+            _ if outcome.is_none() => self.render_facts(order, &delivery, minimum, started, cx),
             _ => None,
         };
         let steps_shown = shows_steps(stage, outcome.is_some());
@@ -1110,8 +1116,11 @@ impl PrivateSwapsView {
             SwapDelivery::Bridge(bridge) => {
                 Some(self.render_bridge_facts(record, Some(order), bridge, stage, started, cx))
             }
+            SwapDelivery::NonEvmBridge(non_evm) => {
+                Some(self.render_non_evm_facts(record, Some(order), &non_evm, stage, started, cx))
+            }
             delivery if outcome.is_none() => {
-                self.render_facts(Some(order), delivery, None, started, cx)
+                self.render_facts(Some(order), &delivery, None, started, cx)
             }
             _ => None,
         };
@@ -1140,7 +1149,7 @@ impl PrivateSwapsView {
     fn render_facts(
         &self,
         order: Option<&SwapOrderRecord>,
-        delivery: SwapDelivery,
+        delivery: &SwapDelivery,
         minimum: Option<(Address, U256)>,
         started: Option<(&'static str, u64)>,
         cx: &App,
@@ -1149,7 +1158,7 @@ impl PrivateSwapsView {
         if order.is_some() {
             rows.push(fact_row("Settled by", settled_by_cow()));
         }
-        if let SwapDelivery::External { receiver } = delivery {
+        if let &SwapDelivery::External { receiver } = delivery {
             rows.push(self.receiver_row(receiver, cx));
         }
         if let Some((buy, minimum)) = minimum {
@@ -1164,38 +1173,15 @@ impl PrivateSwapsView {
         (!rows.is_empty()).then(|| div().w_full().flex().flex_col().gap_2().children(rows))
     }
 
-    /// A Public address swap's receiver, laid out like [`hash_row`]: the wallet's label for it
-    /// when it has one, and its address, shortened, with a control that copies it in full.
+    /// A Public address swap's receiver as [`receiver_fact_row`] lays it out: the wallet's
+    /// label for it when it has one, and its address, shortened, with a control that copies it
+    /// in full.
     fn receiver_row(&self, receiver: Address, cx: &App) -> gpui::Div {
-        let address = receiver.to_checksum(None);
-        let copy_id = SharedString::from(format!("swap-receiver-{address}-copy"));
-        div()
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .justify_between()
-            .gap_2()
-            .debug_selector(|| "swap-detail-receiver".into())
-            .child(app_muted_text("Receiver").flex_none())
-            .child(
-                div()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .children(
-                        self.receiver_label(receiver, cx)
-                            .map(|(label, _)| app_text(label).min_w_0().truncate()),
-                    )
-                    .child(
-                        app_strong_text(short_receiver(receiver))
-                            .flex_none()
-                            .font_family(theme::APP_MONO_FONT_FAMILY),
-                    )
-                    .child(clipboard_with_toast(copy_id, address).tooltip("Copy receiver address")),
-            )
+        receiver_fact_row(
+            receiver.to_checksum(None),
+            short_receiver(receiver),
+            self.receiver_label(receiver, cx).map(|(label, _)| label),
+        )
     }
 
     /// A Bridge swap's facts: its receiver, destination and provider, then what its state
@@ -1530,6 +1516,204 @@ impl PrivateSwapsView {
             .children(note.map(|note| app_muted_text(note).whitespace_normal()))
     }
 
+    /// The facts of a swap NEAR Intents delivers to a non-EVM network, from its record alone,
+    /// as [`Self::render_bridge_facts`] has them for a chain: the receiver in its network's form,
+    /// the network, the provider, the deposit address, the settlement, and what 1Click reports,
+    /// with amounts in the record's token and decimals and the destination transaction in the
+    /// network's own form. The wallet has no connection to the network, so nothing there is
+    /// verified.
+    fn render_non_evm_facts(
+        &self,
+        record: &ExecutorRecord,
+        order: Option<&SwapOrderRecord>,
+        delivery: &NonEvmDelivery,
+        stage: SwapStage,
+        started: Option<(&'static str, u64)>,
+        cx: &App,
+    ) -> gpui::Div {
+        let network = delivery.network.display_name();
+        let origin = network_name(self.origin_chain_id);
+        let provider = provider_name(BridgeProvider::NearIntents);
+        let amount = |amount| non_evm_amount(delivery, amount);
+        let buy = order
+            .and_then(|order| Some(record.swap()?.order_terms(order).buy_token()))
+            .or_else(|| swap_tokens(record).map(|(_, buy)| buy));
+        let attempts = order.map(|order| SwapAttempts::ending_at(record, order));
+        let evidence = attempts.map(|attempts| attempts.bridge_evidence());
+        let observed = evidence
+            .map(SwapOrderRecord::observations)
+            .unwrap_or_default();
+        let near = match evidence.and_then(SwapOrderRecord::bridge) {
+            Some(BridgeOrderTerms::NearIntents(near)) => Some(near),
+            _ => None,
+        };
+        let minimum = evidence
+            .map(SwapOrderRecord::bounds)
+            .or_else(|| record.swap_approval().map(|approval| &approval.bounds))
+            .and_then(|bounds| bounds.destination_minimum);
+        let receiver = self.non_evm_receiver_row(delivery, cx);
+        let destination = fact_row(
+            "Destination",
+            div()
+                .flex()
+                .items_center()
+                .text_size(theme::APP_TEXT_SIZE)
+                .line_height(gpui::relative(theme::APP_TEXT_LINE_HEIGHT))
+                .child(
+                    gpui::img(delivery.network.icon_asset_path())
+                        .size(px(16.0))
+                        .flex_none()
+                        .mr_1(),
+                )
+                .child(network),
+        );
+        let provider_row = fact_row(
+            "Provider",
+            provider_mention(BridgeProvider::NearIntents, app_text),
+        );
+        let deposit = near.map(|near| {
+            address_row(
+                "Deposit address",
+                near.deposit_address,
+                "Copy deposit address",
+            )
+        });
+        let settlement = attempts
+            .and_then(|attempts| attempts.traded)
+            .and_then(|traded| traded.observations().traded?.transaction_hash)
+            .map(|hash| {
+                let hash = hash.to_string();
+                let copy_id = SharedString::from(format!("swap-settlement-{hash}-copy"));
+                hash_row(
+                    "Settlement",
+                    hash,
+                    copy_id,
+                    "Copy settlement transaction hash",
+                )
+            });
+        let started =
+            started.map(|(label, at)| fact_row(label, app_text(local_date_time_label(at))));
+        let mut rows = Vec::new();
+        let mut note = None;
+        match stage {
+            SwapStage::Order(SwapOrderState::Done) => {
+                rows.push(receiver);
+                if let Some(SwapBridgeOutcome::DeliveredReported {
+                    amount_out,
+                    destination_transaction,
+                    ..
+                }) = &observed.bridge_outcome
+                {
+                    rows.extend(amount_out.map(|reported| {
+                        fact_row(
+                            "Reported amount",
+                            amount_with_note(
+                                amount(reported),
+                                minimum.map_or_else(String::new, |minimum| {
+                                    format!("(minimum {})", amount(minimum))
+                                }),
+                            ),
+                        )
+                    }));
+                    rows.extend(destination_transaction.clone().map(|transaction| {
+                        let copy_id = SharedString::from(format!(
+                            "swap-destination-transaction-{transaction}-copy"
+                        ));
+                        fact_row(
+                            "Transaction",
+                            div()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .debug_selector(|| "swap-destination-transaction".into())
+                                .child(
+                                    app_strong_text(short_non_evm(&transaction))
+                                        .flex_none()
+                                        .font_family(theme::APP_MONO_FONT_FAMILY),
+                                )
+                                .child(
+                                    clipboard_with_toast(copy_id, transaction)
+                                        .tooltip("Copy transaction"),
+                                ),
+                        )
+                    }));
+                }
+                rows.push(provider_row);
+                rows.extend(deposit);
+                rows.extend(settlement);
+                note = Some(format!(
+                    "{provider} reports this delivery. The wallet has no connection to {network}, so it doesn't check it there."
+                ));
+            }
+            SwapStage::Order(SwapOrderState::Refunding) => {
+                rows.push(receiver);
+                rows.push(provider_row);
+                rows.extend(deposit);
+                note = Some(format!(
+                    "{provider} refunded the deposit to the stealth account on {origin}. Check status confirms the refund reached it. Then Recover… shields it to your private balance for the shield fee and a broadcaster fee."
+                ));
+            }
+            SwapStage::Order(SwapOrderState::NeedsAttention) => {
+                rows.extend(near.map(|near| deposit_address_box(near.deposit_address)));
+                rows.extend(
+                    buy.zip(evidence.and_then(bridge_sent_amount))
+                        .map(|(buy, sent)| {
+                            fact_row("Amount sent", app_text(self.token_amount(buy, sent, cx)))
+                        }),
+                );
+                rows.extend([receiver, destination, provider_row]);
+                rows.extend(settlement);
+                note = Some(format!(
+                    "Give {provider} support the deposit address. If 1Click refunds it, the {} goes to the stealth account on {origin}, and Check status finds it for recovery.",
+                    buy.map_or_else(|| "deposit".to_owned(), |buy| self.token_symbol(buy, cx))
+                ));
+            }
+            SwapStage::Order(SwapOrderState::Traded | SwapOrderState::Bridging) => {
+                rows.extend([receiver, destination, provider_row]);
+                rows.extend(deposit);
+                rows.extend(settlement);
+                rows.extend(started);
+            }
+            // Before the trade: who settles the order, and what the receiver gets there.
+            _ => {
+                if order.is_some() {
+                    rows.push(fact_row("Settled by", settled_by_cow()));
+                }
+                rows.extend([receiver, destination, provider_row]);
+                rows.extend(
+                    minimum
+                        .filter(|_| swap_order_group(stage, false, false) == SwapOrderGroup::Open)
+                        .map(|minimum| {
+                            fact_row(
+                                format!("Receive on {network}"),
+                                app_text(format!("at least {}", amount(minimum))),
+                            )
+                        }),
+                );
+                rows.extend(started);
+            }
+        }
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .debug_selector(|| "swap-bridge-facts".into())
+            .child(div().w_full().flex().flex_col().gap_2().children(rows))
+            .children(note.map(|note| app_muted_text(note).whitespace_normal()))
+    }
+
+    /// A non-EVM receiver as [`receiver_fact_row`] lays it out: its saved label on that
+    /// network, and the receiver shortened with a control that copies it in full.
+    fn non_evm_receiver_row(&self, delivery: &NonEvmDelivery, cx: &App) -> gpui::Div {
+        let receiver = delivery.receiver.clone();
+        let short = short_non_evm(&receiver);
+        let label = self.non_evm_receiver_label(delivery.network, &receiver, cx);
+        receiver_fact_row(receiver, short, label)
+    }
+
     /// What a delivery under another attempt's lower approved minimum says of both minimums,
     /// as amounts on `delivery`'s network. `None` unless the trade and its delivery are on
     /// different attempts and the traded one approved more.
@@ -1596,6 +1780,9 @@ impl PrivateSwapsView {
                             cx,
                         )
                     }),
+                    SwapDelivery::NonEvmBridge(delivery) => bounds
+                        .destination_minimum
+                        .map(|minimum| non_evm_amount(&delivery, minimum)),
                     _ => record.swap().map(|swap| {
                         self.token_amount(
                             swap.order_terms(order).buy_token(),
@@ -1671,7 +1858,7 @@ impl PrivateSwapsView {
         started: Option<(&'static str, u64)>,
         cx: &Context<'_, Self>,
     ) -> Option<gpui::Div> {
-        if matches!(order.delivery(), SwapDelivery::Bridge(_)) {
+        if order.delivery().is_bridge() {
             return None;
         }
         let SwapStage::Order(
@@ -1681,7 +1868,7 @@ impl PrivateSwapsView {
             return None;
         };
         let swap = record.swap()?;
-        let outcome = swap_outcome(order.bounds(), &order.observations(), order.delivery())?;
+        let outcome = swap_outcome(order.bounds(), &order.observations(), &order.delivery())?;
         let terms = swap.order_terms(order);
         let (sell, buy) = (terms.sell_token(), terms.buy_token());
         let amount =
@@ -1694,7 +1881,7 @@ impl PrivateSwapsView {
             .received_privately
             .map(|(private, _)| private)
             .or_else(|| outcome.trade.map(|trade| trade.buy_amount));
-        let destination = self.receiver_name(order.delivery(), cx).map_or_else(
+        let destination = self.receiver_name(&order.delivery(), cx).map_or_else(
             || {
                 match state {
                     SwapOrderState::Done => "in your private balance",
@@ -1981,7 +2168,7 @@ impl PrivateSwapsView {
         cx: &App,
     ) -> Option<gpui::Div> {
         if stage != SwapStage::Order(SwapOrderState::AttemptEnded(SwapPreHookDeathCause::Expired))
-            || matches!(order.delivery(), SwapDelivery::Bridge(_))
+            || order.delivery().is_bridge()
         {
             return None;
         }
@@ -2094,7 +2281,7 @@ impl PrivateSwapsView {
         let across_reported = stage == SwapStage::Order(SwapOrderState::Done)
             && record.is_some_and(reported_by_across);
         let bridge_check = record.is_some_and(|record| {
-            matches!(swap_delivery(record), SwapDelivery::Bridge(_))
+            swap_delivery(record).is_bridge()
                 && (across_reported
                     || matches!(
                         stage,
@@ -2459,6 +2646,9 @@ impl PrivateSwapsView {
                         self.delivered_token(delivery, cx),
                         cx,
                     ),
+                    SwapDelivery::NonEvmBridge(ref delivery) => {
+                        format!("{} on {}", delivery.symbol, delivery.network.display_name())
+                    }
                     _ => self.token_symbol(tokens.buy, cx),
                 };
                 format!(
@@ -2796,8 +2986,16 @@ impl PrivateSwapsView {
         let Some(order) = record.swap().and_then(|swap| swap.orders().last()) else {
             return;
         };
-        let SwapDelivery::Bridge(delivery) = order.delivery() else {
-            return;
+        let (destination_chain, network) = match order.delivery() {
+            SwapDelivery::Bridge(delivery) => (
+                Some(delivery.destination_chain),
+                network_name(delivery.destination_chain),
+            ),
+            // A non-EVM network has no chain to turn on or read.
+            SwapDelivery::NonEvmBridge(delivery) => {
+                (None, delivery.network.display_name().to_owned())
+            }
+            SwapDelivery::Reshield | SwapDelivery::External { .. } => return,
         };
         let stage = self.stage(record);
         let across_refund =
@@ -2811,14 +3009,16 @@ impl PrivateSwapsView {
         let buy = record
             .swap()
             .map(|swap| swap.order_terms(order).buy_token());
-        let destination = self.root.upgrade().and_then(|root| {
-            root.read(cx)
-                .effective_chain_configs
-                .get(delivery.destination_chain)
-                .filter(|chain| chain.enabled)
-                .cloned()
+        // `Some(None)` for an EVM chain that isn't enabled here.
+        let destination = destination_chain.map(|chain_id| {
+            self.root.upgrade().and_then(|root| {
+                root.read(cx)
+                    .effective_chain_configs
+                    .get(chain_id)
+                    .filter(|chain| chain.enabled)
+                    .cloned()
+            })
         });
-        let network = network_name(delivery.destination_chain);
         let tracking = self.tracking.get(&operation);
         let client = tracking.and_then(|tracking| tracking.orderbook.clone());
         let clients = tracking.and_then(|tracking| tracking.bridge_clients.clone());
@@ -2836,8 +3036,12 @@ impl PrivateSwapsView {
                     || across_refund
                     || across_reported
                 {
-                    let destination = destination.ok_or_else(|| {
-                        eyre::eyre!("Turn on {network} in Settings to check this swap's delivery.")
+                    let destination = destination.map_or(Ok(None), |chain| {
+                        chain.map(Some).ok_or_else(|| {
+                            eyre::eyre!(
+                                "Turn on {network} in Settings to check this swap's delivery."
+                            )
+                        })
                     });
                     let ask = async {
                         let destination = destination?;
@@ -2855,7 +3059,7 @@ impl PrivateSwapsView {
                             operation,
                             uid,
                             &clients,
-                            &destination,
+                            destination.as_ref(),
                             &route,
                         ))
                         .await?;
@@ -3222,7 +3426,7 @@ impl PrivateSwapsView {
         let (sell, buy) = swap_tokens(record)?;
         Some(swap_recovery_token(
             self.stage(record),
-            swap_delivery(record),
+            &swap_delivery(record),
             sell,
             buy,
         ))
@@ -3409,6 +3613,36 @@ pub(super) fn hash_row(
                 .gap_1()
                 .child(app_strong_text(short_hash(&hash)).font_family(theme::APP_MONO_FONT_FAMILY))
                 .child(clipboard_with_toast(copy_id, hash).tooltip(tooltip)),
+        )
+}
+
+/// A swap's receiver row, laid out like [`hash_row`]: the wallet's `label` for it when it has
+/// one, and its `short` form with a control that copies `full`.
+fn receiver_fact_row(full: String, short: String, label: Option<String>) -> gpui::Div {
+    let copy_id = SharedString::from(format!("swap-receiver-{full}-copy"));
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .debug_selector(|| "swap-detail-receiver".into())
+        .child(app_muted_text("Receiver").flex_none())
+        .child(
+            div()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap_1()
+                .children(label.map(|label| app_text(label).min_w_0().truncate()))
+                .child(
+                    app_strong_text(short)
+                        .flex_none()
+                        .font_family(theme::APP_MONO_FONT_FAMILY),
+                )
+                .child(clipboard_with_toast(copy_id, full).tooltip("Copy receiver address")),
         )
 }
 
@@ -3618,6 +3852,22 @@ pub(super) fn progress_group(
                 "transaction",
                 "Copy transaction hash",
             )
+        }),
+        // A non-EVM network's transaction in its own form, with no EVM prefix or link.
+        step.destination_transaction.clone().map(|transaction| {
+            let copy_id = SharedString::from(format!("{id}-destination-transaction-copy"));
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .debug_selector(|| "swap-step-destination-transaction".into())
+                .child(app_muted_text("Transaction").flex_none())
+                .child(
+                    app_muted_text(short_non_evm(&transaction))
+                        .font_family(theme::APP_MONO_FONT_FAMILY),
+                )
+                .child(clipboard_with_toast(copy_id, transaction).tooltip("Copy transaction"))
+                .into_any_element()
         }),
         action,
     ]

@@ -30,12 +30,12 @@ use wallet_ops::{
 
 use super::form::SetupSide;
 use super::model::{
-    RecordSwap, SwapAttempts, SwapIdentity, SwapLabels, SwapOrderGroup, SwapStage,
-    bridge_sent_amount, provider_name, record_swaps, swap_delivery, swap_order_group,
+    RecordSwap, SwapAttempts, SwapBridgeLabels, SwapIdentity, SwapLabels, SwapOrderGroup,
+    SwapStage, bridge_sent_amount, provider_name, record_swaps, swap_delivery, swap_order_group,
     swap_order_status, swap_private_minimum,
 };
 use super::setup_progress::setup_route_card;
-use super::{PrivateSwapsView, local_date_time_label, swap_tokens};
+use super::{PrivateSwapsView, local_date_time_label, non_evm_token_icon, swap_tokens};
 use crate::assets::{
     ACROSS_LOGOMARK_PATH, COW_DAO_LIGHT_PATH, COW_PROTOCOL_LOGO_LIGHT_PATH, LIST_ICON_PATH,
     NEAR_SYMBOL_WHITE_PATH, WalletIconSource,
@@ -820,7 +820,9 @@ impl PrivateSwapsView {
                 let label = match delivery {
                     SwapDelivery::Reshield => "Completed",
                     SwapDelivery::Bridge(bridge) if bridge.is_private() => "Completed",
-                    SwapDelivery::External { .. } | SwapDelivery::Bridge(_) => "Delivered",
+                    SwapDelivery::External { .. }
+                    | SwapDelivery::Bridge(_)
+                    | SwapDelivery::NonEvmBridge(_) => "Delivered",
                 };
                 row.child(
                     app_text(label)
@@ -1197,6 +1199,7 @@ impl PrivateSwapsView {
         let latest = matches!(entry.view, SwapDialogView::Detail(_));
         let pending = latest.then(|| self.pending_order(record)).flatten();
         let tokens = pending
+            .as_ref()
             .map(|pending| (pending.sell, pending.buy))
             .or_else(|| {
                 entry
@@ -1222,6 +1225,7 @@ impl PrivateSwapsView {
                     .zip(attempts.map_or_else(
                         || {
                             pending
+                                .as_ref()
                                 .map(|pending| pending.private_minimum)
                                 .or_else(|| swap_private_minimum(record))
                         },
@@ -1281,7 +1285,7 @@ impl PrivateSwapsView {
         let bought = labels
             .bridge
             .as_ref()
-            .map_or(&labels.buy_symbol, |bridge| &bridge.token);
+            .map_or_else(|| labels.buy_symbol.clone(), SwapBridgeLabels::named_token);
         let title = if bought.is_empty() {
             labels.sell.clone()
         } else {
@@ -1347,6 +1351,11 @@ impl PrivateSwapsView {
                                 cx,
                             )
                             .and_then(|metadata| metadata.icon_path),
+                        SwapDelivery::NonEvmBridge(delivery) => non_evm_token_icon(
+                            delivery.network,
+                            delivery.contract.as_deref(),
+                            &delivery.symbol,
+                        ),
                         _ => self.token_icon(buy, cx),
                     },
                 ]

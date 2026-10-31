@@ -516,12 +516,31 @@ mod tests {
                 .expect("load chain icon")
                 .is_some()
         );
+        for network in wallet_ops::bridge::NonEvmNetwork::ALL {
+            let path = network.icon_asset_path();
+            assert!(
+                assets.load(path).expect("load network icon").is_some(),
+                "{path}"
+            );
+        }
         assert!(
             assets
                 .load("railgun-ui/tokens/1-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.png")
                 .expect("load token icon")
                 .is_some()
         );
+        // A non-EVM token takes the icon of a known token with its exact symbol, such as USDT
+        // on Tron and USDC on Solana; a symbol no known token has, or a look-alike, gets none.
+        for symbol in ["USDT", "USDC"] {
+            let path = railgun_ui::symbol_token_icon_asset_path(symbol).expect(symbol);
+            assert!(
+                assets.load(&path).expect("load token icon").is_some(),
+                "{path}"
+            );
+        }
+        for symbol in ["BONK", "sUSDC"] {
+            assert_eq!(railgun_ui::symbol_token_icon_asset_path(symbol), None);
+        }
         assert!(
             assets
                 .load("railgun/icons/clock.svg")

@@ -4522,7 +4522,7 @@ async fn a_public_orders_state_follows_the_precedence_of_its_observations() {
     };
     let unsettled = PublicSwapObservations {
         cancelled: Some(at),
-        ..expired
+        ..expired.clone()
     };
     let held = PublicSwapObservations {
         traded: Some(at),
@@ -4530,26 +4530,26 @@ async fn a_public_orders_state_follows_the_precedence_of_its_observations() {
             observation: at,
             amount,
         }),
-        ..unsettled
+        ..unsettled.clone()
     };
     let ruled_out = PublicSwapObservations {
         deposit_ruled_out: Some(at),
-        ..held
+        ..held.clone()
     };
     let withdrawn = PublicSwapObservations {
         withdrawn: Some(at),
-        ..held
+        ..held.clone()
     };
     let withdrawn_without_deposit = PublicSwapObservations {
         deposit_ruled_out: Some(at),
-        ..withdrawn
+        ..withdrawn.clone()
     };
     let bridged = PublicSwapObservations {
         bridge_handoff: Some(SwapBridgeHandoff {
             observation: at,
             deposit_id: Some(U256::from(DEPOSIT_ID)),
         }),
-        ..withdrawn
+        ..withdrawn.clone()
     };
     for (observations, expected, finished) in [
         (
@@ -4592,7 +4592,7 @@ async fn a_public_orders_state_follows_the_precedence_of_its_observations() {
     ] {
         payment
             .store
-            .record_public_swap_observations(payment.operation, payment.id, observations)
+            .record_public_swap_observations(payment.operation, payment.id, observations.clone())
             .unwrap();
         let swap = payment.saved().swap;
         assert_eq!(
@@ -4962,9 +4962,12 @@ async fn a_public_swap_is_delivered_by_the_fill_of_its_deposited_amounts_and_its
         output_amount: output,
         shielded: true,
     };
-    assert_eq!(observe().await.unwrap(), Some(delivered));
+    assert_eq!(observe().await.unwrap(), Some(delivered.clone()));
     let saved = payment.saved();
-    assert_eq!(saved.swap.observations().bridge_outcome, Some(delivered));
+    assert_eq!(
+        saved.swap.observations().bridge_outcome,
+        Some(delivered.clone())
+    );
     assert_eq!(
         saved.outcome,
         Some(SwapDestinationOutcome::Shielded {
@@ -5013,7 +5016,7 @@ async fn a_public_swaps_fill_without_its_shield_is_held_on_the_destination() {
             )
             .await
             .unwrap(),
-        Some(held)
+        Some(held.clone())
     );
     let saved = payment.saved();
     assert_eq!(saved.swap.observations().bridge_outcome, Some(held));
@@ -5328,7 +5331,7 @@ async fn an_explicit_check_replaces_a_public_swaps_refund_with_its_verified_fill
             )
             .await
             .unwrap(),
-        Some(delivered)
+        Some(delivered.clone())
     );
     let saved = payment.saved();
     assert_eq!(saved.swap.observations().bridge_outcome, Some(delivered));

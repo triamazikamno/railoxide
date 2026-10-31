@@ -21,8 +21,9 @@ use super::gas::hook_data_cost_from_candidates;
 use super::order::{anchor_token, placeholder_private_delivery_message_len};
 use super::{SwapInputPlan, SwapReview, SwapReviewChange};
 use crate::bridge::{
-    AcrossClient, AcrossFeeQuote, AcrossFeeRequest, AcrossMessageFeeRequest, BridgeApiError,
-    BridgeDestination, NearIntentsClient, OneClickDryQuote, OneClickQuoteParams,
+    AcrossClient, AcrossFeeQuote, AcrossFeeRequest, AcrossMessageFeeRequest, BridgeApi,
+    BridgeApiError, BridgeDestination, NearAssets, NearIntentsClient, NonEvmBridgeDestination,
+    NonEvmNetwork, OneClickDryQuote, OneClickQuoteParams, OneClickRecipient,
 };
 use crate::cow::{
     CowOrderbookClient, DeliveryAllowanceParams, DeliveryAllowanceRate, OrderLimitError,
@@ -36,7 +37,7 @@ use crate::settings::{
 };
 use crate::vault::{
     AcrossOrderTerms, BridgeDelivery, BridgeOrderTerms, BridgeProvider, NearIntentsOrderTerms,
-    SwapDelivery,
+    NonEvmDelivery, SwapDelivery,
 };
 use crate::{
     ExecutorOwner, HttpContext, OperationHttpClient, PairAnchorRate, QuoteDeviationError,
@@ -78,8 +79,44 @@ impl SwapBridgeClients {
 #[derive(Clone, Copy)]
 pub struct SwapBridgeRoute<'a> {
     pub clients: &'a SwapBridgeClients,
-    pub destination: &'a BridgeDestination,
-    pub destination_chain: &'a EffectiveChainConfig,
+    pub destination: SwapBridgeDestination<'a>,
+}
+
+/// Where a Bridge route delivers.
+#[derive(Clone, Copy)]
+pub enum SwapBridgeDestination<'a> {
+    /// A provider's destination on an EVM chain, with that chain's configuration.
+    Chain {
+        destination: &'a BridgeDestination,
+        chain: &'a EffectiveChainConfig,
+    },
+    /// A NEAR Intents destination on a non-EVM network, which has no chain configuration.
+    NonEvm(&'a NonEvmBridgeDestination),
+}
+
+/// A Bridge delivery checked against its route by [`bridge_route`].
+pub(super) enum BridgeLeg<'a> {
+    Chain {
+        delivery: BridgeDelivery,
+        destination: &'a BridgeDestination,
+        chain: &'a EffectiveChainConfig,
+    },
+    NonEvm {
+        delivery: NonEvmDelivery,
+        destination: &'a NonEvmBridgeDestination,
+    },
+}
+
+impl BridgeLeg<'_> {
+    /// The EVM delivery of a leg that shields to the wallet on its destination chain.
+    pub(super) const fn private_delivery(&self) -> Option<(BridgeDelivery, &EffectiveChainConfig)> {
+        match self {
+            Self::Chain {
+                delivery, chain, ..
+            } if delivery.is_private() => Some((*delivery, *chain)),
+            _ => None,
+        }
+    }
 }
 
 /// A Bridge order's provider terms quoted while signing, or the term that changed since the
@@ -116,6 +153,9 @@ pub struct SwapBridgeQuote {
     pub destination_minimum: U256,
     /// The provider's expected output on the destination chain.
     pub expected_output: U256,
+    /// 1Click's USD estimate of `expected_output`, in micro-dollars, for display only: never a
+    /// price anchor or a rate check. `None` for Across.
+    pub expected_output_usd: Option<U256>,
     /// The bridge's cost in bought-token base units. `None` for an unverified leg between
     /// different assets.
     pub fee: Option<U256>,
@@ -173,80 +213,107 @@ impl ExecutorOwner {
         })
     }
 
-    /// Quote `route`'s provider for `buy_amount` of the bought token, the order's buy amount.
-    /// A private delivery's Across quote is the same request, and its output is then reduced by
-    /// the delivery allowance.
+    /// Quote `leg`'s provider on `clients` for `buy_amount` of the bought token, the order's buy
+    /// amount. A private delivery's Across quote is the same request, and its output is then
+    /// reduced by the delivery allowance. No anchor prices a non-EVM token, so a non-EVM leg is
+    /// verified only by the same-asset rule.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn quote_swap_bridge(
         &self,
-        route: SwapBridgeRoute<'_>,
-        delivery: BridgeDelivery,
+        clients: &SwapBridgeClients,
+        leg: &BridgeLeg<'_>,
         profile: &SwapProfile,
         buy_amount: U256,
         slippage_bps: u32,
         anchor_cache: Option<&TokenAnchorRateCache>,
         token_registry: &EffectiveTokenRegistry,
     ) -> Result<SwapBridgeQuote> {
-        let destination = route.destination;
-        let quote = match delivery.provider {
-            BridgeProvider::Across => {
-                let spoke_pool = self
-                    .chain
-                    .bridge_profile()
-                    .ok_or_else(|| eyre!("this network doesn't support bridging"))?
-                    .spoke_pool();
-                quote_across_preview(
-                    &self.http,
-                    &route.clients.across,
-                    AcrossOrigin {
-                        chain_id: self.chain.chain_id,
-                        spoke_pool,
-                        token: destination.intermediate,
-                    },
-                    route.destination_chain,
-                    delivery,
-                    buy_amount,
-                    anchor_cache,
-                    token_registry,
-                )
-                .await?
-            }
-            BridgeProvider::NearIntents => {
-                let assets = destination
-                    .near
-                    .as_ref()
-                    .ok_or_else(|| eyre!("NEAR Intents doesn't list this destination"))?;
-                let deadline = SystemTime::now()
-                    .checked_add(profile.valid_to_window() + NEAR_QUOTE_DEADLINE_MARGIN)
-                    .ok_or_else(|| eyre!("the bridge quote's deadline is out of range"))?;
-                let quote = route
-                    .clients
-                    .near
-                    .dry_quote(&OneClickQuoteParams {
-                        origin_asset: assets.origin_asset.clone(),
-                        destination_asset: assets.destination_asset.clone(),
-                        amount: buy_amount,
+        let quote = match leg {
+            BridgeLeg::Chain {
+                delivery,
+                destination,
+                chain,
+            } => match delivery.provider {
+                BridgeProvider::Across => {
+                    let spoke_pool = self
+                        .chain
+                        .bridge_profile()
+                        .ok_or_else(|| eyre!("this network doesn't support bridging"))?
+                        .spoke_pool();
+                    quote_across_preview(
+                        &self.http,
+                        &clients.across,
+                        AcrossOrigin {
+                            chain_id: self.chain.chain_id,
+                            spoke_pool,
+                            token: destination.intermediate,
+                        },
+                        chain,
+                        *delivery,
+                        buy_amount,
+                        anchor_cache,
+                        token_registry,
+                    )
+                    .await?
+                }
+                BridgeProvider::NearIntents => {
+                    let assets = destination
+                        .near
+                        .as_ref()
+                        .ok_or_else(|| eyre!("NEAR Intents doesn't list this destination"))?;
+                    let quote = near_dry_quote(
+                        &clients.near,
+                        assets,
+                        profile,
+                        buy_amount,
                         slippage_bps,
-                        deadline,
-                    })
+                        None,
+                    )
                     .await?;
-                let anchor = anchor_cache.and_then(|cache| {
-                    cache
-                        .cached_bridge_leg_rate(
-                            self.chain.chain_id,
-                            destination.intermediate,
-                            delivery.destination_chain,
-                            anchor_token(delivery.destination_chain, delivery.destination_token),
-                            token_registry,
-                        )
-                        .ok()
-                        .flatten()
-                });
+                    let anchor = anchor_cache.and_then(|cache| {
+                        cache
+                            .cached_bridge_leg_rate(
+                                self.chain.chain_id,
+                                destination.intermediate,
+                                delivery.destination_chain,
+                                anchor_token(
+                                    delivery.destination_chain,
+                                    delivery.destination_token,
+                                ),
+                                token_registry,
+                            )
+                            .ok()
+                            .flatten()
+                    });
+                    near_bridge_quote(
+                        buy_amount,
+                        &quote,
+                        anchor,
+                        assets,
+                        destination.same_asset,
+                        profile.anchor_deviation_bps(),
+                    )?
+                }
+            },
+            BridgeLeg::NonEvm {
+                delivery,
+                destination,
+            } => {
+                let quote = near_dry_quote(
+                    &clients.near,
+                    &destination.near,
+                    profile,
+                    buy_amount,
+                    slippage_bps,
+                    Some(delivery.network),
+                )
+                .await?;
                 near_bridge_quote(
                     buy_amount,
                     &quote,
-                    anchor,
-                    destination,
+                    None,
+                    &destination.near,
+                    destination.same_asset,
                     profile.anchor_deviation_bps(),
                 )?
             }
@@ -257,18 +324,19 @@ impl ExecutorOwner {
         Ok(quote)
     }
 
-    /// Quote `route`'s provider again for `review`'s approved order: `buy_amount` of the bought
-    /// token, from an order valid until `valid_to`, for at least `destination_minimum` on the
-    /// destination chain. A 1Click quote names the receiver and the executor, so it isn't
-    /// requested when a leg verified at review can no longer be priced. A private delivery's
-    /// Across quote carries `handler_message`, which it requires, so Across simulates the real
-    /// fill. A message that fails there gets no quote, which is an error, not a lower quote.
+    /// Quote `leg`'s provider on `clients` again for `review`'s approved order: `buy_amount` of
+    /// the bought token, from an order valid until `valid_to`, for at least
+    /// `destination_minimum` on the destination chain. A 1Click quote names the receiver and the
+    /// executor, so it isn't requested when a leg verified at review can no longer be priced. A
+    /// private delivery's Across quote carries `handler_message`, which it requires, so Across
+    /// simulates the real fill. A message that fails there gets no quote, which is an error, not
+    /// a lower quote.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn bridge_signing_terms(
         &self,
         review: &SwapReview,
-        route: SwapBridgeRoute<'_>,
-        delivery: BridgeDelivery,
+        clients: &SwapBridgeClients,
+        leg: &BridgeLeg<'_>,
         buy_amount: U256,
         destination_minimum: U256,
         valid_to: u32,
@@ -278,136 +346,231 @@ impl ExecutorOwner {
         token_registry: &EffectiveTokenRegistry,
     ) -> Result<BridgeSigning> {
         let plan = review.plan();
-        let destination = route.destination;
-        if delivery.is_private() != handler_message.is_some() {
+        if leg.private_delivery().is_some() != handler_message.is_some() {
             return Err(eyre!(
                 "only a private bridge delivery is quoted with a handler message"
             ));
         }
-        match delivery.provider {
-            BridgeProvider::Across => {
-                let spoke_pool = self
-                    .chain
-                    .bridge_profile()
-                    .ok_or_else(|| eyre!("this network doesn't support bridging"))?
-                    .spoke_pool();
-                let fee = AcrossFeeRequest {
-                    input_token: plan.buy_token(),
-                    output_token: delivery.destination_token,
-                    origin_chain: self.chain.chain_id,
-                    destination_chain: delivery.destination_chain,
-                    amount: buy_amount,
-                };
-                let fees = match handler_message {
-                    Some(private) => route
-                        .clients
-                        .across
-                        .suggested_fees_with_message(&AcrossMessageFeeRequest {
-                            fee,
-                            recipient: private.handler,
-                            message: private.message.clone(),
-                        })
-                        .await
-                        .map_err(|error| match error {
-                            BridgeApiError::FillSimulationFailed => eyre!(
-                                "Across can't deliver this swap now: the shield on the destination network fails in its simulation. The order wasn't placed."
-                            ),
-                            BridgeApiError::AmountTooLow => eyre!(
-                                "Across won't bridge this amount: the shield's gas on the destination network is too large a share of it. The order wasn't placed. Try a larger amount."
-                            ),
-                            error => error.into(),
-                        })?,
-                    None => route.clients.across.suggested_fees(&fee).await?,
-                };
-                across_order_terms(
-                    &fees,
-                    spoke_pool,
-                    plan.buy_token(),
-                    delivery,
-                    buy_amount,
-                    destination_minimum,
-                    valid_to,
-                    handler_message.map(|private| (private.handler, keccak256(private.message))),
-                )
-            }
-            BridgeProvider::NearIntents => {
-                let assets = destination
-                    .near
-                    .as_ref()
-                    .ok_or_else(|| eyre!("NEAR Intents doesn't list this destination"))?;
-                let anchor = anchor_cache
-                    .cached_bridge_leg_rate(
-                        self.chain.chain_id,
+        let signing = NearSigning {
+            review,
+            near: &clients.near,
+            buy_amount,
+            destination_minimum,
+            valid_to,
+            profile,
+        };
+        match leg {
+            BridgeLeg::Chain {
+                delivery,
+                destination,
+                ..
+            } => match delivery.provider {
+                BridgeProvider::Across => {
+                    let spoke_pool = self
+                        .chain
+                        .bridge_profile()
+                        .ok_or_else(|| eyre!("this network doesn't support bridging"))?
+                        .spoke_pool();
+                    let fee = AcrossFeeRequest {
+                        input_token: plan.buy_token(),
+                        output_token: delivery.destination_token,
+                        origin_chain: self.chain.chain_id,
+                        destination_chain: delivery.destination_chain,
+                        amount: buy_amount,
+                    };
+                    let fees = match handler_message {
+                        Some(private) => clients
+                            .across
+                            .suggested_fees_with_message(&AcrossMessageFeeRequest {
+                                fee,
+                                recipient: private.handler,
+                                message: private.message.clone(),
+                            })
+                            .await
+                            .map_err(|error| match error {
+                                BridgeApiError::FillSimulationFailed => eyre!(
+                                    "Across can't deliver this swap now: the shield on the destination network fails in its simulation. The order wasn't placed."
+                                ),
+                                BridgeApiError::AmountTooLow => eyre!(
+                                    "Across won't bridge this amount: the shield's gas on the destination network is too large a share of it. The order wasn't placed. Try a larger amount."
+                                ),
+                                error => error.into(),
+                            })?,
+                        None => clients.across.suggested_fees(&fee).await?,
+                    };
+                    across_order_terms(
+                        &fees,
+                        spoke_pool,
                         plan.buy_token(),
-                        delivery.destination_chain,
-                        anchor_token(delivery.destination_chain, delivery.destination_token),
-                        token_registry,
-                    )
-                    .ok()
-                    .flatten();
-                if anchor.is_none()
-                    && review
-                        .bridge()
-                        .is_some_and(|bridge| matches!(bridge.leg, BridgeLegPrice::Verified(_)))
-                {
-                    return Ok(BridgeSigning::Changed(SwapReviewChange::PriceUnavailable));
-                }
-                let deadline = UNIX_EPOCH
-                    .checked_add(
-                        Duration::from_secs(u64::from(valid_to)) + NEAR_QUOTE_DEADLINE_MARGIN,
-                    )
-                    .ok_or_else(|| eyre!("the bridge quote's deadline is out of range"))?;
-                let executor = plan.executor();
-                // Refunds return to the executor on this chain.
-                let quote = route
-                    .clients
-                    .near
-                    .quote(
-                        &OneClickQuoteParams {
-                            origin_asset: assets.origin_asset.clone(),
-                            destination_asset: assets.destination_asset.clone(),
-                            amount: buy_amount,
-                            slippage_bps: review.slippage_bps(),
-                            deadline,
-                        },
-                        delivery.receiver,
-                        executor,
-                        executor,
-                    )
-                    .await?;
-                if quote.min_amount_out < destination_minimum {
-                    return Ok(BridgeSigning::Changed(
-                        SwapReviewChange::DestinationMinimum {
-                            approved: destination_minimum,
-                            current: quote.min_amount_out,
-                        },
-                    ));
-                }
-                if let Some(rate) = anchor {
-                    match check_quote_against_anchor(
+                        *delivery,
                         buy_amount,
-                        quote.min_amount_out,
-                        rate,
-                        profile.anchor_deviation_bps(),
-                    ) {
-                        Ok(()) => {}
-                        Err(QuoteDeviationError::ExceedsThreshold) => {
-                            return Ok(BridgeSigning::Changed(SwapReviewChange::QuoteDeviates));
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
+                        destination_minimum,
+                        valid_to,
+                        handler_message
+                            .map(|private| (private.handler, keccak256(private.message))),
+                    )
                 }
-                Ok(BridgeSigning::Terms(BridgeOrderTerms::NearIntents(
-                    NearIntentsOrderTerms {
-                        deposit_address: quote.deposit_address,
-                        min_amount_out: quote.min_amount_out,
-                        amount_out: quote.amount_out,
-                        deadline: quote.deadline,
-                        signed_quote: quote.signed_response,
-                    },
-                )))
+                BridgeProvider::NearIntents => {
+                    let assets = destination
+                        .near
+                        .as_ref()
+                        .ok_or_else(|| eyre!("NEAR Intents doesn't list this destination"))?;
+                    let anchor = anchor_cache
+                        .cached_bridge_leg_rate(
+                            self.chain.chain_id,
+                            plan.buy_token(),
+                            delivery.destination_chain,
+                            anchor_token(delivery.destination_chain, delivery.destination_token),
+                            token_registry,
+                        )
+                        .ok()
+                        .flatten();
+                    signing
+                        .order_terms(assets, anchor, OneClickRecipient::Evm(delivery.receiver))
+                        .await
+                }
+            },
+            // 1Click checks the receiver only now, since review quotes send a placeholder.
+            BridgeLeg::NonEvm {
+                delivery,
+                destination,
+            } => signing
+                .order_terms(
+                    &destination.near,
+                    None,
+                    OneClickRecipient::NonEvm(delivery.receiver.clone()),
+                )
+                .await
+                .map_err(|error| match error.downcast::<BridgeApiError>() {
+                    Ok(error) => non_evm_quote_error(error),
+                    Err(error) => error,
+                }),
+        }
+    }
+}
+
+/// A 1Click dry quote of `buy_amount` between `assets`, for the profile's window. The
+/// placeholder recipient is a `non_evm` network's address when the destination is one.
+async fn near_dry_quote(
+    near: &NearIntentsClient,
+    assets: &NearAssets,
+    profile: &SwapProfile,
+    buy_amount: U256,
+    slippage_bps: u32,
+    non_evm: Option<NonEvmNetwork>,
+) -> Result<OneClickDryQuote> {
+    let deadline = SystemTime::now()
+        .checked_add(profile.valid_to_window() + NEAR_QUOTE_DEADLINE_MARGIN)
+        .ok_or_else(|| eyre!("the bridge quote's deadline is out of range"))?;
+    Ok(near
+        .dry_quote(
+            &OneClickQuoteParams {
+                origin_asset: assets.origin_asset.clone(),
+                destination_asset: assets.destination_asset.clone(),
+                amount: buy_amount,
+                slippage_bps,
+                deadline,
+            },
+            non_evm,
+        )
+        .await?)
+}
+
+/// What a 1Click quote for an approved order needs besides its assets, anchor and recipient.
+struct NearSigning<'a> {
+    review: &'a SwapReview,
+    near: &'a NearIntentsClient,
+    buy_amount: U256,
+    destination_minimum: U256,
+    valid_to: u32,
+    profile: &'a SwapProfile,
+}
+
+impl NearSigning<'_> {
+    /// The 1Click terms of the approved order, which pays `recipient` with refunds to the
+    /// executor. A leg verified at review must still have its `anchor`, and the quote must
+    /// deliver the approved minimum within the anchor's deviation.
+    async fn order_terms(
+        &self,
+        assets: &NearAssets,
+        anchor: Option<PairAnchorRate>,
+        recipient: OneClickRecipient,
+    ) -> Result<BridgeSigning> {
+        let review = self.review;
+        if anchor.is_none()
+            && review
+                .bridge()
+                .is_some_and(|bridge| matches!(bridge.leg, BridgeLegPrice::Verified(_)))
+        {
+            return Ok(BridgeSigning::Changed(SwapReviewChange::PriceUnavailable));
+        }
+        let deadline = UNIX_EPOCH
+            .checked_add(Duration::from_secs(u64::from(self.valid_to)) + NEAR_QUOTE_DEADLINE_MARGIN)
+            .ok_or_else(|| eyre!("the bridge quote's deadline is out of range"))?;
+        let executor = review.plan().executor();
+        // Refunds return to the executor on this chain.
+        let quote = self
+            .near
+            .quote(
+                &OneClickQuoteParams {
+                    origin_asset: assets.origin_asset.clone(),
+                    destination_asset: assets.destination_asset.clone(),
+                    amount: self.buy_amount,
+                    slippage_bps: review.slippage_bps(),
+                    deadline,
+                },
+                recipient,
+                executor,
+                executor,
+            )
+            .await?;
+        if quote.min_amount_out < self.destination_minimum {
+            return Ok(BridgeSigning::Changed(
+                SwapReviewChange::DestinationMinimum {
+                    approved: self.destination_minimum,
+                    current: quote.min_amount_out,
+                },
+            ));
+        }
+        if let Some(rate) = anchor {
+            match check_quote_against_anchor(
+                self.buy_amount,
+                quote.min_amount_out,
+                rate,
+                self.profile.anchor_deviation_bps(),
+            ) {
+                Ok(()) => {}
+                Err(QuoteDeviationError::ExceedsThreshold) => {
+                    return Ok(BridgeSigning::Changed(SwapReviewChange::QuoteDeviates));
+                }
+                Err(error) => return Err(error.into()),
             }
         }
+        Ok(BridgeSigning::Terms(BridgeOrderTerms::NearIntents(
+            NearIntentsOrderTerms {
+                deposit_address: quote.deposit_address,
+                min_amount_out: quote.min_amount_out,
+                amount_out: quote.amount_out,
+                deadline: quote.deadline,
+                signed_quote: quote.signed_response,
+            },
+        )))
+    }
+}
+
+/// The error of a non-EVM leg's signing quote. 1Click refuses a receiver the wallet's own check
+/// accepted with `400 recipient is not valid`, which is reported as such.
+pub(super) fn non_evm_quote_error(error: BridgeApiError) -> eyre::Report {
+    match error {
+        BridgeApiError::Rejected {
+            api: BridgeApi::NearIntents,
+            status: 400,
+            message,
+            ..
+        } if message.contains("recipient") => eyre!(
+            "NEAR Intents rejected the receiver: {message}. The order wasn't placed. Check the receiver address."
+        ),
+        error => error.into(),
     }
 }
 
@@ -530,25 +693,55 @@ async fn private_delivery_allowance(
 }
 
 /// The validated route of `plan`'s Bridge delivery, which requires one; other deliveries take
-/// none. The route must bridge the plan's bought token to the delivery's token and chain with
-/// the delivery's provider.
+/// none. The route must bridge the plan's bought token to the delivery's token and chain or
+/// network with the delivery's provider, and returns its clients with the checked leg.
 pub(super) fn bridge_route<'a>(
     plan: &SwapInputPlan,
     route: Option<SwapBridgeRoute<'a>>,
-) -> Result<Option<(BridgeDelivery, SwapBridgeRoute<'a>)>> {
+) -> Result<Option<(&'a SwapBridgeClients, BridgeLeg<'a>)>> {
+    let mismatch = || eyre!("the bridge route doesn't match the swap's delivery");
     match (plan.delivery(), route) {
         (SwapDelivery::Bridge(delivery), Some(route)) => {
-            let destination = route.destination;
+            let SwapBridgeDestination::Chain { destination, chain } = route.destination else {
+                return Err(mismatch());
+            };
             if destination.intermediate != plan.buy_token()
                 || destination.destination_token != delivery.destination_token
-                || route.destination_chain.chain_id != delivery.destination_chain
+                || chain.chain_id != delivery.destination_chain
                 || (delivery.provider == BridgeProvider::Across) != destination.near.is_none()
             {
-                return Err(eyre!("the bridge route doesn't match the swap's delivery"));
+                return Err(mismatch());
             }
-            Ok(Some((delivery, route)))
+            Ok(Some((
+                route.clients,
+                BridgeLeg::Chain {
+                    delivery,
+                    destination,
+                    chain,
+                },
+            )))
         }
-        (SwapDelivery::Bridge(_), None) => Err(eyre!("a bridge swap needs its bridge route")),
+        (SwapDelivery::NonEvmBridge(delivery), Some(route)) => {
+            let SwapBridgeDestination::NonEvm(destination) = route.destination else {
+                return Err(mismatch());
+            };
+            if destination.intermediate != plan.buy_token()
+                || destination.near.destination_asset != delivery.asset_id
+                || destination.contract != delivery.contract
+            {
+                return Err(mismatch());
+            }
+            Ok(Some((
+                route.clients,
+                BridgeLeg::NonEvm {
+                    delivery,
+                    destination,
+                },
+            )))
+        }
+        (SwapDelivery::Bridge(_) | SwapDelivery::NonEvmBridge(_), None) => {
+            Err(eyre!("a bridge swap needs its bridge route"))
+        }
         (_, Some(_)) => Err(eyre!("only a bridge swap takes a bridge route")),
         (_, None) => Ok(None),
     }
@@ -607,6 +800,7 @@ pub(super) fn across_bridge_quote(
         provider: BridgeProvider::Across,
         destination_minimum: output,
         expected_output: output,
+        expected_output_usd: None,
         fee: Some(fees.total_relay_fee_total),
         leg: BridgeLegPrice::SameAsset,
         fill_time_sec: Some(fees.estimated_fill_time_sec),
@@ -727,21 +921,22 @@ pub(super) fn across_deposit(
     }
 }
 
-/// A 1Click dry quote for `buy_amount` of `destination`'s intermediate. Its minimum output is
+/// A 1Click dry quote for `buy_amount` of the intermediate in `assets`. Its minimum output is
 /// the destination minimum. With an `anchor` rate for the leg, that minimum must be within
 /// `deviation_bps` of it, and the fee is `buy_amount` less the minimum's value in the
-/// intermediate. Without one, a same-asset leg's fee is `buy_amount` less the minimum in the
+/// intermediate. Without one, a `same_asset` leg's fee is `buy_amount` less the minimum in the
 /// intermediate's decimals, and a leg between different assets is unverified.
 pub(super) fn near_bridge_quote(
     buy_amount: U256,
     quote: &OneClickDryQuote,
     anchor: Option<PairAnchorRate>,
-    destination: &BridgeDestination,
+    assets: &NearAssets,
+    same_asset: bool,
     deviation_bps: u32,
 ) -> Result<SwapBridgeQuote> {
     let minimum = quote.min_amount_out;
-    let (fee, leg) = match (anchor, &destination.near) {
-        (Some(rate), _) => {
+    let (fee, leg) = match anchor {
+        Some(rate) => {
             check_quote_against_anchor(buy_amount, minimum, rate, deviation_bps)?;
             let value =
                 U512::from(minimum) * U512::from(rate.sell_rate) / U512::from(rate.buy_rate);
@@ -750,7 +945,7 @@ pub(super) fn near_bridge_quote(
                 BridgeLegPrice::Verified(rate),
             )
         }
-        (None, Some(assets)) if destination.same_asset => (
+        None if same_asset => (
             Some(buy_amount.saturating_sub(rescale(
                 minimum,
                 assets.destination_decimals,
@@ -758,12 +953,13 @@ pub(super) fn near_bridge_quote(
             ))),
             BridgeLegPrice::SameAsset,
         ),
-        (None, _) => (None, BridgeLegPrice::Unverified),
+        None => (None, BridgeLegPrice::Unverified),
     };
     Ok(SwapBridgeQuote {
         provider: BridgeProvider::NearIntents,
         destination_minimum: minimum,
         expected_output: quote.amount_out,
+        expected_output_usd: quote.amount_out_usd,
         fee,
         leg,
         fill_time_sec: quote.time_estimate_sec,

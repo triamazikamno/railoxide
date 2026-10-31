@@ -3,7 +3,7 @@ use std::sync::Arc;
 use alloy::primitives::Address;
 use gpui::{
     App, Context, ElementId, Entity, Focusable, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Pixels, SharedString, Styled, Window, div, px, rgb,
+    ParentElement, Pixels, SharedString, Styled, Window, div, img, px, rgb,
 };
 use gpui_component::{
     Icon, Sizable, WindowExt,
@@ -16,8 +16,9 @@ use railgun_ui::short_address;
 use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
+    bridge::{NonEvmNetwork, NonEvmReceiverError},
     parse_railgun_recipient,
-    vault::{PrivateAddressBookEntry, PublicAddressBookEntry, VaultError},
+    vault::{NonEvmAddressBookEntry, PrivateAddressBookEntry, PublicAddressBookEntry, VaultError},
 };
 
 use crate::assets::RailgunActionIcon;
@@ -31,11 +32,13 @@ use super::{
 
 const ADDRESS_BOOK_CONTENT_WIDTH: Pixels = px(980.0);
 const ADDRESS_BOOK_DIALOG_WIDTH: Pixels = px(500.0);
+const NON_EVM_SECTION_LABEL: &str = "Non-EVM recipients";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::root) enum AddressBookEntryKind {
     Private,
     Public,
+    NonEvm(NonEvmNetwork),
 }
 
 impl AddressBookEntryKind {
@@ -43,6 +46,7 @@ impl AddressBookEntryKind {
         match self {
             Self::Private => "Private recipients",
             Self::Public => "Public EVM recipients",
+            Self::NonEvm(_) => NON_EVM_SECTION_LABEL,
         }
     }
 
@@ -50,6 +54,15 @@ impl AddressBookEntryKind {
         match self {
             Self::Private => "Private address-book entries must use a 0zk recipient",
             Self::Public => "Public address-book entries must use a 0x EVM address",
+            Self::NonEvm(NonEvmNetwork::Bitcoin) => {
+                "Bitcoin address-book entries must use a Bitcoin address"
+            }
+            Self::NonEvm(NonEvmNetwork::Solana) => {
+                "Solana address-book entries must use a Solana address"
+            }
+            Self::NonEvm(NonEvmNetwork::Tron) => {
+                "Tron address-book entries must use a Tron address"
+            }
         }
     }
 
@@ -57,6 +70,9 @@ impl AddressBookEntryKind {
         match self {
             Self::Private => "Enter a valid private 0zk recipient",
             Self::Public => "Enter a valid public EVM address",
+            Self::NonEvm(NonEvmNetwork::Bitcoin) => "Enter a valid mainnet Bitcoin address",
+            Self::NonEvm(NonEvmNetwork::Solana) => "Enter a valid Solana address",
+            Self::NonEvm(NonEvmNetwork::Tron) => "Enter a valid Tron address",
         }
     }
 }
@@ -65,6 +81,7 @@ impl AddressBookEntryKind {
 pub(in crate::root) enum AddressBookDetectedType {
     Private,
     Public,
+    NonEvm(NonEvmNetwork),
     Unknown,
 }
 
@@ -73,6 +90,9 @@ impl AddressBookDetectedType {
         match self {
             Self::Private => "Private recipient",
             Self::Public => "Public EVM recipient",
+            Self::NonEvm(NonEvmNetwork::Bitcoin) => "Bitcoin recipient",
+            Self::NonEvm(NonEvmNetwork::Solana) => "Solana recipient",
+            Self::NonEvm(NonEvmNetwork::Tron) => "Tron recipient",
             Self::Unknown => "Unknown type",
         }
     }
@@ -83,6 +103,7 @@ impl From<AddressBookEntryKind> for AddressBookDetectedType {
         match value {
             AddressBookEntryKind::Private => Self::Private,
             AddressBookEntryKind::Public => Self::Public,
+            AddressBookEntryKind::NonEvm(network) => Self::NonEvm(network),
         }
     }
 }
@@ -144,6 +165,7 @@ impl AddressBookDialogMode {
             Self::Add => "Add address-book entry",
             Self::Edit(AddressBookEntryKind::Private) => "Edit private recipient",
             Self::Edit(AddressBookEntryKind::Public) => "Edit public recipient",
+            Self::Edit(AddressBookEntryKind::NonEvm(_)) => "Edit non-EVM recipient",
         }
     }
 
@@ -156,11 +178,14 @@ impl AddressBookDialogMode {
 }
 
 pub(in crate::root) fn address_book_detected_type(address: &str) -> AddressBookDetectedType {
-    let address = address.trim().to_ascii_lowercase();
-    if address.starts_with("0zk") {
+    let address = address.trim();
+    let prefix = address.to_ascii_lowercase();
+    if prefix.starts_with("0zk") {
         AddressBookDetectedType::Private
-    } else if address.starts_with("0x") {
+    } else if prefix.starts_with("0x") {
         AddressBookDetectedType::Public
+    } else if let Some((network, _)) = NonEvmNetwork::detect_receiver(address) {
+        AddressBookDetectedType::NonEvm(network)
     } else {
         AddressBookDetectedType::Unknown
     }
@@ -199,19 +224,27 @@ pub(in crate::root) fn address_book_entry_validation_message(
             AddressBookDetectedType::Public => {
                 validate_address_for_kind(AddressBookEntryKind::Public, address)
             }
-            AddressBookDetectedType::Unknown => {
-                Some("Enter a 0zk private recipient or 0x public EVM address")
-            }
+            // Detection only finds a network whose receiver format parses.
+            AddressBookDetectedType::NonEvm(_) => None,
+            AddressBookDetectedType::Unknown => Some(
+                "Enter a 0zk private recipient, 0x public EVM address, or Bitcoin, Solana or Tron address",
+            ),
         },
     }
 }
 
 fn validate_address_for_kind(kind: AddressBookEntryKind, address: &str) -> Option<&'static str> {
-    let detected = address_book_detected_type(address);
-    if detected != AddressBookDetectedType::from(kind) {
-        return Some(kind.type_validation_message());
-    }
     let valid = match kind {
+        AddressBookEntryKind::NonEvm(network) => match network.parse_receiver(address) {
+            Ok(_) => true,
+            Err(NonEvmReceiverError::OtherNetwork(_)) => {
+                return Some(kind.type_validation_message());
+            }
+            Err(NonEvmReceiverError::Testnet | NonEvmReceiverError::Invalid) => false,
+        },
+        _ if address_book_detected_type(address) != AddressBookDetectedType::from(kind) => {
+            return Some(kind.type_validation_message());
+        }
         AddressBookEntryKind::Private => parse_railgun_recipient(address).is_ok(),
         AddressBookEntryKind::Public => address.parse::<Address>().is_ok(),
     };
@@ -240,6 +273,16 @@ fn filtered_public_address_book_entries<'a>(
         .collect()
 }
 
+pub(in crate::root) fn filtered_non_evm_address_book_entries<'a>(
+    entries: &'a [NonEvmAddressBookEntry],
+    query: &str,
+) -> Vec<&'a NonEvmAddressBookEntry> {
+    entries
+        .iter()
+        .filter(|entry| address_book_entry_matches_search(&entry.label, &entry.address, query))
+        .collect()
+}
+
 impl WalletRoot {
     pub(super) fn render_address_book_view(&self, root: &Entity<Self>) -> gpui::AnyElement {
         let add_root = root.clone();
@@ -249,6 +292,10 @@ impl WalletRoot {
         );
         let public_entries = filtered_public_address_book_entries(
             &self.public_address_book,
+            &self.address_book.search_query,
+        );
+        let non_evm_entries = filtered_non_evm_address_book_entries(
+            &self.non_evm_address_book,
             &self.address_book.search_query,
         );
 
@@ -310,7 +357,8 @@ impl WalletRoot {
                     }))
                     .child(app_input(&self.address_book.search_input))
                     .child(self.render_private_address_book_section(root, &private_entries))
-                    .child(self.render_public_address_book_section(root, &public_entries)),
+                    .child(self.render_public_address_book_section(root, &public_entries))
+                    .child(self.render_non_evm_address_book_section(root, &non_evm_entries)),
             )
             .into_any_element()
     }
@@ -321,7 +369,7 @@ impl WalletRoot {
         entries: &[&PrivateAddressBookEntry],
     ) -> gpui::Div {
         let mut section = address_book_section_shell(
-            AddressBookEntryKind::Private,
+            AddressBookEntryKind::Private.section_label(),
             entries.len(),
             self.private_address_book.len(),
             &self.address_book.search_query,
@@ -341,7 +389,7 @@ impl WalletRoot {
         entries: &[&PublicAddressBookEntry],
     ) -> gpui::Div {
         let mut section = address_book_section_shell(
-            AddressBookEntryKind::Public,
+            AddressBookEntryKind::Public.section_label(),
             entries.len(),
             self.public_address_book.len(),
             &self.address_book.search_query,
@@ -351,6 +399,32 @@ impl WalletRoot {
         }
         for entry in entries {
             section = section.child(Self::render_public_address_book_row(root, entry));
+        }
+        section
+    }
+
+    fn render_non_evm_address_book_section(
+        &self,
+        root: &Entity<Self>,
+        entries: &[&NonEvmAddressBookEntry],
+    ) -> gpui::Div {
+        let mut section = address_book_section_shell(
+            NON_EVM_SECTION_LABEL,
+            entries.len(),
+            self.non_evm_address_book.len(),
+            &self.address_book.search_query,
+        );
+        if entries.is_empty() {
+            return section.child(address_book_empty_state(&self.address_book.search_query));
+        }
+        for entry in entries {
+            section = section.child(Self::render_address_book_row(
+                root,
+                AddressBookEntryKind::NonEvm(entry.network),
+                &entry.entry_uuid,
+                &entry.label,
+                &short_hash(&entry.address),
+            ));
         }
         section
     }
@@ -417,9 +491,32 @@ impl WalletRoot {
                     .gap_1()
                     .child(app_strong_text(label.to_owned()))
                     .child(
-                        app_muted_text(display_address.to_owned())
-                            .font_family(APP_MONO_FONT_FAMILY)
-                            .text_size(APP_TEXT_SIZE),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .children(match kind {
+                                AddressBookEntryKind::NonEvm(network) => Some(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            img(network.icon_asset_path())
+                                                .size(APP_TEXT_SIZE)
+                                                .flex_none(),
+                                        )
+                                        .child(app_muted_text(network.display_name())),
+                                ),
+                                AddressBookEntryKind::Private | AddressBookEntryKind::Public => {
+                                    None
+                                }
+                            })
+                            .child(
+                                app_muted_text(display_address.to_owned())
+                                    .font_family(APP_MONO_FONT_FAMILY)
+                                    .text_size(APP_TEXT_SIZE),
+                            ),
                     ),
             )
             .child(Self::render_address_book_row_actions(
@@ -627,10 +724,15 @@ impl WalletRoot {
                 .iter()
                 .find(|entry| entry.entry_uuid == target.entry_uuid.as_ref())
                 .map(|entry| (entry.label.clone(), entry.address.to_checksum(None))),
+            AddressBookEntryKind::NonEvm(_) => self
+                .non_evm_address_book
+                .iter()
+                .find(|entry| entry.entry_uuid == target.entry_uuid.as_ref())
+                .map(|entry| (entry.label.clone(), entry.address.clone())),
         }
     }
 
-    fn add_address_book_entry_from_dialog(
+    pub(in crate::root) fn add_address_book_entry_from_dialog(
         &mut self,
         _window: &mut Window,
         cx: &mut Context<'_, Self>,
@@ -668,6 +770,14 @@ impl WalletRoot {
                 .map(|_| ()),
             AddressBookDetectedType::Public => store
                 .add_public_address_book_entry_for_session(view_session.as_ref(), &label, &address)
+                .map(|_| ()),
+            AddressBookDetectedType::NonEvm(network) => store
+                .add_non_evm_address_book_entry_for_session(
+                    view_session.as_ref(),
+                    &label,
+                    network,
+                    &address,
+                )
                 .map(|_| ()),
             AddressBookDetectedType::Unknown => unreachable!("validated add entry type"),
         };
@@ -730,6 +840,14 @@ impl WalletRoot {
                     &address,
                 )
                 .map(|_| ()),
+            AddressBookEntryKind::NonEvm(_) => store
+                .update_non_evm_address_book_entry_for_session(
+                    view_session.as_ref(),
+                    target.entry_uuid.as_ref(),
+                    &label,
+                    &address,
+                )
+                .map(|_| ()),
         };
         self.handle_address_book_mutation_result(result, "update address book entry", cx)
     }
@@ -759,6 +877,12 @@ impl WalletRoot {
                 .map(|_| ()),
             AddressBookEntryKind::Public => store
                 .delete_public_address_book_entry_for_session(
+                    view_session.as_ref(),
+                    target.entry_uuid.as_ref(),
+                )
+                .map(|_| ()),
+            AddressBookEntryKind::NonEvm(_) => store
+                .delete_non_evm_address_book_entry_for_session(
                     view_session.as_ref(),
                     target.entry_uuid.as_ref(),
                 )
@@ -796,7 +920,7 @@ impl WalletRoot {
 }
 
 fn address_book_section_shell(
-    kind: AddressBookEntryKind,
+    label: &'static str,
     visible_count: usize,
     total_count: usize,
     query: &str,
@@ -811,7 +935,7 @@ fn address_book_section_shell(
             .flex()
             .items_center()
             .gap_2()
-            .child(app_strong_text(kind.section_label()).text_size(px(13.0)))
+            .child(app_strong_text(label).text_size(px(13.0)))
             .child(app_status_tag(count_label, theme::PRIMARY)),
     )
 }
@@ -921,8 +1045,20 @@ fn address_book_error_message(error: &VaultError) -> String {
             "This public recipient is already saved or belongs to an active Public account"
                 .to_owned()
         }
+        VaultError::InvalidNonEvmAddressBookAddress(NonEvmReceiverError::OtherNetwork(network)) => {
+            AddressBookEntryKind::NonEvm(*network)
+                .type_validation_message()
+                .to_owned()
+        }
+        VaultError::InvalidNonEvmAddressBookAddress(_) => {
+            "Enter a valid Bitcoin, Solana or Tron address".to_owned()
+        }
+        VaultError::DuplicateNonEvmAddressBookAddress => {
+            "This recipient is already saved for its network".to_owned()
+        }
         VaultError::PrivateAddressBookEntryNotFound
-        | VaultError::PublicAddressBookEntryNotFound => "Address-book entry not found".to_owned(),
+        | VaultError::PublicAddressBookEntryNotFound
+        | VaultError::NonEvmAddressBookEntryNotFound => "Address-book entry not found".to_owned(),
         _ => error.to_string(),
     }
 }

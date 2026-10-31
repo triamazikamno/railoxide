@@ -167,7 +167,7 @@ impl ExecutorOwner {
         let lost_withdrawals = lost_withdrawals(swap, claimed.source, order.buy_token());
         let read = OrderRead {
             finality_depth: origin.finality_depth,
-            observed,
+            observed: &observed,
             trade_block: reported.flatten(),
             expiry: reported == Some(None),
             trade: ExpectedTrade {
@@ -197,7 +197,7 @@ impl ExecutorOwner {
         let mut next = if read.pending() {
             self.read_public_swap_order(origin, &read, client).await?
         } else {
-            observed
+            observed.clone()
         };
         // The orderbook may learn of a fill after the first answer: an order invalidated after
         // it filled reads as cancelled, and past validTo as expired. It is asked once more
@@ -354,7 +354,7 @@ fn lost_withdrawals(
 struct OrderRead<'a> {
     finality_depth: u64,
     /// What the record holds.
-    observed: PublicSwapObservations,
+    observed: &'a PublicSwapObservations,
     /// The block the orderbook reports the order's trade in.
     trade_block: Option<u64>,
     /// Whether the orderbook was asked and reported no trade, so an expiry may be recorded.
@@ -378,7 +378,7 @@ struct OrderRead<'a> {
 impl OrderRead<'_> {
     /// Whether the chain can show anything the record doesn't hold yet.
     const fn pending(&self) -> bool {
-        let observed = &self.observed;
+        let observed = self.observed;
         let trade = observed.traded.is_none() && self.trade_block.is_some();
         let expiry = self.expiry && observed.expired.is_none();
         let late_deposit =
@@ -422,7 +422,7 @@ async fn read_order(
     provider: &DynProvider,
     read: &OrderRead<'_>,
 ) -> Result<PublicSwapObservations> {
-    let mut next = read.observed;
+    let mut next = read.observed.clone();
     if next.traded.is_none()
         && let Some(number) = read.trade_block
         && let Some(settled) = read_trade(provider, read, number).await?

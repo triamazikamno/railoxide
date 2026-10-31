@@ -1107,7 +1107,7 @@ async fn swap_order_is_signed_for_current_terms_and_persisted_before_submission(
         ..SwapOrderObservations::default()
     };
     store
-        .record_swap_observations(operation, uid, expired)
+        .record_swap_observations(operation, uid, expired.clone())
         .unwrap();
     let record = store
         .records()
@@ -1635,7 +1635,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
             delegate,
             Some("Private swap"),
             &[crate::ExecutorAsset::Erc20(USDC)],
-            Some(setup_approval(USDC, Address::ZERO, approved)),
+            Some(setup_approval(USDC, Address::ZERO, approved.clone())),
             None,
         )
         .unwrap();
@@ -1647,8 +1647,8 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         .unwrap();
     assert_eq!(record.swap_approval_tokens(), Some((USDC, Address::ZERO)));
     assert_eq!(
-        record.swap_approval().map(|approval| approval.delivery),
-        Some(approved)
+        record.swap_approval().map(|approval| &approval.delivery),
+        Some(&approved)
     );
 
     let operation = ExecutorOperationId::random().unwrap();
@@ -1656,7 +1656,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         .prepare_swap_setup(
             operation,
             broadcaster(delegate),
-            setup_approval(USDC, Address::ZERO, approved),
+            setup_approval(USDC, Address::ZERO, approved.clone()),
             None,
             &password(),
             crate::OperationHttpClient::direct_for_tests(),
@@ -1728,7 +1728,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
     }))
     .unwrap();
     let isolation = OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct);
-    let review_at = |buy_token, delivery, gas_price_wei: u128| {
+    let review_at = |buy_token, delivery: &SwapDelivery, gas_price_wei: u128| {
         let SwapAmountPlan::Fits(plan) = crate::plan_swap_inputs(
             &builder,
             &swap_profile,
@@ -1738,7 +1738,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
                 sell_token: USDC,
                 buy_token,
                 amount,
-                delivery,
+                delivery: delivery.clone(),
                 byte_budget: None,
             },
             swap_profile.app_data_byte_budget(),
@@ -1767,6 +1767,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
                 provider: bridge.provider,
                 destination_minimum: U256::from(1_000),
                 expected_output: U256::from(1_010),
+                expected_output_usd: None,
                 fee: Some(U256::ZERO),
                 leg: crate::BridgeLegPrice::SameAsset,
                 fill_time_sec: None,
@@ -1775,9 +1776,9 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         }
         review
     };
-    let review = |buy_token, delivery| review_at(buy_token, delivery, 1);
-    let first = review(Address::ZERO, approved);
-    let changed = review(Address::ZERO, moved);
+    let review = |buy_token, delivery: SwapDelivery| review_at(buy_token, &delivery, 1);
+    let first = review(Address::ZERO, approved.clone());
+    let changed = review(Address::ZERO, moved.clone());
 
     // The receiver's address is part of the approved terms; its label is not, so the same
     // address keeps the approval.
@@ -1874,7 +1875,7 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
         SwapOrderOutcome::ReviewRequired(SwapReviewChange::Delivery)
     );
     let dai = alloy::primitives::address!("6b175474e89094c44da98b954eedeac495271d0f");
-    let other_pair = review(dai, approved);
+    let other_pair = review(dai, approved.clone());
     assert!(
         issue!(&other_pair)
             .unwrap_err()
@@ -1885,8 +1886,8 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
     assert!(unsigned.swap().is_none());
     assert_eq!(unsigned.issued().len(), 1);
     assert_eq!(
-        unsigned.swap_approval().map(|approval| approval.delivery),
-        Some(approved)
+        unsigned.swap_approval().map(|approval| &approval.delivery),
+        Some(&approved)
     );
     assert!(submissions.lock().unwrap().is_empty());
 
@@ -1965,8 +1966,10 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
     };
     let route = crate::SwapBridgeRoute {
         clients: &clients,
-        destination: &near_destination,
-        destination_chain: polygon,
+        destination: crate::SwapBridgeDestination::Chain {
+            destination: &near_destination,
+            chain: polygon,
+        },
     };
     let polygon_railgun = polygon.require_railgun().unwrap().deployment.contract;
     let spoke_pool = polygon.bridge_profile().unwrap().spoke_pool();
@@ -2038,12 +2041,12 @@ async fn external_order_pays_the_approved_receiver_without_a_post_hook() {
     // the order is signed at the approved minimum and persisted. Its submission response is
     // lost, and the resubmission rebuilds the identical order.
     let gas_price_wei = 100_000_000_000_000_000 / u128::from(changed.plan().hook_gas_estimate());
-    let reviewed = review_at(Address::ZERO, moved, gas_price_wei);
+    let reviewed = review_at(Address::ZERO, &moved, gas_price_wei);
     let approval = reviewed
         .approval(reviewed.suggested_private_minimum(), true)
         .unwrap();
     let private_minimum = approval.bounds.private_minimum;
-    let requote = review_at(Address::ZERO, moved, gas_price_wei + gas_price_wei / 10);
+    let requote = review_at(Address::ZERO, &moved, gas_price_wei + gas_price_wei / 10);
     assert!(requote.suggested_private_minimum() < private_minimum);
     assert_eq!(
         requote.approved_order_minimum(&approval),
@@ -2292,14 +2295,14 @@ impl BridgeOrderFixture {
         view: &DesktopViewSession,
         profile: crate::settings::ExecutorProfile,
         swap_profile: &crate::settings::SwapProfile,
-        delivery: BridgeDelivery,
+        delivery: SwapDelivery,
     ) -> Self {
         let operation = ExecutorOperationId::random().unwrap();
         let executor = owner
             .prepare_swap_setup(
                 operation,
                 broadcaster(profile.delegate()),
-                setup_approval(USDC, WETH, SwapDelivery::Bridge(delivery)),
+                setup_approval(USDC, WETH, delivery.clone()),
                 None,
                 &password(),
                 crate::OperationHttpClient::direct_for_tests(),
@@ -2327,7 +2330,7 @@ impl BridgeOrderFixture {
         swap_profile: &crate::settings::SwapProfile,
         operation: ExecutorOperationId,
         executor: Address,
-        delivery: BridgeDelivery,
+        delivery: SwapDelivery,
     ) -> Self {
         let delegated = delegate_setup(store, operation, profile);
         Self::planned(view, swap_profile, delegated, executor, delivery)
@@ -2339,9 +2342,10 @@ impl BridgeOrderFixture {
         swap_profile: &crate::settings::SwapProfile,
         delegated: crate::DelegatedSwapExecutor,
         executor: Address,
-        delivery: BridgeDelivery,
+        delivery: SwapDelivery,
     ) -> Self {
         let operation = delegated.operation();
+        let provider = delivery.bridge_provider().unwrap();
         let amount = U256::from(1_000_000);
         let input = Utxo::new(
             broadcaster_core::notes::Note::new_change(
@@ -2373,7 +2377,7 @@ impl BridgeOrderFixture {
                 sell_token: USDC,
                 buy_token: WETH,
                 amount,
-                delivery: SwapDelivery::Bridge(delivery),
+                delivery,
                 byte_budget: None,
             },
             swap_profile.app_data_byte_budget(),
@@ -2382,7 +2386,7 @@ impl BridgeOrderFixture {
         .unwrap() else {
             panic!("one note fits one order");
         };
-        let review = Self::review_at(plan, swap_profile, delivery.provider, 1, 1_000);
+        let review = Self::review_at(plan, swap_profile, provider, 1, 1_000);
         let transaction = Transaction {
             proof: SnarkProof::default(),
             merkleRoot: B256::ZERO,
@@ -2438,6 +2442,7 @@ impl BridgeOrderFixture {
             provider,
             destination_minimum: U256::from(destination_minimum),
             expected_output: U256::from(destination_minimum + 10),
+            expected_output_usd: None,
             fee: Some(U256::ZERO),
             leg: crate::BridgeLegPrice::SameAsset,
             fill_time_sec: None,
@@ -2643,8 +2648,15 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
         surplus: BridgeSurplus::Reshield,
         private: None,
     };
-    let fixture =
-        BridgeOrderFixture::new(&owner, &store, &view, profile, &swap_profile, delivery).await;
+    let fixture = BridgeOrderFixture::new(
+        &owner,
+        &store,
+        &view,
+        profile,
+        &swap_profile,
+        SwapDelivery::Bridge(delivery),
+    )
+    .await;
     let executor = fixture.executor;
 
     // The quote's output and fill deadline, in seconds after the request.
@@ -2688,8 +2700,10 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
     };
     let route = crate::SwapBridgeRoute {
         clients: &clients,
-        destination: &destination,
-        destination_chain: chains.get(137).unwrap(),
+        destination: crate::SwapBridgeDestination::Chain {
+            destination: &destination,
+            chain: chains.get(137).unwrap(),
+        },
     };
 
     // A Bridge review keeps the profile's validity even when another is requested, since its
@@ -2785,7 +2799,10 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
     let approved = fixture.record(&store).swap_approval().unwrap().clone();
     let delegated = fixture.review.plan().swap_executor().delegated().unwrap();
     let base_route = crate::SwapBridgeRoute {
-        destination_chain: chains.get(8453).unwrap(),
+        destination: crate::SwapBridgeDestination::Chain {
+            destination: &destination,
+            chain: chains.get(8453).unwrap(),
+        },
         ..route
     };
     let to_base = |receiver| {
@@ -2794,11 +2811,11 @@ async fn across_order_deposits_the_approved_terms_in_its_post_hook() {
             &swap_profile,
             delegated,
             executor,
-            BridgeDelivery {
+            SwapDelivery::Bridge(BridgeDelivery {
                 destination_chain: 8453,
                 receiver,
                 ..delivery
-            },
+            }),
         );
         let approval = base
             .review
@@ -4082,8 +4099,15 @@ async fn an_across_speed_up_qualifies_by_its_final_buy_amount() {
         surplus: BridgeSurplus::Reshield,
         private: None,
     };
-    let fixture =
-        BridgeOrderFixture::new(&owner, &store, &view, profile, &swap_profile, delivery).await;
+    let fixture = BridgeOrderFixture::new(
+        &owner,
+        &store,
+        &view,
+        profile,
+        &swap_profile,
+        SwapDelivery::Bridge(delivery),
+    )
+    .await;
 
     // Across quotes 1,005 for a deposit of at least the first amount, and the second amount
     // for a smaller one.
@@ -4134,8 +4158,10 @@ async fn an_across_speed_up_qualifies_by_its_final_buy_amount() {
     };
     let route = crate::SwapBridgeRoute {
         clients: &clients,
-        destination: &destination,
-        destination_chain: chains.get(137).unwrap(),
+        destination: crate::SwapBridgeDestination::Chain {
+            destination: &destination,
+            chain: chains.get(137).unwrap(),
+        },
     };
     // `plan`'s review with its hooks' gas priced at `gas_wei` in total. At 0.1 native tokens
     // the allowed gas is about 3% of the quote, as in the cushion case of the order test
@@ -4534,7 +4560,7 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
             &swap_profile,
             source_delegated,
             prepared.origin.executor(),
-            delivery,
+            SwapDelivery::Bridge(delivery),
         );
         let executor = fixture.executor;
         let delegated = existing_destination.unwrap_or_else(|| {
@@ -4575,6 +4601,7 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
             provider: BridgeProvider::Across,
             destination_minimum: U256::from(1_000),
             expected_output: U256::from(1_000),
+            expected_output_usd: None,
             fee: Some(U256::ZERO),
             leg: crate::BridgeLegPrice::SameAsset,
             fill_time_sec: None,
@@ -4676,8 +4703,10 @@ async fn private_across_order_records_the_destination_shield_before_its_deposit_
         };
         let route = crate::SwapBridgeRoute {
             clients: &clients,
-            destination: &bridge_destination,
-            destination_chain: &destination_chain,
+            destination: crate::SwapBridgeDestination::Chain {
+                destination: &bridge_destination,
+                chain: &destination_chain,
+            },
         };
         let tokens = crate::settings::EffectiveTokenRegistry {
             tokens: std::collections::BTreeMap::new(),
@@ -5353,8 +5382,15 @@ async fn near_intents_order_pays_a_verified_deposit_address() {
         surplus: BridgeSurplus::BridgedByProvider,
         private: None,
     };
-    let fixture =
-        BridgeOrderFixture::new(&owner, &store, &view, profile, &swap_profile, delivery).await;
+    let fixture = BridgeOrderFixture::new(
+        &owner,
+        &store,
+        &view,
+        profile,
+        &swap_profile,
+        SwapDelivery::Bridge(delivery),
+    )
+    .await;
     let executor = fixture.executor;
     let buy_amount = fixture.review.suggested_private_minimum();
 
@@ -5436,8 +5472,10 @@ async fn near_intents_order_pays_a_verified_deposit_address() {
     };
     let route = crate::SwapBridgeRoute {
         clients: &clients,
-        destination: &destination,
-        destination_chain: chains.get(137).unwrap(),
+        destination: crate::SwapBridgeDestination::Chain {
+            destination: &destination,
+            chain: chains.get(137).unwrap(),
+        },
     };
 
     // A quote signed by another key isn't 1Click's.
@@ -5594,6 +5632,168 @@ async fn near_intents_order_pays_a_verified_deposit_address() {
     );
     let body = submissions.lock().unwrap().last().unwrap().1.clone();
     assert_eq!(submitted_order(&body).receiver, second_address);
+
+    near_task.abort();
+    orderbook_task.abort();
+    owner.shutdown().await;
+    drop(owner);
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// A non-EVM delivery's signing-time 1Click quote names its receiver exactly as stored and
+// refunds to the executor, and its order pays the quote's deposit address. When 1Click rejects
+// the receiver there, nothing is signed and the error says so.
+#[tokio::test]
+async fn non_evm_order_quotes_its_receiver_and_stops_when_1click_rejects_it() {
+    let rpc = Rpc::start().await;
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let chain = chain(&rpc);
+    let profile = chain.accepted_executor_profile().unwrap();
+    let swap_profile = chain.swap_profile().unwrap();
+    let owner = ExecutorOwner::new(
+        0,
+        db.clone(),
+        view.clone(),
+        chain,
+        HttpContext::direct_for_tests(),
+    )
+    .unwrap();
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let receiver = "So11111111111111111111111111111111111111112".to_owned();
+    let delivery = NonEvmDelivery {
+        network: crate::bridge::NonEvmNetwork::Solana,
+        receiver: receiver.clone(),
+        asset_id: "nep141:sol.omft.near".to_owned(),
+        contract: None,
+        symbol: "SOL".to_owned(),
+        decimals: 9,
+    };
+    let fixture = BridgeOrderFixture::new(
+        &owner,
+        &store,
+        &view,
+        profile,
+        &swap_profile,
+        SwapDelivery::NonEvmBridge(delivery.clone()),
+    )
+    .await;
+    let executor = fixture.executor;
+
+    let quote_key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let pinned = format!(
+        "ed25519:{}",
+        bs58::encode(quote_key.verifying_key().to_bytes()).into_string()
+    );
+    let deposit_address = Address::repeat_byte(0xd0);
+    let accepts = Arc::new(Mutex::new(false));
+    let answer = accepts.clone();
+    let (near_url, near_requests, near_task) = spawn_bridge_stub_with(move |_, request| {
+        if !*answer.lock().unwrap() {
+            return (
+                400,
+                json!({ "message": "recipient is not valid" }).to_string(),
+            );
+        }
+        let response = json!({
+            "quote": {
+                "amountIn": request["amount"],
+                "amountInFormatted": "1",
+                "amountInUsd": "1",
+                "minAmountIn": request["amount"],
+                "amountOut": "1010",
+                "amountOutFormatted": "1",
+                "amountOutUsd": "1",
+                "minAmountOut": "1000",
+                "timeEstimate": 20,
+                "deadline": request["deadline"],
+                "timeWhenInactive": request["deadline"],
+                "depositAddress": deposit_address
+            },
+            "quoteRequest": request,
+            "timestamp": "2026-09-30T00:00:00.000Z"
+        });
+        (
+            200,
+            crate::bridge::sign_quote_response_for_tests(response, &quote_key),
+        )
+    })
+    .await;
+    let isolation = OperationNetworkIsolation::Unavailable(WalletNetworkMode::Direct);
+    let (orderbook_url, submissions, orderbook_task) = spawn_orderbook(
+        db.clone(),
+        view.clone(),
+        fixture.operation,
+        swap_profile.settlement(),
+    )
+    .await;
+    let orderbook = CowOrderbookClient::new(
+        OperationHttpClient::for_tests(reqwest::Client::new(), isolation),
+        orderbook_url,
+        1,
+    )
+    .unwrap();
+    let mut clients = owner.swap_bridge_clients(&orderbook).unwrap();
+    clients.near = crate::bridge::NearIntentsClient::new(
+        OperationHttpClient::for_tests(reqwest::Client::new(), isolation),
+        near_url,
+        &pinned,
+    )
+    .unwrap();
+    let destination = crate::bridge::NonEvmBridgeDestination {
+        contract: None,
+        intermediate: WETH,
+        symbol: "SOL".to_owned(),
+        same_asset: false,
+        near: crate::bridge::NearAssets {
+            origin_asset: "nep141:eth-weth.omft.near".to_owned(),
+            destination_asset: delivery.asset_id.clone(),
+            origin_decimals: 18,
+            destination_decimals: 9,
+        },
+    };
+    let route = crate::SwapBridgeRoute {
+        clients: &clients,
+        destination: crate::SwapBridgeDestination::NonEvm(&destination),
+    };
+
+    let error = fixture.issue(&owner, &orderbook, route).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("NEAR Intents rejected the receiver"),
+        "{error:#}"
+    );
+    fixture.assert_unsigned(&store, &submissions);
+    let (_, request) = near_requests.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(request["recipient"], receiver.as_str());
+    assert_eq!(
+        request["refundTo"]
+            .as_str()
+            .unwrap()
+            .parse::<Address>()
+            .unwrap(),
+        executor
+    );
+
+    *accepts.lock().unwrap() = true;
+    assert!(matches!(
+        fixture.issue(&owner, &orderbook, route).await.unwrap(),
+        SwapOrderOutcome::Submitted { .. }
+    ));
+    let saved = fixture.record(&store).swap().unwrap().orders()[0].clone();
+    assert_eq!(saved.delivery(), SwapDelivery::NonEvmBridge(delivery));
+    assert!(saved.post_hook().is_none());
+    let body = submissions.lock().unwrap().last().unwrap().1.clone();
+    assert_eq!(submitted_order(&body).receiver, deposit_address);
 
     near_task.abort();
     orderbook_task.abort();

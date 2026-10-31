@@ -54,8 +54,8 @@ use tracing::Instrument as _;
 use zeroize::Zeroizing;
 
 use super::bridge::{
-    AcrossHandlerMessage, BridgeLegPrice, BridgeSigning, SwapBridgeClients, SwapBridgeQuote,
-    SwapBridgeRoute, across_deposit, bridge_route,
+    AcrossHandlerMessage, BridgeLeg, BridgeLegPrice, BridgeSigning, SwapBridgeClients,
+    SwapBridgeQuote, SwapBridgeRoute, across_deposit, bridge_route,
 };
 use super::continuing::{SwapContinuingApprovals, is_public_across};
 use super::gas::hook_data_cost_from_candidates;
@@ -157,7 +157,7 @@ const SPEED_UP_TERMS_CHANGED: &str = "this swap's fixed terms changed; review it
 const DESTINATION_ACCOUNT_MISMATCH: &str = "a private Bridge delivery needs its destination stealth account, and no other delivery takes one";
 
 /// An amount to plan for a swap, before or after its executor's setup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwapAmountRequest {
     pub sell_token: Address,
     /// `Address::ZERO` for the native asset, which only External delivery can buy.
@@ -213,8 +213,8 @@ impl SwapInputPlan {
         self.buy_token
     }
     #[must_use]
-    pub const fn delivery(&self) -> SwapDelivery {
-        self.delivery
+    pub fn delivery(&self) -> SwapDelivery {
+        self.delivery.clone()
     }
     /// The private spend the pre-hook unshields to the executor.
     #[must_use]
@@ -309,16 +309,17 @@ impl SwapInputPlan {
 /// Estimated gas of `delivery`'s post-hook, `None` for an order without one.
 const fn swap_post_hook_gas(
     gas_model: &RailgunGasModel,
-    delivery: SwapDelivery,
+    delivery: &SwapDelivery,
     mode: GasEstimateMode,
 ) -> Option<u64> {
-    match delivery {
+    match *delivery {
         SwapDelivery::Reshield => Some(post_hook_gas(gas_model, mode)),
         SwapDelivery::External { .. }
         | SwapDelivery::Bridge(BridgeDelivery {
             provider: BridgeProvider::NearIntents,
             ..
-        }) => None,
+        })
+        | SwapDelivery::NonEvmBridge(_) => None,
         SwapDelivery::Bridge(BridgeDelivery {
             provider: BridgeProvider::Across,
             surplus,
@@ -589,12 +590,12 @@ impl SwapReview {
     /// the plan sizes it as one static ABI word, so every other term, the bridge leg included,
     /// stays as quoted. A private Bridge delivery's receiver is its destination stealth account,
     /// which neither the preview quote nor the delivery allowance names. Reshield delivery has no
-    /// receiver and is returned unchanged.
+    /// receiver, and a non-EVM delivery's isn't an EVM address: both are returned unchanged.
     #[must_use]
     pub fn with_receiver(&self, receiver: Address) -> Self {
         let mut review = self.clone();
         match &mut review.plan.delivery {
-            SwapDelivery::Reshield => {}
+            SwapDelivery::Reshield | SwapDelivery::NonEvmBridge(_) => {}
             SwapDelivery::External { receiver: current }
             | SwapDelivery::Bridge(BridgeDelivery {
                 receiver: current, ..
@@ -727,7 +728,8 @@ impl SwapReview {
     }
     /// A review of the Across `delivery` to a public receiver from `record`'s stealth account,
     /// priced without I/O for one stand-in note of `amount`: `bought` is the quoted buy amount,
-    /// and the bridge leg delivers `destination_minimum` and `expected_output`. It exists only
+    /// and the bridge leg delivers `destination_minimum` and `expected_output`, which 1Click
+    /// values at `expected_output_usd`. It exists only
     /// for the desktop's debug UI fixture, which shows a review on a wallet without private
     /// funds. Its executor is no confirmed delegation and the store holds no such record, so
     /// `ExecutorOwner::issue_swap_order` refuses it before anything is signed.
@@ -742,9 +744,10 @@ impl SwapReview {
         bought: U256,
         rate: PairAnchorRate,
         gas_price_wei: u128,
-        delivery: BridgeDelivery,
+        delivery: &SwapDelivery,
         destination_minimum: U256,
         expected_output: U256,
+        expected_output_usd: Option<U256>,
         continuing: Vec<super::continuing::SwapContinuingApproval>,
         isolation: OperationNetworkIsolation,
     ) -> Result<Self> {
@@ -785,7 +788,7 @@ impl SwapReview {
                 sell_token,
                 buy_token,
                 amount,
-                delivery: SwapDelivery::Bridge(delivery),
+                delivery: delivery.clone(),
                 byte_budget: None,
             },
             profile.app_data_byte_budget(),
@@ -794,6 +797,8 @@ impl SwapReview {
         else {
             return Err(eyre!("the stand-in note doesn't fit one order"));
         };
+        // A non-EVM delivery's leg between different assets has no anchor, as most do.
+        let non_evm = matches!(delivery, SwapDelivery::NonEvmBridge(_));
         let quote = CowQuote {
             quote: CowQuoteParameters {
                 sell_token,
@@ -831,12 +836,17 @@ impl SwapReview {
             isolation,
         )?;
         review.bridge = Some(SwapBridgeQuote {
-            provider: BridgeProvider::Across,
+            provider: delivery.bridge_provider().unwrap_or(BridgeProvider::Across),
             destination_minimum,
             expected_output,
+            expected_output_usd,
             // The deposit is the order's buy amount, and Across keeps the rest.
-            fee: Some(review.limit.buy_amount.saturating_sub(expected_output)),
-            leg: BridgeLegPrice::SameAsset,
+            fee: (!non_evm).then(|| review.limit.buy_amount.saturating_sub(expected_output)),
+            leg: if non_evm {
+                BridgeLegPrice::Unverified
+            } else {
+                BridgeLegPrice::SameAsset
+            },
             fill_time_sec: Some(4),
             private: None,
         });
@@ -907,7 +917,7 @@ impl SwapReview {
             },
             price_verified: Some(self.price_verified()),
             price_acknowledged,
-            delivery: self.plan.delivery,
+            delivery: self.plan.delivery.clone(),
             tokens: Some(SwapApprovalTokens {
                 sell: self.plan.sell_token,
                 buy: self.plan.buy_token,
@@ -1040,7 +1050,7 @@ impl SwapReview {
         let destination = self
             .bridge
             .map_or(U256::ZERO, |bridge| bridge.destination_minimum);
-        if matches!(self.plan.delivery, SwapDelivery::Bridge(_))
+        if self.plan.delivery.is_bridge()
             && approved
                 .destination_minimum
                 .is_none_or(|minimum| destination < minimum)
@@ -1080,7 +1090,7 @@ impl SwapReview {
         approved_allowance: U256,
     ) -> Option<U256> {
         let quoted_buy_amount = self.limit.buy_amount;
-        let minimum = if let SwapDelivery::Bridge(delivery) = self.plan.delivery {
+        let minimum = if let Some(provider) = self.plan.delivery.bridge_provider() {
             let approved_destination = approved.destination_minimum?;
             let quoted_destination = self.bridge?.destination_minimum;
             // Bridge orders carry no shield, so the deposit is the private minimum.
@@ -1094,7 +1104,7 @@ impl SwapReview {
                 // one, so that takes the margin too when it fits the cushion.
                 scaled
                     .filter(|&deposit| {
-                        delivery.provider == BridgeProvider::NearIntents
+                        provider == BridgeProvider::NearIntents
                             && self.within_cushion(deposit, approved_allowance)
                     })
                     .unwrap_or(approved.private_minimum)
@@ -1147,14 +1157,16 @@ impl SwapReview {
         destination_minimum: Option<U256>,
         price_acknowledged: bool,
     ) -> Result<U256> {
-        if let SwapDelivery::Bridge(bridge) = self.plan.delivery {
-            if !bridge.has_valid_surplus() {
-                return Err(eyre!("this bridge provider can't handle surplus that way"));
-            }
-            if !bridge.has_valid_private_delivery() {
-                return Err(eyre!(
-                    "this bridge provider can't deliver to a private balance"
-                ));
+        if self.plan.delivery.is_bridge() {
+            if let SwapDelivery::Bridge(bridge) = self.plan.delivery {
+                if !bridge.has_valid_surplus() {
+                    return Err(eyre!("this bridge provider can't handle surplus that way"));
+                }
+                if !bridge.has_valid_private_delivery() {
+                    return Err(eyre!(
+                        "this bridge provider can't deliver to a private balance"
+                    ));
+                }
             }
             if self.bridge.is_none() {
                 return Err(eyre!("quote the bridge before approving this swap"));
@@ -1244,11 +1256,11 @@ pub struct SwapOrderRequest<'a> {
 /// A term that changed between review and signing. Nothing was signed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwapReviewChange {
-    /// The delivery kind, the External receiver's address, or a Bridge delivery's provider,
-    /// destination, receiver, token or surplus choice differs from the approval. For a private
-    /// Bridge delivery the receiver is the destination stealth account, and the choice of what
-    /// happens when the destination shield fails is compared too. This always needs a full
-    /// review.
+    /// The delivery kind, the External receiver's address, a Bridge delivery's provider,
+    /// destination, receiver, token or surplus choice, or a non-EVM delivery's network, receiver
+    /// or asset differs from the approval. For a private Bridge delivery the receiver is the
+    /// destination stealth account, and the choice of what happens when the destination shield
+    /// fails is compared too. This always needs a full review.
     Delivery,
     /// A declared hook gas limit increased, or the pre-hook must now invalidate another order.
     HookCost,
@@ -1458,7 +1470,7 @@ pub(crate) fn plan_swap_inputs(
     )?;
     let gas_model = RailgunGasModel::for_chain(profile.chain_id());
     let post_hook_gas =
-        swap_post_hook_gas(gas_model, request.delivery, GasEstimateMode::UpperBound);
+        swap_post_hook_gas(gas_model, &request.delivery, GasEstimateMode::UpperBound);
     let template = SwapAppDataTemplate {
         app_code: profile.app_code().to_owned(),
         pre_hook_gas_limit: hook_gas_limit(pre_hook_gas(
@@ -1474,7 +1486,7 @@ pub(crate) fn plan_swap_inputs(
                 calls: placeholder_post_hook_calls(
                     context.executor,
                     request.buy_token,
-                    request.delivery,
+                    &request.delivery,
                 )?,
                 gas_limit: hook_gas_limit(gas),
             }),
@@ -1492,7 +1504,7 @@ pub(crate) fn plan_swap_inputs(
         context,
         sell_token: request.sell_token,
         buy_token: request.buy_token,
-        delivery: request.delivery,
+        delivery: request.delivery.clone(),
         invalidates,
         byte_budget,
         size,
@@ -1536,7 +1548,9 @@ pub(crate) fn price_swap_review(
     let surplus_shield_fee_bps = shield_fee_bps;
     let shield_fee_bps = match plan.delivery {
         SwapDelivery::Reshield => shield_fee_bps,
-        SwapDelivery::External { .. } | SwapDelivery::Bridge(_) => U256::ZERO,
+        SwapDelivery::External { .. } | SwapDelivery::Bridge(_) | SwapDelivery::NonEvmBridge(_) => {
+            U256::ZERO
+        }
     };
     let gas = swap_gas_pricing(&quote.quote, &price, gas_price_wei, hook_data_cost_wei)?;
     tracing::debug!(
@@ -1792,7 +1806,7 @@ impl ExecutorOwner {
     ) -> Result<SwapAmountPlan> {
         self.require_swap_session(session)?;
         let profile = self.swap_order_profile()?;
-        if profile.pair_eligibility(request.sell_token, request.buy_token, request.delivery)
+        if profile.pair_eligibility(request.sell_token, request.buy_token, &request.delivery)
             != SwapTokenEligibility::Eligible
         {
             return Err(eyre!("this token pair is not eligible for private swaps"));
@@ -1956,7 +1970,7 @@ impl ExecutorOwner {
         let profile = self.swap_order_profile()?;
         let bridge = bridge_route(&plan, bridge)?;
         // A bridge leg is quoted for the profile's window.
-        let valid_for = if matches!(plan.delivery, SwapDelivery::Bridge(_)) {
+        let valid_for = if plan.delivery.is_bridge() {
             profile.valid_to_window()
         } else {
             valid_for
@@ -2076,14 +2090,14 @@ impl ExecutorOwner {
             orderbook.isolation(),
         )
         .map_err(|error| wrap_pricing_error(error, diagnostics))?;
-        if let Some((delivery, route)) = bridge {
+        if let Some((clients, leg)) = bridge {
             // Bridge orders carry no shield, so the buy amount is the suggested minimum.
             let started = Instant::now();
             tracing::debug!(target: "swap_quote", step = "bridge_quote", "started");
             let quote = self
                 .quote_swap_bridge(
-                    route,
-                    delivery,
+                    clients,
+                    &leg,
                     &profile,
                     review.limit.buy_amount,
                     slippage_bps,
@@ -2106,7 +2120,7 @@ impl ExecutorOwner {
         // use, whose attempts are compared with nothing. A speed-up names its use and signs at
         // its open order's nonce.
         if let Some(speed_up) = review.plan.speed_up
-            && is_public_across(review.plan.delivery)
+            && is_public_across(&review.plan.delivery)
             && !review.plan.executor.is_reused()
             && let Some(operation) = review.plan.operation()
         {
@@ -2114,7 +2128,7 @@ impl ExecutorOwner {
                 .swap_continuing_approvals(
                     operation,
                     speed_up.swap_use,
-                    review.plan.delivery,
+                    &review.plan.delivery,
                     Some(speed_up.pre_hook_nonce),
                     orderbook.http(),
                 )
@@ -2136,7 +2150,7 @@ impl ExecutorOwner {
     ) -> Result<SwapReview> {
         self.while_active(Box::pin(async {
             let profile = self.swap_order_profile()?;
-            let Some((delivery, route)) = bridge_route(&review.plan, Some(route))? else {
+            let Some((clients, leg)) = bridge_route(&review.plan, Some(route))? else {
                 return Err(eyre!("only a bridge swap has a bridge leg to quote"));
             };
             if let Some(operation) = review.plan.operation() {
@@ -2147,8 +2161,8 @@ impl ExecutorOwner {
             // Bridge orders carry no shield, so the buy amount is the suggested minimum.
             repriced.bridge = Some(
                 self.quote_swap_bridge(
-                    route,
-                    delivery,
+                    clients,
+                    &leg,
                     &profile,
                     repriced.limit.buy_amount,
                     repriced.slippage_bps,
@@ -2474,12 +2488,13 @@ impl ExecutorOwner {
     /// Sign the pre-hook at the executor's current nonce `k`, for Reshield and Across delivery
     /// the post-hook at `k + 1`, and the order, after checking cached anchors. The first order
     /// after setup must match the pair and delivery approved with the setup, an External
-    /// receiver must pass [`SwapProfile::check_receiver`], and a public Bridge receiver the
-    /// destination chain's [`crate::settings::BridgeDestinationProfile::check_receiver`]. A
-    /// Bridge order's provider is quoted again before anything is signed: Across for the
-    /// deposit's terms, NEAR Intents for a verified deposit address that the order pays. An
-    /// Across quote below the approved destination minimum is taken once more for a deposit
-    /// raised within the approval's cushion, which the order then signs. Persist
+    /// receiver must pass [`SwapProfile::check_receiver`], a public Bridge receiver the
+    /// destination chain's [`crate::settings::BridgeDestinationProfile::check_receiver`], and a
+    /// non-EVM receiver its network's parser in canonical form. A Bridge order's provider is
+    /// quoted again before anything is signed: Across for the deposit's terms, NEAR Intents for a
+    /// verified deposit address that the order pays, which 1Click may refuse for a non-EVM
+    /// receiver. An Across quote below the approved destination minimum is taken once more for a
+    /// deposit raised within the approval's cushion, which the order then signs. Persist
     /// them with the input reservation and the provider's terms, then submit. Nothing signed
     /// leaves the wallet before the write succeeds.
     ///
@@ -2673,20 +2688,31 @@ impl ExecutorOwner {
             )?;
         }
         // A private delivery's receiver is the wallet's own account, checked above.
-        if let Some((delivery, route)) = bridge
-            && !delivery.is_private()
-        {
-            let destination = route.destination_chain;
-            destination
-                .bridge_destination()
-                .ok_or_else(|| eyre!("the destination network doesn't support bridging"))?
-                .check_receiver(
-                    destination
-                        .railgun
-                        .as_ref()
-                        .map(|railgun| railgun.deployment.contract),
-                    delivery.receiver,
-                )?;
+        match &bridge {
+            Some((
+                _,
+                BridgeLeg::Chain {
+                    delivery, chain, ..
+                },
+            )) if !delivery.is_private() => {
+                chain
+                    .bridge_destination()
+                    .ok_or_else(|| eyre!("the destination network doesn't support bridging"))?
+                    .check_receiver(
+                        chain
+                            .railgun
+                            .as_ref()
+                            .map(|railgun| railgun.deployment.contract),
+                        delivery.receiver,
+                    )?;
+            }
+            // The receiver must be in the canonical form the network's parser gives it.
+            Some((_, BridgeLeg::NonEvm { delivery, .. }))
+                if delivery.network.parse_receiver(&delivery.receiver)? != delivery.receiver =>
+            {
+                return Err(eyre!("the receiver isn't in its network's canonical form"));
+            }
+            _ => {}
         }
         // The pre-hook must invalidate every earlier order that could fill with its funds.
         if swap_invalidation(&record, &profile, SystemTime::now())?
@@ -2757,149 +2783,157 @@ impl ExecutorOwner {
         let valid_to = valid_to_after(SystemTime::now(), review.valid_for)?;
         // The provider quotes the approved order before anything is signed. A 1Click quote
         // names the receiver, so it follows every check above.
-        let (bridge_terms, private_delivery, raised) = match bridge {
-            Some((delivery, route)) => {
-                let destination_minimum = destination_minimum
-                    .ok_or_else(|| eyre!("a bridge swap needs its approved destination minimum"))?;
-                // The destination account signs its shield for the approved destination
-                // minimum, the deposit's output amount. Its payload is durable on the
-                // destination chain before the quote request carries it out of the wallet.
-                let private_delivery = match destination {
-                    Some(destination) => {
-                        let handler = route
-                            .destination_chain
-                            .bridge_profile()
-                            .ok_or_else(|| {
-                                eyre!("the destination network doesn't support bridging")
-                            })?
-                            .multicall_handler();
-                        let destination_executor = destination.delegated.executor();
-                        let shield_multicall = trace_step(
-                            "order_destination_shield",
-                            self.while_active(destination.owner.issue_swap_destination_shield(
-                                destination.delegated,
-                                swap_use,
+        let (bridge_terms, private_delivery, raised) =
+            match &bridge {
+                Some((clients, leg)) => {
+                    let destination_minimum = destination_minimum.ok_or_else(|| {
+                        eyre!("a bridge swap needs its approved destination minimum")
+                    })?;
+                    // The destination account signs its shield for the approved destination
+                    // minimum, the deposit's output amount. Its payload is durable on the
+                    // destination chain before the quote request carries it out of the wallet.
+                    let private_leg = leg.private_delivery();
+                    let private_delivery = match (destination, private_leg) {
+                        (Some(destination), Some((delivery, chain))) => {
+                            let handler = chain
+                                .bridge_profile()
+                                .ok_or_else(|| {
+                                    eyre!("the destination network doesn't support bridging")
+                                })?
+                                .multicall_handler();
+                            let destination_executor = destination.delegated.executor();
+                            let shield_multicall = trace_step(
+                                "order_destination_shield",
+                                self.while_active(destination.owner.issue_swap_destination_shield(
+                                    destination.delegated,
+                                    swap_use,
+                                    delivery.destination_token,
+                                    destination_minimum,
+                                    destination.authorization,
+                                    destination.notes,
+                                    client,
+                                )),
+                            )
+                            .await?;
+                            // Without a fallback a failing shield reverts the fill, and Across
+                            // refunds the deposit on this chain.
+                            let keep = delivery.private.is_some_and(|private| {
+                                private.on_shield_failure == BridgeShieldFailure::KeepOnDestination
+                            });
+                            Some(AcrossPrivateDelivery {
+                                handler,
+                                destination_executor,
+                                shield_multicall,
+                                fallback: keep.then_some(destination_executor),
+                            })
+                        }
+                        (None, None) => None,
+                        _ => return Err(eyre!(DESTINATION_ACCOUNT_MISMATCH)),
+                    };
+                    let message = private_delivery.as_ref().zip(private_leg).map(
+                        |(private, (delivery, _))| {
+                            private_delivery_message(
+                                private.handler,
                                 delivery.destination_token,
-                                destination_minimum,
-                                destination.authorization,
-                                destination.notes,
-                                client,
-                            )),
-                        )
-                        .await?;
-                        // Without a fallback a failing shield reverts the fill, and Across
-                        // refunds the deposit on this chain.
-                        let keep = delivery.private.is_some_and(|private| {
-                            private.on_shield_failure == BridgeShieldFailure::KeepOnDestination
-                        });
-                        Some(AcrossPrivateDelivery {
-                            handler,
-                            destination_executor,
-                            shield_multicall,
-                            fallback: keep.then_some(destination_executor),
-                        })
-                    }
-                    None => None,
-                };
-                let message = private_delivery.as_ref().map(|private| {
-                    private_delivery_message(
-                        private.handler,
-                        delivery.destination_token,
-                        private.destination_executor,
-                        private.shield_multicall.clone(),
-                        private.fallback,
-                    )
-                });
-                let handler_message =
-                    private_delivery
-                        .as_ref()
-                        .zip(message.as_ref())
-                        .map(|(private, message)| AcrossHandlerMessage {
+                                private.destination_executor,
+                                private.shield_multicall.clone(),
+                                private.fallback,
+                            )
+                        },
+                    );
+                    let handler_message = private_delivery.as_ref().zip(message.as_ref()).map(
+                        |(private, message)| AcrossHandlerMessage {
                             handler: private.handler,
                             message,
-                        });
-                let mut signing = trace_step(
-                    "order_bridge_quote",
-                    self.while_active(self.bridge_signing_terms(
-                        review,
-                        route,
-                        delivery,
-                        buy_amount,
-                        destination_minimum,
-                        valid_to,
-                        handler_message,
-                        &profile,
-                        anchor_cache,
-                        token_registry,
-                    )),
-                )
-                .await?;
-                // An Across quote that fell short within the approval's cushion is taken again
-                // for the deposit that delivers the approved minimum. The destination shield
-                // stays the one signed for that minimum. A NEAR Intents quote creates a deposit
-                // address, so it is never requested twice.
-                let mut raised = None;
-                if let BridgeSigning::Changed(SwapReviewChange::DestinationMinimum {
-                    current, ..
-                }) = signing
-                    && delivery.provider == BridgeProvider::Across
-                {
-                    // The allowed gas of the approval that binds a first order, else the
-                    // review's own.
-                    let approved_allowance = record
-                        .swap_approval()
-                        .filter(|_| record.swap().is_none())
-                        .and_then(|approval| approval.bounds.gas_allowance)
-                        .unwrap_or_else(|| review.gas_allowance());
-                    let deposit = review.raised_deposit(
-                        buy_amount,
-                        destination_minimum,
-                        current,
-                        approved_allowance,
+                        },
                     );
-                    tracing::debug!(target: "executor_observation", step = "order_bridge_quote",
-                        approved = %destination_minimum, current = %current,
-                        within_cushion = deposit.is_some(), "below the approved minimum");
-                    if let Some(deposit) = deposit
-                        && let Ok(raised_buy) = review.require_approval(
-                            deposit,
-                            Some(destination_minimum),
-                            price_acknowledged,
+                    let mut signing = trace_step(
+                        "order_bridge_quote",
+                        self.while_active(self.bridge_signing_terms(
+                            review,
+                            clients,
+                            leg,
+                            buy_amount,
+                            destination_minimum,
+                            valid_to,
+                            handler_message,
+                            &profile,
+                            anchor_cache,
+                            token_registry,
+                        )),
+                    )
+                    .await?;
+                    // An Across quote that fell short within the approval's cushion is taken again
+                    // for the deposit that delivers the approved minimum. The destination shield
+                    // stays the one signed for that minimum. A NEAR Intents quote creates a deposit
+                    // address, so it is never requested twice.
+                    let mut raised = None;
+                    if let BridgeSigning::Changed(SwapReviewChange::DestinationMinimum {
+                        current,
+                        ..
+                    }) = signing
+                        && matches!(
+                            leg,
+                            BridgeLeg::Chain { delivery, .. }
+                                if delivery.provider == BridgeProvider::Across
                         )
                     {
-                        let raised_signing = trace_step(
-                            "order_bridge_quote",
-                            self.while_active(self.bridge_signing_terms(
-                                review,
-                                route,
-                                delivery,
-                                raised_buy,
-                                destination_minimum,
-                                valid_to,
-                                handler_message,
-                                &profile,
-                                anchor_cache,
-                                token_registry,
-                            )),
-                        )
-                        .await?;
-                        // A still-short quote for the raised deposit can't replace the review
-                        // at its reviewed deposit. Keep that first change.
-                        if matches!(raised_signing, BridgeSigning::Terms(_)) {
-                            signing = raised_signing;
-                            raised = Some((deposit, raised_buy));
+                        // The allowed gas of the approval that binds a first order, else the
+                        // review's own.
+                        let approved_allowance = record
+                            .swap_approval()
+                            .filter(|_| record.swap().is_none())
+                            .and_then(|approval| approval.bounds.gas_allowance)
+                            .unwrap_or_else(|| review.gas_allowance());
+                        let deposit = review.raised_deposit(
+                            buy_amount,
+                            destination_minimum,
+                            current,
+                            approved_allowance,
+                        );
+                        tracing::debug!(target: "executor_observation", step = "order_bridge_quote",
+                        approved = %destination_minimum, current = %current,
+                        within_cushion = deposit.is_some(), "below the approved minimum");
+                        if let Some(deposit) = deposit
+                            && let Ok(raised_buy) = review.require_approval(
+                                deposit,
+                                Some(destination_minimum),
+                                price_acknowledged,
+                            )
+                        {
+                            let raised_signing = trace_step(
+                                "order_bridge_quote",
+                                self.while_active(self.bridge_signing_terms(
+                                    review,
+                                    clients,
+                                    leg,
+                                    raised_buy,
+                                    destination_minimum,
+                                    valid_to,
+                                    handler_message,
+                                    &profile,
+                                    anchor_cache,
+                                    token_registry,
+                                )),
+                            )
+                            .await?;
+                            // A still-short quote for the raised deposit can't replace the review
+                            // at its reviewed deposit. Keep that first change.
+                            if matches!(raised_signing, BridgeSigning::Terms(_)) {
+                                signing = raised_signing;
+                                raised = Some((deposit, raised_buy));
+                            }
+                        }
+                    }
+                    match signing {
+                        BridgeSigning::Terms(terms) => (Some(terms), private_delivery, raised),
+                        BridgeSigning::Changed(change) => {
+                            return Ok(SwapOrderOutcome::ReviewRequired(change));
                         }
                     }
                 }
-                match signing {
-                    BridgeSigning::Terms(terms) => (Some(terms), private_delivery, raised),
-                    BridgeSigning::Changed(change) => {
-                        return Ok(SwapOrderOutcome::ReviewRequired(change));
-                    }
-                }
-            }
-            None => (None, None, None),
-        };
+                None => (None, None, None),
+            };
         // A raised deposit is the order's minimum and buy amount from here on.
         let (private_minimum, buy_amount, gas_allowance) = match raised {
             Some((deposit, raised_buy)) => {
@@ -2917,7 +2951,7 @@ impl ExecutorOwner {
         // at, the open order's included, can still deposit under its own lower minimum. The
         // user must have accepted that minimum. An ordinary retry discloses none.
         if plan.speed_up.is_some()
-            && is_public_across(plan.delivery)
+            && is_public_across(&plan.delivery)
             && let Some(destination_minimum) = destination_minimum
         {
             let continuing = trace_step(
@@ -2925,7 +2959,7 @@ impl ExecutorOwner {
                 self.swap_continuing_approvals(
                     operation,
                     swap_use,
-                    plan.delivery,
+                    &plan.delivery,
                     Some(nonce),
                     client,
                 ),
@@ -2959,7 +2993,7 @@ impl ExecutorOwner {
             )?;
         }
         // Resolved before anything is signed.
-        let receiver = order_receiver(executor, plan.delivery, bridge_terms.as_ref())?;
+        let receiver = order_receiver(executor, &plan.delivery, bridge_terms.as_ref())?;
 
         let signing_started = Instant::now();
         tracing::debug!(target: "executor_observation", step = "order_sign", "started");
@@ -3009,7 +3043,7 @@ impl ExecutorOwner {
         // shielding any surplus when the user chose to. A private delivery's deposit pays the
         // destination chain's handler with the message that runs the destination account's
         // shield. External and NEAR Intents orders pay their receiver and sign none.
-        let post_hook_calls = match (plan.delivery, &bridge_terms) {
+        let post_hook_calls = match (&plan.delivery, &bridge_terms) {
             (SwapDelivery::Reshield, _) => Some(guarded_shield_calls(
                 executor,
                 plan.buy_token,
@@ -3017,7 +3051,7 @@ impl ExecutorOwner {
                 wallet_shield()?,
             )?),
             (SwapDelivery::Bridge(delivery), Some(BridgeOrderTerms::Across(terms))) => {
-                let deposit = across_deposit(executor, delivery, terms);
+                let deposit = across_deposit(executor, *delivery, terms);
                 let surplus_shield = (delivery.surplus == BridgeSurplus::Reshield)
                     .then(wallet_shield)
                     .transpose()?;
@@ -3033,7 +3067,7 @@ impl ExecutorOwner {
                         // The plan sized the message from a placeholder of the destination
                         // account's payload.
                         let planned =
-                            placeholder_post_hook_calls(executor, plan.buy_token, plan.delivery)?;
+                            placeholder_post_hook_calls(executor, plan.buy_token, &plan.delivery)?;
                         if calls.abi_encode().len() != planned.abi_encode().len() {
                             return Err(eyre!(
                                 "the swap's post-hook differs from the planned one; plan the swap again"
@@ -3046,7 +3080,12 @@ impl ExecutorOwner {
                     }
                 })
             }
-            (SwapDelivery::External { .. } | SwapDelivery::Bridge(_), _) => None,
+            (
+                SwapDelivery::External { .. }
+                | SwapDelivery::Bridge(_)
+                | SwapDelivery::NonEvmBridge(_),
+                _,
+            ) => None,
         };
         let post_hook = match post_hook_calls {
             Some(calls) => {
@@ -3159,7 +3198,7 @@ impl ExecutorOwner {
                 proof: SwapProof::new(proof_digest, input_identities.clone()),
                 uid,
                 submission: Some(SwapSubmission::new(signature, review.quote_id)),
-                delivery: plan.delivery,
+                delivery: plan.delivery.clone(),
                 bounds: SwapApprovedBounds {
                     sell_amount: review.sell_amount,
                     unshield_amount: Some(plan.amount()),
@@ -3451,7 +3490,7 @@ impl ExecutorOwner {
         let order = swap_order(
             swap.order_terms(saved).sell_token(),
             swap.order_terms(saved).buy_token(),
-            order_receiver(executor, saved.delivery(), saved.bridge())?,
+            order_receiver(executor, &saved.delivery(), saved.bridge())?,
             bounds.sell_amount,
             bounds.buy_amount,
             saved.valid_to(),
@@ -4252,7 +4291,7 @@ fn require_swap_use_terms(
     swap_use: SwapUseId,
     plan: &SwapInputPlan,
 ) -> Result<()> {
-    if record.swap_use_keeps_terms(swap_use, plan.sell_token, plan.buy_token, plan.delivery) {
+    if record.swap_use_keeps_terms(swap_use, plan.sell_token, plan.buy_token, &plan.delivery) {
         return Ok(());
     }
     Err(ExecutorStoreError::SwapUseTermsChanged.into())
@@ -4363,7 +4402,7 @@ pub(crate) fn plan_swap_speed_up_inputs(
         delivery: open.delivery(),
         byte_budget: None,
     };
-    if profile.pair_eligibility(request.sell_token, request.buy_token, request.delivery)
+    if profile.pair_eligibility(request.sell_token, request.buy_token, &request.delivery)
         != SwapTokenEligibility::Eligible
     {
         return Err(eyre!("this token pair is not eligible for private swaps"));
@@ -4729,9 +4768,9 @@ fn pre_hook_request(
 fn placeholder_post_hook_calls(
     executor: Address,
     buy_token: Address,
-    delivery: SwapDelivery,
+    delivery: &SwapDelivery,
 ) -> Result<Vec<Call>> {
-    Ok(match delivery {
+    Ok(match *delivery {
         SwapDelivery::Bridge(
             bridge @ BridgeDelivery {
                 provider: BridgeProvider::Across,
@@ -4902,10 +4941,10 @@ pub(super) fn swap_order(
 /// External receiver, or the NEAR Intents deposit address in the order's `bridge` terms.
 fn order_receiver(
     executor: Address,
-    delivery: SwapDelivery,
+    delivery: &SwapDelivery,
     bridge: Option<&BridgeOrderTerms>,
 ) -> Result<Address> {
-    match delivery {
+    match *delivery {
         SwapDelivery::Reshield
         | SwapDelivery::Bridge(BridgeDelivery {
             provider: BridgeProvider::Across,
@@ -4915,7 +4954,8 @@ fn order_receiver(
         SwapDelivery::Bridge(BridgeDelivery {
             provider: BridgeProvider::NearIntents,
             ..
-        }) => match bridge {
+        })
+        | SwapDelivery::NonEvmBridge(_) => match bridge {
             Some(BridgeOrderTerms::NearIntents(terms)) => Ok(terms.deposit_address),
             _ => Err(eyre!(
                 "NEAR Intents orders need their verified deposit address"

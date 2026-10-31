@@ -31,7 +31,7 @@ use wallet_ops::{
     swap_setup_recorded_executed,
     vault::{
         BridgeDelivery, BridgeProvider, ExecutorNonceObservation, ExecutorOperationId,
-        ExecutorPayloadPurpose, ExecutorRecord, SwapApproval, SwapApprovedBounds,
+        ExecutorPayloadPurpose, ExecutorRecord, NonEvmDelivery, SwapApproval, SwapApprovedBounds,
         SwapBridgeOutcome, SwapDelivery, SwapOrderRecord, SwapUseId, SwapUseRecord,
     },
 };
@@ -296,7 +296,7 @@ struct SwapJob {
 }
 
 /// Approved display terms while a new order is being prepared, before it has a durable UID.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PendingSwapOrder {
     previous_order: Option<OrderUid>,
     sell: Address,
@@ -331,7 +331,7 @@ impl PendingSwapOrder {
             previous_order: None,
             sell: tokens.sell,
             buy: tokens.buy,
-            delivery: approval.delivery,
+            delivery: approval.delivery.clone(),
             amount: bounds.spend_amount(),
             private_minimum: bounds.private_minimum,
             slippage_bps: bounds.slippage_bps,
@@ -349,7 +349,7 @@ impl PendingSwapOrder {
     }
 
     /// Whether the draft is another swap than the record's latest order belongs to.
-    fn starts_new_swap(self, record: &ExecutorRecord) -> bool {
+    fn starts_new_swap(&self, record: &ExecutorRecord) -> bool {
         record
             .swap()
             .and_then(|swap| swap.orders().last())
@@ -358,7 +358,7 @@ impl PendingSwapOrder {
 
     /// When the draft's swap started. A reused account's new swap starts when its use claims
     /// the account, which a retry of the draft keeps.
-    fn started(self, record: &ExecutorRecord) -> u64 {
+    fn started(&self, record: &ExecutorRecord) -> u64 {
         record
             .swap_use(self.swap_use)
             .filter(|swap_use| !swap_use.is_fresh())
@@ -521,7 +521,7 @@ fn authorization_summary(
 fn bridge_pair_label(labels: &SwapLabels, bridge: Option<&SwapBridgeLabels>) -> String {
     swap_pair_label(
         &labels.sell,
-        bridge.map_or(&labels.buy_symbol, |bridge| &bridge.token),
+        &bridge.map_or_else(|| labels.buy_symbol.clone(), SwapBridgeLabels::named_token),
     )
 }
 
@@ -711,7 +711,9 @@ fn early_order(
     let delivery = order.delivery();
     let observed = order.observations();
     let recorded = match delivery {
-        SwapDelivery::Bridge(_) => observed.bridge_handoff.is_some(),
+        SwapDelivery::Bridge(_) | SwapDelivery::NonEvmBridge(_) => {
+            observed.bridge_handoff.is_some()
+        }
         SwapDelivery::Reshield | SwapDelivery::External { .. } => observed.traded.is_some(),
     };
     (!recorded).then_some((delivery, hint.trade_block))
@@ -754,10 +756,7 @@ fn early_request(
                 reads_fill,
             })
     };
-    let provider = match delivery {
-        SwapDelivery::Bridge(delivery) => Some(delivery.provider),
-        SwapDelivery::Reshield | SwapDelivery::External { .. } => None,
-    };
+    let provider = delivery.bridge_provider();
     let asked = !hint.ends_polling()
         && match provider {
             Some(BridgeProvider::NearIntents) => true,
@@ -1084,7 +1083,7 @@ pub(super) fn swap_entry_availability(
     use wallet_ops::settings::{SwapIneligibility, SwapTokenRole};
     let profile = profile?;
     Some(if actions_available {
-        match token.map(|token| profile.token_eligibility(token, SwapTokenRole::Sell)) {
+        match token.map(|token| profile.token_eligibility(token, &SwapTokenRole::Sell)) {
             None | Some(SwapTokenEligibility::Ineligible(SwapIneligibility::NativeAsset)) => {
                 Err("Native assets can't be swapped privately")
             }
@@ -1277,10 +1276,13 @@ impl PrivateSwapsView {
                     if let Some(root) = this.root.upgrade() {
                         root.update(cx, |root, _| {
                             root.activate_chains_background(requests.iter().flat_map(|request| {
+                                // A non-EVM delivery has no chain to activate.
                                 request
                                     .bridges
                                     .iter()
-                                    .map(|(_, chain)| chain.chain_id)
+                                    .filter_map(|(_, chain)| {
+                                        chain.as_ref().map(|chain| chain.chain_id)
+                                    })
                                     .chain(request.destination.iter().map(|chain| chain.chain_id))
                             }));
                         });
@@ -2036,7 +2038,7 @@ impl PrivateSwapsView {
         let operation = record.operation();
         self.tracking
             .get(&operation)
-            .and_then(|tracking| tracking.pending_order)
+            .and_then(|tracking| tracking.pending_order.clone())
             .filter(|pending| {
                 pending.previous_order
                     == model::swap_use_last_order(record, pending.swap_use)
@@ -2056,7 +2058,7 @@ impl PrivateSwapsView {
                     && let Some(SwapDelivery::Bridge(bound)) = model::prepared_swap_use(record)
                         .filter(|swap_use| swap_use.id() == pending.swap_use)
                         .and_then(SwapUseRecord::approval)
-                        .map(|approval| approval.delivery)
+                        .map(|approval| approval.delivery.clone())
                     && bound.is_private()
                     && bound.destination_chain == delivery.destination_chain
                     && !bound.receiver.is_zero()
@@ -2268,10 +2270,10 @@ impl PrivateSwapsView {
                 None,
                 cx,
             );
-            let bridge = self.bridge_labels(record, pending.delivery, pending.buy, None, None, cx);
+            let bridge = self.bridge_labels(record, &pending.delivery, pending.buy, None, None, cx);
             return SwapLabels {
                 pair: bridge_pair_label(&labels, bridge.as_ref()),
-                receiver: self.receiver_name(pending.delivery, cx),
+                receiver: self.receiver_name(&pending.delivery, cx),
                 minimum: Some(self.token_amount(pending.buy, pending.private_minimum, cx)),
                 bridge,
                 ..labels
@@ -2315,10 +2317,10 @@ impl PrivateSwapsView {
         // Before its first order, the swap delivers as approved with its setup.
         let delivery = swap_delivery(record);
         let approved = record.swap_approval().map(|approval| &approval.bounds);
-        let bridge = self.bridge_labels(record, delivery, buy, None, approved, cx);
+        let bridge = self.bridge_labels(record, &delivery, buy, None, approved, cx);
         SwapLabels {
             pair: bridge_pair_label(&labels, bridge.as_ref()),
-            receiver: self.receiver_name(delivery, cx),
+            receiver: self.receiver_name(&delivery, cx),
             minimum: model::swap_private_minimum(record)
                 .map(|minimum| self.token_amount(buy, minimum, cx)),
             bridge,
@@ -2572,12 +2574,23 @@ impl PrivateSwapsView {
                         cx,
                     ));
                 }
+                // 1Click's reported amount, in the record's token.
+                SwapDelivery::NonEvmBridge(delivery) => {
+                    let Some(SwapBridgeOutcome::DeliveredReported {
+                        amount_out: Some(amount),
+                        ..
+                    }) = observed.bridge_outcome
+                    else {
+                        return None;
+                    };
+                    return Some(non_evm_amount(&delivery, amount));
+                }
             };
             amount.map(|amount| self.token_amount(buy, amount, cx))
         });
         let valid_to = attempts.map(|attempts| attempts.valid_to());
         let mut bridge = evidence.and_then(|order| {
-            self.bridge_labels(record, order.delivery(), buy, Some(order), None, cx)
+            self.bridge_labels(record, &order.delivery(), buy, Some(order), None, cx)
         });
         // The deposit read early and a provider's early report show only beside the reported
         // fill they follow.
@@ -2597,7 +2610,9 @@ impl PrivateSwapsView {
         SwapLabels {
             pair: swap_pair_label(
                 &sell_label,
-                bridge.as_ref().map_or(&buy_symbol, |bridge| &bridge.token),
+                &bridge
+                    .as_ref()
+                    .map_or_else(|| buy_symbol.clone(), SwapBridgeLabels::named_token),
             ),
             sell: sell_label,
             buy_symbol,
@@ -2605,7 +2620,7 @@ impl PrivateSwapsView {
             lapsed: valid_to.is_some_and(|valid_to| valid_to < now_unix()),
             fill_hint,
             received,
-            receiver: order.and_then(|order| self.receiver_name(order.delivery(), cx)),
+            receiver: order.and_then(|order| self.receiver_name(&order.delivery(), cx)),
             minimum: order.map(|order| self.token_amount(buy, order.bounds().private_minimum, cx)),
             uncovered_gas: order
                 .and_then(|order| {
@@ -2644,14 +2659,18 @@ impl PrivateSwapsView {
     fn bridge_labels(
         &self,
         record: &ExecutorRecord,
-        delivery: SwapDelivery,
+        delivery: &SwapDelivery,
         buy: Address,
         order: Option<&SwapOrderRecord>,
         approved: Option<&SwapApprovedBounds>,
         cx: &gpui::App,
     ) -> Option<SwapBridgeLabels> {
-        let SwapDelivery::Bridge(bridge) = delivery else {
-            return None;
+        let bridge = match delivery {
+            SwapDelivery::Bridge(bridge) => *bridge,
+            SwapDelivery::NonEvmBridge(delivery) => {
+                return Some(self.non_evm_bridge_labels(delivery, buy, order, approved, cx));
+            }
+            SwapDelivery::Reshield | SwapDelivery::External { .. } => return None,
         };
         let token = self.delivered_token(bridge, cx);
         let destination_amount =
@@ -2670,6 +2689,7 @@ impl PrivateSwapsView {
             provider: bridge.provider,
             network: form::network_name(bridge.destination_chain),
             token: self.network_token_symbol(bridge.destination_chain, token, cx),
+            non_evm: false,
             origin: form::network_name(self.origin_chain_id),
             receiver: self
                 .receiver_label(bridge.receiver, cx)
@@ -2712,6 +2732,7 @@ impl PrivateSwapsView {
                     _ => None,
                 }
             }),
+            destination_transaction: None,
             handoff_transaction: order.and_then(|order| {
                 order
                     .observations()
@@ -2726,6 +2747,65 @@ impl PrivateSwapsView {
         })
     }
 
+    /// [`Self::bridge_labels`] of a non-EVM delivery, from its record alone, so it needs no
+    /// token list: the network's name, the receiver's saved label on that network or its short
+    /// form, the token's symbol, and amounts in its decimals. 1Click's destination transaction
+    /// is kept as it reports it.
+    fn non_evm_bridge_labels(
+        &self,
+        delivery: &NonEvmDelivery,
+        buy: Address,
+        order: Option<&SwapOrderRecord>,
+        approved: Option<&SwapApprovedBounds>,
+        cx: &gpui::App,
+    ) -> SwapBridgeLabels {
+        let observed = order.map(SwapOrderRecord::observations);
+        SwapBridgeLabels {
+            provider: BridgeProvider::NearIntents,
+            network: delivery.network.display_name().to_owned(),
+            token: delivery.symbol.clone(),
+            non_evm: true,
+            origin: form::network_name(self.origin_chain_id),
+            receiver: self
+                .non_evm_receiver_label(delivery.network, &delivery.receiver, cx)
+                .unwrap_or_else(|| short_non_evm(&delivery.receiver)),
+            sent: order
+                .and_then(bridge_sent_amount)
+                .map(|amount| self.token_amount(buy, amount, cx)),
+            minimum: order
+                .map(SwapOrderRecord::bounds)
+                .or(approved)
+                .and_then(|bounds| bounds.destination_minimum)
+                .map(|minimum| non_evm_amount(delivery, minimum)),
+            private: None,
+            reported: observed.as_ref().is_some_and(|observed| {
+                matches!(
+                    observed.bridge_outcome,
+                    Some(SwapBridgeOutcome::DeliveredReported { .. })
+                )
+            }),
+            // The destination transaction isn't an EVM hash.
+            delivered_transaction: None,
+            destination_transaction: observed.as_ref().and_then(|observed| {
+                match &observed.bridge_outcome {
+                    Some(SwapBridgeOutcome::DeliveredReported {
+                        destination_transaction,
+                        ..
+                    }) => destination_transaction.clone(),
+                    _ => None,
+                }
+            }),
+            handoff_transaction: observed
+                .as_ref()
+                .and_then(|observed| observed.bridge_handoff?.observation.transaction_hash),
+            refund_transaction: observed
+                .as_ref()
+                .and_then(|observed| observed.bridge_refund?.transaction_hash),
+            deposit: SwapSeen::Looking,
+            report: None,
+        }
+    }
+
     /// What its bridge provider reported early about the order of `record` whose fill the
     /// orderbook reports, with a delivered amount in the destination network's token, and for
     /// a private delivery what its fill block showed: the private credit after the shield fee,
@@ -2737,18 +2817,22 @@ impl PrivateSwapsView {
             model::tracked_orders(record)
                 .into_iter()
                 .find_map(|order| {
-                    let SwapDelivery::Bridge(delivery) = order.delivery() else {
+                    let delivery = order.delivery();
+                    if !delivery.is_bridge() {
                         return None;
-                    };
+                    }
                     Some((order, delivery, hints.get(&order.uid())?.report?))
                 })?;
-        let shown = |amount: U256| {
-            self.network_token_amount(
+        // A non-EVM delivery's amounts are in its record's token and decimals.
+        let shown = |amount: U256| match &delivery {
+            SwapDelivery::Bridge(delivery) => self.network_token_amount(
                 delivery.destination_chain,
-                self.delivered_token(delivery, cx),
+                self.delivered_token(*delivery, cx),
                 amount,
                 cx,
-            )
+            ),
+            SwapDelivery::NonEvmBridge(delivery) => non_evm_amount(delivery, amount),
+            SwapDelivery::Reshield | SwapDelivery::External { .. } => amount.to_string(),
         };
         Some(match report {
             SwapBridgeReport::Delivered {
@@ -2863,8 +2947,8 @@ impl PrivateSwapsView {
 
     /// How swaps name a Public address receiver: the wallet's label for it, or its short
     /// address. `None` for a swap back to the private balance.
-    fn receiver_name(&self, delivery: SwapDelivery, cx: &gpui::App) -> Option<String> {
-        let SwapDelivery::External { receiver } = delivery else {
+    fn receiver_name(&self, delivery: &SwapDelivery, cx: &gpui::App) -> Option<String> {
+        let &SwapDelivery::External { receiver } = delivery else {
             return None;
         };
         Some(
@@ -3220,13 +3304,18 @@ impl PrivateSwapsView {
                             .is_none_or(|poll| poll.next_at <= now)
                     })
                     .filter_map(|order| {
-                        let SwapDelivery::Bridge(delivery) = order.delivery() else {
-                            return None;
+                        let delivery = match order.delivery() {
+                            SwapDelivery::Bridge(delivery) => delivery,
+                            // A non-EVM network has no chain to read.
+                            SwapDelivery::NonEvmBridge(_) => return Some((order.uid(), None)),
+                            SwapDelivery::Reshield | SwapDelivery::External { .. } => {
+                                return None;
+                            }
                         };
                         let chain = chains?
                             .get(delivery.destination_chain)
                             .filter(|chain| chain.enabled)?;
-                        Some((order.uid(), chain.clone()))
+                        Some((order.uid(), Some(chain.clone())))
                     })
                     .collect::<Vec<_>>();
                 // Handed-off orders are polled once per pass, with the first request.
@@ -3665,6 +3754,7 @@ impl PrivateSwapsView {
         tracking.inclusion = None;
         if tracking
             .pending_order
+            .as_ref()
             .is_some_and(|pending| pending.speeds_up)
         {
             return false;
@@ -3732,6 +3822,7 @@ impl PrivateSwapsView {
         // A speed-up that failed placed no order, so the open one is the swap's order again.
         if tracking
             .pending_order
+            .as_ref()
             .is_some_and(|pending| pending.speeds_up)
         {
             tracking.pending_order = None;
@@ -4216,8 +4307,9 @@ struct HintRequest {
     fee: bool,
     /// The swap's own route.
     route: SwapRoute,
-    /// Handed-off Bridge orders to poll, with their destination chain.
-    bridges: Vec<(OrderUid, EffectiveChainConfig)>,
+    /// Handed-off Bridge orders to poll, with their destination chain. A non-EVM network has
+    /// none.
+    bridges: Vec<(OrderUid, Option<EffectiveChainConfig>)>,
     /// Set when `uid` is due an early request: a Bridge order's provider, and what is known
     /// for its reported trade block.
     early: Option<(Option<BridgeProvider>, SwapEarlyHint)>,
@@ -4298,7 +4390,7 @@ async fn fetch_order_hints(
                         request.operation,
                         *uid,
                         clients,
-                        destination,
+                        destination.as_ref(),
                         rpc,
                     ))
                     .await,
@@ -4404,10 +4496,48 @@ async fn observe_pages(
     results
 }
 
+/// `amount` of a non-EVM delivery's token, in its decimals and with its symbol from the record.
+pub(super) fn non_evm_amount(delivery: &NonEvmDelivery, amount: U256) -> String {
+    format!(
+        "{} {}",
+        railgun_ui::format_token_amount(amount, delivery.decimals),
+        delivery.symbol
+    )
+}
+
+/// The icon of `network`'s token at `contract`: the network's own for its native asset, and
+/// for another, the icon of a known token with exactly its `symbol`. `None` without one.
+pub(super) fn non_evm_token_icon(
+    network: wallet_ops::bridge::NonEvmNetwork,
+    contract: Option<&str>,
+    symbol: &str,
+) -> Option<crate::assets::WalletIconSource> {
+    let path = match contract {
+        None => network.icon_asset_path().to_owned(),
+        Some(_) => railgun_ui::symbol_token_icon_asset_path(symbol)?,
+    };
+    Some(crate::assets::WalletIconSource::embedded(path))
+}
+
 /// "0x7b2E…91F4": a receiver's address, shortened, in its checksummed case.
 pub(super) fn short_receiver(receiver: Address) -> String {
     let checksummed = receiver.to_checksum(None);
     format!("{}…{}", &checksummed[..6], &checksummed[38..])
+}
+
+/// "bc1qar…5mdq": a non-EVM receiver, mint or contract, shortened as addresses are. It comes
+/// from the user or 1Click's list, so it is cut by characters.
+pub(super) fn short_non_evm(text: &str) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() <= 12 {
+        return text.to_owned();
+    }
+    let (head, tail) = (&chars[..6], &chars[chars.len() - 4..]);
+    format!(
+        "{}…{}",
+        head.iter().collect::<String>(),
+        tail.iter().collect::<String>()
+    )
 }
 
 /// Local wall-clock time of a Unix timestamp, such as "14:32".

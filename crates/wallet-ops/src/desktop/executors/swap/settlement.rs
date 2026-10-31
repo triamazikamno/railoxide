@@ -528,7 +528,10 @@ async fn read_block_settlement(
                         }
                     }
                 }
-                (SwapDelivery::Bridge(_), Some(BridgeOrderTerms::NearIntents(_))) => (
+                (
+                    SwapDelivery::Bridge(_) | SwapDelivery::NonEvmBridge(_),
+                    Some(BridgeOrderTerms::NearIntents(_)),
+                ) => (
                     None,
                     Some(SwapBridgeHandoff {
                         observation,
@@ -536,7 +539,12 @@ async fn read_block_settlement(
                     }),
                 ),
                 // A Bridge order always carries its provider's terms.
-                (SwapDelivery::External { .. } | SwapDelivery::Bridge(_), _) => (None, None),
+                (
+                    SwapDelivery::External { .. }
+                    | SwapDelivery::Bridge(_)
+                    | SwapDelivery::NonEvmBridge(_),
+                    _,
+                ) => (None, None),
             };
             found = Some(Settlement {
                 trade: observation,

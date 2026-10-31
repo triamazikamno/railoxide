@@ -28,8 +28,9 @@ arti-client = { workspace = true, features = ["onion-service-client"] }
 argon2 = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+bech32 = "0.12"
 bip39 = { version = "2", features = ["zeroize"] }
-bs58 = { workspace = true }
+bs58 = { workspace = true, features = ["check"] }
 chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 cid = "0.11"

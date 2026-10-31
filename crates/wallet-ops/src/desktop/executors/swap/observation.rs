@@ -123,7 +123,9 @@ fn order_state(order: &SwapOrderRecord, funded: bool, superseded: bool) -> SwapO
             (None, _) if observed.undelivered.is_some() => SwapOrderState::NotDelivered,
             (None, _) => SwapOrderState::Traded,
             // A Bridge order's delivery on this chain is its hand-off.
-            (Some(_), SwapDelivery::Bridge(_)) => bridge_state(observed.bridge_outcome),
+            (Some(_), SwapDelivery::Bridge(_) | SwapDelivery::NonEvmBridge(_)) => {
+                bridge_state(observed.bridge_outcome.as_ref())
+            }
             (Some(_), SwapDelivery::Reshield | SwapDelivery::External { .. }) => {
                 SwapOrderState::Done
             }
@@ -146,7 +148,7 @@ fn order_state(order: &SwapOrderRecord, funded: bool, superseded: bool) -> SwapO
 }
 
 /// Where a handed-off Bridge order stands, from its outcome on the destination chain.
-const fn bridge_state(outcome: Option<SwapBridgeOutcome>) -> SwapOrderState {
+const fn bridge_state(outcome: Option<&SwapBridgeOutcome>) -> SwapOrderState {
     match outcome {
         None => SwapOrderState::Bridging,
         Some(outcome) if outcome.is_delivered() => SwapOrderState::Done,
@@ -183,7 +185,7 @@ pub fn swap_attempt_state(record: &ExecutorRecord, order: &SwapOrderRecord) -> S
                 swap.is_some_and(|swap| swap.traded_sibling(order).is_some()),
             )
         },
-        |delivery| bridge_state(delivery.observations().bridge_outcome),
+        |delivery| bridge_state(delivery.observations().bridge_outcome.as_ref()),
     )
 }
 
@@ -1084,7 +1086,7 @@ fn use_source_resolved(
 }
 
 /// An order's Across delivery and the terms its post-hook's deposit signed.
-const fn across_terms(order: &SwapOrderRecord) -> Option<(BridgeDelivery, &AcrossOrderTerms)> {
+fn across_terms(order: &SwapOrderRecord) -> Option<(BridgeDelivery, &AcrossOrderTerms)> {
     match (order.delivery(), order.bridge()) {
         (SwapDelivery::Bridge(delivery), Some(BridgeOrderTerms::Across(terms))) => {
             Some((delivery, terms))
@@ -1225,7 +1227,7 @@ fn derive_swap_observations(
         .map(|(order, observed)| {
             let valid_to = u64::from(order.valid_to());
             let nonce = order.pre_hook().nonce();
-            let mut next = observed.retained;
+            let mut next = observed.retained.clone();
             next.pre_hook_executed = next.pre_hook_executed.or(observed.executed);
             // Retained amounts belong to the retained trade; new ones to the trade just read.
             if next.traded.is_none() {
@@ -1268,7 +1270,7 @@ fn derive_swap_observations(
                     // Only the settlement receipt records a Bridge hand-off; explicit
                     // reconciliation doesn't look for one.
                     (SwapDelivery::Reshield | SwapDelivery::Bridge(_), None)
-                    | (SwapDelivery::Bridge(_), Some(_)) => {}
+                    | (SwapDelivery::Bridge(_) | SwapDelivery::NonEvmBridge(_), _) => {}
                 }
             }
             if next.traded.is_none()

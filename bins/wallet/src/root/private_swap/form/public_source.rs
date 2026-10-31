@@ -3547,7 +3547,7 @@ impl PrivateSwapsView {
                             |network| format!("Private balance on {}", network_name(network)),
                         )),
                     ))
-                    .children(receive_to_problem(form, cx)),
+                    .children(receive_to_problem(form)),
             )
             .children(
                 form.network
@@ -3593,6 +3593,7 @@ impl PrivateSwapsView {
                         failure.message,
                         Self::quote_details(form, failure.details, cx),
                         None,
+                        near_intents_status(error),
                         cx,
                     ))
                 }
@@ -4525,7 +4526,6 @@ impl PrivateSwapsView {
                         network_name(setup.chain_id)
                     ),
                     false,
-                    cx,
                 );
             }
             let (line, problem) = self.setup_line(form, cx);
@@ -4534,7 +4534,7 @@ impl PrivateSwapsView {
             } else {
                 line
             };
-            return setup_fee_line(line, problem, cx);
+            return setup_fee_line(line, problem);
         }
         app_muted_text(match self.public_destination_setup_progress(form) {
             Some(SwapSetupProgress::Done) | None => "Already set up for this swap. No setup fee.",
