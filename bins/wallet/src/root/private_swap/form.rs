@@ -15169,7 +15169,7 @@ fn bridge_notice_card(provider: &'static str, window: &Window) -> gpui::Div {
     )
 }
 
-/// A provider's hint card: its `notes`, then its `disclaimer`. NEAR Intents' is a warning.
+/// A provider's hint card: its `notes`, then its `disclaimer`. NEAR Intents' title is a warning.
 fn provider_hint_card(
     provider: BridgeProvider,
     notes: &[SharedString],
@@ -15184,14 +15184,7 @@ fn provider_hint_card(
                 .iter()
                 .map(|note| div().whitespace_normal().child(note.clone())),
         )
-        .child(
-            div()
-                .whitespace_normal()
-                .when(warning, |disclaimer| {
-                    disclaimer.text_color(rgb(theme::WARNING))
-                })
-                .child(disclaimer.clone()),
-        )
+        .child(div().whitespace_normal().child(disclaimer.clone()))
 }
 
 /// The gas explanation as a hint card: `text`'s paragraphs under the title, with a legend of
