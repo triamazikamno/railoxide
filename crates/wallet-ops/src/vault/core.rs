@@ -26,6 +26,8 @@ pub(super) const HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX: &str = "hardware-wallet-a
 pub const MAX_HARDWARE_RECOVERY_RANGE_COUNT: u32 = 255;
 pub(super) const PUBLIC_ACCOUNT_METADATA_PREFIX: &str = "public-account-meta|";
 pub(super) const PUBLIC_ACCOUNT_SECRET_PREFIX: &str = "public-account-secret|";
+pub(super) const TRON_ACCOUNT_METADATA_PREFIX: &str = "tron-account-meta|";
+pub(super) const TRON_ACCOUNT_SECRET_PREFIX: &str = "tron-account-secret|";
 pub(super) const PRIVATE_ADDRESS_BOOK_PREFIX: &str = "private-address-book|";
 pub(super) const PUBLIC_ADDRESS_BOOK_PREFIX: &str = "public-address-book|";
 pub(super) const NON_EVM_ADDRESS_BOOK_PREFIX: &str = "non-evm-address-book|";
@@ -258,6 +260,8 @@ pub enum RecordKind {
     HardwareWalletAccountIndexReservation,
     PublicAccountMetadata,
     PublicAccountSecret,
+    TronAccountMetadata,
+    TronAccountSecret,
     PrivateAddressBookEntry,
     PublicAddressBookEntry,
     NonEvmAddressBookEntry,
@@ -291,6 +295,8 @@ impl RecordKind {
             }
             Self::PublicAccountMetadata => "public-account-metadata",
             Self::PublicAccountSecret => "public-account-secret",
+            Self::TronAccountMetadata => "tron-account-metadata",
+            Self::TronAccountSecret => "tron-account-secret",
             Self::PrivateAddressBookEntry => "private-address-book-entry",
             Self::PublicAddressBookEntry => "public-address-book-entry",
             Self::NonEvmAddressBookEntry => "non-evm-address-book-entry",

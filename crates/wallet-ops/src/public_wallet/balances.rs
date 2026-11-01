@@ -44,21 +44,7 @@ pub(super) fn public_balance_assets_for_chain_with_registry(
     let chain_id = chain.chain_id;
     let mut assets = vec![native_asset_for_chain(chain)];
     if let Some(token_registry) = token_registry {
-        assets.extend(
-            token_registry
-                .tokens
-                .values()
-                .filter(|token| token.chain_id == chain_id)
-                .filter_map(|token| {
-                    Address::from_str(&token.token_address)
-                        .ok()
-                        .map(|address| PublicBalanceAsset {
-                            id: PublicAssetId::Erc20(address),
-                            symbol: token.symbol.clone(),
-                            decimals: token.decimals,
-                        })
-                }),
-        );
+        assets.extend(registry_balance_assets(token_registry, chain_id));
     } else {
         assets.extend(
             known_tokens_for_chain(chain_id).map(|token| PublicBalanceAsset {
@@ -69,6 +55,26 @@ pub(super) fn public_balance_assets_for_chain_with_registry(
         );
     }
     assets
+}
+
+/// `registry`'s tokens on `chain_id`, skipping any with an unparseable address.
+pub(crate) fn registry_balance_assets(
+    registry: &EffectiveTokenRegistry,
+    chain_id: u64,
+) -> impl Iterator<Item = PublicBalanceAsset> + '_ {
+    registry
+        .tokens
+        .values()
+        .filter(move |token| token.chain_id == chain_id)
+        .filter_map(|token| {
+            Address::from_str(&token.token_address)
+                .ok()
+                .map(|address| PublicBalanceAsset {
+                    id: PublicAssetId::Erc20(address),
+                    symbol: token.symbol.clone(),
+                    decimals: token.decimals,
+                })
+        })
 }
 
 pub(super) fn plan_public_balance_calls(

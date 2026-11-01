@@ -1251,7 +1251,7 @@ impl WalletRoot {
             .iter()
             .filter(|account| {
                 account.status == PublicAccountStatus::Active
-                    && account.is_available_on_chain(self.selected_chain)
+                    && account.is_available_on_chain(self.last_evm_chain)
             })
             .cloned()
             .collect()
@@ -1458,7 +1458,7 @@ impl WalletRoot {
         self.public_accounts.iter().find(|account| {
             account.status == PublicAccountStatus::Active
                 && account.public_account_uuid == selected_uuid
-                && account.is_available_on_chain(self.selected_chain)
+                && account.is_available_on_chain(self.last_evm_chain)
         })
     }
 }

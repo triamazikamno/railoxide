@@ -1,4 +1,4 @@
-use super::{commands::AccountCommand, public_account_matches_search};
+use super::commands::AccountCommand;
 use crate::root::{
     WalletRoot,
     actions::{
@@ -23,7 +23,7 @@ use gpui_component::{
     scroll::ScrollableElement,
 };
 use gpui_kit::base::{Accordion, AccordionHeader, AccordionItem, AccordionPanel, AccordionTrigger};
-use railgun_ui::{format_usd_micro_value, short_address};
+use railgun_ui::format_usd_micro_value;
 use std::sync::Arc;
 use ui::controls::{
     app_button, app_button_base, app_button_label, app_input, app_muted_text, app_strong_text,
@@ -187,28 +187,33 @@ pub(super) fn dimension(value: f32) -> gpui::Rems {
 
 impl WalletRoot {
     pub(super) fn public_chain_has_pricing(&self) -> bool {
+        if self.tron_selected() {
+            return self.tron_has_pricing();
+        }
         self.effective_chain_configs
-            .get(self.selected_chain)
+            .get(self.last_evm_chain)
             .is_some_and(|chain| chain.native_usd_oracle.is_some())
     }
 
+    /// The listed network's accounts, active then inactive, after search, the empty-account
+    /// filter and sort.
     pub(in crate::root) fn public_list_accounts(
         &self,
     ) -> (Vec<PublicAccountMetadata>, Vec<PublicAccountMetadata>) {
+        let chain_id = self.listed_public_chain();
+        let snapshot = self.listed_public_snapshot();
         let (mut active, mut inactive): (Vec<_>, Vec<_>) = self
-            .public_accounts
+            .listed_public_accounts()
             .iter()
-            .filter(|account| account.is_available_on_chain(self.selected_chain))
-            .filter(|account| {
-                public_account_matches_search(account, &self.public_form.search_query)
-            })
+            .filter(|account| account.is_available_on_chain(chain_id))
+            .filter(|account| self.listed_account_matches_search(account))
             .filter(|account| {
                 // Hide empty hides accounts read as empty; unread ones stay listed.
                 account.status != PublicAccountStatus::Active
                     || !self.ui_state.public_hide_empty_accounts
                     || public_account_balances_for_chain(
-                        self.public_balance_snapshot.as_deref(),
-                        self.selected_chain,
+                        snapshot,
+                        chain_id,
                         &account.public_account_uuid,
                         account.status,
                     )
@@ -226,8 +231,8 @@ impl WalletRoot {
             sort_public_accounts(
                 accounts,
                 self.ui_state.public_account_sort,
-                self.public_balance_snapshot.as_deref(),
-                self.selected_chain,
+                snapshot,
+                chain_id,
                 self.public_chain_has_pricing(),
                 Some(&self.public_broadcaster_anchor_cache),
             );
@@ -263,15 +268,14 @@ impl WalletRoot {
         let accounts = self.public_open_section_accounts();
         if accounts.iter().any(|account| {
             Some(account.public_account_uuid.as_str())
-                == self.public_form.selected_account_uuid.as_deref()
+                == self.listed_selected_uuid().map(AsRef::as_ref)
         }) {
             return;
         }
         if let Some(first) = accounts.first() {
             self.reset_public_asset_focus();
             self.public_form.selected_asset = None;
-            self.public_form.selected_account_uuid =
-                Some(Arc::from(first.public_account_uuid.as_str()));
+            self.set_listed_selected_uuid(Some(Arc::from(first.public_account_uuid.as_str())));
             self.public_form.selected_row_bounds.set(None);
             self.public_form
                 .list_scroll
@@ -304,10 +308,10 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.public_form.selected_account_uuid != uuid {
+        if self.listed_selected_uuid() != uuid.as_ref() {
             self.reset_public_asset_focus();
             self.public_form.selected_asset = None;
-            self.public_form.selected_account_uuid = uuid;
+            self.set_listed_selected_uuid(uuid);
             self.remember_public_account_selection();
             self.publish_gateway_desktop_state();
         }
@@ -328,7 +332,7 @@ impl WalletRoot {
         }
         let current = accounts.iter().position(|account| {
             Some(account.public_account_uuid.as_str())
-                == self.public_form.selected_account_uuid.as_deref()
+                == self.listed_selected_uuid().map(AsRef::as_ref)
         });
         let index = current.map_or(if next { 0 } else { accounts.len() - 1 }, |index| {
             if next {
@@ -382,10 +386,11 @@ impl WalletRoot {
         root: &Entity<Self>,
         cx: &App,
     ) -> impl IntoElement {
+        let tron = self.tron_selected();
         let total = public_active_usd_total(
-            self.public_balance_snapshot.as_deref(),
-            &self.public_accounts,
-            self.selected_chain,
+            self.listed_public_snapshot(),
+            self.listed_public_accounts(),
+            self.listed_public_chain(),
             Some(&self.public_broadcaster_anchor_cache),
         );
         let subtle = cx.theme().muted_foreground;
@@ -397,11 +402,11 @@ impl WalletRoot {
                 .child(text)
         };
         let freshness = public_section_freshness(
-            self.public_balance_snapshot.as_deref(),
-            &self.public_accounts,
-            self.selected_chain,
+            self.listed_public_snapshot(),
+            self.listed_public_accounts(),
+            self.listed_public_chain(),
             PublicAccountStatus::Active,
-            &self.public_failed_accounts(),
+            &self.listed_failed_accounts(),
         );
         let mut value = div().flex().items_baseline().gap_2().min_w_0();
         if self.public_chain_has_pricing() {
@@ -426,9 +431,14 @@ impl WalletRoot {
                 .when(total.partial, |value| {
                     value.child(app_muted_text("partial").text_xs())
                 });
+        } else if tron {
+            // Tron's native USD source is chosen in Tron settings.
+            value = value
+                .items_center()
+                .child(app_muted_text("No USD pricing on Tron"));
         } else {
             let root = root.clone();
-            let chain_id = self.selected_chain;
+            let chain_id = self.last_evm_chain;
             value = value
                 .items_center()
                 .child(app_muted_text("No USD pricing on this chain"))
@@ -520,7 +530,11 @@ impl WalletRoot {
                     .loading(refreshing)
                     .disabled(refreshing || none_included)
                     .when(
-                        none_included && self.has_active_public_accounts(),
+                        none_included
+                            && self.listed_public_accounts().iter().any(|account| {
+                                account.status == PublicAccountStatus::Active
+                                    && account.is_available_on_chain(self.listed_public_chain())
+                            }),
                         |button| button.tooltip("No active accounts are included in Refresh"),
                     )
                     .on_click(move |_, _, cx| {
@@ -579,7 +593,9 @@ impl WalletRoot {
                     .child(refresh_controls),
             )
             .child(div().flex_1())
-            .child(self.render_stealth_accounts_button(root, cx))
+            .when(!tron, |strip| {
+                strip.child(self.render_stealth_accounts_button(root, cx))
+            })
     }
 
     /// The summary strip's "Last refreshed" line, and whether it marks the total stale.
@@ -587,18 +603,17 @@ impl WalletRoot {
         if self.public_section_refreshing(PublicAccountStatus::Active) {
             return ("Refreshing…".to_owned(), false);
         }
-        let snapshot = self.public_balance_snapshot.as_deref();
+        let snapshot = self.listed_public_snapshot();
         let freshness = public_section_freshness(
             snapshot,
-            &self.public_accounts,
-            self.selected_chain,
+            self.listed_public_accounts(),
+            self.listed_public_chain(),
             PublicAccountStatus::Active,
-            &self.public_failed_accounts(),
+            &self.listed_failed_accounts(),
         );
         if freshness.stale || freshness.failed {
             let reason = self
-                .public_balance_error
-                .as_deref()
+                .listed_balance_error(PublicAccountStatus::Active)
                 .unwrap_or("some balances could not be read");
             return (format!("Stale · {reason}"), true);
         }
@@ -613,11 +628,14 @@ impl WalletRoot {
     }
 
     pub(super) fn public_selected_chain_name(&self) -> String {
+        if self.tron_selected() {
+            return railgun_ui::TRON_NAME.to_owned();
+        }
         self.effective_chain_configs
-            .get(self.selected_chain)
+            .get(self.last_evm_chain)
             .map_or_else(
                 || {
-                    railgun_ui::chain_name(self.selected_chain)
+                    railgun_ui::chain_name(self.last_evm_chain)
                         .unwrap_or("selected chain")
                         .to_owned()
                 },
@@ -821,7 +839,7 @@ impl WalletRoot {
                 let root = root.clone();
                 move |_: &CopySelectedAddress, window, cx| {
                     root.update(cx, |root, cx| {
-                        if let Some(uuid) = root.public_form.selected_account_uuid.clone() {
+                        if let Some(uuid) = root.listed_selected_uuid().cloned() {
                             root.run_public_account_command(
                                 &uuid,
                                 AccountCommand::Copy,
@@ -836,7 +854,7 @@ impl WalletRoot {
                 let root = root.clone();
                 move |_: &RenameSelectedAccount, window, cx| {
                     root.update(cx, |root, cx| {
-                        if let Some(uuid) = root.public_form.selected_account_uuid.clone() {
+                        if let Some(uuid) = root.listed_selected_uuid().cloned() {
                             root.run_public_account_command(
                                 &uuid,
                                 AccountCommand::Rename,
@@ -1020,18 +1038,17 @@ impl WalletRoot {
         let mut rows = div().w_full().flex().flex_col();
         let inactive_freshness = inactive.then(|| {
             public_section_freshness(
-                self.public_balance_snapshot.as_deref(),
-                &self.public_accounts,
-                self.selected_chain,
+                self.listed_public_snapshot(),
+                self.listed_public_accounts(),
+                self.listed_public_chain(),
                 PublicAccountStatus::Inactive,
-                &self.public_failed_accounts(),
+                &self.listed_failed_accounts(),
             )
         });
         if inactive_freshness.is_some_and(|freshness| freshness.stale || freshness.failed) {
             rows = rows.child(
                 app_muted_text(
-                    self.public_inactive_balance_error
-                        .as_deref()
+                    self.listed_balance_error(PublicAccountStatus::Inactive)
                         .unwrap_or("Some inactive balances could not be read")
                         .to_owned(),
                 )
@@ -1040,13 +1057,22 @@ impl WalletRoot {
             );
         }
         if accounts.is_empty() {
+            let tron = self.tron_selected();
+            let none = self.listed_public_accounts().is_empty();
             rows = rows.child(
-                app_muted_text(if self.public_accounts.is_empty() {
-                    "No Public accounts yet. Add a derived account or import a private key."
-                } else {
-                    "No Public accounts match these filters."
+                app_muted_text(match (tron, none) {
+                    (false, true) => {
+                        "No Public accounts yet. Add a derived account or import a private key."
+                    }
+                    (true, true) => {
+                        "No Tron accounts yet. Add a derived account or import a private key."
+                    }
+                    (_, false) => "No Public accounts match these filters.",
                 })
-                .p_2(),
+                .p_2()
+                .when(tron && none, |text| {
+                    text.debug_selector(|| "public-tron-empty".into())
+                }),
             );
         } else if open {
             for (index, account) in accounts.iter().enumerate() {
@@ -1110,20 +1136,22 @@ impl WalletRoot {
         window: &Window,
         cx: &App,
     ) -> impl IntoElement {
-        let selected = self.public_form.selected_account_uuid.as_deref()
+        let selected = self.listed_selected_uuid().map(AsRef::as_ref)
             == Some(account.public_account_uuid.as_str());
         let uuid: Arc<str> = Arc::from(account.public_account_uuid.as_str());
         let group = SharedString::from(format!("public-row-{uuid}"));
         let pricing = self.public_chain_has_pricing();
+        let chain_id = self.listed_public_chain();
+        let tron = self.tron_selected();
         let balances = self.public_account_sorted_balances(account);
         let total = public_balances_usd_total(
             &balances,
-            self.selected_chain,
+            chain_id,
             Some(&self.public_broadcaster_anchor_cache),
         );
         let dim = account.status == PublicAccountStatus::Inactive || balances.is_empty();
         let label = public_account_display_label(account);
-        let address = short_address(&account.address);
+        let address = self.listed_short_address(account);
         let subtle = cx.theme().muted_foreground;
         let name = label.clone().map_or_else(
             || {
@@ -1155,7 +1183,7 @@ impl WalletRoot {
             .public_refresh_excluded
             .contains(&account.public_account_uuid);
         let refreshing = self
-            .public_refreshing_accounts()
+            .listed_refreshing_accounts()
             .contains(&account.public_account_uuid);
         let shortcuts = |root: &Entity<Self>| {
             let mut shortcuts = div()
@@ -1246,12 +1274,33 @@ impl WalletRoot {
         };
         let mut tags = div().flex().items_center().gap_1().flex_none();
         let source = match (account.source, account.derivation_index) {
+            // A hardware-derived Tron account's key is held by the app after device approval.
+            (PublicAccountSource::HardwareDerived, Some(index)) if tron => {
+                format!("Hardware-derived #{index}").into()
+            }
             (PublicAccountSource::Derived | PublicAccountSource::HardwareDerived, Some(index)) => {
                 format!("Derived #{index}").into()
             }
             (source, _) => super::public_account_source_label(source).into(),
         };
-        tags = tags.child(tag(source, gpui::rgb(ui::theme::TEXT_MUTED).into()));
+        let source = tag(source, gpui::rgb(ui::theme::TEXT_MUTED).into());
+        tags = if tron && account.source == PublicAccountSource::HardwareDerived {
+            tags.child(
+                div()
+                    .id(SharedString::from(format!("public-source-{uuid}")))
+                    .flex_none()
+                    .tooltip(|window, cx| {
+                        gpui_component::tooltip::Tooltip::new(
+                            "Hardware-derived software custody: after device approval, the app \
+                             signs with a key it derives in memory.",
+                        )
+                        .build(window, cx)
+                    })
+                    .child(source),
+            )
+        } else {
+            tags.child(source)
+        };
         if account.is_global() {
             tags = tags.child(tag("Global".into(), cx.theme().info));
         }
@@ -1276,8 +1325,8 @@ impl WalletRoot {
             );
         }
         if public_account_stale_for_chain(
-            self.public_balance_snapshot.as_deref(),
-            self.selected_chain,
+            self.listed_public_snapshot(),
+            chain_id,
             &account.public_account_uuid,
             account.status,
         ) {
@@ -1347,9 +1396,8 @@ impl WalletRoot {
             .when(selected, gpui::Styled::flex_wrap);
         if balances.is_empty() {
             let fetched = self
-                .public_balance_snapshot
-                .as_ref()
-                .filter(|snapshot| snapshot.chain_id == self.selected_chain)
+                .listed_public_snapshot()
+                .filter(|snapshot| snapshot.chain_id == chain_id)
                 .is_some_and(|snapshot| {
                     snapshot.accounts.iter().any(|entry| {
                         entry.account.public_account_uuid == account.public_account_uuid
@@ -1380,7 +1428,7 @@ impl WalletRoot {
             if shown < balances.len() {
                 let hidden = public_balances_usd_total(
                     &balances[shown..],
-                    self.selected_chain,
+                    chain_id,
                     Some(&self.public_broadcaster_anchor_cache),
                 );
                 let select_root = root.clone();

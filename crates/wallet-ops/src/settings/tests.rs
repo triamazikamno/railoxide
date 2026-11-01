@@ -2488,6 +2488,127 @@ fn endpoint_lists_must_cover_every_traffic_class() {
 }
 
 #[test]
+fn tron_defaults_are_the_presets_in_order() {
+    let settings = WalletSettings::default();
+    settings.validate().expect("defaults are valid");
+    let endpoints = settings.tron.effective_endpoints();
+    assert_eq!(
+        endpoints
+            .iter()
+            .map(|endpoint| (
+                endpoint.json_rpc_url.as_str(),
+                endpoint.http_api_url.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "https://tron.api.pocket.network",
+                Some("https://tron.api.pocket.network")
+            ),
+            (
+                "https://api.trongrid.io/jsonrpc",
+                Some("https://api.trongrid.io")
+            ),
+            (
+                "https://tron-rpc.publicnode.com/jsonrpc",
+                Some("https://tron-rpc.publicnode.com")
+            ),
+        ]
+    );
+}
+
+#[test]
+fn tron_endpoint_validation_rejects_each_rule() {
+    let endpoint = |url: &str, http: bool, [general, sensitive, submit]: [bool; 3]| {
+        super::TronEndpointSetting {
+            json_rpc_url: url.to_owned(),
+            http_api_url: http.then(|| "https://api.example".to_owned()),
+            direct: false,
+            general,
+            sensitive,
+            submit,
+        }
+    };
+    let ok = |url: &str| endpoint(url, true, [true; 3]);
+    let long_url = format!("https://a.example/{}", "a".repeat(4096));
+    let mut ws_api = ok("https://a.example");
+    ws_api.http_api_url = Some("ws://api.example".into());
+
+    for (endpoints, expected) in [
+        (
+            vec![endpoint("https://a.example", true, [false, true, true])],
+            vec!["tron.endpoints must include a General endpoint".to_owned()],
+        ),
+        (
+            vec![endpoint("https://a.example", true, [true, false, true])],
+            vec![
+                "tron.endpoints must include a Sensitive endpoint".to_owned(),
+                "tron.endpoints: sending needs a Sensitive endpoint with the HTTP API".to_owned(),
+            ],
+        ),
+        (
+            vec![endpoint("https://a.example", true, [true, true, false])],
+            vec!["tron.endpoints must include a Submit endpoint".to_owned()],
+        ),
+        (
+            vec![
+                ok("https://a.example"),
+                endpoint("https://b.example", false, [false, false, true]),
+            ],
+            vec![
+                "tron.endpoints[1] accepts Submit without an HTTP API URL; broadcasting needs the HTTP API"
+                    .to_owned(),
+            ],
+        ),
+        (
+            vec![
+                endpoint("https://a.example", false, [true, true, false]),
+                endpoint("https://b.example", true, [false, false, true]),
+            ],
+            vec![
+                "tron.endpoints: sending needs a Sensitive endpoint with the HTTP API".to_owned(),
+            ],
+        ),
+        (
+            vec![ok("ftp://a.example")],
+            vec![
+                "tron.endpoints[0].json_rpc_url must use one of these URL schemes: http, https; got ftp"
+                    .to_owned(),
+            ],
+        ),
+        (
+            vec![ws_api],
+            vec![
+                "tron.endpoints[0].http_api_url must use one of these URL schemes: http, https; got ws"
+                    .to_owned(),
+            ],
+        ),
+        (
+            vec![ok(long_url.as_str())],
+            vec!["tron.endpoints[0].json_rpc_url is too long".to_owned()],
+        ),
+        (
+            vec![
+                endpoint("https://a.example", true, [true, false, false]),
+                endpoint("https://A.example/", true, [false, true, true]),
+            ],
+            vec!["tron.endpoints[1].json_rpc_url duplicates tron.endpoints[0]".to_owned()],
+        ),
+        (
+            (0..=super::MAX_CHAIN_ENDPOINTS)
+                .map(|index| ok(&format!("https://{index}.example")))
+                .collect(),
+            vec!["tron.endpoints has too many RPC endpoints".to_owned()],
+        ),
+    ] {
+        let mut settings = WalletSettings::default();
+        settings.tron.endpoints = Some(endpoints);
+        let error = settings.validate().expect_err(&expected[0]);
+        assert_eq!(error.messages, expected);
+    }
+}
+
+#[test]
 fn effective_chain_configs_apply_quick_sync_bounds_and_disabled_state() {
     let mut settings = WalletSettings::default();
     let ethereum = settings
@@ -2617,6 +2738,48 @@ fn effective_token_registry_applies_overrides_tombstones_and_custom_tokens() {
         .expect("custom token");
     assert!(!custom.built_in);
     assert_eq!(custom.decimals, 9);
+}
+
+#[test]
+fn tron_tokens_join_the_registry_while_unknown_evm_chains_stay_rejected() {
+    let tron = crate::tron::TRON_CHAIN_ID;
+    let mut settings = WalletSettings::default();
+    settings
+        .tokens
+        .custom_tokens
+        .push(super::CustomTokenSettings {
+            chain_id: tron,
+            token_address: "0x0000000000000000000000000000000000000003".to_string(),
+            symbol: "TCST".to_string(),
+            decimals: 6,
+            ..super::CustomTokenSettings::default()
+        });
+
+    let registry = build_effective_token_registry(&settings).expect("Tron custom token is valid");
+    let custom = registry
+        .tokens
+        .get(&(
+            tron,
+            "0x0000000000000000000000000000000000000003".to_string(),
+        ))
+        .expect("custom Tron token");
+    assert!(!custom.built_in);
+    let usdt = registry
+        .tokens
+        .get(&(
+            tron,
+            "0xa614f803b6fd780986a42c78ec9c7f77e6ded13c".to_string(),
+        ))
+        .expect("built-in Tron USDT");
+    assert_eq!(usdt.symbol, "USDT");
+
+    settings.tokens.custom_tokens[0].chain_id = 999_999_999;
+    let err = build_effective_token_registry(&settings).expect_err("unknown chain rejected");
+    assert!(
+        err.messages
+            .iter()
+            .any(|message| message == "tokens.custom_tokens[0].chain_id is not supported")
+    );
 }
 
 #[test]
@@ -3710,6 +3873,96 @@ fn released_v6_overrides_migrate_without_losing_repairable_or_unrelated_settings
     fs::remove_dir_all(root_dir).unwrap();
 }
 
+/// The top-level record of released versions 7 through 11 (`v0.2.0-beta.13`), before `tron`.
+/// Its sections are unchanged since `v0.2.0-beta.13`.
+#[derive(Serialize)]
+struct ReleasedV11WalletSettingsWire<'a> {
+    version: u32,
+    network: &'a super::NetworkSettings,
+    privacy: &'a super::PrivacySettings,
+    chains: &'a super::ChainSettings,
+    indexed_artifacts: &'a super::IndexedArtifactSettings,
+    poi: &'a super::PoiSettings,
+    broadcaster: &'a super::PublicBroadcasterSettings,
+    tokens: &'a super::TokenSettings,
+    gas: &'a super::GasSettings,
+    runtime: &'a super::RuntimeSettings,
+    waku: &'a super::WakuSettings,
+    walletconnect: &'a super::WalletConnectSettings,
+}
+
+fn released_v11_payload(settings: &WalletSettings) -> Vec<u8> {
+    rmp_serde::to_vec_named(&ReleasedV11WalletSettingsWire {
+        version: settings.version,
+        network: &settings.network,
+        privacy: &settings.privacy,
+        chains: &settings.chains,
+        indexed_artifacts: &settings.indexed_artifacts,
+        poi: &settings.poi,
+        broadcaster: &settings.broadcaster,
+        tokens: &settings.tokens,
+        gas: &settings.gas,
+        runtime: &settings.runtime,
+        waku: &settings.waku,
+        walletconnect: &settings.walletconnect,
+    })
+    .expect("encode released v11 settings")
+}
+
+#[test]
+fn released_beta13_settings_load_unchanged_with_tron_defaults() {
+    let mut expected = WalletSettings::default();
+    expected.network.mode = super::NetworkModeSetting::Direct;
+    expected.privacy.unwrap_unshields_by_default = true;
+    let ethereum = expected.chains.per_chain.get_mut(&1).unwrap();
+    ethereum.native_usd_pricing = super::NativeUsdPricing::Disabled;
+    ethereum.rpc_endpoints = vec![super::RpcEndpointSetting {
+        url: "https://rpc.example".into(),
+        direct: true,
+        general: true,
+        sensitive: true,
+        submit: false,
+    }];
+    expected.chains.custom.insert(31337, custom_evm_chain());
+    expected.runtime.auto_lock_timeout_secs = Some(600);
+    expected.walletconnect.project_id_override = Some("custom-project".into());
+    let payload = released_v11_payload(&expected);
+
+    let loaded = decode_wallet_settings(&payload).expect("decode beta.13 settings");
+    assert_eq!(loaded, expected);
+    assert_eq!(loaded.tron, super::TronSettings::default());
+}
+
+/// beta.13 accepted Tron's id as a custom EVM chain; adding it is refused only in the editors.
+#[test]
+fn released_custom_chain_with_trons_id_loads_and_other_settings_save() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+    let mut saved = WalletSettings::default();
+    saved
+        .chains
+        .custom
+        .insert(crate::tron::TRON_CHAIN_ID, custom_evm_chain());
+    store
+        .put_app_settings_record(WALLET_SETTINGS_KEY, &released_v11_payload(&saved))
+        .expect("store beta.13 settings");
+
+    let mut loaded = load_wallet_settings(&store).expect("load beta.13 settings");
+    assert_eq!(loaded, saved);
+    loaded.runtime.auto_lock_timeout_secs = Some(600);
+    save_wallet_settings(&store, &loaded).expect("save other settings");
+    assert_eq!(
+        load_wallet_settings(&store).expect("reload settings"),
+        loaded
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
 /// `settings` in the released v7–v10 shape, whose built-in overrides list endpoint URLs.
 fn released_v7_to_v10_settings(settings: &WalletSettings) -> super::legacy::ReleasedWalletSettings {
     let mut without_endpoints = settings.clone();
@@ -3717,7 +3970,7 @@ fn released_v7_to_v10_settings(settings: &WalletSettings) -> super::legacy::Rele
         chain.rpc_endpoints.clear();
     }
     let mut released: super::legacy::ReleasedWalletSettings =
-        rmp_serde::from_slice(&rmp_serde::to_vec_named(&without_endpoints).unwrap()).unwrap();
+        rmp_serde::from_slice(&released_v11_payload(&without_endpoints)).unwrap();
     for (chain_id, chain) in &settings.chains.per_chain {
         released
             .chains

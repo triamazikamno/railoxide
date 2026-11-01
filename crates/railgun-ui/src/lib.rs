@@ -5,9 +5,9 @@ pub mod governance;
 pub mod tokens;
 
 pub use chains::{
-    DEFAULT_CHAINS, NativeCurrency, PUBLIC_CHAINS, built_in_chain_ids, chain_icon_asset_path,
-    chain_icon_path, chain_name, is_built_in_chain, is_testnet_chain,
-    native_currency_icon_asset_path,
+    DEFAULT_CHAINS, NativeCurrency, PUBLIC_CHAINS, TRON_CHAIN_ID, TRON_ICON_ASSET_PATH, TRON_NAME,
+    built_in_chain_ids, chain_icon_asset_path, chain_icon_path, chain_name, is_built_in_chain,
+    is_testnet_chain, native_currency_icon_asset_path, tron_native_currency,
 };
 pub use governance::{
     GovernanceContracts, GovernanceRewardToken, governance_contracts, governance_treasury,
@@ -16,7 +16,7 @@ pub use tokens::{
     KnownTokenInfo, TokenAnchorInfo, TokenAnchorSource, TokenInfo, WRAPPED_NATIVE_FEE_RATE,
     format_broadcaster_address_label, format_scaled_amount, format_token_amount,
     format_token_amount_ceiling, format_usd_micro_value, known_tokens_for_chain, lookup_token,
-    native_usd_micro_value, non_redundant_usd_micro_value, short_address,
+    native_usd_micro_value, non_redundant_usd_micro_value, short_address, short_non_evm,
     symbol_token_icon_asset_path, token_anchor_entries, token_icon_asset_path, token_icon_path,
     token_usd_micro_value,
 };

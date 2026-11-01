@@ -23,6 +23,7 @@ use super::order::cow_buy_token;
 use crate::block_observer::{BlockReceiptsError, fetch_checked_block_receipts};
 use crate::cow::CowOrderbookClient;
 use crate::desktop::executor_observation::{expected_shields, trace_step};
+pub(crate) use crate::public_wallet::PublicErc20::Transfer;
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
     AcrossOrderTerms, BridgeDelivery, BridgeOrderTerms, BridgeProvider, BridgeSurplus,
@@ -30,11 +31,6 @@ use crate::vault::{
     SwapOrderRecord, SwapSettlementEvidence, SwapShieldObservation, SwapTradeAmounts,
 };
 use crate::{ExecutorOwner, OperationHttpClient};
-
-// The pinned shared ERC20 bindings do not expose the Transfer event.
-alloy::sol! {
-    event Transfer(address indexed from, address indexed to, uint256 value);
-}
 
 /// A Bridge order's hand-off as its reported settlement block shows it before finality depth.
 /// A hint for display: it is never persisted and never establishes an outcome.

@@ -93,7 +93,7 @@ pub const GAS_SHARE_LOOSE_BPS: u16 = 10_000;
 /// Calls a pre-hook makes besides the deadline guard and the exact approval.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PreHookCalls {
-    /// Invalidates the executor's still-live earlier order (design decision 3).
+    /// Invalidates the executor's still-live earlier order.
     pub invalidate_order: bool,
 }
 

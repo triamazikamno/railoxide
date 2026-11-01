@@ -382,6 +382,10 @@ pub(crate) fn parse_dapp_chain_request(
         .ok_or_else(|| malformed_params("chainId is required"))?;
     if method == "wallet_switchEthereumChain" {
         Ok(WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id })
+    } else if chain_id == crate::tron::TRON_CHAIN_ID {
+        Err(WalletConnectError::UnsupportedChain(
+            crate::settings::TRON_CHAIN_REFUSAL.to_owned(),
+        ))
     } else {
         Ok(WalletConnectParsedRequest::WalletAddEthereumChain {
             chain_id,

@@ -12,6 +12,7 @@ mod helpers;
 mod key_export;
 mod public_accounts;
 mod software_context;
+mod tron_accounts;
 mod wallet_metadata;
 mod wallet_storage;
 mod walletconnect_sessions;

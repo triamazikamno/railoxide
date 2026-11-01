@@ -15,18 +15,7 @@ pub fn estimated_fees(
     mono_font: impl Into<SharedString>,
 ) -> Div {
     let mono_font = mono_font.into();
-    div()
-        .w_full()
-        .min_w(px(0.0))
-        .flex()
-        .flex_col()
-        .gap_2()
-        .p(px(10.0))
-        .rounded_md()
-        .bg(rgb(theme::SURFACE_ELEVATED))
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .child(app_strong_text("Estimated fees"))
+    fees_card()
         .when_some(gas_limit, |this, limit| {
             this.child(fee_row("Gas limit", limit, false, &mono_font))
         })
@@ -42,6 +31,36 @@ pub fn estimated_fees(
         .when_some(protocol_fee, |this, (label, value)| {
             this.child(fee_row(label, value, false, &mono_font))
         })
+}
+
+/// [`estimated_fees`] for a network that charges fees rather than gas, such as Tron.
+#[must_use]
+pub fn estimated_network_fees(
+    expected_fee: String,
+    maximum_fee: Option<String>,
+    mono_font: impl Into<SharedString>,
+) -> Div {
+    let mono_font = mono_font.into();
+    fees_card()
+        .child(fee_row("Expected fee", expected_fee, false, &mono_font))
+        .when_some(maximum_fee, |this, maximum| {
+            this.child(fee_row("Maximum fee", maximum, true, &mono_font))
+        })
+}
+
+fn fees_card() -> Div {
+    div()
+        .w_full()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p(px(10.0))
+        .rounded_md()
+        .bg(rgb(theme::SURFACE_ELEVATED))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .child(app_strong_text("Estimated fees"))
 }
 
 fn fee_row(

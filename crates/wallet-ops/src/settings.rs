@@ -33,6 +33,7 @@ mod presets;
 mod storage;
 mod swaps;
 mod tokens_gas_waku;
+mod tron;
 mod validation;
 mod walletconnect;
 
@@ -53,6 +54,7 @@ pub use poi_broadcaster::*;
 pub use storage::*;
 pub use swaps::*;
 pub use tokens_gas_waku::*;
+pub use tron::*;
 pub use walletconnect::*;
 
 #[cfg(test)]

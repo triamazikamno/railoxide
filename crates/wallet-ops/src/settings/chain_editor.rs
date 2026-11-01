@@ -10,6 +10,10 @@ use railgun_ui::chain_editor::{
     RpcEndpointDraft,
 };
 
+/// Why chain id 728126428 can't be added as a custom EVM chain.
+pub const TRON_CHAIN_REFUSAL: &str =
+    "Chain 728126428 is Tron, which is configured in Tron settings, not as an EVM chain";
+
 pub fn chain_editor_snapshot(
     settings: &WalletSettings,
     selected: Option<u64>,
@@ -552,6 +556,10 @@ fn draft_mutation(
     existing: bool,
 ) -> Result<ChainMutation, String> {
     let id = editor_chain_id(&draft.chain_id)?;
+    // Not in settings validation: beta.13 accepted this id, and a saved chain must keep loading.
+    if id == crate::tron::TRON_CHAIN_ID && !settings.chains.contains(id) {
+        return Err(TRON_CHAIN_REFUSAL.to_owned());
+    }
     let built_in = railgun_ui::is_built_in_chain(id);
     let has_railgun = railgun_ui::DEFAULT_CHAINS.contains(&id);
     if draft.built_in != built_in
@@ -745,6 +753,41 @@ mod tests {
                     .contains("Oracle contract")
             );
         }
+    }
+
+    #[test]
+    fn tron_cannot_be_added_as_a_custom_chain_but_a_saved_one_stays_editable() {
+        let mut draft = ChainDraft::new();
+        draft.chain_id = crate::tron::TRON_CHAIN_ID.to_string();
+        for (field, value) in [
+            (ChainField::Name, "Tron"),
+            (ChainField::NativeName, "Tron"),
+            (ChainField::NativeSymbol, "TRX"),
+            (ChainField::NativeDecimals, "6"),
+        ] {
+            draft.fields.insert(field, value.into());
+        }
+        draft.rpc_endpoints = vec![RpcEndpointDraft::new("https://rpc.example".into())];
+        let mut settings = WalletSettings::default();
+        let add = ChainEditorCommand::Save {
+            draft: draft.clone(),
+            existing: false,
+        };
+        assert_eq!(
+            chain_editor_mutation(&settings, &add).err(),
+            Some(TRON_CHAIN_REFUSAL.to_owned())
+        );
+        assert!(chain_editor_probe_chain(&settings, &draft).is_err());
+
+        settings.chains.custom.insert(
+            crate::tron::TRON_CHAIN_ID,
+            super::super::tests::custom_evm_chain(),
+        );
+        let edit = ChainEditorCommand::Save {
+            draft,
+            existing: true,
+        };
+        assert!(chain_editor_mutation(&settings, &edit).is_ok());
     }
 
     fn save_draft(settings: &WalletSettings, draft: ChainDraft) -> WalletSettings {

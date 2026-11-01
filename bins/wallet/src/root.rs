@@ -18,6 +18,8 @@ use gpui_component::{
 use rand::RngExt;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
+// The header's network. EVM-only code reaches a chain id only by matching `Evm`.
+use ui::chain_select::Network as SelectedNetwork;
 use ui::controls::FullWidthSelectItems;
 use ui::logs::LogsPane;
 use ui::theme::APP_TEXT_SIZE;
@@ -125,7 +127,7 @@ use private_action::{
 };
 use private_broadcaster::PrivateBroadcasterProgressState;
 use proposals::ProposalsState;
-use public_account::{DerivePreviewState, PublicAccountFormState};
+use public_account::{DerivePreviewState, PublicAccountFormState, TronPublicState, TronSendState};
 use public_action::{PublicActionMode, PublicActionProgressLifecycle, PublicSendKind};
 use public_balances::{
     public_account_visible_balances_for_chain, public_asset_decimals, public_asset_label,
@@ -168,7 +170,7 @@ use vault::{
     PassphraseOpenUi, PendingSoftwareProfileOpen, VaultState, WalletOption, WalletSetupMode,
     vault_error_kind,
 };
-use wallet_header::{ChainSelectItem, WalletSelectItem};
+use wallet_header::WalletSelectItem;
 
 #[cfg(test)]
 use broadcaster_picker::{
@@ -470,9 +472,12 @@ pub(crate) struct WalletRoot {
     wallet_switch_generation: u64,
     wallet_switch_loading_generation: Option<u64>,
     wallet_switch_delayed: bool,
-    selected_chain: u64,
+    selected_network: SelectedNetwork,
+    /// The most recently selected EVM chain. Background chain work and the gateway follow it,
+    /// so selecting Tron leaves them running.
+    last_evm_chain: u64,
     ui_state: WalletUiState,
-    chain_select: Entity<SelectState<ui::chain_select::ChainSelectItems>>,
+    chain_select: Entity<SelectState<wallet_header::NetworkSelectItems>>,
     window_handle: gpui::AnyWindowHandle,
     chain_states: BTreeMap<u64, ChainUtxoState>,
     pending_ppoi_validation_toast: Option<(Arc<str>, u64)>,
@@ -511,6 +516,8 @@ pub(crate) struct WalletRoot {
     stealth_accounts: Option<stealth_accounts::StealthAccountsPanel>,
     private_swaps: Option<private_swap::PrivateSwapsPanel>,
     public_balance_cache: PublicBalanceCache,
+    /// Tron accounts and balances, and Tron's route.
+    tron_public: TronPublicState,
     public_transaction_tracker: wallet_ops::PublicTransactionTracker,
     public_transaction_submissions: public_transactions::PublicTransactionSubmissions,
     public_transaction_cleanup: Option<public_transactions::PublicTransactionCleanup>,
@@ -1172,10 +1179,7 @@ impl WalletRoot {
             .filter_map(|chain_id| {
                 effective_chain_configs
                     .get(chain_id)
-                    .map(|chain| ChainSelectItem {
-                        chain_id,
-                        label: chain.name.clone().into(),
-                    })
+                    .map(|chain| (chain_id, chain.name.clone()))
             })
             .collect();
         let mut chain_states = BTreeMap::new();
@@ -1355,6 +1359,7 @@ impl WalletRoot {
             native_shield_preparation: public_action::NativeShieldPreparationState::default(),
             native_shield_operation: None,
             import_global: false,
+            import_tron: false,
             selected_account_uuid: None,
             editing_account_uuid: None,
             search_query: Arc::from(""),
@@ -1389,6 +1394,7 @@ impl WalletRoot {
             action_current_gas_fee: None,
             action_fees_authorized: false,
             action_action_error: None,
+            action_error_summary: None,
             action_contract_address: None,
             next_derived_index: None,
             derive_preview: DerivePreviewState::new(window, cx),
@@ -1415,10 +1421,17 @@ impl WalletRoot {
         platform_attention.sync_badge_count(0);
         platform_attention.clear_attention();
         let walletconnect = walletconnect::WalletConnectUiState::new(window, cx);
+        let tron_settings = settings_editor.as_ref().map_or_else(
+            || wallet_ops::settings::TronSettings {
+                enabled: false,
+                ..Default::default()
+            },
+            |editor| editor.read(cx).saved.tron.clone(),
+        );
         let chain_select = cx.new(|cx| {
             ui::chain_select::chain_select_state(
-                chain_select_items,
-                Some(initial_chain_id),
+                wallet_header::network_select_items(chain_select_items, tron_settings.enabled),
+                Some(SelectedNetwork::Evm(initial_chain_id)),
                 window,
                 cx,
             )
@@ -1488,9 +1501,14 @@ impl WalletRoot {
                     .set_pricing_status(public_broadcaster_anchor_cache.native_usd_statuses(), cx);
             });
         }
+        // Tron's pricing source is installed now and reads nothing until Tron is selected.
+        let tron_public = TronPublicState::new(tron_settings, TronSendState::new(window, cx));
+        public_broadcaster_anchor_refresh
+            .reconcile_tron(&tron_public.settings, tron_public.route.as_ref());
         let (root_shutdown, _) = watch::channel(false);
         let root = Self {
-            selected_chain: initial_chain_id,
+            selected_network: SelectedNetwork::Evm(initial_chain_id),
+            last_evm_chain: initial_chain_id,
             options,
             vault_store,
             poi_read_source,
@@ -1646,6 +1664,7 @@ impl WalletRoot {
             stealth_accounts: None,
             private_swaps: None,
             public_balance_cache: PublicBalanceCache::default(),
+            tron_public,
             public_transaction_tracker,
             public_transaction_submissions:
                 public_transactions::PublicTransactionSubmissions::default(),
@@ -1882,11 +1901,16 @@ impl WalletRoot {
         cx.subscribe_in(
             &chain_select,
             window,
-            |this, _select, event: &SelectEvent<ui::chain_select::ChainSelectItems>, window, cx| {
-                let SelectEvent::Confirm(Some(chain_id)) = event else {
-                    return;
-                };
-                this.select_chain(*chain_id, window, cx);
+            |this, _select, event: &SelectEvent<wallet_header::NetworkSelectItems>, window, cx| {
+                match event {
+                    SelectEvent::Confirm(Some(SelectedNetwork::Evm(chain_id))) => {
+                        this.select_chain(*chain_id, window, cx);
+                    }
+                    SelectEvent::Confirm(Some(SelectedNetwork::Tron)) => {
+                        this.select_tron(window, cx);
+                    }
+                    SelectEvent::Confirm(None) => return,
+                }
                 cx.defer_in(window, |_this, window, cx| {
                     if should_apply_background_focus(window.has_active_dialog(cx)) {
                         window.blur(cx);
@@ -2218,7 +2242,7 @@ impl WalletRoot {
                             root.active_activity,
                             root.active_wallet_tab,
                             root.chain_states
-                                .get(&root.selected_chain)
+                                .get(&root.last_evm_chain)
                                 .is_some_and(|state| state.snapshot().is_some()),
                         ) {
                             root.utxo_table.update(cx, |_table, cx| cx.notify());

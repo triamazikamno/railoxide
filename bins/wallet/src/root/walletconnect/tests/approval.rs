@@ -764,7 +764,8 @@ fn transaction_approval_activates_its_chain_without_changing_selection(
                 chain
             })
             .collect();
-        root.selected_chain = 10;
+        root.selected_network = crate::root::SelectedNetwork::Evm(10);
+        root.last_evm_chain = 10;
         root.install_chain_background();
         assert!(!root.active_rpc_chains.contains(&20));
 
@@ -795,7 +796,7 @@ fn transaction_approval_activates_its_chain_without_changing_selection(
 
         assert!(root.walletconnect.walletconnect_fee_state.is_some());
         assert!(root.active_rpc_chains.contains(&20));
-        assert_eq!(root.selected_chain, 10);
+        assert_eq!(root.selected_network, crate::root::SelectedNetwork::Evm(10));
         assert!(!root.active_rpc_chains.contains(&30));
     });
     cx.update(|window, _| window.remove_window());

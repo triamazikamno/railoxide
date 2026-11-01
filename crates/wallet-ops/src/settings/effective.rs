@@ -485,7 +485,8 @@ pub fn build_effective_token_registry(
 ) -> Result<EffectiveTokenRegistry, WalletSettingsValidationError> {
     settings.validate()?;
     let mut tokens = BTreeMap::new();
-    for chain_id in railgun_ui::built_in_chain_ids() {
+    // Tron's rows join the registry without making Tron a chain in the EVM chain list.
+    for chain_id in railgun_ui::built_in_chain_ids().chain([railgun_ui::TRON_CHAIN_ID]) {
         for token in railgun_ui::known_tokens_for_chain(chain_id) {
             tokens.insert(
                 (chain_id, normalize_address_string(&token.token.to_string())),

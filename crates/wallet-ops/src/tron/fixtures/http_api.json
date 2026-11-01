@@ -1,0 +1,185 @@
+{
+ "recorded": "2026-10-31 from https://tron-rpc.publicnode.com and https://nile.trongrid.io; arrays trimmed",
+ "getaccount": {
+  "address": "TNXoiAJ3dct8Fjg4M9fkLFh9S2v9TXc32G",
+  "balance": 143000652,
+  "create_time": 1631617425000,
+  "latest_opration_time": 1793347518000,
+  "net_window_size": 28800000,
+  "account_resource": {
+   "latest_consume_time_for_energy": 1793347518000,
+   "acquired_delegated_frozen_balance_for_energy": 129000000,
+   "energy_window_size": 28800000,
+   "acquired_delegated_frozenV2_balance_for_energy": 131672536192386,
+   "energy_window_optimized": true
+  },
+  "frozenV2": [
+   {},
+   {
+    "type": "ENERGY"
+   }
+  ],
+  "acquired_delegated_frozenV2_balance_for_bandwidth": 2173350698750,
+  "assetV2": [
+   {
+    "key": "1004746",
+    "value": 96000000000
+   },
+   {
+    "key": "1004988",
+    "value": 58
+   }
+  ]
+ },
+ "getaccount_missing": {},
+ "getaccountresource": {
+  "freeNetLimit": 600,
+  "NetLimit": 3528933,
+  "assetNetUsed": [
+   {
+    "key": "1004746",
+    "value": 0
+   },
+   {
+    "key": "1004988",
+    "value": 0
+   }
+  ],
+  "assetNetLimit": [
+   {
+    "key": "1004746",
+    "value": 0
+   },
+   {
+    "key": "1004988",
+    "value": 0
+   }
+  ],
+  "TotalNetLimit": 43200000000,
+  "TotalNetWeight": 26605417159,
+  "EnergyLimit": 1282988888,
+  "TotalEnergyLimit": 180000000000,
+  "TotalEnergyWeight": 18473332035
+ },
+ "getchainparameters": {
+  "chainParameter": [
+   {
+    "key": "getMaintenanceTimeInterval",
+    "value": 21600000
+   },
+   {
+    "key": "getCreateAccountFee",
+    "value": 100000
+   },
+   {
+    "key": "getTransactionFee",
+    "value": 1000
+   },
+   {
+    "key": "getCreateNewAccountFeeInSystemContract",
+    "value": 1000000
+   },
+   {
+    "key": "getCreateNewAccountBandwidthRate",
+    "value": 1
+   },
+   {
+    "key": "getEnergyFee",
+    "value": 100
+   },
+   {
+    "key": "getAllowTvmCompatibleEvm"
+   }
+  ]
+ },
+ "gettransactioninfobyblocknum_87594600": [
+  {
+   "id": "ade12ef05202cc1d37e47ac54d67efd58a968eba63d4248565c55d1a051ff759",
+   "blockNumber": 87594600,
+   "blockTimeStamp": 1793457225000,
+   "contractResult": [
+    "0000000000000000000000000000000000000000000000000000000000000000"
+   ],
+   "contract_address": "41a614f803b6fd780986a42c78ec9c7f77e6ded13c",
+   "receipt": {
+    "energy_usage": 64284,
+    "origin_energy_usage": 1,
+    "energy_usage_total": 64285,
+    "net_usage": 345,
+    "result": "SUCCESS",
+    "energy_penalty_total": 49635
+   },
+   "log": [
+    {
+     "address": "a614f803b6fd780986a42c78ec9c7f77e6ded13c",
+     "topics": [
+      "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+      "00000000000000000000000095c05d0d7abc240a03f78a4ad71efb474acb44e9",
+      "0000000000000000000000004c207e8e954ab1c5e5d33fc2e1ea29a035792a8f"
+     ],
+     "data": "0000000000000000000000000000000000000000000000000000000017b8ff80"
+    }
+   ]
+  },
+  {
+   "id": "7c865866559375413052700527ecdb03326aca23165ec5fb32f04221549dec0e",
+   "blockNumber": 87594600,
+   "blockTimeStamp": 1793457225000,
+   "contractResult": [
+    ""
+   ],
+   "receipt": {
+    "net_usage": 271
+   }
+  },
+  {
+   "id": "764a1dff9e20e056757224ce080af85dab55b157c785bf8140c87452cea3d845",
+   "blockNumber": 87594600,
+   "blockTimeStamp": 1793457225000,
+   "contractResult": [
+    "e39aafee"
+   ],
+   "contract_address": "416d587d39c016bf456fd95107b6c9204884052042",
+   "receipt": {
+    "energy_usage": 3777,
+    "origin_energy_usage": 373866,
+    "energy_usage_total": 377643,
+    "net_usage": 1179,
+    "result": "REVERT",
+    "energy_penalty_total": 111778
+   },
+   "result": "FAILED",
+   "resMessage": "524556455254206f70636f6465206578656375746564"
+  }
+ ],
+ "getblockbynum_0": {
+  "blockID": "00000000000000001ebf88508a03865c71d452e25f4d51194196a1d22b6653dc",
+  "block_header": {
+   "raw_data": {
+    "txTrieRoot": "8ef446bf3f395af929c218014f6101ec86576c5f61b2ae3236bf3a2ab5e2fecd",
+    "parentHash": "e58f33f9baf9305dc6f82b9f1934ea8f0ade2defb951258d50167028c780351f",
+    "witness_address": "41206e65772073797374656d206d75737420616c6c6f77206578697374696e672073797374656d7320746f206265206c696e6b656420746f67657468657220776974686f757420726571756972696e6720616e792063656e7472616c20636f6e74726f6c206f7220636f6f7264696e6174696f6e"
+   }
+  }
+ },
+ "getblockbynum_0_nile": {
+  "blockID": "0000000000000000d698d4192c56cb6be724a558448e2684802de4d6cd8690dc",
+  "block_header": {
+   "raw_data": {
+    "txTrieRoot": "6556a96828248d6b89cfd0487d4cef82b134b5544dc428c8a218beb2db85ab24",
+    "parentHash": "e58f33f9baf9305dc6f82b9f1934ea8f0ade2defb951258d50167028c780351f",
+    "witness_address": "41206e65772073797374656d206d75737420616c6c6f77206578697374696e672073797374656d7320746f206265206c696e6b656420746f67657468657220776974686f757420726571756972696e6720616e792063656e7472616c20636f6e74726f6c206f7220636f6f7264696e6174696f6e"
+   }
+  }
+ },
+ "broadcasthex_rejected": {
+  "result": false,
+  "code": "CONTRACT_VALIDATE_ERROR",
+  "message": "Contract validate error : No contract!",
+  "transaction": "{\"raw_data\": {}}",
+  "txid": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+ },
+ "trongrid_rate_limit": {
+  "Error": "request rate exceeded the allowed_rps(3), and the query server is suspended for 5 s. To obtain higher request quotas and a more stable service, it is recommended to authenticate with an API Key. Please refer to the documentation: https://developers.tron.network/reference/select-network#how-to-get-an-api-key"
+ }
+}

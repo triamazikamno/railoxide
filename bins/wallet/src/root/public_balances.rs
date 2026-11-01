@@ -10,8 +10,8 @@ use railgun_ui::{
 };
 use rand::RngExt as _;
 use wallet_ops::{
-    PublicAccountBalance, PublicAssetId, PublicBalanceAmount, PublicBalanceEntry,
-    PublicBalanceRefreshTicket, PublicBalanceSnapshot, TokenAnchorRateCache,
+    PublicAccountBalance, PublicAssetId, PublicBalanceAmount, PublicBalanceCache,
+    PublicBalanceEntry, PublicBalanceRefreshTicket, PublicBalanceSnapshot, TokenAnchorRateCache,
     refresh_public_balances_at_least, settings::EffectiveTokenRegistry, vault::PublicAccountStatus,
 };
 
@@ -381,7 +381,7 @@ impl WalletRoot {
     ) -> Option<PublicBalanceEntry> {
         public_balance_entry_for_chain(
             self.public_balance_snapshot.as_deref(),
-            self.selected_chain,
+            self.last_evm_chain,
             public_account_uuid,
             asset,
             status,
@@ -394,7 +394,14 @@ impl WalletRoot {
         self.public_inactive_balance_error = None;
         self.public_form.selected_asset = None;
         self.reset_public_asset_focus();
-        self.clear_public_action_progress_state();
+        // A handed-off Tron Send isn't this chain's; aborting it would lose its outcome.
+        if !self.claim_tron_send_stop_unless_handed_off() {
+            // Reject the aborted task's late callbacks and release admission for the next action.
+            self.public_form.action_generation = self.public_form.action_generation.wrapping_add(1);
+            self.public_form.sending = false;
+            self.public_form.shielding = false;
+            self.clear_public_action_progress_state();
+        }
         self.public_form.send_error = None;
         self.public_form.shield_error = None;
     }
@@ -402,18 +409,19 @@ impl WalletRoot {
     /// Shows the balances already read this session for the selected chain, without RPC.
     pub(super) fn restore_public_balance_snapshot(&mut self) {
         self.public_balance_snapshot = self
-            .current_public_balance_scope(self.selected_chain)
+            .current_public_balance_scope(self.last_evm_chain)
             .and_then(|scope| self.public_balance_cache.snapshot(&scope))
             .map(Arc::new);
     }
 
-    /// Selected-chain accounts of `status` that a global refresh reads.
+    /// The listed network's accounts of `status` that a global refresh reads.
     pub(super) fn public_global_refresh_ids(&self, status: PublicAccountStatus) -> Vec<String> {
-        self.public_accounts
+        let chain_id = self.listed_public_chain();
+        self.listed_public_accounts()
             .iter()
             .filter(|account| {
                 account.status == status
-                    && account.is_available_on_chain(self.selected_chain)
+                    && account.is_available_on_chain(chain_id)
                     && !self
                         .ui_state
                         .public_refresh_excluded
@@ -425,21 +433,21 @@ impl WalletRoot {
 
     /// Selected-chain account ids in the in-flight refresh or queued behind it.
     pub(super) fn public_refreshing_accounts(&self) -> BTreeSet<String> {
-        self.current_public_balance_scope(self.selected_chain)
+        self.current_public_balance_scope(self.last_evm_chain)
             .map(|scope| self.public_balance_cache.refreshing_accounts(&scope))
             .unwrap_or_default()
     }
 
     /// Selected-chain account ids whose latest refresh failed without returning their row.
     pub(super) fn public_failed_accounts(&self) -> BTreeSet<String> {
-        self.current_public_balance_scope(self.selected_chain)
+        self.current_public_balance_scope(self.last_evm_chain)
             .map(|scope| self.public_balance_cache.failed_accounts(&scope))
             .unwrap_or_default()
     }
 
     pub(super) fn public_section_refreshing(&self, status: PublicAccountStatus) -> bool {
-        let pending = self.public_refreshing_accounts();
-        self.public_accounts.iter().any(|account| {
+        let pending = self.listed_refreshing_accounts();
+        self.listed_public_accounts().iter().any(|account| {
             account.status == status && pending.contains(&account.public_account_uuid)
         })
     }
@@ -469,14 +477,19 @@ impl WalletRoot {
         }
     }
 
-    /// The section's included accounts on the selected chain, whatever the toggle says.
+    /// The section's included accounts on the selected network, whatever the toggle says. With
+    /// Tron selected these are Tron accounts; EVM accounts are read again on an EVM chain.
     pub(super) fn schedule_global_public_balance_refresh(
         &self,
         status: PublicAccountStatus,
         cx: &mut Context<'_, Self>,
     ) {
         let accounts = self.public_global_refresh_ids(status);
-        self.schedule_account_public_balance_refresh(self.selected_chain, accounts, None, cx);
+        if self.tron_selected() {
+            self.schedule_tron_balance_refresh(accounts, cx);
+        } else {
+            self.schedule_account_public_balance_refresh(self.last_evm_chain, accounts, None, cx);
+        }
     }
 
     /// Exactly the named accounts, ignoring the toggle and exclusions.
@@ -558,10 +571,8 @@ impl WalletRoot {
         let cache = self.public_balance_cache.clone();
         cx.spawn(async move |this, cx| {
             let result = join.await;
-            let mut completion = Some((ticket, result));
-            let (sync_window, focus_window) = this
-                .update(cx, |root, cx| {
-                    let (ticket, result) = completion.take().expect("refresh completion available");
+            let (sync_window, focus_window) =
+                Self::apply_balance_ticket(&this, cx, &cache, ticket, |root, ticket, cx| {
                     let (sync_selects, restore_focus) =
                         root.apply_public_balance_refresh_result(ticket, result, window, cx);
                     let target = window.or_else(|| cx.windows().first().copied());
@@ -569,13 +580,7 @@ impl WalletRoot {
                         target.filter(|_| sync_selects),
                         target.filter(|_| restore_focus),
                     )
-                })
-                .unwrap_or_default();
-            if let Some((ticket, _)) = completion {
-                let _ = cache.finish_refresh(ticket, None);
-                // The owner has gone away; discard any admitted follow-up as well.
-                cache.clear();
-            }
+                });
             if let Some(window) = focus_window {
                 let _ = window.update(cx, |_, window, cx| {
                     let _ = this.update(cx, |root, cx| {
@@ -602,22 +607,51 @@ impl WalletRoot {
         window: Option<gpui::AnyWindowHandle>,
         cx: &Context<'_, Self>,
     ) {
+        Self::run_balance_follow_up(
+            self.public_balance_cache.clone(),
+            ticket,
+            cx,
+            move |root, ticket, cx| root.run_public_balance_refresh(ticket, window, cx),
+        );
+    }
+
+    /// Runs `refresh` with a follow-up `ticket` from `cache` after a random 0.5-3 s. If the
+    /// root has gone by then, `cache` finishes the ticket instead.
+    pub(super) fn run_balance_follow_up<F>(
+        cache: PublicBalanceCache,
+        ticket: PublicBalanceRefreshTicket,
+        cx: &Context<'_, Self>,
+        refresh: F,
+    ) where
+        F: FnOnce(&mut Self, PublicBalanceRefreshTicket, &mut Context<'_, Self>) + 'static,
+    {
         let delay = isolated_read_jitter();
-        let cache = self.public_balance_cache.clone();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
-            let mut ticket = Some(ticket);
-            let _ = this.update(cx, |root, cx| {
-                let ticket = ticket.take().expect("follow-up ticket available");
-                root.run_public_balance_refresh(ticket, window, cx);
-            });
-            if let Some(ticket) = ticket {
-                let _ = cache.finish_refresh(ticket, None);
-                // The owner has gone away; discard any admitted follow-up as well.
-                cache.clear();
-            }
+            Self::apply_balance_ticket(&this, cx, &cache, ticket, refresh);
         })
         .detach();
+    }
+
+    /// Runs `apply` with `ticket` on the root. If the root has gone, `cache` finishes the
+    /// ticket instead, and the result is `R::default()`.
+    pub(super) fn apply_balance_ticket<R: Default>(
+        this: &gpui::WeakEntity<Self>,
+        cx: &mut gpui::AsyncApp,
+        cache: &PublicBalanceCache,
+        ticket: PublicBalanceRefreshTicket,
+        apply: impl FnOnce(&mut Self, PublicBalanceRefreshTicket, &mut Context<'_, Self>) -> R,
+    ) -> R {
+        let mut ticket = Some(ticket);
+        let applied = this.update(cx, |root, cx| {
+            apply(root, ticket.take().expect("balance ticket available"), cx)
+        });
+        if let Some(ticket) = ticket {
+            let _ = cache.finish_refresh(ticket, None);
+            // The owner has gone away; discard any admitted follow-up as well.
+            cache.clear();
+        }
+        applied.unwrap_or_default()
     }
 
     pub(super) fn apply_public_balance_refresh_result(
@@ -642,7 +676,7 @@ impl WalletRoot {
         };
         let succeeded = snapshot.is_some();
         let completion = self.public_balance_cache.finish_refresh(ticket, snapshot);
-        let selected = scope.chain_id() == self.selected_chain;
+        let selected = scope.chain_id() == self.last_evm_chain;
         let mut restore_focus = false;
         if completion.accepted && selected {
             // Keep the focused tile and any open asset menu across a background

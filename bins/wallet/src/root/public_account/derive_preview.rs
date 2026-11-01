@@ -295,6 +295,29 @@ fn balance_check_summary(
     )
 }
 
+/// The Trezor app passphrase field of a hardware account request, around `input`.
+#[cfg(feature = "hardware")]
+pub(super) fn trezor_app_passphrase_panel(input: impl IntoElement) -> gpui::Div {
+    div()
+        .w_full()
+        .p(px(12.0))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .rounded_md()
+        .border_1()
+        .border_color(gpui::rgb(ui::theme::BORDER))
+        .bg(gpui::rgb(ui::theme::SURFACE))
+        .child(ui::controls::app_strong_text("Trezor app passphrase"))
+        .child(
+            app_muted_text(
+                "If the Trezor session expired, enter the app passphrase for this account request.",
+            )
+            .whitespace_normal(),
+        )
+        .child(input)
+}
+
 fn add_result_message(result: &PreviewedPublicAccountsAdded) -> String {
     let mut message = format!("Added {}.", count_label(result.added.len(), "account"));
     for (index, reason) in &result.skipped {
@@ -622,7 +645,7 @@ impl WalletRoot {
             .public_form
             .next_derived_index
             .filter(|index| *index < INDEX_LIMIT);
-        let chain_id = self.selected_chain;
+        let chain_id = self.last_evm_chain;
         let chains = self
             .effective_chain_configs
             .enabled_chains()
@@ -1024,7 +1047,7 @@ impl WalletRoot {
         }
         self.reload_public_accounts(window, cx);
         if !added.is_empty() {
-            self.schedule_account_public_balance_refresh(self.selected_chain, added, None, cx);
+            self.schedule_account_public_balance_refresh(self.last_evm_chain, added, None, cx);
         }
     }
 
@@ -1303,7 +1326,7 @@ impl WalletRoot {
     }
 
     #[cfg(feature = "hardware")]
-    fn trezor_pin_matrix_prompt(&self, root: &Entity<Self>) -> Option<gpui::AnyElement> {
+    pub(super) fn trezor_pin_matrix_prompt(&self, root: &Entity<Self>) -> Option<gpui::AnyElement> {
         self.hardware_profile_unlock
             .trezor_pin_matrix_prompt
             .as_ref()
@@ -1315,7 +1338,10 @@ impl WalletRoot {
 
     #[cfg(not(feature = "hardware"))]
     #[allow(clippy::unused_self)]
-    const fn trezor_pin_matrix_prompt(&self, _root: &Entity<Self>) -> Option<gpui::AnyElement> {
+    pub(super) const fn trezor_pin_matrix_prompt(
+        &self,
+        _root: &Entity<Self>,
+    ) -> Option<gpui::AnyElement> {
         None
     }
 
@@ -1349,35 +1375,20 @@ impl WalletRoot {
                 cx.stop_propagation();
                 show_on_enter(window, cx);
             })
-            .child(app_muted_text(hardware_public_account_setup_copy(device_kind)))
+            .child(app_muted_text(hardware_public_account_setup_copy(
+                device_kind,
+            )))
             .when(self.current_session_needs_trezor_app_passphrase(), |this| {
                 #[cfg(feature = "hardware")]
                 {
-                    this.child(
-                        div()
-                            .w_full()
-                            .p(px(12.0))
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(gpui::rgb(ui::theme::BORDER))
-                            .bg(gpui::rgb(ui::theme::SURFACE))
-                            .child(ui::controls::app_strong_text("Trezor app passphrase"))
-                            .child(
-                                app_muted_text(
-                                    "If the Trezor session expired, enter the app passphrase for this account request.",
-                                )
-                                .whitespace_normal(),
-                            )
-                            .child(input_enter_scope(!state.authorizing, show.clone()).child(
-                                ui::controls::app_masked_input(
-                                    &self.trezor_app_passphrase_input,
-                                    state.authorizing,
-                                ),
-                            )),
-                    )
+                    this.child(trezor_app_passphrase_panel(
+                        input_enter_scope(!state.authorizing, show.clone()).child(
+                            ui::controls::app_masked_input(
+                                &self.trezor_app_passphrase_input,
+                                state.authorizing,
+                            ),
+                        ),
+                    ))
                 }
                 #[cfg(not(feature = "hardware"))]
                 {

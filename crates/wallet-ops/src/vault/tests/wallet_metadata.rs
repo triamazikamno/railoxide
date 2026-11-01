@@ -977,6 +977,16 @@ fn permanent_wallet_delete_purges_wallet_scoped_records_and_guards_last_active()
         })
         .collect::<Vec<_>>();
     assert!(private_account_ids.contains(&private_account.public_account_uuid));
+    let [private_tron, global_tron] = [
+        (IMPORT_PRIVATE_KEY_ONE, false),
+        (IMPORT_PRIVATE_KEY_TWO, true),
+    ]
+    .map(|(private_key, global)| {
+        store
+            .import_tron_account(TEST_PASSWORD, &second_session, private_key, None, global)
+            .expect("import tron account")
+            .tron_account_uuid
+    });
 
     db.put_desktop_wallet_vault_record(
         &wallet_chain_metadata_record_key(&second_chain.wallet_chain_uuid),
@@ -1126,6 +1136,20 @@ fn permanent_wallet_delete_purges_wallet_scoped_records_and_guards_last_active()
         .expect("load global secret")
         .is_some()
     );
+    for (account_id, retained) in [(private_tron, false), (global_tron, true)] {
+        for key in [
+            tron_account_metadata_record_key(&account_id),
+            tron_account_secret_record_key(&account_id),
+        ] {
+            assert_eq!(
+                db.get_desktop_wallet_vault_record(&key)
+                    .expect("load tron account record")
+                    .is_some(),
+                retained,
+                "{key}"
+            );
+        }
+    }
 
     store
         .set_wallet_active_for_session(&first_session, third_wallet_id, false)

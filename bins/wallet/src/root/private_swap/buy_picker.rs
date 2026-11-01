@@ -34,7 +34,7 @@ use wallet_ops::{PublicBroadcasterCandidate, WalletSession, bridge::NonEvmNetwor
 
 use super::{
     AbortOnDrop, BridgeProvider, BridgeRoutes, PrivateSwapsView, ReceiveTo, SwapBuyItem, SwapForm,
-    action_alert, bridge_routes_retry_button, error_alert, network_name, same_offer, short_non_evm,
+    action_alert, bridge_routes_retry_button, error_alert, network_name, same_offer,
 };
 use crate::root::private_swap::dialog::provider_mark;
 use crate::root::shell::WalletTab;
@@ -834,7 +834,7 @@ impl ListDelegate for BuyTokensDelegate {
                         )
                         // Look-alike symbols are told apart by their mint or contract.
                         .children(row.item.contract.as_deref().map(|contract| {
-                            app_muted_text(short_non_evm(contract))
+                            app_muted_text(railgun_ui::short_non_evm(contract))
                                 .text_xs()
                                 .flex_none()
                                 .font_family(theme::APP_MONO_FONT_FAMILY)

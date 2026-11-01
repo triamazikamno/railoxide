@@ -7,13 +7,13 @@ use super::{
     PUBLIC_ACCOUNT_METADATA_PREFIX, PUBLIC_ACCOUNT_SECRET_PREFIX, PUBLIC_ADDRESS_BOOK_PREFIX,
     PrivateAddressBookEntry, PrivateKeySigner, PublicAccountMetadata, PublicAccountScope,
     PublicAccountSecret, PublicAccountSource, PublicAccountStatus, PublicAddressBookEntry,
-    RecordKind, SigningKey, SpendUnlock, U256, VaultError, ViewUnlock,
-    WALLET_CHAIN_INDEX_COMPLETE_PREFIX, WALLET_CHAIN_INDEX_COMPLETE_VERSION,
-    WALLET_CHAIN_INDEX_PREFIX, WALLET_CHAIN_METADATA_PREFIX, WALLET_METADATA_PREFIX,
-    WALLET_SPEND_PREFIX, WALLET_VIEW_PREFIX, WALLETCONNECT_RELAY_IDENTITY_PREFIX,
-    WALLETCONNECT_SESSION_PREFIX, WalletCacheError, WalletConnectRelayIdentity,
-    WalletConnectSessionRecord, WalletKeys, WalletMetadataBundle, WalletUtxo, Zeroize, Zeroizing,
-    bip39_mnemonic_from_entropy, generate_opaque_id,
+    RecordKind, SigningKey, SpendUnlock, TRON_ACCOUNT_METADATA_PREFIX, TRON_ACCOUNT_SECRET_PREFIX,
+    TronAccountMetadata, U256, VaultError, ViewUnlock, WALLET_CHAIN_INDEX_COMPLETE_PREFIX,
+    WALLET_CHAIN_INDEX_COMPLETE_VERSION, WALLET_CHAIN_INDEX_PREFIX, WALLET_CHAIN_METADATA_PREFIX,
+    WALLET_METADATA_PREFIX, WALLET_SPEND_PREFIX, WALLET_VIEW_PREFIX,
+    WALLETCONNECT_RELAY_IDENTITY_PREFIX, WALLETCONNECT_SESSION_PREFIX, WalletCacheError,
+    WalletConnectRelayIdentity, WalletConnectSessionRecord, WalletKeys, WalletMetadataBundle,
+    WalletUtxo, Zeroize, Zeroizing, bip39_mnemonic_from_entropy, generate_opaque_id,
 };
 
 use coins_bip32::prelude::{ChainCode, Hint, KeyFingerprint, Parent, XKeyInfo, XPriv, XPub};
@@ -121,6 +121,14 @@ pub(super) fn public_account_secret_record_key(public_account_uuid: &str) -> Str
     format!("{PUBLIC_ACCOUNT_SECRET_PREFIX}{public_account_uuid}")
 }
 
+pub(super) fn tron_account_metadata_record_key(tron_account_uuid: &str) -> String {
+    format!("{TRON_ACCOUNT_METADATA_PREFIX}{tron_account_uuid}")
+}
+
+pub(super) fn tron_account_secret_record_key(tron_account_uuid: &str) -> String {
+    format!("{TRON_ACCOUNT_SECRET_PREFIX}{tron_account_uuid}")
+}
+
 pub(super) fn private_address_book_record_key(entry_uuid: &str) -> String {
     format!("{PRIVATE_ADDRESS_BOOK_PREFIX}{entry_uuid}")
 }
@@ -216,6 +224,25 @@ pub(super) fn public_account_secret_record_entry(
 ) -> Result<(String, Vec<u8>), VaultError> {
     let key = public_account_secret_record_key(&metadata.public_account_uuid);
     let record = spend.encrypt_public_account_secret(&metadata.public_account_uuid, secret)?;
+    record.to_record_entry(key)
+}
+
+pub(super) fn tron_account_metadata_record_entry(
+    view: &ViewUnlock,
+    metadata: &TronAccountMetadata,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = tron_account_metadata_record_key(&metadata.tron_account_uuid);
+    let record = view.encrypt_tron_account_metadata(&metadata.tron_account_uuid, metadata)?;
+    record.to_record_entry(key)
+}
+
+pub(super) fn tron_account_secret_record_entry(
+    spend: &SpendUnlock,
+    metadata: &TronAccountMetadata,
+    secret: &PublicAccountSecret,
+) -> Result<(String, Vec<u8>), VaultError> {
+    let key = tron_account_secret_record_key(&metadata.tron_account_uuid);
+    let record = spend.encrypt_tron_account_secret(&metadata.tron_account_uuid, secret)?;
     record.to_record_entry(key)
 }
 
@@ -439,15 +466,30 @@ pub fn sort_public_account_metadata(metadata: &mut [PublicAccountMetadata]) {
 pub(super) fn next_public_account_display_order(
     metadata: &[PublicAccountMetadata],
 ) -> Result<u32, VaultError> {
-    metadata
-        .iter()
-        .map(|metadata| metadata.display_order)
-        .max()
-        .map_or(Ok(0), |max_display_order| {
-            max_display_order
-                .checked_add(1)
-                .ok_or(VaultError::PublicAccountDisplayOrderOverflow)
-        })
+    next_after_max(metadata.iter().map(|metadata| metadata.display_order))
+}
+
+pub fn sort_tron_account_metadata(metadata: &mut [TronAccountMetadata]) {
+    metadata.sort_by(|left, right| {
+        left.display_order
+            .cmp(&right.display_order)
+            .then_with(|| left.address.cmp(&right.address))
+            .then_with(|| left.tron_account_uuid.cmp(&right.tron_account_uuid))
+    });
+}
+
+pub(super) fn next_tron_account_display_order(
+    metadata: &[TronAccountMetadata],
+) -> Result<u32, VaultError> {
+    next_after_max(metadata.iter().map(|metadata| metadata.display_order))
+}
+
+/// One past the largest value, or 0 when there is none.
+fn next_after_max(values: impl Iterator<Item = u32>) -> Result<u32, VaultError> {
+    values.max().map_or(Ok(0), |max| {
+        max.checked_add(1)
+            .ok_or(VaultError::PublicAccountDisplayOrderOverflow)
+    })
 }
 
 #[must_use]
@@ -727,13 +769,70 @@ pub(super) fn next_derived_public_account_index(
     metadata: &[PublicAccountMetadata],
     wallet_uuid: &str,
 ) -> Result<u32, VaultError> {
-    derived_public_account_indexes(metadata, wallet_uuid)
-        .max()
-        .map_or(Ok(0), |max_index| {
-            max_index
-                .checked_add(1)
-                .ok_or(VaultError::PublicAccountDisplayOrderOverflow)
+    next_after_max(derived_public_account_indexes(metadata, wallet_uuid))
+}
+
+/// Derivation indexes used by the wallet's derived Tron accounts, of any status, so hiding an
+/// account never frees its index.
+pub(super) fn derived_tron_account_indexes<'a>(
+    metadata: &'a [TronAccountMetadata],
+    wallet_uuid: &'a str,
+) -> impl Iterator<Item = u32> + 'a {
+    metadata
+        .iter()
+        .filter(move |account| {
+            matches!(
+                &account.scope,
+                PublicAccountScope::PrivateWallet { wallet_uuid: scoped } if scoped == wallet_uuid
+            )
         })
+        .filter_map(|account| account.source.derivation_index())
+}
+
+pub(super) fn next_derived_tron_account_index(
+    metadata: &[TronAccountMetadata],
+    wallet_uuid: &str,
+) -> Result<u32, VaultError> {
+    next_after_max(derived_tron_account_indexes(metadata, wallet_uuid))
+}
+
+/// Whether `address` is already an active account that a list `scope` appears in would show:
+/// every wallet's for a global account, the selected wallet's otherwise.
+fn account_address_taken(
+    existing_status: PublicAccountStatus,
+    existing_address: Address,
+    existing_scope: &PublicAccountScope,
+    address: Address,
+    scope: &PublicAccountScope,
+    selected_wallet_uuid: &str,
+) -> bool {
+    existing_status == PublicAccountStatus::Active
+        && existing_address == address
+        && (*scope == PublicAccountScope::Global
+            || existing_scope.includes_wallet(selected_wallet_uuid))
+}
+
+pub(super) fn ensure_tron_account_address_available(
+    metadata: &[TronAccountMetadata],
+    address: Address,
+    scope: &PublicAccountScope,
+    selected_wallet_uuid: &str,
+) -> Result<(), VaultError> {
+    let duplicate = metadata.iter().any(|account| {
+        account_address_taken(
+            account.status,
+            account.address,
+            &account.scope,
+            address,
+            scope,
+            selected_wallet_uuid,
+        )
+    });
+    if duplicate {
+        Err(VaultError::DuplicatePublicAccountAddress)
+    } else {
+        Ok(())
+    }
 }
 
 pub(super) fn ensure_public_account_address_available(
@@ -742,14 +841,16 @@ pub(super) fn ensure_public_account_address_available(
     scope: &PublicAccountScope,
     selected_wallet_uuid: &str,
 ) -> Result<(), VaultError> {
-    let duplicates = match scope {
-        PublicAccountScope::Global => metadata.iter().any(|account| {
-            account.status == PublicAccountStatus::Active && account.address == address
-        }),
-        PublicAccountScope::PrivateWallet { .. } => metadata.iter().any(|account| {
-            account.address == address && account.is_active_for_wallet(selected_wallet_uuid)
-        }),
-    };
+    let duplicates = metadata.iter().any(|account| {
+        account_address_taken(
+            account.status,
+            account.address,
+            &account.scope,
+            address,
+            scope,
+            selected_wallet_uuid,
+        )
+    });
     if duplicates {
         Err(VaultError::DuplicatePublicAccountAddress)
     } else {
@@ -846,11 +947,35 @@ pub fn derive_public_evm_private_key_from_mnemonic_with_passphrase(
     derive_public_evm_private_key_from_seed(&seed, derivation_index)
 }
 
+const EVM_COIN_TYPE: u32 = 60;
+const TRON_COIN_TYPE: u32 = 195;
+
 pub(super) fn derive_public_evm_private_key_from_seed(
     seed: &[u8; 64],
     derivation_index: u32,
 ) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
-    let child = derive_public_evm_account_key_from_seed(seed)?
+    derive_bip44_private_key_from_seed(seed, EVM_COIN_TYPE, derivation_index)
+}
+
+/// The Tron account key at `m/44'/195'/0'/0/{derivation_index}`. Its EVM address
+/// (`public_evm_address_from_private_key`) is the account's Tron address.
+pub(super) fn derive_tron_private_key_from_seed(
+    seed: &[u8; 64],
+    derivation_index: u32,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+    // Higher indexes would silently derive hardened children, off Tron's path.
+    if derivation_index >= coins_bip32::BIP32_HARDEN {
+        return Err(VaultError::InvalidPublicAccountSelection);
+    }
+    derive_bip44_private_key_from_seed(seed, TRON_COIN_TYPE, derivation_index)
+}
+
+fn derive_bip44_private_key_from_seed(
+    seed: &[u8; 64],
+    coin_type: u32,
+    derivation_index: u32,
+) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+    let child = derive_bip44_account_key_from_seed(seed, coin_type)?
         .derive_child(derivation_index)
         .map_err(|_| VaultError::PublicEvmKeyDerivation)?;
     let signing_key: &coins_bip32::ecdsa::SigningKey = child.as_ref();
@@ -860,11 +985,15 @@ pub(super) fn derive_public_evm_private_key_from_seed(
     Ok(Zeroizing::new(private_key))
 }
 
-/// Extended key at `m/44'/60'/0'/0`, the parent of every derived Public account.
-fn derive_public_evm_account_key_from_seed(seed: &[u8; 64]) -> Result<XPriv, VaultError> {
+/// Extended key at `m/44'/{coin_type}'/0'/0`, the parent of every derived account of that
+/// coin: Public accounts at 60, Tron accounts at 195.
+fn derive_bip44_account_key_from_seed(
+    seed: &[u8; 64],
+    coin_type: u32,
+) -> Result<XPriv, VaultError> {
     XPriv::root_from_seed(seed, None)
         .and_then(|root| root.derive_child(coins_bip32::BIP32_HARDEN + 44))
-        .and_then(|key| key.derive_child(coins_bip32::BIP32_HARDEN + 60))
+        .and_then(|key| key.derive_child(coins_bip32::BIP32_HARDEN + coin_type))
         .and_then(|key| key.derive_child(coins_bip32::BIP32_HARDEN))
         .and_then(|key| key.derive_child(0))
         .map_err(|_| VaultError::PublicEvmKeyDerivation)
@@ -887,7 +1016,7 @@ impl DerivedPublicAccountPreview {
     pub(super) fn from_seed(wallet_uuid: &str, seed: &[u8; 64]) -> Result<Self, VaultError> {
         Ok(Self {
             wallet_uuid: wallet_uuid.to_owned(),
-            account_key: derive_public_evm_account_key_from_seed(seed)?.verify_key(),
+            account_key: derive_bip44_account_key_from_seed(seed, EVM_COIN_TYPE)?.verify_key(),
         })
     }
 
@@ -911,12 +1040,6 @@ impl DerivedPublicAccountPreview {
             wallet_uuid: wallet_uuid.to_owned(),
             account_key: XPub::new(key, info),
         })
-    }
-
-    pub(super) fn from_entropy(wallet_uuid: &str, entropy: &[u8]) -> Result<Self, VaultError> {
-        let mnemonic = Zeroizing::new(bip39_mnemonic_from_entropy(entropy)?);
-        let seed = bip39_seed_from_mnemonic(&mnemonic, "")?;
-        Self::from_seed(wallet_uuid, &seed)
     }
 
     pub fn address(&self, derivation_index: u32) -> Result<Address, VaultError> {

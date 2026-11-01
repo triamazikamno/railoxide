@@ -256,7 +256,7 @@ impl WalletSettingsEditor {
             return false;
         }
         let apply_mode = classify_settings_apply_mode(&self.saved, &self.draft);
-        if self.saved.chains != self.draft.chains
+        if (self.saved.chains != self.draft.chains || self.saved.tron != self.draft.tron)
             && let Some(root) = self.active_root.as_ref()
         {
             let admission = root
@@ -572,6 +572,7 @@ impl WalletSettingsEditor {
         cx.defer(move |cx| {
             let _ = root.update(cx, |root, cx| {
                 root.apply_saved_auto_lock_policy(&settings);
+                root.apply_saved_tron_enabled(&settings, cx);
                 if apply_mode == SettingsApplyMode::NewRequests {
                     root.apply_saved_request_settings(&settings, cx);
                 }
@@ -1199,18 +1200,7 @@ impl WalletSettingsEditor {
             let remove_editor = editor.clone();
             let remove_kind = kind.clone();
             list = list.child(
-                div()
-                    .id(kind.row_id(index))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px(px(2.0))
-                    .py(px(9.0))
-                    .hover(|this| this.bg(rgb(theme::SURFACE_HOVER_SUBTLE)))
-                    .when(index + 1 < endpoint_count, |this| {
-                        this.border_b_1()
-                            .border_color(rgb_with_alpha(theme::BORDER_SUBTLE, 0.45))
-                    })
+                settings_list_row(kind.row_id(index), index + 1 == endpoint_count)
                     .child(
                         div()
                             .flex_1()
@@ -1223,11 +1213,7 @@ impl WalletSettingsEditor {
                             .child(SharedString::from(endpoint)),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .gap_1()
+                        settings_row_actions()
                             .child(
                                 settings_icon_button(
                                     kind.edit_id(index),
@@ -1376,21 +1362,10 @@ impl WalletSettingsEditor {
         for (index, peer) in peers.into_iter().enumerate() {
             let edit_editor = editor.clone();
             let remove_editor = editor.clone();
+            let row_id =
+                SharedString::from(format!("wallet-settings-waku-{kind_id}-peer-row-{index}"));
             list = list.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "wallet-settings-waku-{kind_id}-peer-row-{index}"
-                    )))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px(px(2.0))
-                    .py(px(9.0))
-                    .hover(|this| this.bg(rgb(theme::SURFACE_HOVER_SUBTLE)))
-                    .when(index + 1 < peer_count, |this| {
-                        this.border_b_1()
-                            .border_color(rgb_with_alpha(theme::BORDER_SUBTLE, 0.45))
-                    })
+                settings_list_row(row_id, index + 1 == peer_count)
                     .child(
                         div()
                             .flex_1()
@@ -1418,11 +1393,7 @@ impl WalletSettingsEditor {
                             ),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .gap_1()
+                        settings_row_actions()
                             .child(
                                 settings_icon_button(
                                     SharedString::from(format!(
@@ -1502,8 +1473,12 @@ impl WalletSettingsEditor {
         let inputs = TokenDialogInputs {
             chain_id: cx
                 .new(|cx| InputState::new(window, cx).default_value(values.chain_id.to_string())),
-            token_address: cx
-                .new(|cx| InputState::new(window, cx).default_value(values.token_address.clone())),
+            token_address: cx.new(|cx| {
+                InputState::new(window, cx).default_value(display_token_address(
+                    values.chain_id,
+                    &values.token_address,
+                ))
+            }),
             symbol: cx.new(|cx| InputState::new(window, cx).default_value(values.symbol.clone())),
             decimals: cx
                 .new(|cx| InputState::new(window, cx).default_value(values.decimals.to_string())),
@@ -1529,11 +1504,14 @@ impl WalletSettingsEditor {
         let editor = cx.entity();
         let save_inputs = inputs.clone();
         let save_target = target.clone();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        let error = cx.new(|_| None::<SharedString>);
+        window.open_dialog(cx, move |dialog, _window, cx| {
             let save_editor = editor.clone();
             let save_inputs = save_inputs.clone();
             let render_inputs = save_inputs.clone();
             let save_target = save_target.clone();
+            let save_error = error.clone();
+            let shown_error = error.read(cx).clone();
             dialog
                 .w(dialog_width)
                 .max_h(dialog_max_height)
@@ -1542,11 +1520,8 @@ impl WalletSettingsEditor {
                 .on_ok(move |_event, _window, cx| {
                     let values = match token_dialog_values_from_inputs(&save_inputs, cx) {
                         Ok(values) => values,
-                        Err(error) => {
-                            save_editor.update(cx, |editor, cx| {
-                                editor.status = Some(Arc::from(error));
-                                cx.notify();
-                            });
+                        Err(message) => {
+                            set_dialog_error(&save_error, message, cx);
                             return false;
                         }
                     };
@@ -1557,11 +1532,12 @@ impl WalletSettingsEditor {
                     });
                     true
                 })
-                .child(render_token_dialog_content(
-                    &render_inputs,
-                    content_width,
-                    readonly_identity,
-                ))
+                .child(
+                    render_token_dialog_content(&render_inputs, content_width, readonly_identity)
+                        .when_some(shown_error, |this, error| {
+                            this.child(settings_dialog_error(error))
+                        }),
+                )
         });
         let focus_input = if readonly_identity {
             inputs.symbol
@@ -1680,11 +1656,14 @@ impl WalletSettingsEditor {
         } else {
             "Save"
         });
+        let error = cx.new(|_| None::<SharedString>);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let save_editor = editor.clone();
             let save_inputs = save_inputs.clone();
             let render_inputs = save_inputs.clone();
             let save_target = save_target.clone();
+            let save_error = error.clone();
+            let shown_error = error.read(cx).clone();
             dialog
                 .w(dialog_width)
                 .max_h(dialog_max_height)
@@ -1693,11 +1672,8 @@ impl WalletSettingsEditor {
                 .on_ok(move |_event, _window, cx| {
                     let anchor = match price_anchor_override_from_dialog_inputs(&save_inputs, cx) {
                         Ok(anchor) => anchor,
-                        Err(error) => {
-                            save_editor.update(cx, |editor, cx| {
-                                editor.status = Some(Arc::from(error));
-                                cx.notify();
-                            });
+                        Err(message) => {
+                            set_dialog_error(&save_error, message, cx);
                             return false;
                         }
                     };
@@ -1708,11 +1684,12 @@ impl WalletSettingsEditor {
                     });
                     true
                 })
-                .child(render_price_anchor_dialog_content(
-                    &render_inputs,
-                    content_width,
-                    cx,
-                ))
+                .child(
+                    render_price_anchor_dialog_content(&render_inputs, content_width, cx)
+                        .when_some(shown_error, |this, error| {
+                            this.child(settings_dialog_error(error))
+                        }),
+                )
         });
         let focus_input = inputs.chain_id;
         cx.defer_in(window, move |_editor, window, cx| {
@@ -1722,7 +1699,7 @@ impl WalletSettingsEditor {
 
     pub(in crate::root) fn product_anchor_component_dialog_inputs(
         values: &PriceAnchorComponentDialogValues,
-        chain_items: &[ChainSelectItem],
+        chain_items: &[NetworkSelectItem],
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> ProductAnchorComponentDialogInputs {
@@ -1851,29 +1828,16 @@ impl WalletSettingsEditor {
                 TokenEditTarget::Custom(entry.custom_index.unwrap_or(index))
             };
             let remove_index = entry.custom_index;
+            let row_id = SharedString::from(format!(
+                "wallet-settings-token-row-{}-{}",
+                entry.chain_id, entry.token_address
+            ));
             list = list.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "wallet-settings-token-row-{}-{}",
-                        entry.chain_id, entry.token_address
-                    )))
-                    .flex()
-                    .items_center()
+                settings_list_row(row_id, index + 1 == token_count)
                     .gap_3()
-                    .px(px(2.0))
-                    .py(px(9.0))
-                    .hover(|this| this.bg(rgb(theme::SURFACE_HOVER_SUBTLE)))
-                    .when(index + 1 < token_count, |this| {
-                        this.border_b_1()
-                            .border_color(rgb_with_alpha(theme::BORDER_SUBTLE, 0.45))
-                    })
                     .child(render_token_entry_summary(&entry))
                     .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .gap_1()
+                        settings_row_actions()
                             .child(
                                 settings_icon_button(
                                     SharedString::from(format!(
@@ -1958,29 +1922,16 @@ impl WalletSettingsEditor {
             let edit_target = PriceAnchorEditTarget::Edit(entry.clone());
             let remove_entry = entry.clone();
             let can_remove = entry.override_index.is_some();
+            let row_id = SharedString::from(format!(
+                "wallet-settings-price-anchor-row-{}-{}",
+                entry.key.chain_id, entry.key.token_address
+            ));
             list = list.child(
-                div()
-                    .id(SharedString::from(format!(
-                        "wallet-settings-price-anchor-row-{}-{}",
-                        entry.key.chain_id, entry.key.token_address
-                    )))
-                    .flex()
-                    .items_center()
+                settings_list_row(row_id, index + 1 == anchor_count)
                     .gap_3()
-                    .px(px(2.0))
-                    .py(px(9.0))
-                    .hover(|this| this.bg(rgb(theme::SURFACE_HOVER_SUBTLE)))
-                    .when(index + 1 < anchor_count, |this| {
-                        this.border_b_1()
-                            .border_color(rgb_with_alpha(theme::BORDER_SUBTLE, 0.45))
-                    })
                     .child(render_price_anchor_entry_summary(&entry))
                     .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .gap_1()
+                        settings_row_actions()
                             .child(
                                 settings_icon_button(
                                     SharedString::from(format!(

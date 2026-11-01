@@ -158,7 +158,7 @@ struct BlockedShieldRefundGuidance {
 
 impl WalletRoot {
     pub(super) fn sync_utxo_table(&mut self, cx: &mut Context<'_, Self>) {
-        let (mut rows, snapshot) = match self.chain_states.get(&self.selected_chain) {
+        let (mut rows, snapshot) = match self.chain_states.get(&self.last_evm_chain) {
             Some(state) => {
                 let snapshot = state.snapshot().cloned();
                 let rows = snapshot.as_ref().map_or_else(Vec::new, |snapshot| {
@@ -182,7 +182,7 @@ impl WalletRoot {
         }
         // The debug UI fixture shows its synthesized rows. No release build has any.
         if let Some(mut fixture_rows) =
-            super::private_swap::ui_fixture_utxo_rows(self.selected_chain)
+            super::private_swap::ui_fixture_utxo_rows(self.last_evm_chain)
         {
             let query = self.tx_search_query.as_ref();
             fixture_rows.retain(|row| {
@@ -196,11 +196,11 @@ impl WalletRoot {
         }
         let poi_refreshing = self
             .chain_states
-            .get(&self.selected_chain)
+            .get(&self.last_evm_chain)
             .is_some_and(ChainUtxoState::poi_refreshing);
         let poi_retry_session_available = self
             .chain_states
-            .get(&self.selected_chain)
+            .get(&self.last_evm_chain)
             .and_then(ChainUtxoState::poi_refresh_session)
             .is_some();
         self.executor_locked_note_count = self
@@ -226,13 +226,13 @@ impl WalletRoot {
         }
         let sync_tip = self
             .chain_states
-            .get(&self.selected_chain)
+            .get(&self.last_evm_chain)
             .and_then(ChainUtxoState::sync_tip);
         UtxoFinalityContext::new(
             sync_tip.and_then(|tip| tip.head_block),
             sync_tip.and_then(|tip| tip.safe_head_block),
             self.effective_chain_configs
-                .get(self.selected_chain)
+                .get(self.last_evm_chain)
                 .map(|config| config.finality_depth),
         )
     }
@@ -463,7 +463,7 @@ impl WalletRoot {
         };
         let Ok(effective_chain) = self
             .effective_chain_configs
-            .enabled(self.selected_chain)
+            .enabled(self.last_evm_chain)
             .cloned()
         else {
             return;
@@ -477,7 +477,7 @@ impl WalletRoot {
 
         let http = self.http.clone();
         let request = BlockedShieldRescueEligibilityRequest {
-            chain_id: self.selected_chain,
+            chain_id: self.last_evm_chain,
             effective_chain,
             view_session,
             session,
@@ -622,7 +622,7 @@ impl WalletRoot {
                         blocked_shield_refund_guidance(
                             blocker.as_ref(),
                             wallet.stealth_session().is_some(),
-                            native_wrapped_output_labels(wallet.selected_chain)
+                            native_wrapped_output_labels(wallet.last_evm_chain)
                                 .map(|(native, _)| native),
                         );
                     let message = info
@@ -718,7 +718,7 @@ impl WalletRoot {
     ) {
         let Ok(resolved_chain) = self
             .effective_chain_configs
-            .railgun(self.selected_chain)
+            .railgun(self.last_evm_chain)
             .cloned()
         else {
             return;
@@ -782,7 +782,7 @@ impl WalletRoot {
             }
         };
         let transaction_tracking = match self
-            .public_transaction_tracking_context(self.selected_chain, &public_account_uuid)
+            .public_transaction_tracking_context(self.last_evm_chain, &public_account_uuid)
         {
             Ok(context) => context,
             Err(error) => {
@@ -805,7 +805,7 @@ impl WalletRoot {
         Self::show_blocked_shield_refund_progress_dialog(utxo_id, window, cx);
         let request = BlockedShieldRescueSelfBroadcastRequest {
             transaction_tracking: Some(transaction_tracking),
-            chain_id: self.selected_chain,
+            chain_id: self.last_evm_chain,
             effective_chain: resolved_chain,
             view_session,
             session,
@@ -1001,7 +1001,7 @@ impl WalletRoot {
 
     pub(super) fn selected_chain_session(&self) -> Option<Arc<wallet_ops::WalletSession>> {
         self.chain_states
-            .get(&self.selected_chain)
+            .get(&self.selected_evm_chain()?)
             .and_then(ChainUtxoState::poi_refresh_session)
     }
 
@@ -1045,7 +1045,7 @@ impl WalletRoot {
         &self,
         utxo_id: BlockedShieldRescueUtxoId,
     ) -> Option<UtxoDisplayRow> {
-        let snapshot = self.chain_states.get(&self.selected_chain)?.snapshot()?;
+        let snapshot = self.chain_states.get(&self.last_evm_chain)?.snapshot()?;
         let mut row = snapshot
             .utxos
             .iter()
@@ -1068,7 +1068,7 @@ impl WalletRoot {
             || !should_focus_utxo_table(
                 self.active_activity,
                 self.active_wallet_tab,
-                self.chain_states.get(&self.selected_chain),
+                self.chain_states.get(&self.last_evm_chain),
             )
         {
             return;
@@ -1097,7 +1097,7 @@ impl WalletRoot {
         // The debug UI fixture's rows show in the table whatever the chain's state. No release
         // build has any.
         let fixture_rows = super::private_swap::ui_fixture_shows_utxos();
-        match self.chain_states.get(&self.selected_chain) {
+        match self.chain_states.get(&self.last_evm_chain) {
             Some(ChainUtxoState::Error { message, .. }) if !fixture_rows => div()
                 .size_full()
                 .min_w(px(0.0))
@@ -1157,7 +1157,7 @@ impl WalletRoot {
 
     fn render_utxo_controls(&self, root: &Entity<Self>) -> impl IntoElement {
         let search_active = !self.tx_search_query.is_empty();
-        let state = self.chain_states.get(&self.selected_chain);
+        let state = self.chain_states.get(&self.last_evm_chain);
         let snapshot = state.and_then(ChainUtxoState::snapshot);
         let local_pending_spent_count =
             snapshot.map_or(0, |snapshot| snapshot.local_pending_spent_count);
@@ -1316,7 +1316,7 @@ impl WalletRoot {
         if !should_focus_utxo_table(
             self.active_activity,
             self.active_wallet_tab,
-            self.chain_states.get(&self.selected_chain),
+            self.chain_states.get(&self.last_evm_chain),
         ) {
             return;
         }

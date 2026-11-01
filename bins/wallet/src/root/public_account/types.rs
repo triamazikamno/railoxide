@@ -46,6 +46,9 @@ pub(in crate::root) struct PublicAccountFormState {
     pub(in crate::root) native_shield_operation:
         Option<(NativeShieldKey, wallet_ops::vault::ExecutorOperationId)>,
     pub(in crate::root) import_global: bool,
+    /// The Import dialog adds a Tron account, not an EVM one.
+    pub(in crate::root) import_tron: bool,
+    /// The selected EVM account; Tron's selection is `WalletRoot::tron_public.selected`.
     pub(in crate::root) selected_account_uuid: Option<Arc<str>>,
     pub(in crate::root) editing_account_uuid: Option<Arc<str>>,
     pub(in crate::root) search_query: Arc<str>,
@@ -81,6 +84,9 @@ pub(in crate::root) struct PublicAccountFormState {
     pub(in crate::root) action_current_gas_fee: Option<(u128, u128)>,
     pub(in crate::root) action_fees_authorized: bool,
     pub(in crate::root) action_action_error: Option<Arc<str>>,
+    /// The failed step's concise summary when the action states one itself, in place of the
+    /// summary derived from its message, which then shows under Details.
+    pub(in crate::root) action_error_summary: Option<Arc<str>>,
     pub(in crate::root) action_contract_address: Option<Arc<str>>,
     pub(in crate::root) next_derived_index: Option<u32>,
     /// The Derive dialog's authorization and address preview.

@@ -23,10 +23,11 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::rpc_broker::total_failure;
 use crate::settings::{
-    EffectiveChainRegistry, EffectiveTokenRegistry, PriceAnchorSettings,
+    EffectiveChainRegistry, EffectiveTokenRegistry, PriceAnchorSettings, TronSettings,
     resolve_effective_chain_rpc_route,
 };
-use crate::{HttpContext, RpcBrokerError, RpcRoute, WalletRpcOrigin};
+use crate::tron::TRON_CHAIN_ID;
+use crate::{HttpContext, RpcBrokerError, RpcChainRoute, RpcRoute, WalletRpcOrigin};
 
 mod fresh;
 mod native_usd;
@@ -440,6 +441,20 @@ impl TokenAnchorRefreshHandle {
                 .send_modify(|revision| *revision = revision.wrapping_add(1));
         }
     }
+
+    /// Installs Tron's native USD source and the route for its native USD and token anchor
+    /// reads. Call it at startup and after each save of Tron settings, with the installation's
+    /// [`crate::tron::tron_rpc_route`] (`None` while Tron is disabled). A changed source or route
+    /// drops Tron's native USD quote. Nothing is read until [`Self::set_active_chains`] includes
+    /// [`TRON_CHAIN_ID`], which the app does once Tron is selected in the session; Tron's token
+    /// anchors are then read at once and refresh with the others.
+    pub fn reconcile_tron(&self, settings: &TronSettings, route: Option<&RpcChainRoute>) {
+        if self.cache.reconcile_tron_source(settings, route) {
+            self.configuration_tx
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+    }
+
     pub fn wake(&self) {
         let current = *self.wake_tx.borrow();
         let _ = self.wake_tx.send(current.wrapping_add(1));
@@ -490,8 +505,10 @@ async fn run_token_anchor_refresh_worker(
     mut wake_rx: watch::Receiver<u64>,
     configuration_rx: watch::Receiver<u64>,
 ) {
+    let mut tron_configuration_rx = configuration_rx.clone();
     let native_worker = native_usd::run_worker(&cache, &http, configuration_rx, wake_rx.clone());
     let token_worker = async {
+        let mut tron = cache.active_tron_route();
         refresh_token_anchor_rates(
             &cache,
             &chain_ids,
@@ -520,6 +537,20 @@ async fn run_token_anchor_refresh_worker(
                         next_refresh = last_refresh + token_anchor_refresh_delay(&cache, &chain_ids, &token_registry);
                     }
                 }
+                changed = tron_configuration_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let current = cache.active_tron_route();
+                    if current != tron {
+                        tron = current;
+                        if tron.is_some() {
+                            // Without other chains, this reads only Tron's anchors.
+                            refresh_token_anchor_rates(&cache, &[], &effective_chains, &token_registry, &http).await;
+                            next_refresh = next_refresh.min(Instant::now() + token_anchor_refresh_delay(&cache, &chain_ids, &token_registry));
+                        }
+                    }
+                }
             }
         }
     };
@@ -531,7 +562,8 @@ fn token_anchor_refresh_delay(
     chain_ids: &[u64],
     token_registry: &EffectiveTokenRegistry,
 ) -> Duration {
-    let missing_token_rate = token_anchor_entries_for_chains(chain_ids, token_registry)
+    let chain_ids = with_active_tron(chain_ids, cache.active_tron_route().as_ref());
+    let missing_token_rate = token_anchor_entries_for_chains(&chain_ids, token_registry)
         .into_iter()
         .any(|entry| cache.cached_rate(entry.chain_id, entry.token).is_none());
     if missing_token_rate {
@@ -541,6 +573,15 @@ fn token_anchor_refresh_delay(
     }
 }
 
+/// `chain_ids`, with Tron while it has an active route.
+fn with_active_tron(chain_ids: &[u64], tron: Option<&RpcChainRoute>) -> Vec<u64> {
+    let mut chain_ids = chain_ids.to_vec();
+    if tron.is_some() {
+        chain_ids.push(TRON_CHAIN_ID);
+    }
+    chain_ids
+}
+
 pub async fn refresh_token_anchor_rates(
     cache: &TokenAnchorRateCache,
     chain_ids: &[u64],
@@ -548,6 +589,8 @@ pub async fn refresh_token_anchor_rates(
     token_registry: &EffectiveTokenRegistry,
     http: &HttpContext,
 ) {
+    let tron = cache.active_tron_route();
+    let chain_ids = &with_active_tron(chain_ids, tron.as_ref());
     tracing::debug!(
         chain_count = chain_ids.len(),
         "token anchor refresh started"
@@ -555,6 +598,7 @@ pub async fn refresh_token_anchor_rates(
     let entries = token_anchor_entries_for_chains(chain_ids, token_registry);
     let oracle_addresses_by_chain = oracle_addresses_for_entries(&entries);
     let (pool_keys, observation_keys) = twap_keys_for_entries(&entries);
+    let tron = tron.as_ref();
     refresh_token_anchor_rates_with_fetch(
         cache,
         &entries,
@@ -574,6 +618,7 @@ pub async fn refresh_token_anchor_rates(
                             chain_id,
                             &addresses,
                             effective_chains,
+                            tron,
                             http,
                         )
                         .await,
@@ -589,6 +634,7 @@ pub async fn refresh_token_anchor_rates(
                             &pools,
                             &observations,
                             effective_chains,
+                            tron,
                             http,
                         )
                         .await,
@@ -718,35 +764,56 @@ async fn fetch_oracle_answers_for_chain(
     chain_id: u64,
     oracle_addresses: &[Address],
     effective_chains: &EffectiveChainRegistry,
+    tron: Option<&RpcChainRoute>,
     http: &HttpContext,
 ) -> Result<BTreeMap<Address, U256>> {
     fetch_oracle_answers_for_chain_with_timeout(
         chain_id,
         oracle_addresses,
         effective_chains,
+        tron,
         http,
         TOKEN_ANCHOR_ORACLE_REQUEST_TIMEOUT,
     )
     .await
 }
 
+/// The General route of `chain_id`'s anchor reads. Tron's id always means `tron`, its route
+/// while active, and never a registry chain with that id. Reads use `latest`, the only block
+/// Tron accepts.
+fn anchor_read_route(
+    chain_id: u64,
+    effective_chains: &EffectiveChainRegistry,
+    tron: Option<&RpcChainRoute>,
+    request_timeout: Duration,
+) -> Result<RpcRoute> {
+    let chain_route = if chain_id == TRON_CHAIN_ID {
+        tron.cloned()
+            .ok_or_else(|| eyre::eyre!("Tron is not active"))?
+    } else {
+        resolve_effective_chain_rpc_route(
+            chain_id,
+            effective_chains
+                .get(chain_id)
+                .ok_or_else(|| eyre::eyre!("chain {chain_id} is not configured"))?,
+        )?
+    };
+    Ok(
+        RpcRoute::from(chain_route.for_class(crate::RpcTrafficClass::General)?)
+            .with_request_timeout(request_timeout)
+            .with_attempt_timeout(Duration::from_secs(5)),
+    )
+}
+
 async fn fetch_oracle_answers_for_chain_with_timeout(
     chain_id: u64,
     oracle_addresses: &[Address],
     effective_chains: &EffectiveChainRegistry,
+    tron: Option<&RpcChainRoute>,
     http: &HttpContext,
     request_timeout: Duration,
 ) -> Result<BTreeMap<Address, U256>> {
-    let chain_route = resolve_effective_chain_rpc_route(
-        chain_id,
-        effective_chains
-            .get(chain_id)
-            .ok_or_else(|| eyre::eyre!("chain {chain_id} is not configured"))?,
-    )?
-    .for_class(crate::RpcTrafficClass::General)?;
-    let route = RpcRoute::from(chain_route)
-        .with_request_timeout(request_timeout)
-        .with_attempt_timeout(Duration::from_secs(5));
+    let route = anchor_read_route(chain_id, effective_chains, tron, request_timeout)?;
     let calls = oracle_addresses
         .iter()
         .map(|&oracle_address| {
@@ -1030,6 +1097,7 @@ async fn fetch_twap_inputs_for_chain(
     pools: &[PoolKey],
     observations: &[ObservationKey],
     effective_chains: &EffectiveChainRegistry,
+    tron: Option<&RpcChainRoute>,
     http: &HttpContext,
 ) -> Result<TwapFetchedInputs> {
     fetch_twap_inputs_for_chain_with_timeout(
@@ -1037,6 +1105,7 @@ async fn fetch_twap_inputs_for_chain(
         pools,
         observations,
         effective_chains,
+        tron,
         http,
         TOKEN_ANCHOR_ORACLE_REQUEST_TIMEOUT,
     )
@@ -1048,22 +1117,14 @@ async fn fetch_twap_inputs_for_chain_with_timeout(
     pools: &[PoolKey],
     observations: &[ObservationKey],
     effective_chains: &EffectiveChainRegistry,
+    tron: Option<&RpcChainRoute>,
     http: &HttpContext,
     request_timeout: Duration,
 ) -> Result<TwapFetchedInputs> {
     if pools.is_empty() && observations.is_empty() {
         return Ok(TwapFetchedInputs::default());
     }
-    let chain_route = resolve_effective_chain_rpc_route(
-        chain_id,
-        effective_chains
-            .get(chain_id)
-            .ok_or_else(|| eyre::eyre!("chain {chain_id} is not configured"))?,
-    )?
-    .for_class(crate::RpcTrafficClass::General)?;
-    let route = RpcRoute::from(chain_route)
-        .with_request_timeout(request_timeout)
-        .with_attempt_timeout(Duration::from_secs(5));
+    let route = anchor_read_route(chain_id, effective_chains, tron, request_timeout)?;
     fetch_twap_inputs_at(
         http,
         &route,
@@ -1971,6 +2032,7 @@ mod tests {
             1,
             &[address!("0x0000000000000000000000000000000000000100")],
             &effective_chains,
+            None,
             &http,
             Duration::from_millis(25),
         )
@@ -2027,6 +2089,7 @@ mod tests {
                 window_seconds: 1_800,
             }],
             &effective_chains,
+            None,
             &http,
             Duration::from_millis(25),
         )
@@ -2077,6 +2140,7 @@ mod tests {
             &[pool_key],
             &[observation_key],
             &effective_chains,
+            None,
             &http,
             Duration::from_secs(2),
         )
@@ -2159,6 +2223,7 @@ mod tests {
             &[first_pool, second_pool],
             &[first_observation, second_observation],
             &effective_chains,
+            None,
             &http,
             Duration::from_secs(2),
         )
@@ -2218,6 +2283,7 @@ mod tests {
             &[pool_key],
             &[observation_key],
             &effective_chains,
+            None,
             &http,
             Duration::from_secs(2),
         )
@@ -2337,6 +2403,7 @@ mod tests {
                             chain_id,
                             &addresses,
                             effective_chains,
+                            None,
                             http,
                         )
                         .await,
@@ -3099,6 +3166,7 @@ mod tests {
                             &pools,
                             &observations,
                             &effective_chains,
+                            None,
                             &http,
                         )
                         .await,
@@ -3122,6 +3190,134 @@ mod tests {
             BroadcasterFeePolicy::default().classify_fee(U256::from(1), cache.cached_rate(1, rail)),
             BroadcasterFeePolicyStatus::UnknownAnchor
         ));
+    }
+
+    #[tokio::test]
+    async fn tron_prices_are_read_on_its_route_only_once_active() {
+        use crate::rpc_broker::tests::spawn_recording_rpc_mock;
+        use crate::settings::{EffectiveChainConfig, EffectiveTokenInfo, TronEndpointSetting};
+        use alloy::primitives::I256;
+        use alloy::providers::bindings::IMulticall3;
+
+        // $0.25 per TRX, with 8 decimals, for every feed call.
+        let feed = |call_data: &Bytes| -> Bytes {
+            if call_data.starts_with(&AggregatorInterface::decimalsCall::SELECTOR) {
+                AggregatorInterface::decimalsCall::abi_encode_returns(&8).into()
+            } else {
+                AggregatorInterface::latestAnswerCall::abi_encode_returns(
+                    &I256::try_from(25_000_000).unwrap(),
+                )
+                .into()
+            }
+        };
+        let (url, recorded, server) =
+            spawn_recording_rpc_mock(SharedArc::new(move |request: Value| {
+                let result = if request["method"] == "eth_chainId" {
+                    json!("0x2b6653dc")
+                } else {
+                    let call = &request["params"][0];
+                    let input = call
+                        .get("input")
+                        .or_else(|| call.get("data"))
+                        .and_then(Value::as_str)
+                        .unwrap()
+                        .parse::<Bytes>()
+                        .unwrap();
+                    match IMulticall3::tryAggregateCall::abi_decode(&input) {
+                        Ok(aggregate) => {
+                            let returns = aggregate
+                                .calls
+                                .iter()
+                                .map(|call| IMulticall3::Result {
+                                    success: true,
+                                    returnData: feed(&call.callData),
+                                })
+                                .collect::<Vec<_>>();
+                            json!(Bytes::from(
+                                IMulticall3::tryAggregateCall::abi_encode_returns(&returns)
+                            ))
+                        }
+                        Err(_) => json!(feed(&input)),
+                    }
+                };
+                json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+            }))
+            .await;
+        let settings = TronSettings {
+            endpoints: Some(vec![TronEndpointSetting {
+                json_rpc_url: url.to_string(),
+                ..TronEndpointSetting::default()
+            }]),
+            ..TronSettings::default()
+        };
+        let route = crate::tron::tron_rpc_route(&settings).unwrap();
+        // Tron USDT, anchored on the TRX/USD feed.
+        let usdt = address!("0xa614f803b6fd780986a42c78ec9c7f77e6ded13c");
+        let registry = EffectiveTokenRegistry {
+            tokens: [(
+                (TRON_CHAIN_ID, usdt.to_string()),
+                EffectiveTokenInfo {
+                    chain_id: TRON_CHAIN_ID,
+                    token_address: usdt.to_string(),
+                    symbol: "USDT".to_owned(),
+                    decimals: 6,
+                    icon_path: None,
+                    price_anchor: None,
+                    built_in: true,
+                },
+            )]
+            .into(),
+        };
+        let cache = Arc::new(TokenAnchorRateCache::new());
+        let mut updates = cache.subscribe_refreshes();
+        let worker = spawn_token_anchor_refresh_worker(
+            &Handle::current(),
+            cache.clone(),
+            vec![],
+            std::iter::empty::<EffectiveChainConfig>().collect(),
+            registry,
+            HttpContext::direct_for_tests(),
+        );
+        worker.reconcile_tron(&settings, Some(&route));
+
+        // Enabled but not selected in this session: nothing is sent, identity checks included.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(recorded.lock().unwrap().is_empty());
+
+        worker.set_active_chains(&[TRON_CHAIN_ID]);
+        let (four_trx, one_usdt) = (U256::from(4_000_000), U256::from(1_000_000));
+        timeout(Duration::from_secs(10), async {
+            while cache
+                .cached_native_usd_micro_value(TRON_CHAIN_ID, four_trx)
+                .is_none()
+                || cache
+                    .cached_token_usd_micro_value(TRON_CHAIN_ID, usdt, one_usdt)
+                    .is_none()
+            {
+                updates.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("Tron prices once Tron is active");
+        assert_eq!(
+            cache.cached_native_usd_micro_value(TRON_CHAIN_ID, four_trx),
+            Some(U256::from(1_000_000))
+        );
+        assert_eq!(
+            cache.cached_token_usd_micro_value(TRON_CHAIN_ID, usdt, one_usdt),
+            Some(U256::from(1_000_000))
+        );
+        // Tron answers calls only at `latest`.
+        assert!(
+            recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, request)| request["method"] == "eth_call")
+                .all(|(_, request)| request["params"][1] == "latest")
+        );
+        drop(worker);
+        server.abort();
     }
 
     #[test]

@@ -13,6 +13,7 @@ use gpui_component::{
     separator::Separator,
     tooltip::Tooltip,
 };
+use ui::chain_select::NetworkSelectItem;
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::{icons, theme};
@@ -74,13 +75,31 @@ impl SelectItem for WalletSelectItem {
     }
 }
 
-pub(super) use ui::chain_select::ChainSelectItem;
+pub(super) type NetworkSelectItems = ui::chain_select::ChainSelectItems<NetworkSelectItem>;
+
+/// The header selector's choices: the enabled EVM chains, then Tron while it is enabled.
+pub(super) fn network_select_items(
+    chains: impl IntoIterator<Item = (u64, String)>,
+    tron_enabled: bool,
+) -> Vec<NetworkSelectItem> {
+    chains
+        .into_iter()
+        .map(|(chain_id, label)| NetworkSelectItem {
+            network: super::SelectedNetwork::Evm(chain_id),
+            label: label.into(),
+        })
+        .chain(tron_enabled.then(|| NetworkSelectItem {
+            network: super::SelectedNetwork::Tron,
+            label: railgun_ui::TRON_NAME.into(),
+        }))
+        .collect()
+}
 
 impl WalletRoot {
     pub(super) fn repair_wallet_cache_from_input(&mut self, cx: &mut Context<'_, Self>) -> bool {
         if self
             .chain_states
-            .get(&self.selected_chain)
+            .get(&self.last_evm_chain)
             .is_some_and(ChainUtxoState::is_syncing)
         {
             self.repair_cache_error = Some(Arc::from(
@@ -110,7 +129,7 @@ impl WalletRoot {
         overrides.sync_to_block = None;
         overrides.rewind_wallet_cache = true;
         self.repair_cache_error = None;
-        self.start_chain_load(self.selected_chain, &overrides, true, cx);
+        self.start_chain_load(self.last_evm_chain, &overrides, true, cx);
         cx.notify();
         true
     }
@@ -194,7 +213,7 @@ impl WalletRoot {
 
     fn render_wallet_actions_menu(&self, root: Entity<Self>) -> impl IntoElement {
         let disabled = matches!(
-            self.chain_states.get(&self.selected_chain),
+            self.chain_states.get(&self.last_evm_chain),
             Some(state) if state.is_syncing()
         ) || self.view_session.is_none();
         let add_root = root.clone();

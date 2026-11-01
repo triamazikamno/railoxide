@@ -130,6 +130,7 @@ impl From<LegacyWalletSettings> for super::WalletSettings {
             runtime: old.runtime,
             waku: old.waku,
             walletconnect: old.walletconnect,
+            tron: super::TronSettings::default(),
         }
     }
 }
@@ -341,6 +342,7 @@ impl From<ReleasedWalletSettings> for super::WalletSettings {
             runtime: old.runtime,
             waku: old.waku,
             walletconnect: old.walletconnect,
+            tron: super::TronSettings::default(),
         }
     }
 }

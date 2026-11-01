@@ -120,7 +120,7 @@ impl WalletRoot {
             &self.walletconnect.account_select,
             &accounts,
             self.public_balance_snapshot.as_deref(),
-            self.selected_chain,
+            self.last_evm_chain,
             Some(self.public_broadcaster_anchor_cache.as_ref()),
             selected.as_ref(),
             window,

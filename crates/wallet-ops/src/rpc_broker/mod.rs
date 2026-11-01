@@ -24,6 +24,7 @@ mod resolution;
 mod scheduler;
 #[cfg(test)]
 pub(crate) mod tests;
+mod tron;
 mod warmup;
 pub(crate) use actor::EndpointHealthOutcome;
 pub use broker::RpcBroker;

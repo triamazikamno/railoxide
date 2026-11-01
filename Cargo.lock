@@ -15875,6 +15875,7 @@ name = "wallet"
 version = "0.2.0-beta.13"
 dependencies = [
  "alloy",
+ "async-trait",
  "broadcaster-core",
  "broadcaster-monitor",
  "broadcaster-monitor-gpui",
@@ -15955,6 +15956,7 @@ dependencies = [
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",
  "poi",
+ "prost",
  "protobuf",
  "public-broadcaster-protocol",
  "railgun-ui",

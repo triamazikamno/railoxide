@@ -37,6 +37,7 @@ pub use balance_cache::{
 };
 #[cfg(test)]
 pub(crate) use balances::native_asset_for_chain;
+pub(crate) use balances::registry_balance_assets;
 pub use balances::{
     public_balance_assets_for_chain, public_balance_refresh_interval_secs, refresh_public_balances,
     refresh_public_balances_at_least,

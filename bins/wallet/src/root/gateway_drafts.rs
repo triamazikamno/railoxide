@@ -566,7 +566,7 @@ impl WalletRoot {
             .view_session
             .clone()
             .ok_or("Unlock the desktop wallet")?;
-        if self.selected_chain != input.chain_id
+        if self.last_evm_chain != input.chain_id
             || self.public_form.selected_account_uuid.as_deref() != Some(input.account.as_str())
         {
             return Err("Account or network changed. Open a new draft.".into());
@@ -745,7 +745,7 @@ impl WalletRoot {
                     return;
                 };
                 record.estimation = None;
-                if root.selected_chain != record.view.input.chain_id()
+                if root.last_evm_chain != record.view.input.chain_id()
                     || root.public_form.selected_account_uuid.as_deref()
                         != record
                             .view

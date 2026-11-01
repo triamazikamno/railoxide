@@ -19,8 +19,8 @@ use alloy::primitives::{Address, U256};
 use gpui::{
     Anchor, App, AppContext as _, Context, Entity, FocusHandle, Focusable as _, FontWeight,
     InteractiveElement as _, IntoElement, KeyBinding, MouseButton, ParentElement as _,
-    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task,
-    Window, div, prelude::FluentBuilder as _, px, relative, rems, rgb,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div,
+    prelude::FluentBuilder as _, px, relative, rems, rgb,
 };
 use gpui_component::{
     ActiveTheme as _, Colorize as _, Disableable as _, Icon, IconName, Selectable as _,
@@ -101,8 +101,8 @@ use super::model::{
 use super::setup_progress::SetupProgress;
 use super::{
     PrivateSwapsView, SWAP_BROADCASTER_REPUBLISH_INTERVAL, SWAP_BROADCASTER_RESPONSE_TIMEOUT,
-    SwapAction, SwapJobKind, SwapTracking, non_evm_amount, non_evm_token_icon, short_non_evm,
-    swap_delivery, swap_private_delivery, swap_sell_amount, swap_tokens,
+    SwapAction, SwapJobKind, SwapTracking, non_evm_amount, non_evm_token_icon, swap_delivery,
+    swap_private_delivery, swap_sell_amount, swap_tokens,
 };
 use crate::assets::{RailgunActionIcon, WalletIconSource};
 use crate::root::broadcaster_picker::{
@@ -112,10 +112,10 @@ use crate::root::broadcaster_picker::{
 };
 use crate::root::chain_load::ChainUtxoState;
 use crate::root::private_action::{
-    PrivateActionAssetSelectItem, RecipientOption, RecipientRules, UnshieldAsset,
-    fee_token_selector, form_recipient_picker, non_evm_recipient_options,
-    private_action_asset_select_items, recipient_suggestion_moved, recipient_suggestion_to_confirm,
-    recipient_suggestions_for_input, recipient_suggestions_toggled,
+    PrivateActionAssetSelectItem, RecipientOption, RecipientPickerState, RecipientRules,
+    UnshieldAsset, fee_token_selector, form_recipient_picker, non_evm_recipient_options,
+    private_action_asset_select_items, recipient_suggestion_to_confirm,
+    recipient_suggestions_for_input,
 };
 use crate::root::public_account::public_account_display_label;
 use crate::root::public_balances::{public_asset_icon_path, public_balance_amount_label};
@@ -1320,9 +1320,7 @@ pub(super) struct SwapForm {
     /// The Public address receiver as entered; the input's value is authoritative.
     receiver_input: Entity<InputState>,
     receiver_value: String,
-    receiver_suggestions_open: bool,
-    receiver_suggestion_index: Option<usize>,
-    receiver_suggestions_scroll: ScrollHandle,
+    receiver_picker: RecipientPickerState,
     /// The delivery the choices and the receiver give, or why there is none. Checked again
     /// when any of them, or the stealth account, changes. See [`Self::quote_delivery`] for the
     /// delivery a quote is requested for.
@@ -1777,15 +1775,6 @@ impl SwapForm {
 
     pub(super) fn set_error(&mut self, error: String) {
         self.error = Some(error);
-    }
-
-    /// Open or close the receiver suggestions, keeping the highlighted row in view.
-    fn set_receiver_suggestions(&mut self, (open, index): (bool, Option<usize>)) {
-        if let Some(index) = index {
-            self.receiver_suggestions_scroll.scroll_to_item(index);
-        }
-        self.receiver_suggestions_open = open;
-        self.receiver_suggestion_index = index;
     }
 }
 
@@ -3887,9 +3876,7 @@ impl PrivateSwapsView {
             receive_to,
             receiver_input,
             receiver_value: receiver,
-            receiver_suggestions_open: false,
-            receiver_suggestion_index: None,
-            receiver_suggestions_scroll: ScrollHandle::new(),
+            receiver_picker: RecipientPickerState::default(),
             delivery: Ok(SwapDelivery::Reshield),
             route: SetupRoute::default(),
             destination_route: SetupRoute::default(),
@@ -5108,7 +5095,7 @@ impl PrivateSwapsView {
         form.receive_to = receive_to;
         form.blocked_shield_delivery_changed();
         form.native_output = false;
-        form.set_receiver_suggestions((false, None));
+        form.receiver_picker.set((false, None));
         if let Some(wrapped) = unwrapped {
             match (receive_to, form.buy) {
                 (ReceiveTo::PrivateBalance, Some(Address::ZERO)) => form.buy = Some(wrapped),
@@ -5144,7 +5131,7 @@ impl PrivateSwapsView {
         }
         form.receiver_value = value;
         let suggestions = recipient_suggestions_for_input(rules, &options, &form.receiver_value);
-        form.set_receiver_suggestions(suggestions);
+        form.receiver_picker.set(suggestions);
         self.receiver_changed(window, cx);
     }
 
@@ -5158,7 +5145,7 @@ impl PrivateSwapsView {
         let Some(form) = self.form.as_mut() else {
             return;
         };
-        form.set_receiver_suggestions((false, None));
+        form.receiver_picker.set((false, None));
         if form.receiver_value == receiver {
             cx.notify();
             return;
@@ -5177,39 +5164,20 @@ impl PrivateSwapsView {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if let RecipientPickerEvent::Select(receiver) = event {
+            self.set_form_receiver(receiver, window, cx);
+            return;
+        }
         let (rules, options) = (self.receiver_rules(), self.receiver_options(cx));
         let Some(form) = self.form.as_mut() else {
             return;
         };
-        let suggestions = match event {
-            RecipientPickerEvent::Toggle => recipient_suggestions_toggled(
-                rules,
-                &options,
-                &form.receiver_value,
-                !form.receiver_suggestions_open,
-            ),
-            // Presses anywhere outside the picker dismiss it.
-            RecipientPickerEvent::Dismiss if !form.receiver_suggestions_open => return,
-            RecipientPickerEvent::Dismiss => (false, None),
-            RecipientPickerEvent::Move(direction) => {
-                let Some(suggestions) = recipient_suggestion_moved(
-                    rules,
-                    &options,
-                    &form.receiver_value,
-                    form.receiver_suggestion_index,
-                    *direction,
-                ) else {
-                    return;
-                };
-                suggestions
-            }
-            RecipientPickerEvent::Select(receiver) => {
-                self.set_form_receiver(receiver, window, cx);
-                return;
-            }
-        };
-        form.set_receiver_suggestions(suggestions);
-        cx.notify();
+        if form
+            .receiver_picker
+            .apply(rules, &options, &form.receiver_value, event)
+        {
+            cx.notify();
+        }
     }
 
     /// Enter in the receiver input picks the highlighted suggestion.
@@ -5217,7 +5185,7 @@ impl PrivateSwapsView {
         let Some(form) = self
             .form
             .as_ref()
-            .filter(|form| form.receiver_suggestions_open)
+            .filter(|form| form.receiver_picker.open())
         else {
             return;
         };
@@ -5225,7 +5193,7 @@ impl PrivateSwapsView {
             self.receiver_rules(),
             &self.receiver_options(cx),
             &form.receiver_value,
-            form.receiver_suggestion_index,
+            form.receiver_picker.index(),
         ) else {
             return;
         };
@@ -8816,7 +8784,7 @@ impl PrivateSwapsView {
             SwapDelivery::Bridge(delivery) => self.with_receiver_line(card, delivery.receiver, cx),
             SwapDelivery::NonEvmBridge(delivery) => {
                 let label = self.non_evm_receiver_label(delivery.network, &delivery.receiver, cx);
-                let short = short_non_evm(&delivery.receiver);
+                let short = railgun_ui::short_non_evm(&delivery.receiver);
                 card.with_short_receiver(delivery.receiver, short, label)
             }
         }
@@ -8856,7 +8824,7 @@ impl PrivateSwapsView {
         let label = self.non_evm_receiver_label(delivery.network, &delivery.receiver, cx);
         card.with_short_receiver(
             delivery.receiver.clone(),
-            short_non_evm(&delivery.receiver),
+            railgun_ui::short_non_evm(&delivery.receiver),
             label,
         )
     }
@@ -12525,9 +12493,9 @@ impl PrivateSwapsView {
             rules,
             &form.receiver_input,
             &form.receiver_value,
-            form.receiver_suggestions_open,
-            form.receiver_suggestion_index,
-            &form.receiver_suggestions_scroll,
+            form.receiver_picker.open(),
+            form.receiver_picker.index(),
+            form.receiver_picker.scroll(),
             &self.receiver_options(cx),
             !editable || self.is_retry(form),
             move |event, window, cx| {
@@ -14331,7 +14299,7 @@ fn non_evm_contract_row(delivery: &NonEvmDelivery) -> Option<SpendAuthorizationS
     let contract = delivery.contract.as_deref()?;
     Some(
         SpendAuthorizationSummaryRow::new(contract_label(delivery.network), contract)
-            .with_short_copyable(short_non_evm(contract)),
+            .with_short_copyable(railgun_ui::short_non_evm(contract)),
     )
 }
 
@@ -14363,7 +14331,7 @@ fn render_non_evm_contract(form: &SwapForm) -> Option<gpui::Div> {
                     .flex_none(),
             )
             .child(
-                app_muted_text(short_non_evm(&contract))
+                app_muted_text(railgun_ui::short_non_evm(&contract))
                     .text_xs()
                     .min_w_0()
                     .truncate()

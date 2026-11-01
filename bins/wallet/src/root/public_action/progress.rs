@@ -81,6 +81,27 @@ pub(in crate::root) const fn public_action_step_detail_for_context(
     }
 }
 
+/// `submitted_detail` replaces the detail of a pending step whose transaction was handed off.
+pub(in crate::root) fn public_action_step_state_detail<'a>(
+    step: &PublicActionStepState,
+    requires_device_approval: bool,
+    submitted_detail: Option<&'a str>,
+) -> &'a str {
+    match submitted_detail {
+        Some(detail)
+            if step.status == PublicActionStepStatus::Pending && step.tx_hash.is_some() =>
+        {
+            detail
+        }
+        _ => public_action_step_detail_for_context(
+            step.step,
+            step.status,
+            requires_device_approval,
+            step.tx_hash.is_some(),
+        ),
+    }
+}
+
 pub(in crate::root) fn public_action_error_summary(
     step: PublicActionProgressStep,
     details: Option<&str>,
@@ -305,7 +326,14 @@ pub(in crate::root) fn public_action_error_details(
     details: Option<&str>,
 ) -> Option<String> {
     let details = details?.trim();
-    if details.is_empty() || details == summary {
+    // Details that only restate the summary in other case or punctuation add nothing.
+    let words = |text: &str| -> String {
+        text.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    if details.is_empty() || words(details) == words(summary) {
         None
     } else {
         Some(details.to_string())

@@ -58,6 +58,8 @@ pub(super) use ui_fixture::tor_rotation as ui_fixture_tor_rotation;
 pub(super) use ui_fixture::unshield_asset as ui_fixture_unshield_asset;
 pub(super) use ui_fixture::utxo_finality_context as ui_fixture_utxo_finality_context;
 pub(super) use ui_fixture::utxo_rows as ui_fixture_utxo_rows;
+#[cfg(debug_assertions)]
+pub(super) use ui_fixture::{Tron as UiFixtureTron, tron as ui_fixture_tron};
 /// The debug UI fixture's queries in a release build, which has no fixture.
 #[cfg(not(debug_assertions))]
 mod ui_fixture {
@@ -862,7 +864,7 @@ impl Drop for PrivateSwapsView {
 
 impl WalletRoot {
     pub(super) fn ensure_private_swaps(&mut self, window: &Window, cx: &mut Context<'_, Self>) {
-        let origin_chain_id = self.selected_chain;
+        let origin_chain_id = self.last_evm_chain;
         let Some(chain) = self.effective_chain_configs.get(origin_chain_id) else {
             self.clear_private_swaps(cx);
             return;
@@ -980,7 +982,7 @@ impl WalletRoot {
         self.private_swaps
             .as_ref()
             .filter(|panel| {
-                panel.origin_chain_id == self.selected_chain
+                Some(panel.origin_chain_id) == self.selected_evm_chain()
                     && self.view_session.is_some()
                     && panel
                         .session
@@ -1019,7 +1021,7 @@ impl WalletRoot {
     pub(super) fn private_swap_profile(&self) -> Option<SwapProfile> {
         self.private_swaps_view()?;
         self.effective_chain_configs
-            .get(self.selected_chain)?
+            .get(self.last_evm_chain)?
             .swap_profile()
     }
 
@@ -1406,7 +1408,7 @@ impl PrivateSwapsView {
         self.active
             && self.root.upgrade().is_some_and(|root| {
                 let root = root.read(cx);
-                root.selected_chain == self.origin_chain_id
+                root.last_evm_chain == self.origin_chain_id
                     && root.view_session.is_some()
                     && self
                         .session
@@ -2768,7 +2770,7 @@ impl PrivateSwapsView {
             origin: form::network_name(self.origin_chain_id),
             receiver: self
                 .non_evm_receiver_label(delivery.network, &delivery.receiver, cx)
-                .unwrap_or_else(|| short_non_evm(&delivery.receiver)),
+                .unwrap_or_else(|| railgun_ui::short_non_evm(&delivery.receiver)),
             sent: order
                 .and_then(bridge_sent_amount)
                 .map(|amount| self.token_amount(buy, amount, cx)),
@@ -4523,21 +4525,6 @@ pub(super) fn non_evm_token_icon(
 pub(super) fn short_receiver(receiver: Address) -> String {
     let checksummed = receiver.to_checksum(None);
     format!("{}…{}", &checksummed[..6], &checksummed[38..])
-}
-
-/// "bc1qar…5mdq": a non-EVM receiver, mint or contract, shortened as addresses are. It comes
-/// from the user or 1Click's list, so it is cut by characters.
-pub(super) fn short_non_evm(text: &str) -> String {
-    let chars = text.chars().collect::<Vec<_>>();
-    if chars.len() <= 12 {
-        return text.to_owned();
-    }
-    let (head, tail) = (&chars[..6], &chars[chars.len() - 4..]);
-    format!(
-        "{}…{}",
-        head.iter().collect::<String>(),
-        tail.iter().collect::<String>()
-    )
 }
 
 /// Local wall-clock time of a Unix timestamp, such as "14:32".

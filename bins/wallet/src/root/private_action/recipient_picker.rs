@@ -416,6 +416,68 @@ pub(in crate::root) fn form_recipient_picker(
         })
 }
 
+/// The suggestion list of a [`form_recipient_picker`]: whether it is open, which row is
+/// highlighted, and its scroll.
+#[derive(Default)]
+pub(in crate::root) struct RecipientPickerState {
+    open: bool,
+    index: Option<usize>,
+    scroll: ScrollHandle,
+}
+
+impl RecipientPickerState {
+    pub(in crate::root) const fn open(&self) -> bool {
+        self.open
+    }
+
+    pub(in crate::root) const fn index(&self) -> Option<usize> {
+        self.index
+    }
+
+    pub(in crate::root) const fn scroll(&self) -> &ScrollHandle {
+        &self.scroll
+    }
+
+    /// Open or close the list, keeping the highlighted row in view.
+    pub(in crate::root) fn set(&mut self, (open, index): (bool, Option<usize>)) {
+        if let Some(index) = index {
+            self.scroll.scroll_to_item(index);
+        }
+        self.open = open;
+        self.index = index;
+    }
+
+    /// Apply a Toggle, Dismiss or Move from the picker. Returns whether the caller should
+    /// redraw. The owner handles `Select` itself, so it returns false here.
+    pub(in crate::root) fn apply(
+        &mut self,
+        rules: RecipientRules,
+        options: &[RecipientOption],
+        query: &str,
+        event: &RecipientPickerEvent,
+    ) -> bool {
+        let suggestions = match event {
+            RecipientPickerEvent::Toggle => {
+                recipient_suggestions_toggled(rules, options, query, !self.open)
+            }
+            // Presses anywhere outside the picker dismiss it.
+            RecipientPickerEvent::Dismiss if !self.open => return false,
+            RecipientPickerEvent::Dismiss => (false, None),
+            RecipientPickerEvent::Move(direction) => {
+                let Some(suggestions) =
+                    recipient_suggestion_moved(rules, options, query, self.index, *direction)
+                else {
+                    return false;
+                };
+                suggestions
+            }
+            RecipientPickerEvent::Select(_) => return false,
+        };
+        self.set(suggestions);
+        true
+    }
+}
+
 impl WalletRoot {
     /// Forget the loaded private, public and non-EVM address books.
     pub(in crate::root) fn clear_address_books(&mut self) {
@@ -479,7 +541,7 @@ impl WalletRoot {
         private_unshield_recipient_options(
             &self.public_accounts,
             &self.public_address_book,
-            self.selected_chain,
+            self.last_evm_chain,
         )
     }
 

@@ -344,7 +344,7 @@ impl WalletRoot {
         let mut content = div().w_full().min_w(px(0.0)).flex().flex_col().gap_2();
         match &request.parsed {
             WalletConnectParsedRequest::WalletSwitchEthereumChain { chain_id } => {
-                let description = if self.selected_chain == *chain_id {
+                let description = if self.last_evm_chain == *chain_id {
                     "Switch this website to your wallet's current network."
                 } else {
                     "Switch the network for this website and your wallet."
@@ -657,7 +657,7 @@ impl WalletRoot {
             .ok_or("The request chain is not available in the current wallet settings.")?;
         Ok(WalletConnectIntentContext {
             chain,
-            selected_chain_id: self.selected_chain,
+            selected_chain_id: self.last_evm_chain,
             token_registry: &self.effective_token_registry,
             anchor_rates: &self.public_broadcaster_anchor_cache,
             public_accounts: &self.public_accounts,

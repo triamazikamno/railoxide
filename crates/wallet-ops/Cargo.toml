@@ -46,6 +46,7 @@ hmac = { workspace = true }
 hidapi-rusb = { workspace = true, optional = true }
 libc = "0.2"
 libp2p = { workspace = true }
+prost = "0.14"
 rand = { workspace = true }
 reqwest = { workspace = true }
 reqwest-websocket = { workspace = true }

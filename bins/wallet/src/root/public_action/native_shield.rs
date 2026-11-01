@@ -160,7 +160,7 @@ impl WalletRoot {
             return None;
         }
         let (_, payer) = self.selected_native_shield_payer()?;
-        let chain = self.effective_chain_configs.get(self.selected_chain)?;
+        let chain = self.effective_chain_configs.get(self.last_evm_chain)?;
         // The fee model is the chain's, whichever profile the quote was taken for.
         let observed_fee_model = self
             .public_form
@@ -168,7 +168,7 @@ impl WalletRoot {
             .quote
             .and_then(|quote| quote.observed_fee_model);
         Some(select_native_shield_route(
-            self.selected_chain,
+            self.last_evm_chain,
             chain,
             payer,
             profile,
@@ -232,7 +232,7 @@ impl WalletRoot {
         }
         self.selected_public_account()?;
         let decimals = public_asset_decimals(
-            self.effective_chain_configs.get(self.selected_chain),
+            self.effective_chain_configs.get(self.last_evm_chain),
             PublicAssetId::Native,
             Some(&self.effective_token_registry),
         );
@@ -248,7 +248,7 @@ impl WalletRoot {
         .filter(|amount| !amount.is_zero())?;
         Some(NativeShieldKey {
             wallet_id: self.selected_wallet_id.clone(),
-            chain_id: self.selected_chain,
+            chain_id: self.last_evm_chain,
             public_account_uuid: self.public_form.selected_account_uuid.clone()?,
             profile: self.public_shield_profile(),
             amount,
@@ -284,10 +284,10 @@ impl WalletRoot {
         let (payer_address, payer) = self.selected_native_shield_payer()?;
         let account = self.public_form.selected_account_uuid.clone()?;
         Some(NativeShieldTarget {
-            chain_id: self.selected_chain,
+            chain_id: self.last_evm_chain,
             effective_chain: self
                 .effective_chain_configs
-                .enabled(self.selected_chain)
+                .enabled(self.last_evm_chain)
                 .ok()?
                 .clone(),
             profile: self.public_shield_profile(),
@@ -402,7 +402,7 @@ impl WalletRoot {
             }
         };
         let wallet_id = self.selected_wallet_id.clone();
-        let chain_id = self.selected_chain;
+        let chain_id = self.last_evm_chain;
         let generation = self.public_form.native_shield_preparation.begin();
         self.set_public_action_error(mode, None);
         let join = self
@@ -418,7 +418,7 @@ impl WalletRoot {
                     || !root.native_shield_stealth_applies(mode)
                     || root.public_shield_profile() != profile
                     || root.selected_wallet_id != wallet_id
-                    || root.selected_chain != chain_id
+                    || root.last_evm_chain != chain_id
                     || root.public_form.selected_account_uuid.as_deref()
                         != Some(public_account_uuid.as_ref())
                 {
@@ -588,12 +588,12 @@ impl WalletRoot {
             PublicActionMode::Shield,
             states,
             public_asset_label(
-                self.effective_chain_configs.get(self.selected_chain),
+                self.effective_chain_configs.get(self.last_evm_chain),
                 asset,
                 Some(&self.effective_token_registry),
             ),
             public_asset_icon_path(
-                self.selected_chain,
+                self.last_evm_chain,
                 asset,
                 Some(&self.effective_token_registry),
             ),

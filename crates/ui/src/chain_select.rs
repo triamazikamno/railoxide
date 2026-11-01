@@ -59,6 +59,94 @@ impl SelectItem for ChainSelectItem {
     }
 }
 
+/// A network the header selector offers. Tron is not an EVM chain and has no EVM chain id, so a
+/// custom EVM chain that reuses Tron's id stays a separate choice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Network {
+    Evm(u64),
+    Tron,
+}
+
+impl Network {
+    /// The EVM chain id, or `None` for Tron.
+    #[must_use]
+    pub const fn evm_chain_id(self) -> Option<u64> {
+        match self {
+            Self::Evm(chain_id) => Some(chain_id),
+            Self::Tron => None,
+        }
+    }
+}
+
+/// A choice in the header's network selector: an EVM chain, or Tron.
+#[derive(Clone)]
+pub struct NetworkSelectItem {
+    pub network: Network,
+    pub label: SharedString,
+}
+
+impl NetworkSelectItem {
+    const fn icon_path(&self) -> Option<&'static str> {
+        match self.network {
+            Network::Evm(chain_id) => railgun_ui::chain_icon_asset_path(chain_id),
+            Network::Tron => Some(railgun_ui::TRON_ICON_ASSET_PATH),
+        }
+    }
+}
+
+impl SelectItem for NetworkSelectItem {
+    type Value = Network;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn display_title(&self) -> Option<AnyElement> {
+        Some(
+            crate::wallet_identity::chain_label_row(self.label.clone(), self.icon_path())
+                .into_any_element(),
+        )
+    }
+
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        let network = self.network;
+        crate::wallet_identity::chain_label_row(self.label.clone(), self.icon_path())
+            .debug_selector(move || match network {
+                Network::Evm(chain_id) => format!("chain-option-{chain_id}"),
+                Network::Tron => "chain-option-tron".to_owned(),
+            })
+    }
+
+    fn value(&self) -> &Network {
+        &self.network
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        self.label.to_lowercase().contains(&query.to_lowercase())
+            || self
+                .evm_chain_id()
+                .is_some_and(|chain_id| chain_id.to_string().contains(query))
+    }
+}
+
+/// An item a chain selector can list.
+pub trait ChainChoice: SelectItem + 'static {
+    /// The EVM chain id, or `None` for Tron.
+    fn evm_chain_id(&self) -> Option<u64>;
+}
+
+impl ChainChoice for ChainSelectItem {
+    fn evm_chain_id(&self) -> Option<u64> {
+        Some(self.chain_id)
+    }
+}
+
+impl ChainChoice for NetworkSelectItem {
+    fn evm_chain_id(&self) -> Option<u64> {
+        self.network.evm_chain_id()
+    }
+}
+
 /// Where the network selector lists a chain: the Railgun chains first, then the public-only
 /// ones, each group in preset order and then by chain id.
 #[must_use]
@@ -72,17 +160,25 @@ pub fn chain_select_order(chain_id: u64) -> (bool, usize, u64) {
     )
 }
 
-pub struct ChainSelectItems(SearchableVec<SearchableGroup<ChainSelectItem>>);
+pub struct ChainSelectItems<T: ChainChoice = ChainSelectItem>(SearchableVec<SearchableGroup<T>>);
 
-impl ChainSelectItems {
+impl<T: ChainChoice> ChainSelectItems<T> {
     #[must_use]
-    pub fn new(mut items: Vec<ChainSelectItem>) -> Self {
-        items.sort_by_key(|item| chain_select_order(item.chain_id));
-        // The divider separates Railgun chains from public-only ones, preset or custom.
-        let groups: (Vec<_>, Vec<_>) = items
-            .into_iter()
-            .partition(|item| railgun_ui::DEFAULT_CHAINS.contains(&item.chain_id));
-        let groups: [Vec<_>; 2] = groups.into();
+    pub fn new(mut items: Vec<T>) -> Self {
+        items.sort_by_key(|item| {
+            let chain_id = item.evm_chain_id();
+            (chain_id.is_none(), chain_id.map(chain_select_order))
+        });
+        // Dividers separate Railgun chains, public-only ones (preset or custom) and Tron.
+        let mut groups: [Vec<T>; 3] = Default::default();
+        for item in items {
+            let group = match item.evm_chain_id() {
+                Some(chain_id) if railgun_ui::DEFAULT_CHAINS.contains(&chain_id) => 0,
+                Some(_) => 1,
+                None => 2,
+            };
+            groups[group].push(item);
+        }
         let groups = groups
             .into_iter()
             .filter(|items| !items.is_empty())
@@ -92,8 +188,8 @@ impl ChainSelectItems {
     }
 }
 
-impl SelectDelegate for ChainSelectItems {
-    type Item = ChainSelectItem;
+impl<T: ChainChoice> SelectDelegate for ChainSelectItems<T> {
+    type Item = T;
 
     fn sections_count(&self, cx: &App) -> usize {
         self.0.sections_count(cx)
@@ -127,11 +223,12 @@ impl SelectDelegate for ChainSelectItems {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
-        let chain_id = item.chain_id;
+        // Tron has no chain settings to edit.
+        let chain_id = item.evm_chain_id()?;
         if !window.is_action_available(&EditChain { chain_id }, cx) {
             return None;
         }
-        let label = SharedString::from(format!("Edit {}", item.label));
+        let label = SharedString::from(format!("Edit {}", item.title()));
         Some(
             div()
                 .group("chain-select-row")
@@ -203,19 +300,21 @@ impl SelectDelegate for ChainSelectItems {
     }
 }
 
-pub fn chain_select_state(
-    items: Vec<ChainSelectItem>,
-    selected: Option<u64>,
+pub fn chain_select_state<T: ChainChoice>(
+    items: Vec<T>,
+    selected: Option<T::Value>,
     window: &mut Window,
-    cx: &mut Context<'_, SelectState<ChainSelectItems>>,
-) -> SelectState<ChainSelectItems> {
+    cx: &mut Context<'_, SelectState<ChainSelectItems<T>>>,
+) -> SelectState<ChainSelectItems<T>> {
     let items = ChainSelectItems::new(items);
     let selected = selected.and_then(|id| items.position(&id));
     SelectState::new(items, selected, window, cx).searchable(true)
 }
 
 #[must_use]
-pub fn chain_select(state: &Entity<SelectState<ChainSelectItems>>) -> Select<ChainSelectItems> {
+pub fn chain_select<T: ChainChoice>(
+    state: &Entity<SelectState<ChainSelectItems<T>>>,
+) -> Select<ChainSelectItems<T>> {
     Select::new(state)
         .accessibility_label("Network")
         .search_placeholder("Search networks")
@@ -267,6 +366,37 @@ mod tests {
             assert_eq!(
                 choices.position(&LARGE_CHAIN),
                 Some(IndexPath::new(1).section(1))
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn tron_follows_every_evm_chain_and_keeps_apart_from_its_chain_id(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let cx = cx.add_empty_window();
+        cx.update(|_, cx| {
+            let item = |network, label: &'static str| NetworkSelectItem {
+                network,
+                label: label.into(),
+            };
+            let choices = ChainSelectItems::new(vec![
+                item(Network::Tron, "Tron"),
+                item(Network::Evm(LARGE_CHAIN), "Custom"),
+                item(Network::Evm(railgun_ui::TRON_CHAIN_ID), "Saved custom"),
+                item(Network::Evm(1), "Ethereum"),
+            ]);
+            assert_eq!(choices.sections_count(cx), 3);
+            assert_eq!(
+                choices.position(&Network::Evm(railgun_ui::TRON_CHAIN_ID)),
+                Some(IndexPath::new(0).section(1))
+            );
+            assert_eq!(
+                choices.position(&Network::Evm(LARGE_CHAIN)),
+                Some(IndexPath::new(1).section(1))
+            );
+            assert_eq!(
+                choices.position(&Network::Tron),
+                Some(IndexPath::new(0).section(2))
             );
         });
     }

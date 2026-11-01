@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 alloy = { workspace = true }
+async-trait = { workspace = true }
 chrono = { workspace = true }
 directories = "6"
 eyre = { workspace = true }

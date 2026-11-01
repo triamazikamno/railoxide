@@ -927,18 +927,58 @@ impl PublicAccountMetadata {
 
     #[must_use]
     pub fn is_scoped_to_wallet(&self, wallet_uuid: &str) -> bool {
-        match &self.scope {
-            PublicAccountScope::PrivateWallet {
-                wallet_uuid: scoped,
-            } => scoped == wallet_uuid,
-            PublicAccountScope::Global => true,
-        }
+        self.scope.includes_wallet(wallet_uuid)
     }
 
     #[must_use]
     pub const fn is_global(&self) -> bool {
         matches!(self.scope, PublicAccountScope::Global)
     }
+}
+
+impl PublicAccountScope {
+    #[must_use]
+    pub fn includes_wallet(&self, wallet_uuid: &str) -> bool {
+        match self {
+            Self::PrivateWallet {
+                wallet_uuid: scoped,
+            } => scoped == wallet_uuid,
+            Self::Global => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TronAccountSource {
+    /// From the wallet's software seed at `m/44'/195'/0'/0/{index}`.
+    Derived { index: u32 },
+    /// From a key held in a `RecordKind::TronAccountSecret` record.
+    Imported,
+    /// From a hardware-derived wallet's synthetic seed at `m/44'/195'/0'/0/{index}`.
+    HardwareDerived { index: u32 },
+}
+
+impl TronAccountSource {
+    #[must_use]
+    pub const fn derivation_index(self) -> Option<u32> {
+        match self {
+            Self::Derived { index } | Self::HardwareDerived { index } => Some(index),
+            Self::Imported => None,
+        }
+    }
+}
+
+/// A Public Tron account, stored apart from `PublicAccountMetadata` so that no EVM listing
+/// returns it. `address` is the 20 bytes after Tron's `0x41` version byte.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TronAccountMetadata {
+    pub tron_account_uuid: String,
+    pub address: Address,
+    pub label: Option<String>,
+    pub source: TronAccountSource,
+    pub scope: PublicAccountScope,
+    pub status: PublicAccountStatus,
+    pub display_order: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

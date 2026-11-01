@@ -18,6 +18,8 @@ use alloy::primitives::{Address, address};
 use ruint::aliases::U256;
 use ruint::uint;
 
+use crate::chains::TRON_CHAIN_ID;
+
 static TOKEN_ICON_DIR: LazyLock<PathBuf> =
     LazyLock::new(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/tokens"));
 
@@ -392,6 +394,8 @@ const POLYGON_POL_USD_FEED: Address = address!("0xAB594600376Ec9fD91F8e885dADF0C
 const WORLDCHAIN_ETH_USD_FEED: Address = address!("0x9d5d754a6397c01795Aaa8BBA565FEB99a4cEA6d");
 /// `HyperEVM` (999) Chainlink-compatible `HYPE / USD (same proxy as the chain preset's native oracle)`.
 const HYPEREVM_HYPE_USD_FEED: Address = address!("0xa8a94Da411425634e3Ed6C331a32ab4fd774aa43");
+/// Tron (728126428) Chainlink `TRX / USD` (`feeds-tron-mainnet.json`, checked 2026-10-31).
+const TRON_TRX_USD_FEED: Address = address!("0x175fa5B93CA066D9Acd2E4c9Bf68c50865713C4b");
 
 /// Chain id, token address, symbol, decimals, fee anchors, icon.
 type TokenRow = (
@@ -706,6 +710,11 @@ const TOKENS: &[TokenRow] = &[
     (999, address!("0xD6Eb81136884713E843936843E286FD2a85A205A"), "PENDLE", 18, NO_ANCHORS, TokenIcon::None),
     (999, address!("0x5555555555555555555555555555555555555555"), "WHYPE", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::None),
     (999, address!("0x9b498C3c8A0b8CD8BA1D9851d40D186F1872b44E"), "PURR", 18, NO_ANCHORS, TokenIcon::None),
+    // Tron (728126428), not an EVM chain. Addresses are the 20 bytes after Tron's 0x41 prefix.
+    (TRON_CHAIN_ID, address!("0xa614f803b6fd780986a42c78ec9c7f77e6ded13c"), "USDT", 6, &[feed(TRON_TRX_USD_FEED, 8, 6, false)], TokenIcon::Shared("1-0xdac17f958d2ee523a2206206994597c13d831ec7.png")),
+    (TRON_CHAIN_ID, address!("0xe91a7411e56ce79e83570570f49b9fc35b7727c5"), "USDD", 18, &[feed(TRON_TRX_USD_FEED, 8, 18, false)], TokenIcon::None),
+    (TRON_CHAIN_ID, address!("0x91bed8e784249c91611e61c4585c40e21fd0ace2"), "USD1", 18, &[feed(TRON_TRX_USD_FEED, 8, 18, false)], TokenIcon::Shared("1-0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d.png")),
+    (TRON_CHAIN_ID, address!("0x891cdb91d149f23b1a45d9c5ca78a88d0cb44c18"), "WTRX", 6, &[TokenAnchorSource::Fixed { token_fee_per_unit_gas: uint!(1_000_000_U256) }], TokenIcon::None),
 ];
 
 #[must_use]
@@ -759,7 +768,7 @@ pub fn token_icon_asset_path(chain_id: u64, addr: &Address) -> Option<String> {
 }
 
 /// The icon of a known token with exactly `symbol`, for a token outside the registry such as
-/// USDT on Tron: the Ethereum token's, otherwise the first known one's that ships an icon.
+/// USDC on Solana: the Ethereum token's, otherwise the first known one's that ships an icon.
 /// `None` for a symbol no known token has.
 #[must_use]
 pub fn symbol_token_icon_asset_path(symbol: &str) -> Option<String> {
@@ -971,6 +980,22 @@ fn format_usd_dollars(dollars: U256) -> String {
 pub fn short_address(addr: &Address) -> String {
     let hex = format!("{addr:#x}");
     format!("{}…{}", &hex[..6], &hex[38..])
+}
+
+/// Shorten a non-EVM address, transaction id or contract as `short_address` does, to
+/// `"bc1qar…5mdq"`. It may be arbitrary user text, so it is cut by characters.
+#[must_use]
+pub fn short_non_evm(text: &str) -> String {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.len() <= 12 {
+        return text.to_owned();
+    }
+    let (head, tail) = (&chars[..6], &chars[chars.len() - 4..]);
+    format!(
+        "{}…{}",
+        head.iter().collect::<String>(),
+        tail.iter().collect::<String>()
+    )
 }
 
 /// Format a broadcaster Railgun address the same way across wallet and monitor
@@ -1240,6 +1265,46 @@ mod tests {
         // Same chain_id with a different address should miss.
         let bogus = address!("0x0000000000000000000000000000000000000001");
         assert!(lookup_token(42161, &bogus).is_none());
+    }
+
+    #[test]
+    fn tron_registry_lists_its_four_tokens() {
+        let symbols = known_tokens_for_chain(TRON_CHAIN_ID)
+            .map(|token| token.symbol)
+            .collect::<Vec<_>>();
+        assert_eq!(symbols, ["USDT", "USDD", "USD1", "WTRX"]);
+        let usdt = lookup_token(
+            TRON_CHAIN_ID,
+            &address!("0xa614f803b6fd780986a42c78ec9c7f77e6ded13c"),
+        )
+        .expect("Tron USDT is known");
+        assert_eq!(usdt.decimals, 6);
+        assert!(!crate::chains::is_built_in_chain(TRON_CHAIN_ID));
+
+        // WTRX is 1:1 with 6-decimal TRX, so its anchor is one whole TRX in raw units.
+        let wtrx = lookup_token(
+            TRON_CHAIN_ID,
+            &address!("0x891cdb91d149f23b1a45d9c5ca78a88d0cb44c18"),
+        )
+        .expect("Tron WTRX is known");
+        let [
+            TokenAnchorSource::Fixed {
+                token_fee_per_unit_gas,
+            },
+        ] = wtrx.anchor_sources
+        else {
+            panic!("WTRX has one fixed anchor");
+        };
+        let trx_usd_micro = uint!(250_000_U256);
+        let one_trx = uint!(1_000_000_U256);
+        assert_eq!(
+            token_usd_micro_value(one_trx, *token_fee_per_unit_gas, trx_usd_micro),
+            native_usd_micro_value(one_trx, trx_usd_micro, 6),
+        );
+        assert_eq!(
+            native_usd_micro_value(one_trx, trx_usd_micro, 6),
+            Some(trx_usd_micro)
+        );
     }
 
     #[test]

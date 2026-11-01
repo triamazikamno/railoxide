@@ -26,6 +26,7 @@ use railgun_ui::chain_editor::{
     NativeUsdProbe, NativeUsdState, NativeUsdStatus, RpcEndpointDraft,
 };
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 /// Secondary text metrics shared by meta lines, section headers and field labels.
 const META_TEXT_SIZE: Pixels = px(12.0);
@@ -339,62 +340,13 @@ impl ChainEditor {
         // A host commit while the dialog is open makes this draft stale; don't stamp it.
         let revision = self.snapshot.revision.clone();
         let ok_text = self.save_label(&draft, cx);
-        let (title, body) = match count {
-            0 => ("Submit through a direct endpoint?".to_owned(), None),
-            1 => (
-                "Bypass Tor for this endpoint?".to_owned(),
-                Some(
-                    "This endpoint will see your IP address and every request sent to it, \
-                     including public balance reads that are otherwise isolated per account.",
-                ),
-            ),
-            _ => (
-                format!("Bypass Tor for {count} endpoints?"),
-                Some(
-                    "These endpoints will see your IP address and every request sent to them, \
-                     including public balance reads that are otherwise isolated per account.",
-                ),
-            ),
-        };
-        let submit_body = (submitting > 0).then_some(
-            "Transactions sent through a direct endpoint with Submit on are announced to the \
-             network from that node's IP address. Submit there only if that address can't be \
-             linked to you.",
-        );
-        window.open_alert_dialog(cx, move |dialog, _, _| {
-            let editor = editor.clone();
+        confirm_direct_endpoints(window, cx, count, submitting > 0, ok_text, move |cx| {
             let command = command.clone();
-            let revision = revision.clone();
-            dialog
-                .width(CONFIRM_DIALOG_WIDTH)
-                .title(app_strong_text(title.clone()))
-                .children(body.map(|body| {
-                    app_muted_text(body)
-                        .debug_selector(|| "chain-direct-confirm".into())
-                        .whitespace_normal()
-                }))
-                .children(submit_body.map(|body| {
-                    app_muted_text(body)
-                        .debug_selector(|| "chain-submit-direct-confirm".into())
-                        .whitespace_normal()
-                }))
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text(ok_text)
-                        .ok_variant(ButtonVariant::Primary)
-                        .cancel_variant(ButtonVariant::Secondary),
-                )
-                // After button_props, which would otherwise replace the Cancel flag.
-                .confirm()
-                .on_ok(move |_, _, cx| {
-                    let command = command.clone();
-                    editor.update(cx, |this, cx| {
-                        if this.snapshot.revision == revision {
-                            this.send(command, cx);
-                        }
-                    });
-                    true
-                })
+            editor.update(cx, |this, cx| {
+                if this.snapshot.revision == revision {
+                    this.send(command, cx);
+                }
+            });
         });
     }
 
@@ -1107,33 +1059,15 @@ impl ChainEditor {
             let flags = EndpointFlag::ALL.iter().fold(
                 div().flex().flex_none().items_center().gap_1(),
                 |group, &flag| {
-                    let on = flag.get(endpoint);
-                    let selector = format!("chain-endpoint-{index}-{}", flag.key());
-                    group.child(
-                        row_icon_button(
-                            SharedString::from(selector.clone()),
-                            flag.icon(),
-                            flag.label().into(),
-                            self.pending,
-                            cx.listener(move |this, _, _, cx| {
-                                this.toggle_endpoint_flag(index, flag, cx);
-                            }),
-                        )
-                        .selected(on)
-                        .toggled(on)
-                        // The ghost hover alone can't tell on from off.
-                        .when(!self.pending, |button| {
-                            button
-                                .when(on, |button| button.bg(rgb(theme::SURFACE_HOVER)))
-                                .text_color(rgb(if on {
-                                    theme::PRIMARY
-                                } else {
-                                    theme::TEXT_SUBTLE
-                                }))
-                        })
-                        .tooltip(flag.tooltip())
-                        .debug_selector(move || selector),
-                    )
+                    group.child(endpoint_flag_button(
+                        format!("chain-endpoint-{index}-{}", flag.key()),
+                        flag,
+                        flag.get(endpoint),
+                        self.pending,
+                        cx.listener(move |this, _, _, cx| {
+                            this.toggle_endpoint_flag(index, flag, cx);
+                        }),
+                    ))
                 },
             );
             list = list.child(
@@ -1819,13 +1753,16 @@ fn row_icon_button(
         .on_click(on_click)
 }
 
-fn move_row<T>(rows: &mut [T], index: usize, up: bool) {
+/// Swaps a row with its neighbour, and does nothing when either index is out of range.
+pub fn move_row<T>(rows: &mut [T], index: usize, up: bool) {
     let target = if up {
         index.checked_sub(1)
     } else {
         index.checked_add(1)
     };
-    if let Some(target) = target.filter(|target| *target < rows.len()) {
+    if let Some(target) = target.filter(|target| *target < rows.len())
+        && index < rows.len()
+    {
         rows.swap(index, target);
     }
 }
@@ -1849,9 +1786,100 @@ fn newly_flagged(
         .count()
 }
 
+/// One endpoint flag toggle, as EVM chain and Tron endpoint rows show it.
+#[must_use]
+pub fn endpoint_flag_button(
+    id: impl Into<SharedString>,
+    flag: EndpointFlag,
+    on: bool,
+    disabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Button {
+    let id = id.into();
+    let selector = id.to_string();
+    row_icon_button(id, flag.icon(), flag.label().into(), disabled, on_click)
+        .selected(on)
+        .toggled(on)
+        // The ghost hover alone can't tell on from off.
+        .when(!disabled, |button| {
+            button
+                .when(on, |button| button.bg(rgb(theme::SURFACE_HOVER)))
+                .text_color(rgb(if on {
+                    theme::PRIMARY
+                } else {
+                    theme::TEXT_SUBTLE
+                }))
+        })
+        .tooltip(flag.tooltip())
+        .debug_selector(move || selector)
+}
+
+/// Asks before endpoints bypass Tor or submit from a direct node. `direct` counts endpoints
+/// newly reached directly; `submitting` is whether one newly submits through a direct endpoint.
+pub fn confirm_direct_endpoints(
+    window: &mut Window,
+    cx: &mut App,
+    direct: usize,
+    submitting: bool,
+    ok_text: &'static str,
+    on_ok: impl Fn(&mut App) + 'static,
+) {
+    let (title, body) = match direct {
+        0 => ("Submit through a direct endpoint?".to_owned(), None),
+        1 => (
+            "Bypass Tor for this endpoint?".to_owned(),
+            Some(
+                "This endpoint will see your IP address and every request sent to it, \
+                 including public balance reads that are otherwise isolated per account.",
+            ),
+        ),
+        _ => (
+            format!("Bypass Tor for {direct} endpoints?"),
+            Some(
+                "These endpoints will see your IP address and every request sent to them, \
+                 including public balance reads that are otherwise isolated per account.",
+            ),
+        ),
+    };
+    let submit_body = submitting.then_some(
+        "Transactions sent through a direct endpoint with Submit on are announced to the \
+         network from that node's IP address. Submit there only if that address can't be \
+         linked to you.",
+    );
+    let on_ok = Rc::new(on_ok);
+    window.open_alert_dialog(cx, move |dialog, _, _| {
+        let on_ok = on_ok.clone();
+        dialog
+            .width(CONFIRM_DIALOG_WIDTH)
+            .title(app_strong_text(title.clone()))
+            .children(body.map(|body| {
+                app_muted_text(body)
+                    .debug_selector(|| "chain-direct-confirm".into())
+                    .whitespace_normal()
+            }))
+            .children(submit_body.map(|body| {
+                app_muted_text(body)
+                    .debug_selector(|| "chain-submit-direct-confirm".into())
+                    .whitespace_normal()
+            }))
+            .button_props(
+                DialogButtonProps::default()
+                    .ok_text(ok_text)
+                    .ok_variant(ButtonVariant::Primary)
+                    .cancel_variant(ButtonVariant::Secondary),
+            )
+            // After button_props, which would otherwise replace the Cancel flag.
+            .confirm()
+            .on_ok(move |_, _, cx| {
+                on_ok(cx);
+                true
+            })
+    });
+}
+
 /// One endpoint row toggle. Direct is the transport; the others are the accepted traffic.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum EndpointFlag {
+pub enum EndpointFlag {
     Direct,
     General,
     Sensitive,
@@ -1859,7 +1887,7 @@ enum EndpointFlag {
 }
 
 impl EndpointFlag {
-    const ALL: [Self; 4] = [Self::Direct, Self::General, Self::Sensitive, Self::Submit];
+    pub const ALL: [Self; 4] = [Self::Direct, Self::General, Self::Sensitive, Self::Submit];
 
     const fn get(self, endpoint: &RpcEndpointDraft) -> bool {
         match self {
@@ -1870,7 +1898,8 @@ impl EndpointFlag {
         }
     }
 
-    const fn key(self) -> &'static str {
+    #[must_use]
+    pub const fn key(self) -> &'static str {
         match self {
             Self::Direct => "direct",
             Self::General => "general",

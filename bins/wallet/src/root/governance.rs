@@ -2369,7 +2369,7 @@ impl WalletRoot {
             .collect();
         GovernanceContextKey {
             wallet_id: self.selected_wallet_id.as_ref().map(ToString::to_string),
-            chain_id: self.selected_chain,
+            chain_id: self.last_evm_chain,
             participants,
         }
     }
@@ -2628,13 +2628,15 @@ impl WalletRoot {
         {
             return;
         }
+        let Some(chain_id) = self.selected_evm_chain() else {
+            return;
+        };
         let context_key = self.governance_context_key();
         let gas_fee = &mut self.governance.reward_gas_fee;
         gas_fee.refresh_id = gas_fee.refresh_id.wrapping_add(1);
         gas_fee.refreshing = true;
         gas_fee.quote_error = None;
         let refresh_id = gas_fee.refresh_id;
-        let chain_id = self.selected_chain;
         let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
             return;
         };
@@ -2723,7 +2725,9 @@ impl WalletRoot {
         let StakingActionKind::RewardClaimSelected { tokens } = selection.kind else {
             return;
         };
-        let chain_id = self.selected_chain;
+        let Some(chain_id) = self.selected_evm_chain() else {
+            return;
+        };
         let context_key = self.governance_context_key();
         let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
             return;
@@ -2922,7 +2926,9 @@ impl WalletRoot {
             cx.notify();
             return;
         };
-        let chain_id = self.selected_chain;
+        let Some(chain_id) = self.selected_evm_chain() else {
+            return;
+        };
         let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
             return;
         };
@@ -3183,7 +3189,7 @@ impl WalletRoot {
             })
             .await;
             let _ = this.update_in(cx, |root, window, cx| {
-                if root.selected_chain != context.chain_id
+                if root.selected_evm_chain() != Some(context.chain_id)
                     || root.selected_wallet_id.as_deref()
                         != Some(context.private_wallet_uuid.as_str())
                     || root.governance_context_key() != context_key
@@ -3457,7 +3463,7 @@ impl WalletRoot {
     }
 
     pub(super) fn start_staking_refresh(&mut self, cx: &mut Context<'_, Self>) {
-        if self.governance.tab != GovernanceTab::Staking {
+        if self.governance.tab != GovernanceTab::Staking || self.selected_evm_chain().is_none() {
             return;
         }
         self.clean_governance_participants();
@@ -3970,7 +3976,11 @@ impl WalletRoot {
             staking_account_header_compact(table_available_width, table_layout.compact);
         let state = &self.governance.staking;
         let table_horizontal_scrollbar = table_available_width < STAKING_TABLE_MIN_WIDTH;
-        if governance_contracts(self.selected_chain).is_none() {
+        if self
+            .selected_evm_chain()
+            .and_then(governance_contracts)
+            .is_none()
+        {
             return content
                 .child(app_status_tag(
                     "Staking is not deployed on this chain",
@@ -4011,7 +4021,7 @@ impl WalletRoot {
             _ => {}
         }
         if let Some(metrics) = state.metrics.as_ref() {
-            let token = governance_contracts(self.selected_chain)
+            let token = governance_contracts(self.last_evm_chain)
                 .map_or(Address::ZERO, |contracts| contracts.governance_token);
             let reward_interval = state.reward_interval_countdown;
             let remaining = state.chain_time().and_then(|now| {
@@ -4019,13 +4029,13 @@ impl WalletRoot {
                     .and_then(|countdown| remaining_reward_interval_seconds(countdown, now))
             });
             let total_staked = format_staking_amount(
-                self.selected_chain,
+                self.last_evm_chain,
                 token,
                 metrics.total_staked,
                 &self.effective_token_registry,
             );
             let voting_power = format_staking_amount(
-                self.selected_chain,
+                self.last_evm_chain,
                 token,
                 metrics.total_voting_power,
                 &self.effective_token_registry,
@@ -4098,7 +4108,7 @@ impl WalletRoot {
             let inactive = account.status == PublicAccountStatus::Inactive;
             let actor_uuid = uuid.clone();
             let account_action_ready = state.account_action_ready(&uuid);
-            let token = governance_contracts(self.selected_chain)
+            let token = governance_contracts(self.last_evm_chain)
                 .map_or(Address::ZERO, |contracts| contracts.governance_token);
             let account_view = state.accounts.get(&uuid);
             let mut rows = Vec::new();
@@ -4117,7 +4127,7 @@ impl WalletRoot {
                         account.address,
                         inactive,
                         account_action_ready,
-                        self.selected_chain,
+                        self.last_evm_chain,
                         token,
                         &self.effective_token_registry,
                         state.chain_time(),
@@ -4128,7 +4138,7 @@ impl WalletRoot {
                 None => "Loading...".to_owned(),
                 Some(view) => match &view.voting_power {
                     Ok(amount) => format_staking_amount(
-                        self.selected_chain,
+                        self.last_evm_chain,
                         token,
                         *amount,
                         &self.effective_token_registry,
@@ -4142,19 +4152,19 @@ impl WalletRoot {
                 };
                 let received = projection.received_voting_power(*voting_power);
                 let own_display = format_staking_amount(
-                    self.selected_chain,
+                    self.last_evm_chain,
                     token,
                     projection.active_self_delegated,
                     &self.effective_token_registry,
                 );
                 let received_display = format_staking_amount(
-                    self.selected_chain,
+                    self.last_evm_chain,
                     token,
                     received,
                     &self.effective_token_registry,
                 );
                 let delegated_display = format_staking_amount(
-                    self.selected_chain,
+                    self.last_evm_chain,
                     token,
                     projection.active_external_delegated,
                     &self.effective_token_registry,
@@ -4170,7 +4180,7 @@ impl WalletRoot {
                     (true, false) => Some(format!(
                         "{} staked · delegated away",
                         format_staking_amount(
-                            self.selected_chain,
+                            self.last_evm_chain,
                             token,
                             projection.unclaimed_principal,
                             &self.effective_token_registry,
@@ -4233,7 +4243,7 @@ impl WalletRoot {
                     let table_scrollbar = row_count > 5;
                     let table = {
                         let table_key =
-                            format!("governance-stakes-{}-{}", self.selected_chain, uuid);
+                            format!("governance-stakes-{}-{}", self.last_evm_chain, uuid);
                         if let Some(table) = self.governance.staking_tables.get(&table_key) {
                             let table = table.clone();
                             table.update(cx, |table_state, cx| {
@@ -4368,7 +4378,7 @@ impl WalletRoot {
                         .child(app_muted_text(format!(
                             "{} in wallet",
                             format_token_amount_for_display(
-                                self.selected_chain,
+                                self.last_evm_chain,
                                 token,
                                 balance,
                                 Some(&self.effective_token_registry),
@@ -4393,7 +4403,7 @@ impl WalletRoot {
                         ),
                 );
             }
-            let reward_tokens = governance_contracts(self.selected_chain)
+            let reward_tokens = governance_contracts(self.last_evm_chain)
                 .map_or(&[][..], |contracts| contracts.reward_tokens);
             let mut reward_token_addresses = reward_tokens
                 .iter()
@@ -4427,7 +4437,7 @@ impl WalletRoot {
                     .collect::<Vec<_>>();
                 let positive_token_count = positive_reward_tokens.len();
                 let total_unclaimed = match reward_usd_total(
-                    self.selected_chain,
+                    self.last_evm_chain,
                     &uuid,
                     &reward_token_addresses,
                     &state.rewards,
@@ -4478,7 +4488,7 @@ impl WalletRoot {
                         return None;
                     }
                     Some(render_reward_row(
-                        self.selected_chain,
+                        self.last_evm_chain,
                         token.symbol,
                         token.token,
                         resolved_reward,
@@ -5455,7 +5465,7 @@ fn render_reward_claim_selection_form(
     content_width: gpui::Pixels,
     cx: &App,
 ) -> gpui::Div {
-    let chain_id = wallet.selected_chain;
+    let chain_id = wallet.last_evm_chain;
     let uuid = selection.actor_uuid.as_str();
     let state = &wallet.governance.staking;
     let anchor_cache = &wallet.public_broadcaster_anchor_cache;
@@ -6049,7 +6059,7 @@ fn render_staking_action_form(
         .as_ref()
         .and_then(public_account_display_label)
         .unwrap_or_else(|| "Public account".to_owned());
-    let chain_id = wallet.selected_chain;
+    let chain_id = wallet.last_evm_chain;
     let token = governance_contracts(chain_id)
         .map_or(Address::ZERO, |contracts| contracts.governance_token);
     let decimals = governance_contracts(chain_id)
@@ -9482,7 +9492,7 @@ mod tests {
             (
                 root.selected_wallet_id.clone().unwrap(),
                 root.active_wallet_generation,
-                root.selected_chain,
+                root.last_evm_chain,
                 root.governance.proposal_participation.key.clone().unwrap(),
             )
         });
@@ -9491,7 +9501,8 @@ mod tests {
             wallet_ops::OperationHttpClientSlot::for_tests(mock.http.clone(), mock.client.clone());
         let opened = opens.load(Ordering::SeqCst);
         root.update(cx, |root, cx| {
-            root.selected_chain = chain_id + 1;
+            root.selected_network = crate::root::SelectedNetwork::Evm(chain_id + 1);
+            root.last_evm_chain = chain_id + 1;
             root.invalidate_governance_context();
             root.record_governance_action_success(
                 &wallet_id,
@@ -9520,7 +9531,8 @@ mod tests {
             "{sensitive:?}"
         );
         root.update(cx, |root, _| {
-            root.selected_chain = chain_id;
+            root.selected_network = crate::root::SelectedNetwork::Evm(chain_id);
+            root.last_evm_chain = chain_id;
             root.invalidate_governance_context();
             root.show_proposal_participation(&proposal);
             assert_eq!(row_states(root), ["ready"; 3]);

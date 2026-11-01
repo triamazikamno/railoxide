@@ -24,10 +24,68 @@ impl WalletRoot {
         )
     }
 
+    /// The selected EVM chain, or `None` while Tron is selected.
+    pub(in crate::root) const fn selected_evm_chain(&self) -> Option<u64> {
+        self.selected_network.evm_chain_id()
+    }
+
     pub(in crate::root) fn selected_chain_has_railgun(&self) -> bool {
-        self.effective_chain_configs
-            .railgun(self.selected_chain)
-            .is_ok()
+        self.selected_evm_chain()
+            .is_some_and(|chain_id| self.effective_chain_configs.railgun(chain_id).is_ok())
+    }
+
+    /// Why the Private and Activity tabs are unavailable on the selected network.
+    pub(in crate::root) const fn railgun_unavailable_reason(&self) -> &'static str {
+        match self.selected_network {
+            crate::root::SelectedNetwork::Evm(_) => {
+                "This chain supports Public accounts only; no Railgun deployment is configured."
+            }
+            crate::root::SelectedNetwork::Tron => {
+                "Tron supports Public accounts only; Railgun is not available on Tron."
+            }
+        }
+    }
+
+    pub(in crate::root) const fn tron_enabled(&self) -> bool {
+        self.tron_public.settings.enabled
+    }
+
+    /// Installs saved Tron settings and reconciles Tron's pricing with them. Disabling Tron
+    /// while it is selected returns to the last EVM chain. EVM work kept running on that chain,
+    /// so nothing restarts.
+    pub(in crate::root) fn apply_saved_tron_enabled(
+        &mut self,
+        settings: &WalletSettings,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !settings.tron.enabled && self.selected_network == crate::root::SelectedNetwork::Tron {
+            self.selected_network = crate::root::SelectedNetwork::Evm(self.last_evm_chain);
+            self.reset_public_asset_focus();
+            cx.notify();
+        }
+        self.install_tron_settings(&settings.tron);
+        self.sync_network_select(settings.tron.enabled, cx);
+    }
+
+    /// Rebuilds the header selector's choices and shows the selected network.
+    fn sync_network_select(&self, tron_enabled: bool, cx: &mut Context<'_, Self>) {
+        let items = crate::root::wallet_header::network_select_items(
+            self.effective_chain_configs
+                .enabled_chains()
+                .map(|chain| (chain.chain_id, chain.name.clone())),
+            tron_enabled,
+        );
+        let selected = self.selected_network;
+        let select = self.chain_select.clone();
+        let window = self.window_handle;
+        cx.defer(move |cx| {
+            let _ = window.update(cx, |_, window, cx| {
+                select.update(cx, |select, cx| {
+                    select.set_items(ui::chain_select::ChainSelectItems::new(items), window, cx);
+                    select.set_selected_value(&selected, window, cx);
+                });
+            });
+        });
     }
 
     pub(in crate::root) fn admit_chain_settings(
@@ -41,6 +99,15 @@ impl WalletRoot {
             || self.merkle_forest_cache_resetting
         {
             return Err("Wait for wallet cleanup before changing chains".to_owned());
+        }
+        if self.public_form.sending
+            && self.tron_send_owns_progress()
+            && wallet_ops::tron::tron_rpc_route(&settings.tron) != self.tron_public.route
+        {
+            return Err(
+                "Tron has an active send. Wait for it to finish before changing Tron settings."
+                    .to_owned(),
+            );
         }
         for (&id, previous) in self.effective_chain_configs.iter() {
             if next.get(id) == Some(previous) {
@@ -240,7 +307,7 @@ impl WalletRoot {
             || self.public_broadcaster_policy.max_anchor_bps != new_policy.max_anchor_bps;
 
         if let Ok(effective_chain_configs) = build_effective_chain_configs(settings) {
-            let previous_selection = self.selected_chain;
+            let previous_selection = self.last_evm_chain;
             let changed: Vec<_> = self
                 .effective_chain_configs
                 .iter()
@@ -274,39 +341,20 @@ impl WalletRoot {
             self.refresh_walletconnect_fee_usd_values();
             if self
                 .effective_chain_configs
-                .enabled(self.selected_chain)
+                .enabled(self.last_evm_chain)
                 .is_err()
                 && let Some(chain) = self.effective_chain_configs.enabled_chains().next()
             {
-                self.selected_chain = chain.chain_id;
+                self.last_evm_chain = chain.chain_id;
+                if self.selected_network != crate::root::SelectedNetwork::Tron {
+                    self.selected_network = crate::root::SelectedNetwork::Evm(chain.chain_id);
+                }
                 self.ui_state.last_chain_id = Some(chain.chain_id);
                 self.save_ui_state();
             }
             self.install_chain_background();
-            let items = self
-                .effective_chain_configs
-                .enabled_chains()
-                .map(|chain| crate::root::wallet_header::ChainSelectItem {
-                    chain_id: chain.chain_id,
-                    label: chain.name.clone().into(),
-                })
-                .collect::<Vec<_>>();
-            let selected = self.selected_chain;
-            let select = self.chain_select.clone();
-            let window = self.window_handle;
-            cx.defer(move |cx| {
-                let _ = window.update(cx, |_, window, cx| {
-                    select.update(cx, |select, cx| {
-                        select.set_items(
-                            ui::chain_select::ChainSelectItems::new(items),
-                            window,
-                            cx,
-                        );
-                        select.set_selected_value(&selected, window, cx);
-                    });
-                });
-            });
-            if changed.contains(&previous_selection) || previous_selection != self.selected_chain {
+            self.sync_network_select(settings.tron.enabled, cx);
+            if changed.contains(&previous_selection) || previous_selection != self.last_evm_chain {
                 self.clear_public_chain_balance_state();
                 self.restore_public_balance_snapshot();
                 self.invalidate_advanced_public_send_estimate();

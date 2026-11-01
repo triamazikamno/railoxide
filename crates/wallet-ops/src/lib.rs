@@ -121,6 +121,7 @@ mod utxos;
 pub mod walletconnect;
 
 pub mod settings;
+pub mod tron;
 pub mod vault;
 
 pub use amounts::{

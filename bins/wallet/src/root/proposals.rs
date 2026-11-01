@@ -1069,11 +1069,11 @@ impl WalletRoot {
                     ),
                 );
         };
-        let token = railgun_ui::governance_contracts(self.selected_chain)
+        let token = railgun_ui::governance_contracts(self.last_evm_chain)
             .map_or(Address::ZERO, |contracts| contracts.governance_token);
         let decimals = self
             .effective_token_registry
-            .get(self.selected_chain, &token)
+            .get(self.last_evm_chain, &token)
             .map(|info| info.decimals);
         render_proposal_action_form(
             &root,
@@ -1190,7 +1190,13 @@ impl WalletRoot {
         self.proposals.cancel_prefetch();
         self.proposals.hydrating_pages.clear();
         self.proposals.loading = false;
-        let chain_id = self.selected_chain;
+        let Some(chain_id) = self.selected_evm_chain() else {
+            // Tron has no governance: show the not-deployed state without reading.
+            self.proposals.invalidate(self.last_evm_chain);
+            self.proposals.checked = true;
+            cx.notify();
+            return;
+        };
         let requested_page = if manual {
             self.proposals.current_page
         } else {
@@ -1223,7 +1229,7 @@ impl WalletRoot {
                 return;
             };
             let _ = this.update(cx, |root, cx| {
-                if root.selected_chain != chain_id
+                if root.selected_evm_chain() != Some(chain_id)
                     || root.proposals.generation != chain_generation
                     || root.proposals.request_generation != request_generation
                 {
@@ -1400,10 +1406,12 @@ impl WalletRoot {
         let Some(overview) = self.proposals.overview.clone() else {
             return;
         };
+        let Some(chain_id) = self.selected_evm_chain() else {
+            return;
+        };
         if self.proposals.pages.contains_key(&page) || !self.proposals.loading_pages.insert(page) {
             return;
         }
-        let chain_id = self.selected_chain;
         let chain_generation = self.proposals.generation;
         let request_generation = self.proposals.request_generation;
         let work_token = if prefetch {
@@ -1435,7 +1443,7 @@ impl WalletRoot {
                 return;
             };
             let _ = this.update(cx, |root, cx| {
-                if root.selected_chain != chain_id
+                if root.selected_evm_chain() != Some(chain_id)
                     || root.proposals.generation != chain_generation
                     || root.proposals.request_generation != request_generation
                 {
@@ -1531,10 +1539,12 @@ impl WalletRoot {
         if rows.is_empty() {
             return;
         }
+        let Some(chain_id) = self.selected_evm_chain() else {
+            return;
+        };
         if !self.proposals.hydrating_pages.insert(page) {
             return;
         }
-        let chain_id = self.selected_chain;
         let chain_generation = self.proposals.generation;
         let request_generation = self.proposals.request_generation;
         let work_token = if prefetch {
@@ -1561,7 +1571,7 @@ impl WalletRoot {
                     completions.push(completion);
                 }
                 let _ = this.update(cx, |root, cx| {
-                    if root.selected_chain != chain_id
+                    if root.selected_evm_chain() != Some(chain_id)
                         || root.proposals.generation != chain_generation
                         || root.proposals.request_generation != request_generation
                     {
@@ -1580,7 +1590,7 @@ impl WalletRoot {
                 });
             }
             let _ = this.update(cx, |root, cx| {
-                if root.selected_chain != chain_id
+                if root.selected_evm_chain() != Some(chain_id)
                     || root.proposals.generation != chain_generation
                     || root.proposals.request_generation != request_generation
                 {

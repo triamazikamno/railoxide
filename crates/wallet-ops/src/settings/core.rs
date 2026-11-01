@@ -1,7 +1,7 @@
 use super::{
     ChainSettings, Deserialize, Error, GasSettings, IndexedArtifactSettings, NetworkSettings,
     PoiProxyFallback, PoiReadSource, PoiReadSourceSetting, PoiSettings, PublicBroadcasterSettings,
-    RuntimeSettings, SensitiveUrl, Serialize, TokenSettings, Url, WakuSettings,
+    RuntimeSettings, SensitiveUrl, Serialize, TokenSettings, TronSettings, Url, WakuSettings,
     WalletConnectSettings, WalletNetworkMode, fmt,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -97,6 +97,7 @@ pub struct WalletSettings {
     pub runtime: RuntimeSettings,
     pub waku: WakuSettings,
     pub walletconnect: WalletConnectSettings,
+    pub tron: TronSettings,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -179,6 +180,7 @@ impl Default for WalletSettings {
             runtime: RuntimeSettings::default(),
             waku: WakuSettings::default(),
             walletconnect: WalletConnectSettings::default(),
+            tron: TronSettings::default(),
         }
     }
 }
@@ -196,6 +198,7 @@ impl WalletSettings {
         self.runtime.validate(&mut errors);
         self.waku.validate(&mut errors);
         self.walletconnect.validate(&mut errors);
+        self.tron.validate(&mut errors);
 
         if errors.is_empty() {
             Ok(())
@@ -251,6 +254,10 @@ impl WalletSettings {
 
     pub fn reset_walletconnect(&mut self) {
         self.walletconnect = WalletConnectSettings::default();
+    }
+
+    pub fn reset_tron(&mut self) {
+        self.tron = TronSettings::default();
     }
 
     #[must_use]

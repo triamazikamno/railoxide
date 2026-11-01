@@ -11,6 +11,8 @@ pub(in crate::root) fn render_public_action_stepper(
     fees_authorized: bool,
     action_error: Option<&str>,
     fee_authorization_review: Option<&PublicActionFeeAuthorizationReview>,
+    error_summary: Option<&str>,
+    submitted_detail: Option<&str>,
     generation: u64,
 ) -> gpui::Div {
     let mut stepper = app_stepper_container();
@@ -28,6 +30,8 @@ pub(in crate::root) fn render_public_action_stepper(
             fees_authorized,
             action_error,
             fee_authorization_review,
+            error_summary,
+            submitted_detail,
             generation,
         ));
     }
@@ -46,16 +50,13 @@ pub(in crate::root) fn render_public_action_step(
     fees_authorized: bool,
     action_error: Option<&str>,
     fee_authorization_review: Option<&PublicActionFeeAuthorizationReview>,
+    error_summary: Option<&str>,
+    submitted_detail: Option<&str>,
     generation: u64,
 ) -> gpui::Div {
     let color = public_action_step_color(step.status);
     let title = public_action_step_label(step.step);
-    let detail = public_action_step_detail_for_context(
-        step.step,
-        step.status,
-        requires_device_approval,
-        step.tx_hash.is_some(),
-    );
+    let detail = public_action_step_state_detail(step, requires_device_approval, submitted_detail);
     let mut body = div()
         .flex_1()
         .min_w(px(0.0))
@@ -73,6 +74,7 @@ pub(in crate::root) fn render_public_action_step(
             root.clone(),
             step,
             asset_label,
+            error_summary,
             error_details_open,
         ));
     } else {
@@ -200,9 +202,13 @@ pub(in crate::root) fn render_public_action_step_error(
     root: Entity<WalletRoot>,
     step: &PublicActionStepState,
     asset_label: &str,
+    summary: Option<&str>,
     details_open: bool,
 ) -> gpui::Div {
-    let summary = public_action_error_summary(step.step, step.message.as_deref(), asset_label);
+    let summary = summary.map_or_else(
+        || public_action_error_summary(step.step, step.message.as_deref(), asset_label),
+        str::to_owned,
+    );
     let details = public_action_error_details(&summary, step.message.as_deref());
     let copy_value =
         public_action_error_copy_value(step.step, asset_label, &summary, details.as_deref());
@@ -221,8 +227,7 @@ pub(in crate::root) fn render_public_action_step_error(
                     .flex_1()
                     .min_w(px(0.0))
                     .whitespace_normal()
-                    .text_color(rgb(theme::DANGER))
-                    .line_height(gpui::relative(1.0)),
+                    .text_color(rgb(theme::DANGER)),
             )
             .child(clipboard_with_toast(copy_id, copy_value)),
     );

@@ -812,7 +812,7 @@ impl WalletRoot {
         self.reload_broadcaster_preferences(cx);
         self.reload_public_accounts(window, cx);
         self.schedule_automatic_public_balance_refresh(cx);
-        self.ensure_chain_load(self.selected_chain, cx);
+        self.ensure_chain_load(self.last_evm_chain, cx);
     }
 
     fn reorder_wallet_from_drop(

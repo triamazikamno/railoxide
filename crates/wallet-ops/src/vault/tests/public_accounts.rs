@@ -755,6 +755,28 @@ fn public_account_signing_key_resolves_derived_and_imported_accounts() {
     assert_eq!(&*imported_key, &*expected_private_key);
     assert!(!imported_grant.is_valid());
 
+    let view = store.unlock_view(TEST_PASSWORD).expect("unlock view");
+    let mismatched = PublicAccountMetadata {
+        address: Address::from([0x47; 20]),
+        ..inactive
+    };
+    let (key, data) = public_account_metadata_record_entry(&view, &mismatched)
+        .expect("encode mismatched derived account");
+    db.put_desktop_wallet_vault_record(&key, &data)
+        .expect("persist mismatched derived account");
+    let mut mismatched_grant = store
+        .create_spend_grant(TEST_PASSWORD)
+        .expect("mismatched spend grant");
+    assert!(matches!(
+        store.public_account_signing_key(
+            &mut mismatched_grant,
+            &view_session,
+            &mismatched.public_account_uuid,
+        ),
+        Err(VaultError::InvalidSoftwareContextIdentity)
+    ));
+
+    drop(view);
     drop(store);
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");

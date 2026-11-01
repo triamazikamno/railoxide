@@ -634,7 +634,7 @@ impl WalletRoot {
             wallet_switch_generation,
             profile_open_operation_generation,
             profile_open_lifetime_generation,
-            selected_chain: self.selected_chain,
+            selected_chain: self.last_evm_chain,
             #[cfg(feature = "hardware")]
             active_hardware_profile,
             cleanup: self.wallet_sync_cleanup_wait_group(),
@@ -660,7 +660,7 @@ impl WalletRoot {
                     captured_lifetime_generation,
                     root.pending_software_profile_open_lifetime_generation,
                     captured_chain,
-                    root.selected_chain,
+                    root.last_evm_chain,
                     root.manage_wallets.deleting_wallet_id.is_some(),
                     root.view_session.is_none()
                         && root.vault_view_unlock.is_none()
@@ -693,7 +693,7 @@ impl WalletRoot {
                             captured_lifetime_generation,
                             root.pending_software_profile_open_lifetime_generation,
                             captured_chain,
-                            root.selected_chain,
+                            root.last_evm_chain,
                             root.manage_wallets.deleting_wallet_id.is_some(),
                             root.view_session.is_none()
                                 && root.vault_view_unlock.is_none()
@@ -734,7 +734,7 @@ impl WalletRoot {
                             captured_lifetime_generation,
                             root.pending_software_profile_open_lifetime_generation,
                             captured_chain,
-                            root.selected_chain,
+                            root.last_evm_chain,
                             root.manage_wallets.deleting_wallet_id.is_some(),
                             root.view_session.is_none()
                                 && root.vault_view_unlock.is_none()
@@ -873,7 +873,7 @@ impl WalletRoot {
         self.wallet_setup_mode = WalletSetupMode::Choose;
         self.ensure_waku_started(cx);
         self.ensure_chain_load_with_start_policy(
-            self.selected_chain,
+            self.last_evm_chain,
             Some(created_wallet_init_policy.sync_start_policy()),
             cx,
         );
@@ -991,7 +991,7 @@ impl WalletRoot {
         let effective_chains = self.effective_chain_configs.clone();
         let db = vault_store.db();
         let http = self.http.clone();
-        let skip_chain_id = Some(self.selected_chain);
+        let skip_chain_id = Some(self.last_evm_chain);
 
         let task = self.runtime.spawn(async move {
             wallet_ops::initialize_created_wallet_chain_metadata_for_session(
@@ -1178,7 +1178,7 @@ impl WalletRoot {
             self.pending_software_profile_base_profile_uuid.as_deref(),
             self.selected_wallet_id.as_deref(),
             selected_chain,
-            self.selected_chain,
+            self.last_evm_chain,
             matches!(self.vault_state, VaultState::PendingSoftwareProfileOpen),
         )
     }
@@ -1235,7 +1235,7 @@ impl WalletRoot {
         self.shutdown_wallet_session_store();
         self.invalidate_governance_context();
         self.governance.proposal_participation.clear_session();
-        self.invalidate_proposals_chain(self.selected_chain);
+        self.invalidate_proposals_chain(self.last_evm_chain);
         self.clear_private_broadcaster_progress_state();
         super::super::renew_submission_scope(&mut self.submission_scope);
         self.cancel_tor_rotation();

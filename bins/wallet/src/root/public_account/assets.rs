@@ -34,7 +34,7 @@ impl WalletRoot {
         balances.sort_by_cached_key(|entry| {
             Reverse(
                 public_balance_usd_value(
-                    self.selected_chain,
+                    self.listed_public_chain(),
                     entry.asset.id,
                     &entry.amount,
                     Some(&self.public_broadcaster_anchor_cache),
@@ -51,7 +51,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(account) = self.selected_public_account() else {
+        let Some(account) = self.listed_selected_account() else {
             return;
         };
         let count = self.public_account_sorted_balances(account).len();
@@ -72,12 +72,12 @@ impl WalletRoot {
         cx.notify();
     }
 
-    pub(super) fn activate_public_focused_asset(
+    pub(in crate::root) fn activate_public_focused_asset(
         &mut self,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(account) = self.selected_public_account() else {
+        let Some(account) = self.listed_selected_account() else {
             return;
         };
         let Some(entry) = self
@@ -98,7 +98,7 @@ impl WalletRoot {
     /// Asset under keyboard focus on the selected row, by identity, so a
     /// balance refresh that reorders tiles can find it again.
     pub(in crate::root) fn public_focused_asset(&self) -> Option<PublicAssetId> {
-        let account = self.selected_public_account()?;
+        let account = self.listed_selected_account()?;
         let index = self.public_form.focused_asset_index?;
         self.public_account_sorted_balances(account)
             .get(index)
@@ -114,7 +114,7 @@ impl WalletRoot {
         focused: Option<PublicAssetId>,
     ) -> bool {
         let balances = self
-            .selected_public_account()
+            .listed_selected_account()
             .map(|account| self.public_account_sorted_balances(account))
             .unwrap_or_default();
         let position =
@@ -141,7 +141,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(account) = self.public_account_for_uuid(Some(&uuid)).cloned() else {
+        let Some(account) = self.listed_account_for_uuid(Some(&uuid)).cloned() else {
             return;
         };
         let balances = self.public_account_sorted_balances(&account);
@@ -152,18 +152,20 @@ impl WalletRoot {
         self.public_form.focused_asset_index = Some(index);
         self.public_form.list_focus.focus(window, cx);
         let root = cx.entity();
-        let shield = self.selected_chain_has_railgun();
-        let bridge = self
+        // A Tron asset offers Send alone.
+        let tron = self.tron_selected();
+        let shield = !tron && self.selected_chain_has_railgun();
+        let chain = self
             .effective_chain_configs
-            .get(self.selected_chain)
-            .is_some_and(|chain| chain.bridge_origin_profile().is_some())
+            .get(self.last_evm_chain)
+            .filter(|_| !tron);
+        let bridge = chain.is_some_and(|chain| chain.bridge_origin_profile().is_some())
             && !matches!(
                 account.source,
                 wallet_ops::vault::PublicAccountSource::ExecutorDerived(_)
             );
         let bridge_disabled = account.is_global();
-        let chain = self.effective_chain_configs.get(self.selected_chain);
-        let labels = native_wrapped_output_labels(self.selected_chain);
+        let labels = native_wrapped_output_labels(self.last_evm_chain);
         let wrap_item = chain
             .and_then(|chain| chain.wrapped_native_token)
             .and_then(|wrapped| match asset {
@@ -186,7 +188,7 @@ impl WalletRoot {
                     "Unwrap",
                     labels.map_or_else(
                         || {
-                            self.configured_native_symbol(self.selected_chain)
+                            self.configured_native_symbol(self.last_evm_chain)
                                 .to_owned()
                         },
                         |(symbol, _)| symbol.to_owned(),
@@ -214,6 +216,10 @@ impl WalletRoot {
                             root.public_form.asset_menu = None;
                             // The dialog must return focus to the list, not the closing menu.
                             root.public_form.list_focus.focus(window, cx);
+                            if tron {
+                                root.open_tron_send_dialog(uuid.clone(), asset, window, cx);
+                                return;
+                            }
                             root.open_public_action_dialog(uuid.clone(), asset, window, cx);
                             root.public_form.action_mode = mode;
                             root.refresh_public_action_gas_fee_quote(mode, cx);
@@ -287,9 +293,11 @@ impl WalletRoot {
         index: usize,
         cx: &App,
     ) -> impl IntoElement {
-        let selected = self.public_form.selected_account_uuid.as_deref()
+        let selected = self.listed_selected_uuid().map(AsRef::as_ref)
             == Some(account.public_account_uuid.as_str());
         let focused = selected && self.public_form.focused_asset_index == Some(index);
+        let chain_id = self.listed_public_chain();
+        let tron = self.tron_selected();
         let asset = entry.asset.id;
         let menu = self
             .public_form
@@ -302,18 +310,20 @@ impl WalletRoot {
         let id = SharedString::from(format!("public-asset-{uuid}-{asset:?}"));
         let amount = public_balance_tile_amount(&entry.amount, entry.asset.decimals);
         let usd = public_balance_usd_value(
-            self.selected_chain,
+            chain_id,
             asset,
             &entry.amount,
             Some(&self.public_broadcaster_anchor_cache),
         )
         .filter(|_| self.public_chain_has_pricing())
         .map(public_balance_compact_usd);
-        let icon = public_asset_icon_path(
-            self.selected_chain,
-            asset,
-            Some(&self.effective_token_registry),
-        );
+        let icon = if tron && asset == PublicAssetId::Native {
+            Some(crate::assets::WalletIconSource::embedded(
+                railgun_ui::TRON_ICON_ASSET_PATH,
+            ))
+        } else {
+            public_asset_icon_path(chain_id, asset, Some(&self.effective_token_registry))
+        };
         let subtle = cx.theme().muted_foreground;
         let dust = amount.starts_with('<');
         // Tiles take the page color: flush with an unselected row, one step

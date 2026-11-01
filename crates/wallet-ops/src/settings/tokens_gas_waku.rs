@@ -67,7 +67,7 @@ impl TokenKey {
         chains: &super::ChainSettings,
         errors: &mut Vec<String>,
     ) {
-        if !chains.contains(self.chain_id) {
+        if !token_chain_supported(chains, self.chain_id) {
             errors.push(format!("{field}.chain_id is not supported"));
         }
         validate_address(
@@ -76,6 +76,11 @@ impl TokenKey {
             errors,
         );
     }
+}
+
+/// A configured EVM chain, or Tron, whose tokens are stored by their 20-byte hex address.
+fn token_chain_supported(chains: &super::ChainSettings, chain_id: u64) -> bool {
+    chains.contains(chain_id) || chain_id == railgun_ui::TRON_CHAIN_ID
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -134,7 +139,7 @@ impl CustomTokenSettings {
         chains: &super::ChainSettings,
         errors: &mut Vec<String>,
     ) {
-        if !chains.contains(self.chain_id) {
+        if !token_chain_supported(chains, self.chain_id) {
             errors.push(format!("{field}.chain_id is not supported"));
         }
         validate_address(
@@ -225,7 +230,7 @@ impl PriceAnchorSettings {
                 oracle_decimals,
                 is_inversed: _,
             } => {
-                if !chains.contains(*chain_id) {
+                if !token_chain_supported(chains, *chain_id) {
                     errors.push(format!("{field}.chain_id is not supported"));
                 }
                 validate_address(&format!("{field}.oracle_address"), oracle_address, errors);

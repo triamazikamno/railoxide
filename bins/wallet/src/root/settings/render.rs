@@ -362,6 +362,7 @@ impl Render for WalletSettingsEditor {
                 div().w_full().child(chain_editor.clone())
             })))
             .group(indexed_artifact_group);
+        let tron_page = self.tron_settings_page(&editor);
 
         let mut token_page = SettingPage::new("Tokens");
         let token_entries = display_token_entries(&self.draft);
@@ -645,6 +646,7 @@ impl Render for WalletSettingsEditor {
                             .page(security_page)
                             .page(privacy_page)
                             .page(chains_page)
+                            .page(tron_page)
                             .page(token_page)
                             .page(public_broadcasters_page)
                             .page(walletconnect_page)

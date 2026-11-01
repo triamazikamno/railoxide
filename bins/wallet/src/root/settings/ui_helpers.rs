@@ -57,6 +57,50 @@ pub(in crate::root) fn settings_danger_banner(message: impl Into<SharedString>) 
         .child(Alert::error("wallet-settings-danger-banner", message.into().to_string()).small())
 }
 
+/// A dialog's validation error. The page status banner sits behind the modal, so a dialog that
+/// stays open shows its error itself.
+pub(in crate::root) fn settings_dialog_error(error: SharedString) -> gpui::Div {
+    app_muted_text(error)
+        .text_color(rgb(theme::DANGER))
+        .whitespace_normal()
+}
+
+/// Shows `message` through [`settings_dialog_error`] on the dialog's next render.
+pub(in crate::root) fn set_dialog_error(
+    error: &Entity<Option<SharedString>>,
+    message: impl Into<SharedString>,
+    cx: &mut App,
+) {
+    error.update(cx, |error, cx| {
+        *error = Some(message.into());
+        cx.notify();
+    });
+}
+
+/// A row of a Settings list. Every row but the `last` has a divider below it.
+pub(in crate::root) fn settings_list_row(
+    id: impl Into<ElementId>,
+    last: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .px(px(2.0))
+        .py(px(9.0))
+        .hover(|this| this.bg(rgb(theme::SURFACE_HOVER_SUBTLE)))
+        .when(!last, |this| {
+            this.border_b_1()
+                .border_color(rgb_with_alpha(theme::BORDER_SUBTLE, 0.45))
+        })
+}
+
+/// The trailing group of a Settings list row's action buttons.
+pub(in crate::root) fn settings_row_actions() -> gpui::Div {
+    div().flex().flex_none().items_center().gap_1()
+}
+
 pub(in crate::root) fn settings_info_banner(message: impl Into<SharedString>) -> gpui::Div {
     div()
         .w_full()
@@ -105,6 +149,12 @@ pub(in crate::root) fn render_token_dialog_content(
             &inputs.chain_id,
             readonly_identity,
         ))
+        .when(!readonly_identity, |this| {
+            this.child(app_muted_text(format!(
+                "For a Tron token, use chain ID {} and its base58 address.",
+                railgun_ui::TRON_CHAIN_ID
+            )))
+        })
         .child(settings_dialog_field(
             "Token address",
             &inputs.token_address,
@@ -420,7 +470,10 @@ pub(in crate::root) fn render_token_entry_summary(entry: &DisplayTokenEntry) -> 
                 .text_size(px(12.0))
                 .line_height(px(16.0))
                 .text_color(rgb(theme::TEXT_MUTED))
-                .child(SharedString::from(entry.token_address.clone())),
+                .child(SharedString::from(display_token_address(
+                    entry.chain_id,
+                    &entry.token_address,
+                ))),
         )
 }
 
@@ -433,7 +486,7 @@ pub(in crate::root) fn render_price_anchor_entry_summary(
         "Override"
     };
     let primary_label = price_anchor_token_primary_label(entry);
-    let token_address = entry.key.token_address.clone();
+    let token_address = display_token_address(entry.key.chain_id, &entry.key.token_address);
     let mut body = div()
         .flex_1()
         .min_w(px(0.0))
@@ -505,7 +558,13 @@ pub(in crate::root) fn price_anchor_token_primary_label(entry: &DisplayPriceAnch
 
 pub(in crate::root) fn short_token_address(token_address: &str) -> String {
     token_address.parse::<Address>().map_or_else(
-        |_| token_address.to_string(),
+        |_| {
+            if wallet_ops::tron::address::parse_tron_address(token_address).is_ok() {
+                railgun_ui::short_non_evm(token_address)
+            } else {
+                token_address.to_string()
+            }
+        },
         |address| short_address(&address),
     )
 }
@@ -534,12 +593,11 @@ pub(in crate::root) fn price_anchor_summary(
             oracle_decimals,
             is_inversed,
         } => {
-            let chain =
-                chain_name(*chain_id).map_or_else(|| chain_id.to_string(), ToString::to_string);
+            let chain = token_chain_name(*chain_id);
             let inverse = if *is_inversed { ", inverse" } else { "" };
             format!(
                 "Oracle {} on {chain}, {token_decimals}/{oracle_decimals} decimals{inverse}",
-                short_token_address(oracle_address)
+                short_token_address(&display_token_address(*chain_id, oracle_address))
             )
         }
         PriceAnchorSettings::Product {
@@ -568,7 +626,20 @@ pub(in crate::root) fn price_anchor_summary(
     }
 }
 
+/// Token metadata names Tron by its chain id, which the EVM chain lookups leave unnamed.
+fn token_chain_name(chain_id: u64) -> String {
+    if chain_id == railgun_ui::TRON_CHAIN_ID {
+        return railgun_ui::TRON_NAME.to_owned();
+    }
+    chain_name(chain_id).map_or_else(|| chain_id.to_string(), ToString::to_string)
+}
+
 pub(in crate::root) fn settings_token_chain_header(chain_id: u64) -> gpui::Div {
+    let icon = if chain_id == railgun_ui::TRON_CHAIN_ID {
+        Some(railgun_ui::TRON_ICON_ASSET_PATH)
+    } else {
+        chain_icon_asset_path(chain_id)
+    };
     let mut row = div()
         .flex()
         .items_center()
@@ -580,13 +651,11 @@ pub(in crate::root) fn settings_token_chain_header(chain_id: u64) -> gpui::Div {
         .text_size(px(11.0))
         .line_height(px(14.0))
         .text_color(rgb(theme::TEXT_SUBTLE));
-    if let Some(path) = chain_icon_asset_path(chain_id) {
+    if let Some(path) = icon {
         row = row.child(img(path).size(px(16.0)).flex_none());
     }
     row.child(SharedString::from(
-        chain_name(chain_id)
-            .map_or_else(|| chain_id.to_string(), ToString::to_string)
-            .to_ascii_uppercase(),
+        token_chain_name(chain_id).to_ascii_uppercase(),
     ))
 }
 
@@ -704,25 +773,38 @@ pub(in crate::root) fn product_component_type_select_items() -> Vec<PriceAnchorT
 
 pub(in crate::root) fn price_anchor_chain_select_items(
     settings: &WalletSettings,
-) -> Vec<ChainSelectItem> {
+) -> Vec<NetworkSelectItem> {
     let mut items: Vec<_> = railgun_ui::built_in_chain_ids()
-        .map(|chain_id| ChainSelectItem {
-            chain_id,
+        .map(|chain_id| NetworkSelectItem {
+            network: Network::Evm(chain_id),
             label: chain_name(chain_id).unwrap_or("Chain").into(),
         })
+        .chain([NetworkSelectItem {
+            network: Network::Tron,
+            label: railgun_ui::TRON_NAME.into(),
+        }])
         .collect();
     items.extend(
         settings
             .chains
             .custom
             .iter()
-            .map(|(&chain_id, chain)| ChainSelectItem {
-                chain_id,
+            .map(|(&chain_id, chain)| NetworkSelectItem {
+                network: Network::Evm(chain_id),
                 label: chain.name.clone().into(),
             }),
     );
-    items.sort_by_key(|item| item.chain_id);
+    items.sort_by_key(|item| price_anchor_chain_id(item.network));
     items
+}
+
+/// Token metadata keys Tron by [`railgun_ui::TRON_CHAIN_ID`]; the select item keeps Tron
+/// distinct so it shows Tron's icon.
+pub(in crate::root) const fn price_anchor_chain_id(network: Network) -> u64 {
+    match network {
+        Network::Evm(chain_id) => chain_id,
+        Network::Tron => railgun_ui::TRON_CHAIN_ID,
+    }
 }
 
 pub(in crate::root) fn bool_select_items() -> Vec<BoolSelectItem> {
@@ -739,14 +821,14 @@ pub(in crate::root) fn bool_select_items() -> Vec<BoolSelectItem> {
 }
 
 pub(in crate::root) fn chain_select_index(
-    items: &[ChainSelectItem],
+    items: &[NetworkSelectItem],
     chain_id: u64,
 ) -> Option<IndexPath> {
     (!items.is_empty()).then(|| {
         IndexPath::default().row(
             items
                 .iter()
-                .position(|item| item.chain_id == chain_id)
+                .position(|item| price_anchor_chain_id(item.network) == chain_id)
                 .unwrap_or_default(),
         )
     })

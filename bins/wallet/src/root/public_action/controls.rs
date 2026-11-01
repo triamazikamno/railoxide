@@ -247,13 +247,34 @@ pub(in crate::root) fn render_public_action_amount_input(
     max_label: Option<String>,
     disabled: bool,
 ) -> gpui::Div {
-    let max_root = root;
     let max_id = match mode {
         PublicActionMode::Shield => "wallet-public-shield-max",
         PublicActionMode::Send => "wallet-public-send-max",
         PublicActionMode::Wrap => "wallet-public-wrap-max",
         PublicActionMode::Unwrap => "wallet-public-unwrap-max",
     };
+    render_amount_input(
+        max_id,
+        input,
+        label,
+        max_label,
+        disabled,
+        move |window, cx| {
+            root.update(cx, |root, cx| {
+                root.set_public_action_amount_to_max(mode, window, cx);
+            });
+        },
+    )
+}
+
+pub(in crate::root) fn render_amount_input(
+    max_id: &'static str,
+    input: &Entity<InputState>,
+    label: String,
+    max_label: Option<String>,
+    disabled: bool,
+    on_max: impl Fn(&mut Window, &mut App) + 'static,
+) -> gpui::Div {
     div()
         .flex()
         .flex_col()
@@ -268,11 +289,7 @@ pub(in crate::root) fn render_public_action_amount_input(
                 .children(max_label.map(|label| {
                     amount_max_button(max_id, Some(label))
                         .disabled(disabled)
-                        .on_click(move |_event, window, cx| {
-                            max_root.update(cx, |root, cx| {
-                                root.set_public_action_amount_to_max(mode, window, cx);
-                            });
-                        })
+                        .on_click(move |_event, window, cx| on_max(window, cx))
                 })),
         )
         .child(app_input(input).disabled(disabled))
@@ -385,6 +402,7 @@ pub(in crate::root) fn render_public_action_active_status_notice(
     step: &PublicActionStepState,
     requires_device_approval: bool,
     command_available: bool,
+    submitted_detail: Option<&str>,
 ) -> gpui::Div {
     let step_kind = step.step;
     let discard_available = public_action_discard_attempt_available(command_available, step);
@@ -410,12 +428,7 @@ pub(in crate::root) fn render_public_action_active_status_notice(
     let detail = format!(
         "{}: {}",
         public_action_step_label(step.step),
-        public_action_step_detail_for_context(
-            step.step,
-            step.status,
-            requires_device_approval,
-            step.tx_hash.is_some(),
-        )
+        public_action_step_state_detail(step, requires_device_approval, submitted_detail)
     );
     div()
         .flex()

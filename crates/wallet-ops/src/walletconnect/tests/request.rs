@@ -1032,6 +1032,16 @@ fn gateway_policy_parsing_does_not_enable_walletconnect_methods() {
         matches!(&parsed, WalletConnectParsedRequest::WalletAddEthereumChain { chain_id: 1, raw: retained, .. } if retained == &raw)
     );
     assert!(parse_walletconnect_session_request(1, "wallet_addEthereumChain", &raw).is_err());
+    // Chainlist lists Tron as an EVM chain, but Tron is configured in Tron settings.
+    assert!(
+        crate::walletconnect::parse_dapp_request_for_account(
+            1,
+            "wallet_addEthereumChain",
+            &json!([{ "chainId": "0x2b6653dc" }]),
+            account,
+        )
+        .is_err()
+    );
     let watch = json!({ "type": "ERC20", "options": { "address": account.to_string(), "image": "https://ignored.invalid", "decimals": "untrusted" }, "unknown": 7 });
     let parsed = crate::walletconnect::parse_dapp_request_for_account(
         1,

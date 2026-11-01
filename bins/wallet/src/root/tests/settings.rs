@@ -5,9 +5,10 @@ use crate::root::maintenance::{
     public_sync_reset_restart_is_safe,
 };
 use crate::root::settings::{
-    apply_indexed_artifact_source_mode, indexed_artifact_source_mode_value,
-    indexed_artifact_source_status_message, price_anchor_component_dialog_values_from_anchor,
-    price_anchor_dialog_values_from_override, should_show_indexed_artifact_custom_settings,
+    TRON_ADDRESS_NEEDED, apply_indexed_artifact_source_mode, display_token_address,
+    indexed_artifact_source_mode_value, indexed_artifact_source_status_message,
+    price_anchor_component_dialog_values_from_anchor, price_anchor_dialog_values_from_override,
+    should_show_indexed_artifact_custom_settings, stored_token_address,
 };
 use crate::root::startup::tor_bootstrap_recovery_is_current;
 use wallet_ops::WalletNetworkProgressStage;
@@ -1728,6 +1729,117 @@ fn settings_fields_commit_first_edit_after_sync_and_number_steps(cx: &mut gpui::
     std::fs::remove_dir_all(path).unwrap();
 }
 
+#[test]
+fn tron_token_addresses_are_entered_and_shown_in_base58() {
+    let tron = railgun_ui::TRON_CHAIN_ID;
+    let usdt = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
+    let stored = stored_token_address(tron, usdt).unwrap();
+    assert!(stored.eq_ignore_ascii_case("0xa614f803b6fd780986a42c78ec9c7f77e6ded13c"));
+    assert_eq!(display_token_address(tron, &stored), usdt);
+    assert_eq!(
+        stored_token_address(tron, "0xa614f803b6fd780986a42c78ec9c7f77e6ded13c"),
+        Err(TRON_ADDRESS_NEEDED.to_owned())
+    );
+}
+
+#[gpui::test]
+fn tron_settings_refuse_submit_without_an_http_api_url(cx: &mut gpui::TestAppContext) {
+    use gpui::{
+        AppContext as _, IntoElement, ParentElement as _, Render, Styled as _, VisualTestContext,
+        div,
+    };
+    use gpui_component::setting::Settings as ComponentSettings;
+    use std::{cell::RefCell, rc::Rc};
+    use wallet_ops::settings::TronEndpointSetting;
+
+    struct TronHost(Entity<WalletSettingsEditor>);
+
+    impl Render for TronHost {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+            let page = self.0.read(cx).tron_settings_page(&self.0);
+            div()
+                .size_full()
+                .child(ComponentSettings::new("test-tron-settings").page(page))
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let path = temp_wallet_db_root("tron-settings-submit");
+    let store = Arc::new(DesktopVaultStore::open(path.clone()).unwrap());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut saved = WalletSettings::default();
+    let mut endpoints = saved.tron.effective_endpoints();
+    endpoints.insert(
+        0,
+        TronEndpointSetting {
+            json_rpc_url: "https://json-rpc-only.example/jsonrpc".to_owned(),
+            submit: false,
+            ..TronEndpointSetting::default()
+        },
+    );
+    saved.tron.endpoints = Some(endpoints);
+    saved.validate().unwrap();
+    let owner_slot = Rc::new(RefCell::new(None));
+    let slot = owner_slot.clone();
+    let handle = cx.add_window(|window, cx| {
+        let maintenance = cx.new(|_| WalletMaintenanceController::new(runtime.handle().clone()));
+        let editor = cx.new(|cx| {
+            WalletSettingsEditor::new(
+                store.clone(),
+                runtime.handle().clone(),
+                saved.clone(),
+                maintenance,
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+        let host = cx.new(|_| TronHost(editor.clone()));
+        *slot.borrow_mut() = Some(editor);
+        gpui_component::Root::new(host, window, cx)
+    });
+    let owner = owner_slot.borrow_mut().take().unwrap();
+    let cx = VisualTestContext::from_window(*handle, cx).into_mut();
+    cx.simulate_resize(gpui::size(px(1000.0), px(1200.0)));
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let bounds = cx
+        .debug_bounds("tron-endpoint-0-submit")
+        .expect("the JSON-RPC-only endpoint's Submit toggle is rendered");
+    cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let (draft, status) = cx.update(|_, cx| {
+        let editor = owner.read(cx);
+        (editor.draft.tron.clone(), editor.status.clone())
+    });
+    assert_eq!(
+        draft, saved.tron,
+        "Submit stays off without an HTTP API URL"
+    );
+    assert!(
+        status.is_none(),
+        "the refusal stays in the row, not the shared page banner"
+    );
+    assert!(
+        cx.debug_bounds("tron-endpoint-0-no-http-api").is_some(),
+        "the JSON-RPC-only row states why it can't submit"
+    );
+    assert!(
+        cx.debug_bounds("tron-endpoint-1-no-http-api").is_none(),
+        "a row with an HTTP API URL states no refusal"
+    );
+
+    // Dropping the window and entities releases the test database before removal.
+    cx.update(|window, _| window.remove_window());
+    drop(owner);
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
 #[gpui::test]
 fn chain_background_activation_is_demand_based_sticky_and_stops_on_retirement(
     cx: &mut gpui::TestAppContext,
@@ -1766,7 +1878,8 @@ fn chain_background_activation_is_demand_based_sticky_and_stops_on_retirement(
             ]
             .into_iter()
             .collect();
-            root.selected_chain = 10;
+            root.selected_network = crate::root::SelectedNetwork::Evm(10);
+            root.last_evm_chain = 10;
             root.view_session = None;
             root.install_chain_background();
             assert_eq!(root.active_rpc_chains, [1, 10].into_iter().collect());

@@ -320,12 +320,12 @@ pub(in crate::root) struct WakuDirectPeerDialogInputs {
 
 #[derive(Clone)]
 pub(in crate::root) struct PriceAnchorDialogInputs {
-    pub(in crate::root) chain_id: Entity<SelectState<Vec<ChainSelectItem>>>,
+    pub(in crate::root) chain_id: Entity<SelectState<Vec<NetworkSelectItem>>>,
     pub(in crate::root) token_address: Entity<InputState>,
     pub(in crate::root) anchor_type: Entity<SelectState<Vec<PriceAnchorTypeSelectItem>>>,
     pub(in crate::root) selected_anchor_type: Entity<InputState>,
     pub(in crate::root) fixed_rate: Entity<InputState>,
-    pub(in crate::root) oracle_chain_id: Entity<SelectState<Vec<ChainSelectItem>>>,
+    pub(in crate::root) oracle_chain_id: Entity<SelectState<Vec<NetworkSelectItem>>>,
     pub(in crate::root) oracle_address: Entity<InputState>,
     pub(in crate::root) oracle_token_decimals: Entity<InputState>,
     pub(in crate::root) oracle_decimals: Entity<InputState>,
@@ -344,7 +344,7 @@ pub(in crate::root) struct ProductAnchorComponentDialogInputs {
     pub(in crate::root) anchor_type: Entity<SelectState<Vec<PriceAnchorTypeSelectItem>>>,
     pub(in crate::root) selected_anchor_type: Entity<InputState>,
     pub(in crate::root) fixed_rate: Entity<InputState>,
-    pub(in crate::root) oracle_chain_id: Entity<SelectState<Vec<ChainSelectItem>>>,
+    pub(in crate::root) oracle_chain_id: Entity<SelectState<Vec<NetworkSelectItem>>>,
     pub(in crate::root) oracle_address: Entity<InputState>,
     pub(in crate::root) oracle_token_decimals: Entity<InputState>,
     pub(in crate::root) oracle_decimals: Entity<InputState>,

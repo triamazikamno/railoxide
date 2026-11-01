@@ -54,7 +54,7 @@ use super::setup_progress::{SetupProgress, SetupProgressEnd};
 use super::{
     PrivateSwapsView, SWAP_BROADCASTER_REPUBLISH_INTERVAL, SWAP_BROADCASTER_RESPONSE_TIMEOUT,
     SetupRetryAvailability, SwapAction, SwapJobKind, local_date_time_label, local_time_label,
-    non_evm_amount, now_unix, sets_up_destination, short_non_evm, short_receiver, swap_delivery,
+    non_evm_amount, now_unix, sets_up_destination, short_receiver, swap_delivery,
     swap_recovery_token, swap_tokens,
 };
 use crate::assets::WalletIconSource;
@@ -1628,7 +1628,7 @@ impl PrivateSwapsView {
                                 .gap_1()
                                 .debug_selector(|| "swap-destination-transaction".into())
                                 .child(
-                                    app_strong_text(short_non_evm(&transaction))
+                                    app_strong_text(railgun_ui::short_non_evm(&transaction))
                                         .flex_none()
                                         .font_family(theme::APP_MONO_FONT_FAMILY),
                                 )
@@ -1709,7 +1709,7 @@ impl PrivateSwapsView {
     /// network, and the receiver shortened with a control that copies it in full.
     fn non_evm_receiver_row(&self, delivery: &NonEvmDelivery, cx: &App) -> gpui::Div {
         let receiver = delivery.receiver.clone();
-        let short = short_non_evm(&receiver);
+        let short = railgun_ui::short_non_evm(&receiver);
         let label = self.non_evm_receiver_label(delivery.network, &receiver, cx);
         receiver_fact_row(receiver, short, label)
     }
@@ -3863,7 +3863,7 @@ pub(super) fn progress_group(
                 .debug_selector(|| "swap-step-destination-transaction".into())
                 .child(app_muted_text("Transaction").flex_none())
                 .child(
-                    app_muted_text(short_non_evm(&transaction))
+                    app_muted_text(railgun_ui::short_non_evm(&transaction))
                         .font_family(theme::APP_MONO_FONT_FAMILY),
                 )
                 .child(clipboard_with_toast(copy_id, transaction).tooltip("Copy transaction"))

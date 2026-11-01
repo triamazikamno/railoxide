@@ -3,9 +3,13 @@ use super::{
     TOKEN_ANCHOR_WAKE_REFRESH_MIN_INTERVAL, TokenAnchorRateCache,
 };
 use crate::settings::EffectiveChainConfig;
-use crate::settings::{EffectiveChainRegistry, resolve_effective_chain_rpc_route};
-use crate::{HttpContext, RpcRoute, WalletRpcOrigin};
-use alloy::{primitives::U256, sol_types::SolCall};
+use crate::settings::{EffectiveChainRegistry, TronSettings, resolve_effective_chain_rpc_route};
+use crate::tron::TRON_CHAIN_ID;
+use crate::{HttpContext, RpcChainRoute, RpcRoute, WalletRpcOrigin};
+use alloy::{
+    primitives::{Address, U256},
+    sol_types::SolCall,
+};
 use eyre::Result;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use railgun_ui::chain_editor::{NativeUsdQuote, NativeUsdState, NativeUsdStatus};
@@ -28,15 +32,92 @@ pub(super) struct NativePricing {
 
 #[derive(Debug)]
 struct NativeChain {
-    config: EffectiveChainConfig,
+    source: NativeSource,
     generation: u64,
     status: NativeUsdStatus,
 }
 
+/// What native USD pricing needs from a chain, Tron included: its feed, precision and route.
+#[derive(Debug, Clone)]
+struct NativeSource {
+    chain_id: u64,
+    enabled: bool,
+    native_usd_oracle: Option<Address>,
+    native_decimals: u8,
+    /// `None` without a usable route.
+    route: Option<RpcChainRoute>,
+}
+
+impl NativeSource {
+    fn chain(chain: &EffectiveChainConfig) -> Self {
+        Self {
+            chain_id: chain.chain_id,
+            enabled: chain.enabled,
+            native_usd_oracle: chain.native_usd_oracle,
+            native_decimals: chain.native_currency.decimals,
+            route: resolve_effective_chain_rpc_route(chain.chain_id, chain).ok(),
+        }
+    }
+
+    /// Tron's source, read over `route`; `None` while Tron is disabled.
+    fn tron(settings: &TronSettings, route: Option<&RpcChainRoute>) -> Self {
+        Self {
+            chain_id: TRON_CHAIN_ID,
+            enabled: settings.enabled && route.is_some(),
+            native_usd_oracle: settings.native_usd_oracle(),
+            native_decimals: railgun_ui::tron_native_currency().decimals,
+            route: route.cloned(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct NativeRead {
-    chain: EffectiveChainConfig,
+    chain: NativeSource,
     generation: u64,
+}
+
+impl NativePricing {
+    /// Installs `source`. A changed feed, enablement or route retires its quote and pending
+    /// work; a changed precision revalues the quote it keeps.
+    fn reconcile(&mut self, source: NativeSource, route_changed: bool) -> bool {
+        let id = source.chain_id;
+        let previous = self.chains.get(&id);
+        let source_changed = previous.is_none_or(|old| {
+            old.source.native_usd_oracle != source.native_usd_oracle
+                || old.source.enabled != source.enabled
+        });
+        let precision_changed =
+            previous.is_some_and(|old| old.source.native_decimals != source.native_decimals);
+        if !source_changed && !route_changed && !precision_changed {
+            return false;
+        }
+        let mut status = previous.map_or_else(NativeUsdStatus::default, |old| old.status.clone());
+        if source_changed || route_changed {
+            self.rates.remove(&id);
+            status.quote = None;
+        }
+        if let Some((_, decimals)) = self.rates.get_mut(&id) {
+            *decimals = source.native_decimals;
+        }
+        status.state = if source.enabled && source.native_usd_oracle.is_some() {
+            NativeUsdState::Pending
+        } else {
+            NativeUsdState::Unconfigured
+        };
+        status.reason = None;
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        self.chains.insert(
+            id,
+            NativeChain {
+                source,
+                generation,
+                status,
+            },
+        );
+        true
+    }
 }
 
 impl TokenAnchorRateCache {
@@ -75,62 +156,68 @@ impl TokenAnchorRateCache {
             return false;
         };
         let mut changed = false;
+        // Tron's id always means Tron, which has its own reconciliation, and never a registry
+        // chain with that id.
         let removed: Vec<_> = native
             .chains
             .keys()
             .copied()
-            .filter(|id| chains.get(*id).is_none())
+            .filter(|&id| id != TRON_CHAIN_ID && chains.get(id).is_none())
             .collect();
         for id in removed {
             native.chains.remove(&id);
             native.rates.remove(&id);
             changed = true;
         }
-        for (&id, config) in chains.iter() {
-            let previous = native.chains.get(&id);
-            let source_changed = previous.is_none_or(|old| {
-                old.config.native_usd_oracle != config.native_usd_oracle
-                    || old.config.enabled != config.enabled
-            });
-            let route_changed = operational_changes.contains(&id);
-            let precision_changed = previous.is_some_and(|old| {
-                old.config.native_currency.decimals != config.native_currency.decimals
-            });
-            if !source_changed && !route_changed && !precision_changed {
-                continue;
-            }
-            let mut status =
-                previous.map_or_else(NativeUsdStatus::default, |old| old.status.clone());
-            if source_changed || route_changed {
-                native.rates.remove(&id);
-                status.quote = None;
-            }
-            if let Some((_, decimals)) = native.rates.get_mut(&id) {
-                *decimals = config.native_currency.decimals;
-            }
-            status.state = if config.enabled && config.native_usd_oracle.is_some() {
-                NativeUsdState::Pending
-            } else {
-                NativeUsdState::Unconfigured
-            };
-            status.reason = None;
-            native.next_generation += 1;
-            let generation = native.next_generation;
-            native.chains.insert(
-                id,
-                NativeChain {
-                    config: config.clone(),
-                    generation,
-                    status,
-                },
+        for (&id, config) in chains.iter().filter(|&(&id, _)| id != TRON_CHAIN_ID) {
+            changed |= native.reconcile(
+                NativeSource::chain(config),
+                operational_changes.contains(&id),
             );
-            changed = true;
         }
         drop(native);
         if changed {
             self.notify_refreshed();
         }
         changed
+    }
+
+    /// Installs Tron's source from its settings and route, as `reconcile_native_sources` does
+    /// for registry chains.
+    pub(super) fn reconcile_tron_source(
+        &self,
+        settings: &TronSettings,
+        route: Option<&RpcChainRoute>,
+    ) -> bool {
+        let Ok(mut native) = self.native_pricing.write() else {
+            return false;
+        };
+        let source = NativeSource::tron(settings, route);
+        let route_changed = native
+            .chains
+            .get(&TRON_CHAIN_ID)
+            .is_some_and(|old| old.source.route != source.route);
+        let changed = native.reconcile(source, route_changed);
+        drop(native);
+        if changed {
+            self.notify_refreshed();
+        }
+        changed
+    }
+
+    /// Tron's route while Tron is enabled and active, for its token anchor reads.
+    pub(super) fn active_tron_route(&self) -> Option<RpcChainRoute> {
+        let native = self.native_pricing.read().ok()?;
+        if !native.active_chains.contains(&TRON_CHAIN_ID) {
+            return None;
+        }
+        native
+            .chains
+            .get(&TRON_CHAIN_ID)
+            .filter(|chain| chain.source.enabled)?
+            .source
+            .route
+            .clone()
     }
 
     fn native_reads(&self) -> Vec<NativeRead> {
@@ -142,12 +229,12 @@ impl TokenAnchorRateCache {
                     .chains
                     .values()
                     .filter(|entry| {
-                        native.active_chains.contains(&entry.config.chain_id)
-                            && entry.config.enabled
-                            && entry.config.native_usd_oracle.is_some()
+                        native.active_chains.contains(&entry.source.chain_id)
+                            && entry.source.enabled
+                            && entry.source.native_usd_oracle.is_some()
                     })
                     .map(|entry| NativeRead {
-                        chain: entry.config.clone(),
+                        chain: entry.source.clone(),
                         generation: entry.generation,
                     })
                     .collect()
@@ -193,10 +280,9 @@ impl TokenAnchorRateCache {
                         .as_secs(),
                     decimals,
                 ));
-                native.rates.insert(
-                    read.chain.chain_id,
-                    (rate, read.chain.native_currency.decimals),
-                );
+                native
+                    .rates
+                    .insert(read.chain.chain_id, (rate, read.chain.native_decimals));
             }
             Err(reason) => {
                 current.status.state = NativeUsdState::Failed;
@@ -214,7 +300,7 @@ pub async fn probe_native_usd_quote(
     chain: &EffectiveChainConfig,
     http: &HttpContext,
 ) -> Result<NativeUsdQuote, String> {
-    let (rate, decimals) = fetch_native_quote(chain, http).await?;
+    let (rate, decimals) = fetch_native_quote(&NativeSource::chain(chain), http).await?;
     Ok(NativeUsdQuote::new(
         rate.to_string(),
         SystemTime::now()
@@ -225,15 +311,18 @@ pub async fn probe_native_usd_quote(
     ))
 }
 
+/// Reads at `latest`, the only block Tron accepts.
 async fn fetch_native_quote(
-    chain: &EffectiveChainConfig,
+    chain: &NativeSource,
     http: &HttpContext,
 ) -> Result<(U256, u8), String> {
     let address = chain
         .native_usd_oracle
         .ok_or_else(|| "This chain has no USD price source".to_owned())?;
-    let route = resolve_effective_chain_rpc_route(chain.chain_id, chain)
-        .map_err(|_| "Check the chain's RPC configuration".to_owned())?
+    let route = chain
+        .route
+        .as_ref()
+        .ok_or_else(|| "Check the chain's RPC configuration".to_owned())?
         .for_class(crate::RpcTrafficClass::General)
         .map_err(|error| error.to_string())?;
     let route = RpcRoute::from(route)
@@ -337,7 +426,7 @@ async fn run_worker_with<F, R>(
     mut wake_rx: watch::Receiver<u64>,
     fetch: F,
 ) where
-    F: Fn(EffectiveChainConfig) -> R,
+    F: Fn(NativeSource) -> R,
     R: Future<Output = Result<(U256, u8), String>>,
 {
     let mut pending = FuturesUnordered::new();
@@ -815,8 +904,9 @@ mod tests {
             .into_iter()
             .find(|read| read.chain.chain_id == 31337)
             .unwrap();
-        assert!(read.chain.railgun.is_none());
-        assert!(read.chain.wrapped_native_token.is_none());
+        let config = configs.get(31337).unwrap();
+        assert!(config.railgun.is_none());
+        assert!(config.wrapped_native_token.is_none());
         cache.publish_native(&read, Ok((U256::from(2_000_000), 8)));
         assert_eq!(
             cache.cached_native_usd_micro_value(31337, U256::from(1_500_000)),

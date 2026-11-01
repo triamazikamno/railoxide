@@ -4,21 +4,22 @@ use std::{
     sync::Arc,
 };
 
-use alloy::primitives::Address;
 use gpui::{
-    AppContext as _, Context, Entity, Focusable, IntoElement, ParentElement, Pixels, SharedString,
-    Styled, Window, div, px,
+    AppContext as _, Context, Entity, Focusable, InteractiveElement as _, IntoElement,
+    ParentElement, Pixels, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Disableable, Sizable, WindowExt,
     alert::Alert,
-    button::ButtonVariants,
+    button::{ButtonGroup, ButtonVariants},
     checkbox::Checkbox,
     input::InputGroupButton,
     menu::{DropdownMenu, PopupMenuItem},
 };
-use railgun_ui::{chain_name, short_address};
-use ui::controls::{app_button, app_input, app_masked_input, app_muted_text, app_strong_text};
+use railgun_ui::chain_name;
+use ui::controls::{
+    app_button, app_input, app_masked_input, app_muted_text, app_segment_button, app_strong_text,
+};
 use wallet_ops::{
     PublicAssetId, PublicBalanceEntry,
     hardware::HardwareDeviceKind,
@@ -38,6 +39,8 @@ mod hardware;
 mod identicon;
 pub(super) mod list;
 mod qr;
+mod tron;
+mod tron_send;
 mod types;
 
 pub(super) use components::{
@@ -53,6 +56,8 @@ pub(super) use identicon::{
     public_account_identicon_color, public_account_identicon_pattern,
 };
 pub(super) use qr::{public_address_qr_payload, render_public_address_qr_dialog_content};
+pub(super) use tron::TronPublicState;
+pub(super) use tron_send::{TronSendIntent, TronSendState};
 pub(super) use types::PublicAccountFormState;
 #[cfg(test)]
 pub(super) use ui::public_address::{
@@ -225,11 +230,30 @@ impl WalletRoot {
         });
     }
 
+    /// Receive's label, full address (also the QR payload) and the note naming its network.
+    pub(super) fn public_receive_text(
+        &self,
+        account: &PublicAccountMetadata,
+    ) -> (Option<String>, String, String) {
+        let warning = if self.tron_selected() {
+            tron::TRON_RECEIVE_WARNING.to_owned()
+        } else {
+            let chain_label = chain_name(self.last_evm_chain)
+                .map_or_else(|| format!("chain {}", self.last_evm_chain), str::to_owned);
+            format!("Send only public {chain_label} assets to this address.")
+        };
+        (
+            public_account_display_label(account),
+            self.listed_address(account),
+            warning,
+        )
+    }
+
+    /// Receive: the account's label, full address, its QR code, a copy action and the network
+    /// the address is for.
     pub(super) fn open_public_address_qr_dialog(
         &self,
-        public_account_uuid: &str,
-        label: Option<String>,
-        address: Address,
+        account: &PublicAccountMetadata,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -238,16 +262,14 @@ impl WalletRoot {
             (window.viewport_size().width * 0.92).min(PUBLIC_ADDRESS_QR_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
-        let address_text = SharedString::from(public_address_qr_payload(address));
+        let (label, address, warning) = self.public_receive_text(account);
+        let address_text = SharedString::from(address);
         let account_label = label.map(SharedString::from);
-        let chain_label = chain_name(self.selected_chain)
-            .map_or_else(|| format!("chain {}", self.selected_chain), str::to_owned);
         let copy_id = SharedString::from(format!(
-            "wallet-public-address-qr-copy-{public_account_uuid}"
+            "wallet-public-address-qr-copy-{}",
+            account.public_account_uuid
         ));
-        let receive_warning = SharedString::from(format!(
-            "Send only public {chain_label} assets to this address."
-        ));
+        let receive_warning = SharedString::from(warning);
         let root = cx.entity().downgrade();
         let generation = self.active_wallet_generation;
         window.open_dialog(cx, move |dialog, _window, _cx| {
@@ -289,6 +311,10 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         match kind {
+            // Tron's hardware add has no input to focus.
+            PublicAccountDialogKind::Derive
+                if self.tron_selected()
+                    && self.selected_hardware_public_device_kind().is_some() => {}
             // A hardware wallet's authorize state has no password, so Enter reaches Show addresses.
             PublicAccountDialogKind::Derive
                 if self.selected_hardware_public_device_kind().is_some() =>
@@ -322,7 +348,10 @@ impl WalletRoot {
         window: &Window,
         cx: &gpui::App,
     ) -> gpui::AnyElement {
-        if let Some(view) = self.stealth_accounts_body() {
+        // With Tron selected the same list shows Tron accounts; stealth accounts are EVM only.
+        if !self.tron_selected()
+            && let Some(view) = self.stealth_accounts_body()
+        {
             return view.into_any_element();
         }
         div()
@@ -349,7 +378,11 @@ impl WalletRoot {
                             .gap_3()
                             .child(self.render_public_list_controls(root))
                             .child(div().flex_1().min_w(px(0.0)))
-                            .child(self.render_walletconnect_toolbar_button(root))
+                            .child(
+                                div()
+                                    .debug_selector(|| "public-walletconnect".into())
+                                    .child(self.render_walletconnect_toolbar_button(root)),
+                            )
                             .child(self.render_public_add_account_dropdown(root)),
                     )
                     .child(self.render_public_accounts_summary(root, cx))
@@ -366,6 +399,7 @@ impl WalletRoot {
     pub(super) fn clear_public_wallet_runtime_state(&mut self, cx: &mut Context<'_, Self>) {
         self.clear_stealth_accounts(cx);
         self.clear_private_swaps(cx);
+        self.clear_tron_wallet_state();
         self.public_balance_cache.clear();
         self.public_accounts.clear();
         self.public_balance_snapshot = None;
@@ -436,8 +470,11 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let default_label =
-            public_account_default_label(self.public_form.next_account_label_number);
+        let default_label = public_account_default_label(if self.tron_selected() {
+            next_public_account_label_number(self.tron_public.accounts.len())
+        } else {
+            self.public_form.next_account_label_number
+        });
         match kind {
             PublicAccountDialogKind::Derive => {
                 self.public_form.derive_preview.reset();
@@ -462,6 +499,7 @@ impl WalletRoot {
                     .import_password_input
                     .update(cx, |input, cx| input.set_value("", window, cx));
                 self.public_form.import_global = false;
+                self.public_form.import_tron = self.tron_selected();
             }
             PublicAccountDialogKind::EditLabel => {
                 self.public_form.editing_account_uuid = None;
@@ -477,6 +515,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.reload_tron_accounts();
         let Some(store) = self.vault_store.as_ref() else {
             self.public_form.error = Some(Arc::from("Wallet vault storage is unavailable"));
             return;
@@ -509,7 +548,7 @@ impl WalletRoot {
                 }
                 self.public_accounts = accounts;
                 self.public_form.selected_account_uuid = selected;
-                if let Some(account) = self.selected_public_account() {
+                if let Some(account) = self.listed_selected_account() {
                     self.public_form.open_section = account.status;
                 }
                 self.public_form.next_derived_index = next_derived_index;
@@ -541,9 +580,9 @@ impl WalletRoot {
             .public_form
             .editing_account_uuid
             .as_ref()
-            .or(self.public_form.selected_account_uuid.as_ref());
+            .or_else(|| self.listed_selected_uuid());
         let label = self
-            .public_account_for_uuid(account_uuid.map(AsRef::as_ref))
+            .listed_account_for_uuid(account_uuid.map(AsRef::as_ref))
             .and_then(|account| account.label.clone())
             .unwrap_or_default();
         self.public_form
@@ -567,7 +606,7 @@ impl WalletRoot {
         let selected = public_account_uuid?;
         self.public_accounts.iter().find(|account| {
             account.public_account_uuid == selected
-                && account.is_available_on_chain(self.selected_chain)
+                && account.is_available_on_chain(self.last_evm_chain)
         })
     }
 
@@ -636,7 +675,7 @@ impl WalletRoot {
     pub(super) fn has_active_public_accounts(&self) -> bool {
         self.public_accounts.iter().any(|account| {
             account.status == PublicAccountStatus::Active
-                && account.is_available_on_chain(self.selected_chain)
+                && account.is_available_on_chain(self.last_evm_chain)
         })
     }
 
@@ -657,6 +696,10 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if self.tron_selected() {
+            self.add_derived_tron_account(device_auth_password, window, cx);
+            return;
+        }
         match self.selected_hardware_public_device_kind() {
             Some(device_kind) => self.authorize_hardware_derive_preview(device_kind, window, cx),
             None => self.authorize_derive_preview(device_auth_password, window, cx),
@@ -730,6 +773,19 @@ impl WalletRoot {
             return;
         }
         let global = self.public_form.import_global;
+        if self.public_form.import_tron {
+            self.public_form.error = None;
+            self.import_tron_account(
+                password.as_str(),
+                private_key.as_str(),
+                &label,
+                global,
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
         self.public_form.importing_account = true;
         self.public_form.error = None;
         let result = store.import_public_account(
@@ -750,7 +806,7 @@ impl WalletRoot {
                 self.public_form.import_global = false;
                 self.reload_public_accounts(window, cx);
                 self.schedule_account_public_balance_refresh(
-                    self.selected_chain,
+                    self.last_evm_chain,
                     [account.public_account_uuid],
                     None,
                     cx,
@@ -779,7 +835,7 @@ impl WalletRoot {
             .public_form
             .editing_account_uuid
             .clone()
-            .or_else(|| self.public_form.selected_account_uuid.clone())
+            .or_else(|| self.listed_selected_uuid().cloned())
         else {
             self.public_form.error = Some(Arc::from("Select a public account first"));
             cx.notify();
@@ -797,12 +853,25 @@ impl WalletRoot {
             cx.notify();
             return;
         }
-        match store.update_public_account_label(
-            view_session.as_ref(),
-            account_uuid.as_ref(),
-            Some(&label),
-        ) {
-            Ok(_) => {
+        let result = if self.tron_selected() {
+            store
+                .update_tron_account_label(
+                    view_session.as_ref(),
+                    account_uuid.as_ref(),
+                    Some(&label),
+                )
+                .map(drop)
+        } else {
+            store
+                .update_public_account_label(
+                    view_session.as_ref(),
+                    account_uuid.as_ref(),
+                    Some(&label),
+                )
+                .map(drop)
+        };
+        match result {
+            Ok(()) => {
                 self.public_form.editing_account_uuid = None;
                 self.reload_public_accounts(window, cx);
                 window.close_all_dialogs(cx);
@@ -824,6 +893,10 @@ impl WalletRoot {
         let Some(view_session) = self.view_session.clone() else {
             return;
         };
+        if self.tron_selected() {
+            self.set_tron_account_active(public_account_uuid, false, window, cx);
+            return;
+        }
         let neighbour = self.public_account_neighbour(public_account_uuid);
         match store
             .deactivate_derived_public_account(view_session.as_ref(), public_account_uuid.as_ref())
@@ -853,6 +926,10 @@ impl WalletRoot {
         let Some(view_session) = self.view_session.clone() else {
             return;
         };
+        if self.tron_selected() {
+            self.set_tron_account_active(public_account_uuid, true, window, cx);
+            return;
+        }
         match store
             .activate_derived_public_account(view_session.as_ref(), public_account_uuid.as_ref())
         {
@@ -861,7 +938,7 @@ impl WalletRoot {
                     Some(Arc::from(account.public_account_uuid.as_str()));
                 self.reload_public_accounts(window, cx);
                 self.schedule_account_public_balance_refresh(
-                    self.selected_chain,
+                    self.last_evm_chain,
                     [account.public_account_uuid],
                     None,
                     cx,
@@ -879,7 +956,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let Some(account) = self
-            .public_account_for_uuid(Some(public_account_uuid))
+            .listed_account_for_uuid(Some(public_account_uuid))
             .cloned()
         else {
             return;
@@ -888,7 +965,7 @@ impl WalletRoot {
             let root = cx.entity();
             let account_uuid = account.public_account_uuid.clone();
             let label = public_account_display_label(&account)
-                .unwrap_or_else(|| short_address(&account.address));
+                .unwrap_or_else(|| self.listed_short_address(&account));
             let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
             let dialog_max_height = dialog_max_height(window);
             window.open_alert_dialog(cx, move |dialog, _window, _cx| {
@@ -925,7 +1002,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let Some(account) = self
-            .public_account_for_uuid(Some(public_account_uuid))
+            .listed_account_for_uuid(Some(public_account_uuid))
             .cloned()
         else {
             return;
@@ -939,10 +1016,17 @@ impl WalletRoot {
         let neighbour = self.public_account_neighbour(public_account_uuid);
         let account_is_global = account.is_global();
         let owning_wallet_uuid = view_session.wallet_id().to_owned();
-        match store
-            .delete_imported_public_account(view_session.as_ref(), &account.public_account_uuid)
-        {
-            Ok(_) => {
+        let result = if self.tron_selected() {
+            store
+                .delete_imported_tron_account(view_session.as_ref(), &account.public_account_uuid)
+                .map(drop)
+        } else {
+            store
+                .delete_imported_public_account(view_session.as_ref(), &account.public_account_uuid)
+                .map(drop)
+        };
+        match result {
+            Ok(()) => {
                 let participation_changed = if account_is_global {
                     remove_global_participant(
                         &mut self.ui_state.governance_participants,
@@ -965,8 +1049,8 @@ impl WalletRoot {
                 if participation_changed {
                     self.invalidate_governance_context();
                 }
-                if self.public_form.selected_account_uuid.as_deref() == Some(public_account_uuid) {
-                    self.public_form.selected_account_uuid = neighbour;
+                if self.listed_selected_uuid().map(AsRef::as_ref) == Some(public_account_uuid) {
+                    self.set_listed_selected_uuid(neighbour);
                 }
                 self.reload_public_accounts(window, cx);
                 self.reset_public_asset_focus();
@@ -983,8 +1067,8 @@ impl WalletRoot {
         status: PublicAccountStatus,
     ) -> Vec<PublicBalanceEntry> {
         public_account_visible_balances_for_chain(
-            self.public_balance_snapshot.as_deref(),
-            self.selected_chain,
+            self.listed_public_snapshot(),
+            self.listed_public_chain(),
             public_account_uuid,
             status,
         )
@@ -1194,20 +1278,66 @@ impl WalletRoot {
         device_auth_lease: Weak<Cell<bool>>,
     ) -> gpui::Div {
         match kind {
+            PublicAccountDialogKind::Derive if self.tron_selected() => {
+                self.render_tron_derive_content(root, content_width, device_auth_lease)
+            }
             PublicAccountDialogKind::Derive => {
                 self.render_derive_preview_content(root, content_width, device_auth_lease)
             }
             PublicAccountDialogKind::Import => {
                 let import_root = root.clone();
-                let global_root = root;
+                let global_root = root.clone();
+                let network_root = root;
+                let busy = self.public_form.importing_account || self.device_auth_in_progress;
+                let tron = self.public_form.import_tron;
                 div()
                     .w(content_width)
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .child(app_muted_text(
-                        "Import an EVM private key as a vaulted Public account.",
-                    ))
+                    // The import names its network; Tron is offered while it is enabled.
+                    .when(self.tron_enabled(), |content| {
+                        content.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(app_muted_text("Network"))
+                                .child(
+                                    ButtonGroup::new("wallet-public-import-network")
+                                        .outline()
+                                        .compact()
+                                        .disabled(busy)
+                                        .child(app_segment_button(
+                                            "wallet-public-import-network-evm",
+                                            "EVM",
+                                            !tron,
+                                            busy,
+                                            None,
+                                        ))
+                                        .child(app_segment_button(
+                                            "wallet-public-import-network-tron",
+                                            "Tron",
+                                            tron,
+                                            busy,
+                                            None,
+                                        ))
+                                        .on_click(move |selected, _window, cx| {
+                                            let tron = selected.first() == Some(&1);
+                                            network_root.update(cx, |root, cx| {
+                                                root.public_form.import_tron = tron;
+                                                root.public_form.error = None;
+                                                cx.notify();
+                                            });
+                                        }),
+                                ),
+                        )
+                    })
+                    .child(app_muted_text(if tron {
+                        "Import a private key as a vaulted Tron account. No EVM account is added."
+                    } else {
+                        "Import an EVM private key as a vaulted Public account."
+                    }))
                     .child(
                         app_input(&self.public_form.import_label_input)
                             .disabled(self.device_auth_in_progress),

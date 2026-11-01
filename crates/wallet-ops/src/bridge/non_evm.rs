@@ -8,6 +8,8 @@ use alloy::primitives::Address;
 use bech32::{hrp, segwit};
 use serde::{Deserialize, Serialize};
 
+use crate::tron::address::{encode_tron_address, parse_tron_address};
+
 /// A destination network without EVM addresses, chain configuration or RPC endpoints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NonEvmNetwork {
@@ -46,7 +48,7 @@ impl NonEvmNetwork {
         match self {
             Self::Bitcoin => "Bitcoin",
             Self::Solana => "Solana",
-            Self::Tron => "Tron",
+            Self::Tron => railgun_ui::TRON_NAME,
         }
     }
 
@@ -66,7 +68,7 @@ impl NonEvmNetwork {
         match self {
             Self::Bitcoin => "railgun-ui/chains/bitcoin.svg",
             Self::Solana => "railgun-ui/chains/solana.svg",
-            Self::Tron => "railgun-ui/chains/tron.svg",
+            Self::Tron => railgun_ui::TRON_ICON_ASSET_PATH,
         }
     }
 
@@ -113,9 +115,9 @@ impl NonEvmNetwork {
                 Some(bs58::encode(key).into_string())
             }
             Self::Tron => {
-                let mut address = [TRON_VERSION; 21];
-                getrandom::fill(&mut address[1..]).ok()?;
-                Some(bs58::encode(address).with_check().into_string())
+                let mut address = [0_u8; 20];
+                getrandom::fill(&mut address).ok()?;
+                Some(encode_tron_address(Address::from(address)))
             }
         }
     }
@@ -129,17 +131,12 @@ impl NonEvmNetwork {
                 Ok(key) if key.len() == 32 => Ok(text.to_owned()),
                 _ => Err(NonEvmReceiverError::Invalid),
             },
-            Self::Tron => match base58check(text) {
-                Some(address) if address.len() == 21 && address[0] == TRON_VERSION => {
-                    Ok(text.to_owned())
-                }
-                _ => Err(NonEvmReceiverError::Invalid),
-            },
+            Self::Tron => parse_tron_address(text)
+                .map(|_| text.to_owned())
+                .map_err(|_| NonEvmReceiverError::Invalid),
         }
     }
 }
-
-const TRON_VERSION: u8 = 0x41;
 
 /// A segwit v0 or Taproot address, lowercased, or a base58check P2PKH or P2SH address as
 /// entered. The segwit decoder also accepts future versions and v1 programs of other lengths,

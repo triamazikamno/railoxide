@@ -18,7 +18,8 @@ use super::{
     assign_missing_display_orders, default_wallet_label_for_metadata, generate_opaque_id,
     hardware_wallet_account_index_record_entry, next_wallet_display_order,
     public_account_metadata_record_key, public_account_secret_record_key, sort_wallet_metadata,
-    validate_wallet_label, wallet_chain_index_complete_record_key, wallet_chain_index_prefix,
+    tron_account_metadata_record_key, tron_account_secret_record_key, validate_wallet_label,
+    wallet_chain_index_complete_record_key, wallet_chain_index_prefix,
     wallet_chain_index_record_key, wallet_chain_metadata_record_key, wallet_metadata_record_entry,
     wallet_metadata_record_key, wallet_spend_record_key, wallet_view_record_key,
 };
@@ -1075,6 +1076,15 @@ impl DesktopVaultStore {
                 keys_to_delete.push(public_account_secret_record_key(
                     &account.public_account_uuid,
                 ));
+            }
+        }
+        for account in self.list_tron_account_metadata_with_view(view)? {
+            if matches!(
+                &account.scope,
+                PublicAccountScope::PrivateWallet { wallet_uuid: scoped } if scoped == wallet_uuid
+            ) {
+                keys_to_delete.push(tron_account_metadata_record_key(&account.tron_account_uuid));
+                keys_to_delete.push(tron_account_secret_record_key(&account.tron_account_uuid));
             }
         }
 

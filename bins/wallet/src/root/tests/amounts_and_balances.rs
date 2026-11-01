@@ -1787,6 +1787,13 @@ fn public_action_error_details_hide_duplicate_summary() {
 
     assert_eq!(public_action_error_details(summary, Some(summary)), None);
     assert_eq!(
+        public_action_error_details(
+            "The transaction expired without being included. No TRX was spent.",
+            Some("the transaction expired without being included; no TRX was spent"),
+        ),
+        None,
+    );
+    assert_eq!(
         public_action_error_details(summary, Some("public-send: estimate gas")),
         Some("public-send: estimate gas".to_string()),
     );

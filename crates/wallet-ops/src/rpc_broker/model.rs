@@ -909,6 +909,8 @@ pub struct RpcChainRoute {
     verify_identity: bool,
     pub(super) verified_identities: Arc<VerifiedIdentities>,
     isolation: Option<Arc<RouteIsolation>>,
+    /// Tron only: each endpoint's HTTP API and request pacing, shared by clones.
+    pub(super) tron: Option<Arc<super::tron::TronEndpoints>>,
 }
 
 static NEXT_ROUTE_ISOLATION: AtomicU64 = AtomicU64::new(1);
@@ -937,6 +939,7 @@ impl PartialEq for RpcChainRoute {
             && self.multicall == other.multicall
             && self.verify_identity == other.verify_identity
             && self.isolation_id() == other.isolation_id()
+            && self.tron == other.tron
     }
 }
 
@@ -953,6 +956,7 @@ impl Hash for RpcChainRoute {
             transport.hash(state);
         }
         self.roles.hash(state);
+        self.tron.hash(state);
     }
 }
 
@@ -1007,6 +1011,7 @@ impl RpcChainRoute {
             verify_identity: false,
             verified_identities,
             isolation: None,
+            tron: None,
         }
     }
     /// Returns a clone whose reads go over `client` and are kept apart from every other route,
@@ -1082,6 +1087,12 @@ impl RpcChainRoute {
     #[must_use]
     pub const fn with_multicall(mut self, address: Address) -> Self {
         self.multicall = Some(address);
+        self
+    }
+    /// A clone that sends each read as its own request, never batched into Multicall3.
+    #[must_use]
+    pub(crate) const fn without_multicall(mut self) -> Self {
+        self.multicall = None;
         self
     }
     #[must_use]

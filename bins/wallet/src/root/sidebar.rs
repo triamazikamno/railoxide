@@ -105,7 +105,7 @@ impl WalletRoot {
                                     root.focus_utxo_table_on_render = should_focus_utxo_table(
                                         root.active_activity,
                                         root.active_wallet_tab,
-                                        root.chain_states.get(&root.selected_chain),
+                                        root.chain_states.get(&root.last_evm_chain),
                                     );
                                     cx.notify();
                                 });
@@ -131,7 +131,7 @@ impl WalletRoot {
                                     root.clear_settings_transient_status(cx);
                                     root.invalidate_governance_context();
                                     root.sync_broadcaster_monitor_chain_filter(
-                                        root.selected_chain,
+                                        root.last_evm_chain,
                                         window,
                                         cx,
                                     );

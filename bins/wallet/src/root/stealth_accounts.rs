@@ -148,7 +148,7 @@ impl Drop for StealthAccountsView {
 
 impl WalletRoot {
     pub(super) fn stealth_session(&self) -> Option<Arc<WalletSession>> {
-        match self.chain_states.get(&self.selected_chain) {
+        match self.chain_states.get(&self.last_evm_chain) {
             Some(
                 ChainUtxoState::Ready { session, .. } | ChainUtxoState::Syncing { session, .. },
             ) if session.executor_owner().is_some() => Some(Arc::clone(session)),

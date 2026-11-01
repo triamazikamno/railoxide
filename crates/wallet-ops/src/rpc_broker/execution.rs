@@ -249,15 +249,21 @@ impl Failover for SingleFailover<'_> {
         resources: &'b JobResources,
         endpoint: &'b Url,
     ) -> BoxFuture<'b, Self::Outcome> {
-        Box::pin(execute_single_shared_waiter_attempt(
-            self.route.read_client(&resources.clients, endpoint),
-            &resources.http,
-            self.read,
-            endpoint,
-            &self.waiters,
-            self.fallback_attempt_timeout,
-            None,
-        ))
+        let (route, read, waiters) = (self.route, self.read, &self.waiters);
+        let fallback_attempt_timeout = self.fallback_attempt_timeout;
+        Box::pin(async move {
+            route.pace(endpoint).await;
+            execute_single_shared_waiter_attempt(
+                route.read_client(&resources.clients, endpoint),
+                &resources.http,
+                read,
+                endpoint,
+                waiters,
+                fallback_attempt_timeout,
+                None,
+            )
+            .await
+        })
     }
 
     fn apply(&mut self, endpoint: &Url, outcome: Self::Outcome) -> bool {
@@ -996,6 +1002,7 @@ fn reduce_with_parent(
         } else {
             let error = aggregate_error;
             let index = first_index;
+            context.route.chain_route().pace(&context.endpoint).await;
             let result = execute_single_shared_waiter_attempt(
                 &context.client,
                 &context.semaphore,
@@ -1080,6 +1087,7 @@ async fn execute_aggregate(
             result: AttemptOutcome::NotDispatched,
         };
     }
+    context.route.chain_route().pace(&context.endpoint).await;
     let permit = loop {
         match acquire_permit(&context.semaphore, current.earliest_permit_deadline()).await {
             PermitAcquisition::Acquired(permit) => break permit,
@@ -1372,38 +1380,8 @@ async fn execute_wire_request_with_permit(
     request_deadline: Instant,
 ) -> Result<Value, RpcBrokerError> {
     let request = async {
-        let mut response = client
-            .post(endpoint.clone())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|error| {
-                if error.is_timeout() {
-                    RpcBrokerError::Timeout
-                } else {
-                    RpcBrokerError::Transport
-                }
-            })?;
-        if !response.status().is_success() {
-            return Err(RpcBrokerError::HttpStatus(response.status().as_u16()));
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|error| {
-            if error.is_timeout() {
-                RpcBrokerError::Timeout
-            } else {
-                RpcBrokerError::InvalidResponse
-            }
-        })? {
-            let size = bytes
-                .len()
-                .checked_add(chunk.len())
-                .ok_or(RpcBrokerError::ResponseTooLarge)?;
-            if size > MAX_RESPONSE_BYTES {
-                return Err(RpcBrokerError::ResponseTooLarge);
-            }
-            bytes.extend_from_slice(&chunk);
-        }
+        let mut response = send_json_post(client, endpoint.clone(), &body).await?;
+        let bytes = read_capped_body(&mut response).await?;
         let value = serde_json::from_slice(&bytes).map_err(|_| RpcBrokerError::InvalidResponse);
         if Instant::now() >= request_deadline {
             Err(RpcBrokerError::Timeout)
@@ -1414,6 +1392,49 @@ async fn execute_wire_request_with_permit(
     time::timeout_at(request_deadline, request)
         .await
         .map_err(|_| RpcBrokerError::Timeout)?
+}
+
+/// POSTs `body` as JSON to `url`, failing on a transport error or a non-success status.
+pub(super) async fn send_json_post<B: serde::Serialize + ?Sized>(
+    client: &reqwest::Client,
+    url: Url,
+    body: &B,
+) -> Result<reqwest::Response, RpcBrokerError> {
+    let response = client.post(url).json(body).send().await.map_err(|error| {
+        if error.is_timeout() {
+            RpcBrokerError::Timeout
+        } else {
+            RpcBrokerError::Transport
+        }
+    })?;
+    if !response.status().is_success() {
+        return Err(RpcBrokerError::HttpStatus(response.status().as_u16()));
+    }
+    Ok(response)
+}
+
+/// A response body, capped at [`MAX_RESPONSE_BYTES`].
+pub(super) async fn read_capped_body(
+    response: &mut reqwest::Response,
+) -> Result<Vec<u8>, RpcBrokerError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
+        if error.is_timeout() {
+            RpcBrokerError::Timeout
+        } else {
+            RpcBrokerError::InvalidResponse
+        }
+    })? {
+        let size = bytes
+            .len()
+            .checked_add(chunk.len())
+            .ok_or(RpcBrokerError::ResponseTooLarge)?;
+        if size > MAX_RESPONSE_BYTES {
+            return Err(RpcBrokerError::ResponseTooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 pub(super) fn wire_request_for(read: &RpcRead) -> (&'static str, Value, bool) {
@@ -1467,11 +1488,7 @@ pub(super) fn remote_failure(remote: RpcRemoteError, preserve_revert: bool) -> R
     RpcBrokerError::Remote(remote)
 }
 pub(super) fn decode_hex_value(value: &Value) -> Result<Bytes, RpcBrokerError> {
-    value
-        .as_str()
-        .ok_or(RpcBrokerError::InvalidResponse)?
-        .parse()
-        .map_err(|_| RpcBrokerError::InvalidResponse)
+    Bytes::deserialize(value).map_err(|_| RpcBrokerError::InvalidResponse)
 }
 
 #[cfg(test)]

@@ -9,7 +9,6 @@ use gpui_component::{
 use ui::controls::{app_button_base, app_button_label, app_text};
 use wallet_ops::vault::{PublicAccountMetadata, PublicAccountSource, PublicAccountStatus};
 
-use super::{public_account_display_label, public_address_qr_payload};
 use crate::root::WalletRoot;
 
 #[derive(Clone, Copy)]
@@ -73,15 +72,17 @@ impl WalletRoot {
         account: &PublicAccountMetadata,
     ) -> Vec<AccountCommand> {
         let sessions = self.walletconnect_account_session_count(&account.public_account_uuid);
-        let mut commands = vec![
-            AccountCommand::Copy,
-            AccountCommand::Qr,
-            if sessions == 0 {
+        let mut commands = vec![AccountCommand::Copy, AccountCommand::Qr];
+        // WalletConnect is EVM only.
+        if !self.tron_selected() {
+            commands.push(if sessions == 0 {
                 AccountCommand::Connect
             } else {
                 AccountCommand::Sessions(sessions)
-            },
-            AccountCommand::Refresh,
+            });
+        }
+        commands.push(AccountCommand::Refresh);
+        commands.push(
             if self
                 .ui_state
                 .public_refresh_excluded
@@ -91,7 +92,7 @@ impl WalletRoot {
             } else {
                 AccountCommand::ExcludeFromRefresh
             },
-        ];
+        );
         if matches!(account.source, PublicAccountSource::ExecutorDerived(_)) {
             commands.push(AccountCommand::Stealth);
         }
@@ -114,7 +115,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let Some(account) = self
-            .public_account_for_uuid(Some(uuid))
+            .listed_account_for_uuid(Some(uuid))
             .cloned()
             .filter(|_| self.view_session.is_some())
         else {
@@ -123,27 +124,24 @@ impl WalletRoot {
         if command.disabled(&account) {
             return;
         }
+        let tron = self.tron_selected();
         match command {
             AccountCommand::Copy => ui::clipboard::copy_to_clipboard_with_toast(
-                public_address_qr_payload(account.address),
+                self.listed_address(&account),
                 window,
                 cx,
             ),
-            AccountCommand::Qr => self.open_public_address_qr_dialog(
-                uuid,
-                public_account_display_label(&account),
-                account.address,
-                window,
-                cx,
-            ),
+            AccountCommand::Qr => self.open_public_address_qr_dialog(&account, window, cx),
+            AccountCommand::Connect | AccountCommand::Sessions(_) if tron => {}
             AccountCommand::Connect => {
                 self.open_walletconnect_connection_dialog(Arc::from(uuid), window, cx);
             }
             AccountCommand::Sessions(_) => {
                 self.open_walletconnect_account_sessions_dialog(Arc::from(uuid), window, cx);
             }
+            AccountCommand::Refresh if tron => self.schedule_tron_balance_refresh([uuid], cx),
             AccountCommand::Refresh => {
-                self.schedule_account_public_balance_refresh(self.selected_chain, [uuid], None, cx);
+                self.schedule_account_public_balance_refresh(self.last_evm_chain, [uuid], None, cx);
             }
             AccountCommand::ExcludeFromRefresh => self.set_public_refresh_excluded(uuid, true, cx),
             AccountCommand::IncludeInRefresh => self.set_public_refresh_excluded(uuid, false, cx),

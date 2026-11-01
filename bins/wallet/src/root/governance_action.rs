@@ -564,7 +564,7 @@ impl WalletRoot {
             GovernanceRefreshTarget::Staking(key) => key.clone(),
         };
         if self.selected_wallet_id.as_deref() != Some(draft.context.private_wallet_uuid.as_str())
-            || self.selected_chain != draft.context.chain_id
+            || self.selected_evm_chain() != Some(draft.context.chain_id)
             || self.governance_context_key() != expected_context
             || !self.governance_participants().iter().any(|account| {
                 account.public_account_uuid.as_str() == draft.actor_uuid.as_ref()
@@ -872,7 +872,9 @@ impl WalletRoot {
             selection,
             amount,
         });
-        let chain_id = self.selected_chain;
+        let Some(chain_id) = self.selected_evm_chain() else {
+            return;
+        };
         let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
             return;
         };
@@ -935,14 +937,13 @@ impl WalletRoot {
         #[cfg(not(feature = "hardware"))] window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let Ok(resolved_chain) = self
-            .effective_chain_configs
-            .enabled(self.selected_chain)
-            .cloned()
-        else {
+        let Some(chain_id) = self.selected_evm_chain() else {
             return;
         };
-        if self.public_form.sending {
+        let Ok(resolved_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
+            return;
+        };
+        if self.public_action_in_flight() {
             return;
         }
         let GovernanceSpendDraft {
@@ -1047,24 +1048,15 @@ impl WalletRoot {
         };
         self.public_form.action_progress_title_override = Some(Arc::from("Governance action"));
         self.public_form.sending = true;
-        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
-        Self::spawn_public_action_progress_listener(
-            generation,
-            chain_id,
-            active_wallet_id.clone(),
-            progress_rx,
-            None,
-            cx,
-        );
-        Self::spawn_public_action_session_event_listener(
+        let progress_tx = Self::follow_public_action_progress(
             generation,
             chain_id,
             active_wallet_id.clone(),
             event_rx,
             None,
+            window,
             cx,
         );
-        Self::show_public_action_progress_dialog_after_close(window, cx);
         let public_send = PublicSendRequest {
             executor_owner: self.executor_owner_for_public_chain(chain_id),
             transaction_tracking: Some(transaction_tracking),
@@ -1144,7 +1136,9 @@ impl WalletRoot {
                         cx,
                     );
                 }
-                if root.selected_wallet_id != active_wallet_id || root.selected_chain != chain_id {
+                if root.selected_wallet_id != active_wallet_id
+                    || root.selected_evm_chain() != Some(chain_id)
+                {
                     return;
                 }
                 if !super::public_action::public_action_accepts_update(

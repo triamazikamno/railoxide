@@ -2236,7 +2236,7 @@ const REUSED_READY: &str = "Reused · ready";
 const BACK_IN_PRIVATE_BALANCE: &str = "Back in private balance";
 const BRIDGE_DEPOSIT: &str = "Bridge deposit";
 
-/// The progress steps of decision 8: set up, order open, traded, back in private balance. An
+/// The progress steps: set up, order open, traded, back in private balance. An
 /// attempt that ended, or stranded funds before a trade, ends the list at the order step. A
 /// fill the orderbook reports shows every step its settlement performs as confirming until
 /// observation records it, with one confirmation count, on the trade, and the private return

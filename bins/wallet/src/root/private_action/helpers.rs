@@ -587,7 +587,7 @@ impl WalletRoot {
         chain_id: u64,
         recipient: Address,
     ) -> Option<String> {
-        if self.selected_chain != chain_id {
+        if self.last_evm_chain != chain_id {
             return None;
         }
         self.public_accounts

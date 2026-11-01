@@ -1385,7 +1385,8 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
                 cx,
             )
             .unwrap();
-            root.selected_chain = 137;
+            root.selected_network = crate::root::SelectedNetwork::Evm(137);
+            root.last_evm_chain = 137;
         });
     });
     cx.run_until_parked();

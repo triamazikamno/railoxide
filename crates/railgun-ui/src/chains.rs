@@ -12,6 +12,27 @@ pub const PUBLIC_CHAINS: &[u64] = &[
     747_474, 30, 25, 4326, 80094, 4217, 480, 1672, 999,
 ];
 
+/// Tron mainnet's id, the last four bytes of its genesis block id. Not an EVM chain:
+/// it keys Tron's tokens and price reads, and is never a chain registry entry.
+pub const TRON_CHAIN_ID: u64 = 728_126_428;
+
+/// Tron's network icon. Kept out of the chain-id lookups, so a custom EVM chain saved with
+/// Tron's id keeps its own name and icon.
+pub const TRON_ICON_ASSET_PATH: &str = "railgun-ui/chains/tron.svg";
+
+/// Tron's network name, kept out of `chain_name` for the same reason as its icon.
+pub const TRON_NAME: &str = "Tron";
+
+/// Tron's native currency. Tron has no chain preset to carry it, unlike EVM chains.
+#[must_use]
+pub fn tron_native_currency() -> NativeCurrency {
+    NativeCurrency {
+        name: "TRX".into(),
+        symbol: "TRX".into(),
+        decimals: 6,
+    }
+}
+
 /// True for any chain the app ships a preset for, with or without Railgun.
 #[must_use]
 pub fn is_built_in_chain(chain_id: u64) -> bool {

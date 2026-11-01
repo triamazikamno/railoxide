@@ -286,6 +286,9 @@ async fn typed_submit_helper_decodes_members_and_preserves_errors() {
                             &U256::from(7)
                         )))),
                         Some(2) => Ok(data_result(Bytes::from_static(&[1, 2, 3]))),
+                        Some(4) => Ok(RpcResult::new(json!(
+                            U256::from(7).to_be_bytes::<32>().to_vec()
+                        ))),
                         _ => Err(RpcBrokerError::Transport),
                     };
                     (item.key, result)
@@ -306,6 +309,7 @@ async fn typed_submit_helper_decodes_members_and_preserves_errors() {
                 (Address::ZERO, Bytes::from_static(&[1])),
                 (Address::ZERO, Bytes::from_static(&[2])),
                 (Address::ZERO, Bytes::from_static(&[3])),
+                (Address::ZERO, Bytes::from_static(&[4])),
             ],
             test_origin(),
         )
@@ -314,6 +318,8 @@ async fn typed_submit_helper_decodes_members_and_preserves_errors() {
     assert_eq!(results[0], Ok(U256::from(7)));
     assert_eq!(results[1], Err(RpcBrokerError::InvalidResponse));
     assert_eq!(results[2], Err(RpcBrokerError::Transport));
+    // A JSON byte array decodes like hex, as operation validation accepts it.
+    assert_eq!(results[3], Ok(U256::from(7)));
     drop(broker);
 }
 

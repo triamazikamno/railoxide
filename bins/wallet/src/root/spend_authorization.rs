@@ -255,6 +255,7 @@ pub(super) enum SpendAuthorizationIntent {
     BlockedShieldRefundGasPassword(BlockedShieldRescueUtxoId),
     PublicSend(Box<PublicSendDraft>),
     PublicShield(Box<PublicShieldDraft>),
+    TronSend(Box<super::public_account::TronSendIntent>),
     Governance(Box<GovernanceSpendDraft>),
     WalletConnectRequest {
         request_key: String,
@@ -520,7 +521,7 @@ impl HardwareSpendAuthorizationCompletion {
 }
 
 #[cfg(feature = "hardware")]
-enum HardwareSpendAuthorizationError {
+pub(super) enum HardwareSpendAuthorizationError {
     Hardware(HardwareDerivationError),
     Vault(VaultError),
     Executor(String),
@@ -3951,7 +3952,7 @@ impl WalletRoot {
         });
     }
 
-    fn selected_hardware_descriptor(&self) -> Option<HardwareDerivationDescriptor> {
+    pub(super) fn selected_hardware_descriptor(&self) -> Option<HardwareDerivationDescriptor> {
         let selected_wallet_id = self.selected_wallet_id.as_ref()?;
         self.wallet_metadata
             .iter()
@@ -4016,7 +4017,7 @@ impl WalletRoot {
                     SpendAuthorizationIntent::PublicSwap(_, command) => {
                         command.hardware_executor_chain()
                     }
-                    _ => self.selected_chain,
+                    _ => self.last_evm_chain,
                 };
                 intent
                     .hardware_executor_action(self)
@@ -4596,6 +4597,9 @@ impl WalletRoot {
             SpendAuthorizationIntent::PublicShield(draft) => {
                 self.submit_public_shield_authorized(*draft, authorization, window, cx);
             }
+            SpendAuthorizationIntent::TronSend(intent) => {
+                self.submit_tron_send_authorized(*intent, authorization, window, cx);
+            }
             SpendAuthorizationIntent::Governance(draft) => {
                 self.revalidate_governance_authorized(&draft, authorization, window, cx);
             }
@@ -4712,6 +4716,47 @@ fn hardware_spend_authorization_error_message(error: &HardwareSpendAuthorization
     }
 }
 
+/// Fresh device approval of the hardware-derived wallet's synthetic seed entropy. The session
+/// keeps the device's refreshed Trezor session.
+#[cfg(feature = "hardware")]
+pub(super) async fn hardware_synthetic_entropy(
+    hardware_session: &mut HardwareProfileSession,
+    descriptor: &HardwareDerivationDescriptor,
+    trezor_app_passphrase: Option<Zeroizing<String>>,
+    trezor_pin_matrix_provider: Option<TrezorPinMatrixProvider>,
+) -> Result<wallet_ops::hardware::SyntheticRailgunEntropy, HardwareSpendAuthorizationError> {
+    hardware_session.verify_descriptor(descriptor)?;
+    Ok(match descriptor.device_kind {
+        HardwareDeviceKind::Ledger => {
+            let client = LedgerHardwareDerivationClient::connect().await?;
+            let active = client.active_profile_session(&descriptor.path).await?;
+            active.verify_descriptor(descriptor)?;
+            let output = client.eip1024_shared_secret(&descriptor.path, true).await?;
+            synthetic_entropy_from_hardware_output(descriptor, output)?
+        }
+        HardwareDeviceKind::Trezor => {
+            let mut client = TrezorHardwareDerivationClient::connect_with_session(
+                hardware_session.trezor_session_id.clone(),
+            )?;
+            client.set_passphrase_mode(hardware_session.trezor_passphrase_mode());
+            if let Some(passphrase) = trezor_app_passphrase {
+                client.set_app_passphrase_zeroizing(passphrase);
+            }
+            if let Some(provider) = trezor_pin_matrix_provider {
+                client.set_pin_matrix_provider(provider);
+            }
+            let active = client.active_profile_session(&descriptor.path)?;
+            active.verify_descriptor(descriptor)?;
+            hardware_session
+                .trezor_session_id
+                .clone_from(&active.trezor_session_id);
+            hardware_session.set_trezor_passphrase_mode(active.trezor_passphrase_mode());
+            let output = client.cipher_key_value(descriptor)?;
+            synthetic_entropy_from_hardware_output(descriptor, output)?
+        }
+    })
+}
+
 #[cfg(feature = "hardware")]
 async fn derive_hardware_spend_authorization(
     store: Arc<DesktopVaultStore>,
@@ -4732,36 +4777,13 @@ async fn derive_hardware_spend_authorization(
                 .map_err(|error| HardwareSpendAuthorizationError::Executor(error.to_string()))?;
         }
     }
-    hardware_session.verify_descriptor(&descriptor)?;
-    let entropy = match descriptor.device_kind {
-        HardwareDeviceKind::Ledger => {
-            let client = LedgerHardwareDerivationClient::connect().await?;
-            let active = client.active_profile_session(&descriptor.path).await?;
-            active.verify_descriptor(&descriptor)?;
-            let output = client.eip1024_shared_secret(&descriptor.path, true).await?;
-            synthetic_entropy_from_hardware_output(&descriptor, output)?
-        }
-        HardwareDeviceKind::Trezor => {
-            let mut client = TrezorHardwareDerivationClient::connect_with_session(
-                hardware_session.trezor_session_id.clone(),
-            )?;
-            client.set_passphrase_mode(hardware_session.trezor_passphrase_mode());
-            if let Some(passphrase) = trezor_app_passphrase {
-                client.set_app_passphrase_zeroizing(passphrase);
-            }
-            if let Some(provider) = trezor_pin_matrix_provider {
-                client.set_pin_matrix_provider(provider);
-            }
-            let active = client.active_profile_session(&descriptor.path)?;
-            active.verify_descriptor(&descriptor)?;
-            hardware_session
-                .trezor_session_id
-                .clone_from(&active.trezor_session_id);
-            hardware_session.set_trezor_passphrase_mode(active.trezor_passphrase_mode());
-            let output = client.cipher_key_value(&descriptor)?;
-            synthetic_entropy_from_hardware_output(&descriptor, output)?
-        }
-    };
+    let entropy = hardware_synthetic_entropy(
+        &mut hardware_session,
+        &descriptor,
+        trezor_app_passphrase,
+        trezor_pin_matrix_provider,
+    )
+    .await?;
     if let Some((request, destination)) = executor_requests {
         // A private Bridge swap's two requests are completed from this one device response.
         let (authorization, destination) = match destination {

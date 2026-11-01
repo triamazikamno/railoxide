@@ -479,6 +479,17 @@ impl WalletRoot {
         &self,
         chain_id: u64,
     ) -> Option<wallet_ops::PublicBalanceScope> {
+        let config = self.effective_chain_configs.get(chain_id)?;
+        let route =
+            wallet_ops::settings::resolve_effective_chain_rpc_route(chain_id, config).ok()?;
+        self.public_balance_scope_for_route(route)
+    }
+
+    /// The current wallet's balance authority over `route`, or `None` while reads are blocked.
+    pub(super) fn public_balance_scope_for_route(
+        &self,
+        route: wallet_ops::RpcChainRoute,
+    ) -> Option<wallet_ops::PublicBalanceScope> {
         if self.public_transaction_cleanup.is_some()
             || self.public_sync_cache_resetting
             || self.merkle_forest_cache_resetting
@@ -488,9 +499,6 @@ impl WalletRoot {
             return None;
         }
         let view = self.view_session.as_ref()?;
-        let config = self.effective_chain_configs.get(chain_id)?;
-        let route =
-            wallet_ops::settings::resolve_effective_chain_rpc_route(chain_id, config).ok()?;
         Some(wallet_ops::PublicBalanceScope::new(
             view.wallet_id().to_owned(),
             self.active_wallet_generation,
@@ -541,11 +549,16 @@ impl WalletRoot {
             // Hardware startup can unlock metadata before installing a usable wallet view.
             let unlocked =
                 matches!(self.vault_state, VaultState::ViewUnlocked) && self.view_session.is_some();
+            // The gateway follows the last EVM chain while Tron is selected.
+            let has_railgun = self
+                .effective_chain_configs
+                .railgun(self.last_evm_chain)
+                .is_ok();
             let mut snapshot = GatewayWalletState {
                 network_view: unlocked.then(|| self.gateway_network_view()),
                 private_view_supported: true,
-                private_actions_supported: unlocked && self.selected_chain_has_railgun(),
-                private_self_broadcast_supported: unlocked && self.selected_chain_has_railgun(),
+                private_actions_supported: unlocked && has_railgun,
+                private_self_broadcast_supported: unlocked && has_railgun,
                 private_view: unlocked.then(|| self.gateway_private_view()),
                 wallet_selection_generation: self.wallet_switch_generation,
                 wallet_transition: matches!(self.vault_state, VaultState::SwitchingWallet),
@@ -573,7 +586,7 @@ impl WalletRoot {
                 } else {
                     Vec::new()
                 },
-                default_chain_id: unlocked.then_some(self.selected_chain),
+                default_chain_id: unlocked.then_some(self.last_evm_chain),
                 ..GatewayWalletState::default()
             };
             if unlocked {

@@ -24,6 +24,15 @@ pub(in crate::root) fn public_account_matches_search(
     account: &PublicAccountMetadata,
     query: &str,
 ) -> bool {
+    account_matches_search(account, &format!("{:#x}", account.address), query)
+}
+
+/// Whether `query` matches the account's label or `address`, as the account's network writes it.
+pub(in crate::root) fn account_matches_search(
+    account: &PublicAccountMetadata,
+    address: &str,
+    query: &str,
+) -> bool {
     let query = query.trim().to_ascii_lowercase();
     if query.is_empty() {
         return true;
@@ -32,7 +41,7 @@ pub(in crate::root) fn public_account_matches_search(
         .label
         .as_deref()
         .is_some_and(|label| label.to_ascii_lowercase().contains(&query))
-        || format!("{:#x}", account.address).contains(&query)
+        || address.to_ascii_lowercase().contains(&query)
 }
 
 pub(in crate::root) fn public_account_display_label(

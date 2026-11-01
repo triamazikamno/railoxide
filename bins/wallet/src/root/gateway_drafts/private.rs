@@ -68,7 +68,7 @@ impl PreparedPrivateDraft {
         };
         if !matches!(root.chain_states.get(&self.input.asset.chain_id), Some(ChainUtxoState::Ready { snapshot, .. }) if Arc::ptr_eq(snapshot, &self.snapshot))
             || self.estimate.entered_amount > self.estimate.max_entered_amount
-            || root.selected_chain != self.input.asset.chain_id
+            || root.last_evm_chain != self.input.asset.chain_id
             || root.private_draft_recipient(raw).is_err()
             || root.private_draft_asset(raw).is_err()
         {
@@ -208,7 +208,7 @@ impl WalletRoot {
             .view_session
             .as_ref()
             .is_none_or(|wallet| wallet.wallet_id() != input.wallet)
-            || self.selected_chain != input.chain_id
+            || self.last_evm_chain != input.chain_id
         {
             return Err("Wallet or network changed. Open a new draft.".into());
         }
@@ -1027,7 +1027,7 @@ impl WalletRoot {
                 }) else { return };
                 record.estimation = None;
                 let current = matches!(root.chain_states.get(&input.asset.chain_id), Some(ChainUtxoState::Ready { snapshot: current, .. }) if Arc::ptr_eq(&snapshot, current));
-                if !current || root.selected_chain != input.asset.chain_id {
+                if !current || root.last_evm_chain != input.asset.chain_id {
                     record.view.status = GatewayDraftStatus::Editing;
                     record.view.message = "Private funds changed. Refresh the estimate.".into();
                 } else {

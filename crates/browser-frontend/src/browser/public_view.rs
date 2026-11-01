@@ -326,7 +326,8 @@ impl GatewayView {
                 )
                 .searchable(true)
             });
-            let chain = cx.new(|cx| chain_select_state(Vec::new(), None, window, cx));
+            let chain =
+                cx.new(|cx| chain_select_state(Vec::<ChainSelectItem>::new(), None, window, cx));
             let subscriptions = vec![
                 cx.subscribe_in(
                     &account,

@@ -25,8 +25,8 @@ use super::WakuWorkerCompletionToken;
 use super::proposals::ProposalCleanup;
 use super::utxo::should_focus_utxo_table;
 use super::{
-    BroadcasterActivityTab, InitialCatchUpFingerprint, InitialSyncObservation, WalletRoot,
-    WalletTab, count_label, format_report_chain,
+    BroadcasterActivityTab, InitialCatchUpFingerprint, InitialSyncObservation, SelectedNetwork,
+    WalletRoot, WalletTab, count_label, format_report_chain,
 };
 
 pub(super) enum ChainUtxoState {
@@ -1555,12 +1555,12 @@ impl WalletRoot {
 
     pub(super) fn selected_chain_wallet_start_block(&self) -> Option<u64> {
         self.chain_states
-            .get(&self.selected_chain)
+            .get(&self.last_evm_chain)
             .and_then(ChainUtxoState::start_block)
     }
 
     pub(super) fn selected_chain_poi_artifact_progress(&self) -> Option<&PoiArtifactCacheProgress> {
-        self.poi_artifact_cache_progress.get(&self.selected_chain)
+        self.poi_artifact_cache_progress.get(&self.last_evm_chain)
     }
 
     pub(super) fn is_active_wallet_generation(&self, wallet_id: &str, generation: u64) -> bool {
@@ -1575,7 +1575,7 @@ impl WalletRoot {
     pub(super) fn reset_wallet_scoped_state(&mut self, cx: &mut Context<'_, Self>) {
         self.invalidate_governance_context();
         self.governance.proposal_participation.clear_session();
-        self.invalidate_proposals_chain(self.selected_chain);
+        self.invalidate_proposals_chain(self.last_evm_chain);
         self.clear_protected_software_seed_session(cx);
         self.send_forms.clear();
         self.unshield_forms.clear();
@@ -1659,7 +1659,7 @@ impl WalletRoot {
         self.public_sync_cache_resetting = false;
         self.resume_public_transactions();
         if restart_safe && self.view_session.is_some() {
-            self.ensure_chain_load(self.selected_chain, cx);
+            self.ensure_chain_load(self.last_evm_chain, cx);
         } else {
             cx.notify();
         }
@@ -1800,7 +1800,7 @@ impl WalletRoot {
         self.resume_public_transactions();
         self.prune_finished_wallet_sync_cleanups();
         if reset_succeeded && self.view_session.is_some() {
-            self.ensure_chain_load(self.selected_chain, cx);
+            self.ensure_chain_load(self.last_evm_chain, cx);
         } else {
             cx.notify();
         }
@@ -1939,7 +1939,7 @@ impl WalletRoot {
                 ppoi_workflow_status: ppoi_workflow_status.unwrap_or(previous_ppoi_workflow_status),
             },
         );
-        if self.selected_chain == chain_id {
+        if self.last_evm_chain == chain_id {
             self.sync_utxo_table(cx);
         }
         cx.notify();
@@ -2274,7 +2274,7 @@ impl WalletRoot {
                             chain_id,
                             InitialSyncObservation::Error,
                         );
-                        if root.selected_chain == chain_id {
+                        if root.last_evm_chain == chain_id {
                             root.sync_utxo_table(cx);
                         }
                         cx.notify();
@@ -2312,7 +2312,7 @@ impl WalletRoot {
                             chain_id,
                             InitialSyncObservation::Error,
                         );
-                        if root.selected_chain == chain_id {
+                        if root.last_evm_chain == chain_id {
                             root.sync_utxo_table(cx);
                         }
                         cx.notify();
@@ -2472,7 +2472,7 @@ impl WalletRoot {
                 } else {
                     root.poi_artifact_cache_progress.remove(&chain_id);
                 }
-                if root.selected_chain == chain_id {
+                if root.last_evm_chain == chain_id {
                     root.sync_utxo_table(cx);
                     root.focus_utxo_table_on_render = should_focus_utxo_table(
                         root.active_activity,
@@ -2718,7 +2718,7 @@ impl WalletRoot {
                             if became_ready {
                                 root.reschedule_ready_public_broadcaster_cost_estimates(chain_id, cx);
                             }
-                            if root.selected_chain == chain_id {
+                            if root.last_evm_chain == chain_id {
                                 root.sync_utxo_table(cx);
                             }
                             cx.notify();
@@ -2793,7 +2793,7 @@ impl WalletRoot {
                                     InitialSyncObservation::Progress(fingerprint),
                                 );
                             }
-                            if root.selected_chain == chain_id {
+                            if root.last_evm_chain == chain_id {
                                 root.sync_utxo_finality_context(cx);
                             }
                             cx.notify();
@@ -2832,7 +2832,7 @@ impl WalletRoot {
                                 return false;
                             }
                             state.set_poi_refreshing(poi_refreshing);
-                            if root.selected_chain == chain_id {
+                            if root.last_evm_chain == chain_id {
                                 root.sync_utxo_poi_refreshing(poi_refreshing, cx);
                             }
                             cx.notify();
@@ -2892,14 +2892,14 @@ impl WalletRoot {
         self.rpc_identity_warmup = Some(wallet_ops::start_rpc_identity_warmup(
             &self.http,
             &self.effective_chain_configs,
-            self.selected_chain,
+            self.last_evm_chain,
         ));
         let chains = self
             .effective_chain_configs
             .enabled_chains()
             .filter(|chain| {
                 chain.require_railgun().is_ok()
-                    || chain.chain_id == self.selected_chain
+                    || chain.chain_id == self.last_evm_chain
                     || self.active_rpc_chains.contains(&chain.chain_id)
                     || self
                         .public_transaction_tracker
@@ -2908,6 +2908,8 @@ impl WalletRoot {
             .map(|chain| chain.chain_id)
             .collect::<Vec<_>>();
         self.active_rpc_chains.clear();
+        // The new warmup hasn't seen Tron's route yet.
+        self.tron_public.route_warmed = false;
         self.activate_chains_background(chains);
     }
 
@@ -2929,8 +2931,33 @@ impl WalletRoot {
                 warmup.activate_route(chain.rpc_route.clone());
             }
         }
+        self.sync_active_pricing_chains();
+    }
+
+    /// Native USD sources refresh for the active EVM chains, and for Tron once it has been
+    /// selected this session. A custom EVM chain with Tron's chain id never activates Tron's
+    /// pricing.
+    pub(super) fn sync_active_pricing_chains(&mut self) {
+        let tron_id = wallet_ops::tron::TRON_CHAIN_ID;
+        let mut chains: Vec<u64> = self
+            .active_rpc_chains
+            .iter()
+            .copied()
+            .filter(|&chain_id| chain_id != tron_id)
+            .collect();
+        if self.tron_public.activated
+            && let Some(route) = &self.tron_public.route
+        {
+            chains.push(tron_id);
+            if !self.tron_public.route_warmed
+                && let Some(warmup) = &self.rpc_identity_warmup
+            {
+                warmup.activate_route(route.clone());
+                self.tron_public.route_warmed = true;
+            }
+        }
         self.public_broadcaster_anchor_refresh
-            .set_active_chains(&self.active_rpc_chains.iter().copied().collect::<Vec<_>>());
+            .set_active_chains(&chains);
     }
 
     pub(super) fn select_chain(
@@ -2942,17 +2969,13 @@ impl WalletRoot {
         if self.effective_chain_configs.enabled(chain_id).is_err() {
             return;
         }
-        if self.chain_select.read(cx).selected_value() != Some(&chain_id) {
-            self.chain_select.update(cx, |select, cx| {
-                select.set_selected_value(&chain_id, window, cx);
-                cx.notify();
-            });
-        }
-        if self.selected_chain == chain_id {
+        self.show_network_in_selector(SelectedNetwork::Evm(chain_id), window, cx);
+        if self.selected_network == SelectedNetwork::Evm(chain_id) {
             return;
         }
         window.close_all_dialogs(cx);
-        self.selected_chain = chain_id;
+        self.selected_network = SelectedNetwork::Evm(chain_id);
+        self.last_evm_chain = chain_id;
         self.activate_chain_background(chain_id);
         if let Some(warmup) = &self.rpc_identity_warmup {
             warmup.prioritize_chain(chain_id);
@@ -2965,12 +2988,7 @@ impl WalletRoot {
         self.ui_state.last_chain_id = Some(chain_id);
         self.save_ui_state();
         self.sync_broadcaster_monitor_chain_filter(chain_id, window, cx);
-        self.send_forms.clear();
-        self.unshield_forms.clear();
-        self.private_action_form = None;
-        self.clear_private_broadcaster_progress_state();
-        self.broadcaster_picker = None;
-        self.local_pending_spent_clear_confirming = false;
+        self.clear_private_action_state();
         self.clear_public_chain_balance_state();
         self.restore_public_balance_snapshot();
         self.sync_utxo_table(cx);
@@ -2997,6 +3015,58 @@ impl WalletRoot {
             }
         }
         cx.notify();
+    }
+
+    /// Selects Tron without persisting it. Chain loads, private sync, balances and the gateway
+    /// keep following `last_evm_chain`.
+    pub(super) fn select_tron(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if !self.tron_enabled() {
+            return;
+        }
+        self.show_network_in_selector(SelectedNetwork::Tron, window, cx);
+        if self.selected_network == SelectedNetwork::Tron {
+            return;
+        }
+        window.close_all_dialogs(cx);
+        self.selected_network = SelectedNetwork::Tron;
+        self.activate_tron();
+        self.reset_public_asset_focus();
+        self.reconcile_public_account_selection();
+        self.schedule_automatic_public_balance_refresh(cx);
+        self.active_wallet_tab = WalletTab::Public;
+        self.invalidate_proposals_chain(self.last_evm_chain);
+        self.invalidate_governance_context();
+        self.clear_private_action_state();
+        if self.active_activity == super::sidebar::Activity::Proposals
+            && self.governance.tab == super::governance::GovernanceTab::Proposals
+        {
+            self.start_proposals_refresh(false, cx);
+        }
+        cx.notify();
+    }
+
+    /// Drops the private forms and broadcaster state of the network being left.
+    fn clear_private_action_state(&mut self) {
+        self.send_forms.clear();
+        self.unshield_forms.clear();
+        self.private_action_form = None;
+        self.clear_private_broadcaster_progress_state();
+        self.broadcaster_picker = None;
+        self.local_pending_spent_clear_confirming = false;
+    }
+
+    fn show_network_in_selector(
+        &self,
+        network: SelectedNetwork,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.chain_select.read(cx).selected_value() != Some(&network) {
+            self.chain_select.update(cx, |select, cx| {
+                select.set_selected_value(&network, window, cx);
+                cx.notify();
+            });
+        }
     }
 
     pub(super) fn sync_broadcaster_monitor_chain_filter(

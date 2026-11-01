@@ -24,7 +24,7 @@ impl WalletRoot {
         presentation.mimic_railway_shields_by_default = self.mimic_railway_shields_by_default;
         presentation.drafts = self.gateway.drafts.borrow().views(self);
         presentation.selected_account = self.gateway_selected_public_account();
-        presentation.selected_chain = Some(self.selected_chain);
+        presentation.selected_chain = Some(self.last_evm_chain);
         // The extension shows and refreshes only the selected account, so other accounts'
         // refreshes and failures stay out of its status.
         if let Some(selected) = presentation.selected_account.as_ref() {
@@ -34,10 +34,10 @@ impl WalletRoot {
         let snapshot = self
             .public_balance_snapshot
             .as_deref()
-            .filter(|snapshot| snapshot.chain_id == self.selected_chain);
+            .filter(|snapshot| snapshot.chain_id == self.last_evm_chain);
         for account in self.public_accounts.iter().filter(|account| {
             account.is_active_for_wallet(view.wallet_id())
-                && account.is_available_on_chain(self.selected_chain)
+                && account.is_available_on_chain(self.last_evm_chain)
         }) {
             let mut balances = GatewayAccountBalances::default();
             balances
@@ -45,7 +45,7 @@ impl WalletRoot {
                 .clone_from(&account.public_account_uuid);
             balances.total = public_account_usd_total_label_for_chain(
                 snapshot,
-                self.selected_chain,
+                self.last_evm_chain,
                 &account.public_account_uuid,
                 PublicAccountStatus::Active,
                 Some(&self.public_broadcaster_anchor_cache),
@@ -76,13 +76,13 @@ impl WalletRoot {
                             PublicAssetId::Native => None,
                         };
                         asset.usd = public_balance_usd_label(
-                            self.selected_chain,
+                            self.last_evm_chain,
                             entry.asset.id,
                             &entry.amount,
                             Some(&self.public_broadcaster_anchor_cache),
                         );
                         asset.icon = match public_asset_icon_path(
-                            self.selected_chain,
+                            self.last_evm_chain,
                             entry.asset.id,
                             Some(&self.effective_token_registry),
                         ) {
@@ -108,7 +108,7 @@ impl WalletRoot {
         self.selected_public_account()
             .filter(|account| {
                 account.is_active_for_wallet(view.wallet_id())
-                    && account.is_available_on_chain(self.selected_chain)
+                    && account.is_available_on_chain(self.last_evm_chain)
             })
             .map(|account| account.public_account_uuid.clone())
     }
@@ -134,7 +134,7 @@ impl WalletRoot {
                 if self.public_accounts.iter().any(|account| {
                     account.public_account_uuid == public_account_uuid
                         && (account.is_active_for_wallet(view.wallet_id())
-                            && account.is_available_on_chain(self.selected_chain))
+                            && account.is_available_on_chain(self.last_evm_chain))
                 }) {
                     self.set_public_selected_balance(
                         public_account_uuid.into(),
@@ -153,7 +153,7 @@ impl WalletRoot {
                 // A request during a refresh queues a follow-up read of the account.
                 let account = self.gateway_selected_public_account();
                 self.schedule_account_public_balance_refresh(
-                    self.selected_chain,
+                    self.last_evm_chain,
                     account,
                     None,
                     cx,

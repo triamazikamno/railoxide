@@ -305,6 +305,23 @@
 //!   confirmation of the first selected index that has no account, which the stand-in never
 //!   answers. Close the dialog to leave it. Nothing is read from a device, no account is
 //!   stored, and nothing is sent.
+//! - `tron:<state>` replaces the selected wallet's Tron accounts, on Tron in the network
+//!   selector, with three synthesized ones and their balances, priced at a stand-in $0.25 per
+//!   TRX until Tron's price refresh replaces it: Savings holds 2,480.35 TRX and 1,250 USDT,
+//!   Trading 35.12 TRX and 312.5 USDT, and Deposit only 25 USDT, so it doesn't exist on chain.
+//!   Their balances are never read. A Send form's reads are answered in memory, with stand-in
+//!   fee parameters, 600 free bandwidth and an energy estimate of 64,285, and its Review opens
+//!   the review, whose approval ends in an error on the form. These live in
+//!   `public_account/tron_send.rs`. `accounts` opens Send forms empty; Deposit's says Send is
+//!   unavailable until the account receives TRX. `new-account` fills a form with 25 to a
+//!   receiver that doesn't exist on chain, so a TRX send's review adds the account creation
+//!   fee and says the send creates the account. `waiting`, `complete`, `failed`,
+//!   `token-did-not-move` and `dropped` fill the form with 25 to another of the accounts and
+//!   open the progress of a synthesized send over it, handed off with its transaction id:
+//!   waiting for solidified blocks after the endpoint didn't answer the broadcast, completed,
+//!   failed after burning 7.7142 TRX, included without moving the token after burning
+//!   0.345 TRX, or expired with no TRX spent. A swap form takes these modes as active, as it
+//!   does every mode.
 //!
 //! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
@@ -402,6 +419,25 @@ enum Mode {
     BroadcasterProgress(BroadcasterProgress),
     HardwareDerive,
     NonEvm(NonEvm),
+    Tron(Tron),
+}
+
+/// What a `tron:` mode shows of the synthesized Tron accounts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::root) enum Tron {
+    /// The accounts, whose Send forms open empty.
+    Accounts,
+    /// A Send form filled with a TRX send that creates its receiver's account.
+    NewAccount,
+    /// The progress of a handed-off send, waiting for solidified blocks.
+    Waiting,
+    Complete,
+    /// Included and failed, burning TRX.
+    Failed,
+    /// Included without the token's `Transfer` log, burning TRX.
+    TokenDidNotMove,
+    /// Expired without inclusion.
+    Dropped,
 }
 
 /// What a `non-evm:` mode shows of the synthesized swap delivered by NEAR Intents to a
@@ -715,6 +751,18 @@ fn parse(value: &str) -> Option<Mode> {
             "in-progress" => NonEvm::InProgress,
             "delivered" => NonEvm::Delivered,
             "needs-attention" => NonEvm::NeedsAttention,
+            _ => return None,
+        }));
+    }
+    if let Some(state) = value.strip_prefix("tron:") {
+        return Some(Mode::Tron(match state {
+            "accounts" => Tron::Accounts,
+            "new-account" => Tron::NewAccount,
+            "waiting" => Tron::Waiting,
+            "complete" => Tron::Complete,
+            "failed" => Tron::Failed,
+            "token-did-not-move" => Tron::TokenDidNotMove,
+            "dropped" => Tron::Dropped,
             _ => return None,
         }));
     }
@@ -3136,6 +3184,14 @@ pub(in crate::root) fn tor_rotation() -> Option<bool> {
 /// whatever the network's sync state.
 pub(in crate::root) fn shows_utxos() -> bool {
     matches!(mode(), Some(Mode::Utxos))
+}
+
+/// The `tron:` mode, whose Tron accounts, reads and send progress are staged.
+pub(in crate::root) fn tron() -> Option<Tron> {
+    match mode()? {
+        Mode::Tron(tron) => Some(tron),
+        _ => None,
+    }
 }
 
 /// Whether the Derive dialog treats the selected wallet as Ledger-derived and asks the

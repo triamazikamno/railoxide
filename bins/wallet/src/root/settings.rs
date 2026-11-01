@@ -57,7 +57,7 @@ use super::ui_helpers::{
     ConfirmationDialogProps, confirmation_dialog, dialog_max_height, rgb_with_alpha,
     secondary_dialog_content_width,
 };
-use super::wallet_header::ChainSelectItem;
+use ui::chain_select::{Network, NetworkSelectItem};
 
 mod apply_mode;
 mod chains;
@@ -66,6 +66,7 @@ mod network;
 mod render;
 mod root;
 mod tokens;
+mod tron;
 mod types;
 mod ui_helpers;
 

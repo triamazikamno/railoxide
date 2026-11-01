@@ -34,28 +34,28 @@ impl WalletRoot {
         let trigger_root = root.clone();
         let session_count = self.walletconnect_session_count();
         let pending_count = self.walletconnect_pending_request_count();
-        let disabled = self.view_session.is_none()
+        // WalletConnect requests are EVM-only.
+        let tron = self.selected_evm_chain().is_none();
+        let disabled = tron
+            || self.view_session.is_none()
             || self.vault_store.is_none()
             || (pending_count == 0 && session_count == 0 && !self.has_active_public_accounts());
+        let label = if tron {
+            "WalletConnect is not available on Tron".to_owned()
+        } else if pending_count > 0 {
+            "Review dapp request".to_owned()
+        } else if session_count > 0 {
+            format!("WalletConnect sessions · {session_count}")
+        } else {
+            "Connect dapp".to_owned()
+        };
         app_button_base("wallet-public-walletconnect-trigger")
             .text()
             .size(px(32.0))
             .when(!disabled, gpui::Styled::cursor_pointer)
             .disabled(disabled)
-            .accessibility_label(if pending_count > 0 {
-                "Review dapp request".to_owned()
-            } else if session_count > 0 {
-                format!("WalletConnect sessions · {session_count}")
-            } else {
-                "Connect dapp".to_owned()
-            })
-            .tooltip(if pending_count > 0 {
-                "Review dapp request".to_owned()
-            } else if session_count > 0 {
-                format!("WalletConnect sessions · {session_count}")
-            } else {
-                "Connect dapp".to_owned()
-            })
+            .accessibility_label(label.clone())
+            .tooltip(label)
             .child(walletconnect_logo_with_badges(
                 px(24.0),
                 session_count > 0,

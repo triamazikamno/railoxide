@@ -12160,7 +12160,10 @@ fn non_evm_review_names_the_network_receiver_and_mint(cx: &mut TestAppContext) {
                 );
             }
             // The mint shows in the short form the form and the order detail give it.
-            let mint = ("Mint".to_owned(), short_non_evm(STUB_SOLANA_SUSDC));
+            let mint = (
+                "Mint".to_owned(),
+                railgun_ui::short_non_evm(STUB_SOLANA_SUSDC),
+            );
             let shown = summary.shown_rows_for_test();
             assert!(shown.contains(&mint), "{mint:?} in {shown:?}");
             let warnings = summary.warnings_for_test();

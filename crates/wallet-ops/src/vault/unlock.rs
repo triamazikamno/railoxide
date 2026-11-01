@@ -3,8 +3,8 @@ use super::{
     HardwareViewAccessKey, HardwareWalletAccountIndexReservation, HmacKeyInit, HmacSha256, KEY_LEN,
     Mac, NonEvmAddressBookEntry, PrivateAddressBookEntry, ProtectedSoftwareSeedSession,
     PublicAccountMetadata, PublicAccountSecret, PublicAddressBookEntry, RecordKind,
-    SOFTWARE_CONTEXT_SEED_LEN, SecretKey, SoftwareSeedSessionBinding, VaultError,
-    WalletChainMetadataBundle, WalletConnectRelayIdentity, WalletConnectSessionRecord,
+    SOFTWARE_CONTEXT_SEED_LEN, SecretKey, SoftwareSeedSessionBinding, TronAccountMetadata,
+    VaultError, WalletChainMetadataBundle, WalletConnectRelayIdentity, WalletConnectSessionRecord,
     WalletMetadataBundle, WalletMetadataWire, WalletPrivateRecordKind, WalletSpendBundle,
     WalletViewBundle, Zeroizing, decrypt_payload, decrypt_serialized, derive_context_key,
     encrypt_payload, encrypt_serialized,
@@ -243,6 +243,32 @@ impl ViewUnlock {
             &self.view_dek,
             RecordKind::PublicAccountMetadata,
             public_account_uuid,
+            record,
+        )
+    }
+
+    pub fn encrypt_tron_account_metadata(
+        &self,
+        tron_account_uuid: &str,
+        metadata: &TronAccountMetadata,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.view_dek,
+            RecordKind::TronAccountMetadata,
+            tron_account_uuid,
+            metadata,
+        )
+    }
+
+    pub fn decrypt_tron_account_metadata(
+        &self,
+        tron_account_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<TronAccountMetadata, VaultError> {
+        decrypt_serialized(
+            &self.view_dek,
+            RecordKind::TronAccountMetadata,
+            tron_account_uuid,
             record,
         )
     }
@@ -503,6 +529,32 @@ impl SpendUnlock {
             &self.spend_dek,
             RecordKind::PublicAccountSecret,
             public_account_uuid,
+            record,
+        )
+    }
+
+    pub fn encrypt_tron_account_secret(
+        &self,
+        tron_account_uuid: &str,
+        secret: &PublicAccountSecret,
+    ) -> Result<EncryptedRecord, VaultError> {
+        encrypt_serialized(
+            &self.spend_dek,
+            RecordKind::TronAccountSecret,
+            tron_account_uuid,
+            secret,
+        )
+    }
+
+    pub fn decrypt_tron_account_secret(
+        &self,
+        tron_account_uuid: &str,
+        record: &EncryptedRecord,
+    ) -> Result<PublicAccountSecret, VaultError> {
+        decrypt_serialized(
+            &self.spend_dek,
+            RecordKind::TronAccountSecret,
+            tron_account_uuid,
             record,
         )
     }

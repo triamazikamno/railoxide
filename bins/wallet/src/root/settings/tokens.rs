@@ -49,6 +49,7 @@ pub(in crate::root) fn display_token_entries(settings: &WalletSettings) -> Vec<D
 
 pub(in crate::root) fn default_token_entries() -> Vec<DisplayTokenEntry> {
     railgun_ui::built_in_chain_ids()
+        .chain([railgun_ui::TRON_CHAIN_ID])
         .flat_map(railgun_ui::known_tokens_for_chain)
         .map(|token| DisplayTokenEntry {
             chain_id: token.chain_id,
@@ -193,7 +194,7 @@ pub(in crate::root) fn price_anchor_dialog_values_from_override(
 ) -> PriceAnchorDialogValues {
     let mut values = default_price_anchor_dialog_values();
     values.chain_id = anchor.key.chain_id;
-    values.token_address.clone_from(&anchor.key.token_address);
+    values.token_address = display_token_address(anchor.key.chain_id, &anchor.key.token_address);
     match &anchor.price_anchor {
         PriceAnchorSettings::Fixed { rate } => {
             values.anchor_type = "fixed";
@@ -208,7 +209,7 @@ pub(in crate::root) fn price_anchor_dialog_values_from_override(
         } => {
             values.anchor_type = "oracle";
             values.oracle_chain_id = *chain_id;
-            values.oracle_address.clone_from(oracle_address);
+            values.oracle_address = display_token_address(*chain_id, oracle_address);
             values.oracle_token_decimals = token_decimals.to_string();
             values.oracle_decimals = oracle_decimals.to_string();
             values.oracle_is_inversed = *is_inversed;
@@ -283,7 +284,7 @@ pub(in crate::root) fn price_anchor_component_dialog_values_from_anchor(
             anchor_type: "oracle",
             fixed_rate: "1000000000000000000".to_string(),
             oracle_chain_id: *chain_id,
-            oracle_address: oracle_address.clone(),
+            oracle_address: display_token_address(*chain_id, oracle_address),
             oracle_token_decimals: token_decimals.to_string(),
             oracle_decimals: oracle_decimals.to_string(),
             oracle_is_inversed: *is_inversed,
@@ -418,7 +419,7 @@ pub(in crate::root) fn token_dialog_values_from_inputs(
         .map_err(|error| format!("Invalid token decimals: {error}"))?;
     Ok(TokenDialogValues {
         chain_id,
-        token_address: inputs.token_address.read(cx).value().trim().to_string(),
+        token_address: stored_token_address(chain_id, &inputs.token_address.read(cx).value())?,
         symbol: inputs.symbol.read(cx).value().trim().to_string(),
         decimals,
         icon_path: non_empty_setting(inputs.icon_path.read(cx).value().as_ref()),
@@ -444,6 +445,7 @@ pub(in crate::root) fn price_anchor_override_from_dialog_inputs(
         .read(cx)
         .selected_value()
         .copied()
+        .map(price_anchor_chain_id)
         .ok_or_else(|| "Select a token chain".to_string())?;
     let anchor_type = inputs
         .anchor_type
@@ -456,6 +458,7 @@ pub(in crate::root) fn price_anchor_override_from_dialog_inputs(
         .read(cx)
         .selected_value()
         .copied()
+        .map(price_anchor_chain_id)
         .ok_or_else(|| "Select an oracle chain".to_string())?;
     let oracle_is_inversed = inputs
         .oracle_is_inversed
@@ -534,6 +537,7 @@ pub(in crate::root) fn price_anchor_component_dialog_values(
         .read(cx)
         .selected_value()
         .copied()
+        .map(price_anchor_chain_id)
         .ok_or_else(|| "Select a component oracle chain".to_string())?;
     let oracle_is_inversed = inputs
         .oracle_is_inversed
@@ -590,11 +594,12 @@ pub(in crate::root) fn price_anchor_override_from_dialog_values(
     if token_address.is_empty() {
         return Err("Token address must not be empty".to_string());
     }
+    let token_address = stored_token_address(values.chain_id, token_address)?;
     let anchor_type = parse_price_anchor_type(values.anchor_type)?;
     let price_anchor = match anchor_type {
         "oracle" => PriceAnchorSettings::Oracle {
             chain_id: values.oracle_chain_id,
-            oracle_address: values.oracle_address.trim().to_string(),
+            oracle_address: stored_token_address(values.oracle_chain_id, &values.oracle_address)?,
             token_decimals: parse_price_anchor_u8(
                 "Oracle token decimals",
                 &values.oracle_token_decimals,
@@ -631,7 +636,7 @@ pub(in crate::root) fn price_anchor_override_from_dialog_values(
     Ok(TokenPriceAnchorOverride {
         key: TokenKey {
             chain_id: values.chain_id,
-            token_address: token_address.to_string(),
+            token_address,
         },
         price_anchor,
     })
@@ -657,7 +662,7 @@ pub(in crate::root) fn price_anchor_component_from_dialog_values(
     match parse_product_component_anchor_type(values.anchor_type)? {
         "oracle" => Ok(PriceAnchorSettings::Oracle {
             chain_id: values.oracle_chain_id,
-            oracle_address: values.oracle_address.trim().to_string(),
+            oracle_address: stored_token_address(values.oracle_chain_id, &values.oracle_address)?,
             token_decimals: parse_price_anchor_u8(
                 &format!("Component {} token decimals", index + 1),
                 &values.oracle_token_decimals,
@@ -791,6 +796,29 @@ pub(in crate::root) fn token_key_tuple(key: &TokenKey) -> (u64, String) {
 
 pub(in crate::root) fn normalized_token_key(chain_id: u64, token_address: &str) -> (u64, String) {
     (chain_id, normalize_token_address(token_address))
+}
+
+pub(in crate::root) const TRON_ADDRESS_NEEDED: &str = "A base58 Tron address is needed";
+
+/// Tron addresses are stored as their 20 bytes in hex and shown in base58.
+pub(in crate::root) fn display_token_address(chain_id: u64, address: &str) -> String {
+    match address.parse::<Address>() {
+        Ok(address) if chain_id == railgun_ui::TRON_CHAIN_ID => {
+            wallet_ops::tron::address::encode_tron_address(address)
+        }
+        _ => address.to_owned(),
+    }
+}
+
+/// The stored form of an entered address. On Tron only a base58 address is accepted.
+pub(in crate::root) fn stored_token_address(chain_id: u64, input: &str) -> Result<String, String> {
+    let input = input.trim();
+    if chain_id != railgun_ui::TRON_CHAIN_ID {
+        return Ok(input.to_owned());
+    }
+    wallet_ops::tron::address::parse_tron_address(input)
+        .map(|address| address.to_string())
+        .map_err(|_| TRON_ADDRESS_NEEDED.to_owned())
 }
 
 pub(in crate::root) fn normalize_token_address(token_address: &str) -> String {

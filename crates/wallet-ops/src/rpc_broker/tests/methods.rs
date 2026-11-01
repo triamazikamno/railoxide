@@ -879,3 +879,17 @@ async fn defaulted_fee_history_is_healthy_and_malformed_fields_stay_validated() 
         }
     }
 }
+
+#[test]
+fn recorded_tron_blocks_validate() {
+    // Tron's JSON-RPC blocks carry `"stateRoot": "0x"`; confirmation reads them through the broker.
+    let fixture: Value =
+        serde_json::from_str(include_str!("../../tron/fixtures/confirmation.json")).unwrap();
+    let block = fixture["blocks"]["87595297"].clone();
+    assert_eq!(block["stateRoot"], json!("0x"));
+    let read = named("eth_getBlockByNumber", json!(["finalized", false]));
+    assert_eq!(
+        read.operation().validate_result(block.clone()),
+        Ok(RpcResult::new(block))
+    );
+}

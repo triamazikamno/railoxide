@@ -99,17 +99,21 @@ impl WalletRoot {
                     .and_then(|view| view.receive_address().ok());
             }
         }
-        presentation.selected_chain = Some(self.selected_chain);
+        presentation.selected_chain = Some(self.last_evm_chain);
         if self.unwrap_unshields_by_default
-            && self.unshield_executor_route(self.selected_chain).is_ok()
+            && self.unshield_executor_route(self.last_evm_chain).is_ok()
         {
             presentation.default_unwrap_asset = self
                 .effective_chain_configs
-                .get(self.selected_chain)
+                .get(self.last_evm_chain)
                 .and_then(|chain| chain.wrapped_native_token)
                 .map(|token| token.to_string());
         }
-        if !self.selected_chain_has_railgun() {
+        if self
+            .effective_chain_configs
+            .railgun(self.last_evm_chain)
+            .is_err()
+        {
             presentation.receive_address = None;
             presentation.selection_message = Some(
                 "Private balances and Shield are unavailable on public-only chains".to_owned(),
@@ -131,7 +135,7 @@ impl WalletRoot {
             presentation.message = Some("Choose a wallet to continue".into());
             return presentation;
         }
-        let state = self.chain_states.get(&self.selected_chain);
+        let state = self.chain_states.get(&self.last_evm_chain);
         presentation.forms_available =
             state.is_some_and(ChainUtxoState::private_action_forms_available);
         presentation.generation_ready =
@@ -168,7 +172,7 @@ impl WalletRoot {
         };
         if state
             .and_then(ChainUtxoState::snapshot)
-            .is_some_and(|snapshot| snapshot.chain_id != self.selected_chain)
+            .is_some_and(|snapshot| snapshot.chain_id != self.last_evm_chain)
         {
             presentation.state = GatewayPrivateChainState::Loading;
             presentation.message = Some("Waiting for current network balances.".into());
@@ -182,7 +186,7 @@ impl WalletRoot {
         }
         if let Some(snapshot) = state
             .and_then(ChainUtxoState::snapshot)
-            .filter(|snapshot| snapshot.chain_id == self.selected_chain)
+            .filter(|snapshot| snapshot.chain_id == self.last_evm_chain)
         {
             let assets = self.private_asset_presentation(snapshot);
             presentation.total.clone_from(&assets.total);

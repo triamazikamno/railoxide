@@ -7,15 +7,14 @@ use super::{
     DesktopViewSession, EncryptedRecord, KEY_LEN, PUBLIC_ACCOUNT_METADATA_PREFIX,
     PreviewedPublicAccountSkip, PreviewedPublicAccountsAdded, ProtectedSoftwareSeedSession,
     PublicAccountMetadata, PublicAccountScope, PublicAccountSecret, PublicAccountSource,
-    PublicAccountStatus, SoftwareSeedSessionBinding, SpendGrant, VaultError, ViewUnlock,
-    WalletSoftwareContextKind, Zeroizing, derive_public_evm_private_key_from_entropy,
+    PublicAccountStatus, SpendGrant, VaultError, ViewUnlock, Zeroizing,
     derive_public_evm_private_key_from_seed, derived_public_account_indexes,
     ensure_public_account_address_available, generate_opaque_id, next_derived_public_account_index,
     next_public_account_display_order, normalize_public_account_label,
     parse_public_evm_private_key, public_account_metadata_record_entry,
     public_account_metadata_record_key, public_account_secret_record_entry,
     public_account_secret_record_key, public_evm_address_from_private_key,
-    sort_public_account_metadata, unlock_spend, unlock_view, wallet_spend_record_key,
+    sort_public_account_metadata, unlock_spend, unlock_view,
 };
 
 impl DesktopVaultStore {
@@ -143,29 +142,8 @@ impl DesktopVaultStore {
         wallet_id: &str,
         protected_seed_session: Option<&ProtectedSoftwareSeedSession>,
     ) -> Result<DerivedPublicAccountPreview, VaultError> {
-        let metadata = self.load_wallet_metadata_with_view(view, wallet_id)?;
-        let Some(context) = metadata.software_context.as_ref() else {
-            return Err(VaultError::InvalidWalletMetadata);
-        };
-        match context.kind {
-            WalletSoftwareContextKind::Passphrase => {
-                let session =
-                    protected_seed_session.ok_or(VaultError::SoftwareSeedSessionRequired)?;
-                let binding = SoftwareSeedSessionBinding::new(
-                    &context.base_profile_uuid,
-                    wallet_id,
-                    session.binding().vault_session_id(),
-                );
-                let seed = session.open(grant, &binding)?;
-                DerivedPublicAccountPreview::from_seed(wallet_id, &seed)
-            }
-            WalletSoftwareContextKind::Standard => {
-                let spend = grant.take_spend_unlock()?;
-                let spend_record = self.encrypted_record(&wallet_spend_record_key(wallet_id))?;
-                let spend_bundle = spend.decrypt_spend_bundle(wallet_id, &spend_record)?;
-                DerivedPublicAccountPreview::from_entropy(wallet_id, &spend_bundle.bip39_entropy)
-            }
-        }
+        let seed = self.software_wallet_seed(view, grant, wallet_id, protected_seed_session)?;
+        DerivedPublicAccountPreview::from_seed(wallet_id, &seed)
     }
 
     /// Adds active derived accounts for `indexes` from an authorized preview in
@@ -513,41 +491,17 @@ impl DesktopVaultStore {
                 let Some(derivation_index) = account.derivation_index else {
                     return Err(VaultError::InvalidPublicAccountOperation);
                 };
-                let wallet_id = view_session.wallet_id();
-                let metadata =
-                    self.load_wallet_metadata_with_view(&view_session.view, wallet_id)?;
-                let Some(context) = metadata.software_context.as_ref() else {
-                    return Err(VaultError::InvalidWalletMetadata);
-                };
-                match context.kind {
-                    WalletSoftwareContextKind::Passphrase => {
-                        let session = protected_seed_session
-                            .ok_or(VaultError::SoftwareSeedSessionRequired)?;
-                        let binding = SoftwareSeedSessionBinding::new(
-                            &context.base_profile_uuid,
-                            wallet_id,
-                            session.binding().vault_session_id(),
-                        );
-                        let seed = session.open(grant, &binding)?;
-                        let private_key =
-                            derive_public_evm_private_key_from_seed(&seed, derivation_index)?;
-                        let address = public_evm_address_from_private_key(&private_key)?;
-                        if address != account.address {
-                            return Err(VaultError::InvalidSoftwareContextIdentity);
-                        }
-                        Ok(private_key)
-                    }
-                    WalletSoftwareContextKind::Standard => {
-                        let spend = grant.take_spend_unlock()?;
-                        let spend_record =
-                            self.encrypted_record(&wallet_spend_record_key(wallet_id))?;
-                        let spend_bundle = spend.decrypt_spend_bundle(wallet_id, &spend_record)?;
-                        derive_public_evm_private_key_from_entropy(
-                            &spend_bundle.bip39_entropy,
-                            derivation_index,
-                        )
-                    }
+                let seed = self.software_wallet_seed(
+                    &view_session.view,
+                    grant,
+                    view_session.wallet_id(),
+                    protected_seed_session,
+                )?;
+                let private_key = derive_public_evm_private_key_from_seed(&seed, derivation_index)?;
+                if public_evm_address_from_private_key(&private_key)? != account.address {
+                    return Err(VaultError::InvalidSoftwareContextIdentity);
                 }
+                Ok(private_key)
             }
             PublicAccountSource::Imported => {
                 let spend = grant.take_spend_unlock()?;

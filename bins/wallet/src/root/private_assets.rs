@@ -733,7 +733,7 @@ impl WalletRoot {
             return ui::private_assets::private_message("Choose a wallet to continue", None)
                 .into_any_element();
         }
-        match self.chain_states.get(&self.selected_chain) {
+        match self.chain_states.get(&self.last_evm_chain) {
             Some(ChainUtxoState::Error { message, .. }) => self
                 .render_chain_error_body(root, message.as_ref())
                 .into_any_element(),
@@ -792,9 +792,9 @@ impl WalletRoot {
             .or_else(|| {
                 let wrapped_native = self
                     .effective_chain_configs
-                    .get(self.selected_chain)?
+                    .get(self.last_evm_chain)?
                     .wrapped_native_token?;
-                super::private_swap::ui_fixture_send_asset(self.selected_chain, wrapped_native)
+                super::private_swap::ui_fixture_send_asset(self.last_evm_chain, wrapped_native)
             });
         let unshield_asset = assets
             .iter()
@@ -802,9 +802,9 @@ impl WalletRoot {
             .or_else(|| {
                 let wrapped_native = self
                     .effective_chain_configs
-                    .get(self.selected_chain)?
+                    .get(self.last_evm_chain)?
                     .wrapped_native_token?;
-                super::private_swap::ui_fixture_unshield_asset(self.selected_chain, wrapped_native)
+                super::private_swap::ui_fixture_unshield_asset(self.last_evm_chain, wrapped_native)
             });
         let pending_summary = self.private_pending_summary_from_snapshot(snapshot, assets);
         let swap_profile = self.private_swap_profile();
@@ -815,7 +815,7 @@ impl WalletRoot {
             .map(gpui::IntoElement::into_any_element);
         let fixture_swap_token = self
             .effective_chain_configs
-            .get(self.selected_chain)
+            .get(self.last_evm_chain)
             .and_then(|chain| chain.wrapped_native_token)
             .and_then(super::private_swap::ui_fixture_setup_swap_token);
         let swap_entry = swap_profile.as_ref().map(|profile| {
@@ -1028,7 +1028,7 @@ impl WalletRoot {
     }
 
     fn current_private_pending_summary(&self) -> Option<PrivatePendingSummary> {
-        let snapshot = self.chain_states.get(&self.selected_chain)?.snapshot()?;
+        let snapshot = self.chain_states.get(&self.last_evm_chain)?.snapshot()?;
         let presentation = self.private_asset_presentation(snapshot);
         self.private_pending_summary_from_snapshot(snapshot, &presentation.rows)
     }
@@ -1038,7 +1038,7 @@ impl WalletRoot {
         snapshot: &ListUtxosOutput,
         assets: &[FormattedTokenTotal],
     ) -> Option<PrivatePendingSummary> {
-        let chain_state = self.chain_states.get(&self.selected_chain);
+        let chain_state = self.chain_states.get(&self.last_evm_chain);
         let blocked_shield_rows = blocked_shield_rescue_display_rows(
             snapshot,
             &self.blocked_shield_rescue_rows,
@@ -1060,7 +1060,7 @@ impl WalletRoot {
     pub(super) fn private_pending_status_has_shield_timer(&self) -> bool {
         let Some(snapshot) = self
             .chain_states
-            .get(&self.selected_chain)
+            .get(&self.last_evm_chain)
             .and_then(ChainUtxoState::snapshot)
         else {
             return false;

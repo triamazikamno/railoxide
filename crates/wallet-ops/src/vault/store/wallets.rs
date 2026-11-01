@@ -238,6 +238,37 @@ impl DesktopVaultStore {
             .decrypt_spend_bundle(wallet_id, &record)
     }
 
+    /// The software wallet's BIP-39 seed, from its spend bundle or protected seed session.
+    pub(super) fn software_wallet_seed(
+        &self,
+        view: &ViewUnlock,
+        grant: &mut SpendGrant,
+        wallet_id: &str,
+        protected_seed_session: Option<&ProtectedSoftwareSeedSession>,
+    ) -> Result<Zeroizing<[u8; 64]>, VaultError> {
+        let metadata = self.load_wallet_metadata_with_view(view, wallet_id)?;
+        let Some(context) = metadata.software_context.as_ref() else {
+            return Err(VaultError::InvalidWalletMetadata);
+        };
+        match context.kind {
+            WalletSoftwareContextKind::Passphrase => {
+                let session =
+                    protected_seed_session.ok_or(VaultError::SoftwareSeedSessionRequired)?;
+                let binding = SoftwareSeedSessionBinding::new(
+                    &context.base_profile_uuid,
+                    wallet_id,
+                    session.binding().vault_session_id(),
+                );
+                session.open(grant, &binding)
+            }
+            WalletSoftwareContextKind::Standard => {
+                let bundle = self.load_spend_bundle(grant, wallet_id)?;
+                let mnemonic = Zeroizing::new(bip39_mnemonic_from_entropy(&bundle.bip39_entropy)?);
+                crate::vault::bip39_seed_from_mnemonic(&mnemonic, "")
+            }
+        }
+    }
+
     pub fn railgun_spend_signer(
         &self,
         grant: &mut SpendGrant,

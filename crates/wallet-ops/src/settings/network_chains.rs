@@ -450,13 +450,13 @@ pub struct CustomChainSettings {
     pub gas: ChainGasSettings,
 }
 
-fn validate_endpoint_cap(field: &str, endpoints: usize, errors: &mut Vec<String>) {
+pub(super) fn validate_endpoint_cap(field: &str, endpoints: usize, errors: &mut Vec<String>) {
     if endpoints > super::MAX_CHAIN_ENDPOINTS {
         errors.push(format!("{field} has too many RPC endpoints"));
     }
 }
 
-fn validate_endpoint_length(field: &str, url: &str, errors: &mut Vec<String>) {
+pub(super) fn validate_endpoint_length(field: &str, url: &str, errors: &mut Vec<String>) {
     if url.len() > 4096 {
         errors.push(format!("{field} is too long"));
     }

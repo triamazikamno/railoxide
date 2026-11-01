@@ -276,7 +276,7 @@ impl WalletRoot {
         self.focus_utxo_table_on_render = should_focus_utxo_table(
             self.active_activity,
             self.active_wallet_tab,
-            self.chain_states.get(&self.selected_chain),
+            self.chain_states.get(&self.last_evm_chain),
         );
         if tab == WalletTab::Public {
             self.focus_public_account_search_on_render = true;
@@ -880,7 +880,7 @@ impl WalletRoot {
     }
 
     fn render_wallet_status_bar(&self, root: &Entity<Self>) -> Option<gpui::AnyElement> {
-        let state = self.chain_states.get(&self.selected_chain)?;
+        let state = self.chain_states.get(&self.selected_evm_chain()?)?;
         let counts = self.wallet_status_counts(
             state.snapshot().map(AsRef::as_ref),
             state.ppoi_workflow_status(),
@@ -960,7 +960,7 @@ impl WalletRoot {
     fn balances_status_for_state(&self, state: &ChainUtxoState) -> PresenceStatus {
         let Some(block_time) = self
             .effective_chain_configs
-            .get(self.selected_chain)
+            .get(self.last_evm_chain)
             .and_then(|chain| chain.block_time)
         else {
             return PresenceStatus::Unknown;
@@ -975,7 +975,7 @@ impl WalletRoot {
     }
 
     fn retry_selected_poi_artifact_cache_refresh(&mut self, cx: &mut Context<'_, Self>) {
-        let chain_id = self.selected_chain;
+        let chain_id = self.last_evm_chain;
         let Some(request_token) = self.poi_artifact_cache_retry_attempts.begin(chain_id) else {
             return;
         };
@@ -1194,9 +1194,13 @@ impl WalletRoot {
             .children(WalletTab::ALL.into_iter().map(|tab| {
                 Tab::new()
                     .disabled(tab != WalletTab::Public && !self.selected_chain_has_railgun())
-                    .when(tab != WalletTab::Public && !self.selected_chain_has_railgun(), |tab| {
-                        tab.tooltip(|window, cx| Tooltip::new("This chain supports Public accounts only; no Railgun deployment is configured.").build(window, cx))
-                    })
+                    .when(
+                        tab != WalletTab::Public && !self.selected_chain_has_railgun(),
+                        |tab| {
+                            let reason = self.railgun_unavailable_reason();
+                            tab.tooltip(move |window, cx| Tooltip::new(reason).build(window, cx))
+                        },
+                    )
                     .min_w(px(92.0))
                     .label(tab.label())
                     .prefix(
@@ -1284,7 +1288,7 @@ impl WalletRoot {
                                 if root.view_session.is_none() {
                                     return;
                                 }
-                                let chain_id = root.selected_chain;
+                                let chain_id = root.last_evm_chain;
                                 let overrides = chain_load_overrides();
                                 root.start_chain_load(chain_id, &overrides, true, cx);
                             });
@@ -1381,7 +1385,7 @@ impl Render for BalancesStatusHoverCard {
         let now = now_epoch_secs();
         let (status, labels, sync_tip, data_source, issue, counts, network_mode) = {
             let root = self.root.read(cx);
-            let chain_id = root.selected_chain;
+            let chain_id = root.last_evm_chain;
             let block_time = root
                 .effective_chain_configs
                 .get(chain_id)
@@ -1503,7 +1507,7 @@ impl Render for PpoiStatusHoverCard {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let (status, progress, refreshing, counts, retrying) = {
             let root = self.root.read(cx);
-            let state = root.chain_states.get(&root.selected_chain);
+            let state = root.chain_states.get(&root.last_evm_chain);
             let counts = root.wallet_status_counts(
                 state.and_then(ChainUtxoState::snapshot).map(AsRef::as_ref),
                 state.map_or_else(
@@ -1518,7 +1522,7 @@ impl Render for PpoiStatusHoverCard {
             let progress = root.selected_chain_poi_artifact_progress().cloned();
             let retrying = root
                 .poi_artifact_cache_retry_attempts
-                .contains(root.selected_chain);
+                .contains(root.last_evm_chain);
             (status, progress, refreshing, counts, retrying)
         };
         let color = presence_status_color(status);

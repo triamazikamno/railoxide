@@ -36,12 +36,12 @@ impl WalletRoot {
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let asset_label = public_asset_label(
-            self.effective_chain_configs.get(self.selected_chain),
+            self.effective_chain_configs.get(self.last_evm_chain),
             asset,
             Some(&self.effective_token_registry),
         );
         let icon_path = public_asset_icon_path(
-            self.selected_chain,
+            self.last_evm_chain,
             asset,
             Some(&self.effective_token_registry),
         );
@@ -107,7 +107,7 @@ impl WalletRoot {
         };
         let asset = self
             .effective_chain_configs
-            .get(self.selected_chain)
+            .get(self.last_evm_chain)
             .and_then(|chain| chain.wrapped_native_token)
             .map_or(asset, PublicAssetId::Erc20);
         let message = if funding_error {
@@ -143,12 +143,12 @@ impl WalletRoot {
             PublicActionMode::Shield,
             states,
             public_asset_label(
-                self.effective_chain_configs.get(self.selected_chain),
+                self.effective_chain_configs.get(self.last_evm_chain),
                 asset,
                 Some(&self.effective_token_registry),
             ),
             public_asset_icon_path(
-                self.selected_chain,
+                self.last_evm_chain,
                 asset,
                 Some(&self.effective_token_registry),
             ),
@@ -211,14 +211,14 @@ impl WalletRoot {
             || "selected asset".to_string(),
             |asset| {
                 public_asset_label(
-                    self.effective_chain_configs.get(self.selected_chain),
+                    self.effective_chain_configs.get(self.last_evm_chain),
                     asset,
                     Some(&self.effective_token_registry),
                 )
             },
         );
         let disabled = account.is_none() || selected_asset.is_none();
-        let submitting = self.public_form.sending || self.public_form.shielding;
+        let submitting = self.public_action_in_flight();
         let mode_root = root.clone();
         let submit_root = root.clone();
         let gas_fee_root = root.clone();
@@ -236,7 +236,7 @@ impl WalletRoot {
                 format!(
                     "Amount ({})",
                     public_action_asset_label(
-                        self.effective_chain_configs.get(self.selected_chain),
+                        self.effective_chain_configs.get(self.last_evm_chain),
                         asset,
                         Some(&self.effective_token_registry),
                     )
@@ -268,7 +268,7 @@ impl WalletRoot {
                 }
             };
             let decimals = public_asset_decimals(
-                self.effective_chain_configs.get(self.selected_chain),
+                self.effective_chain_configs.get(self.last_evm_chain),
                 asset,
                 Some(&self.effective_token_registry),
             );
@@ -291,23 +291,17 @@ impl WalletRoot {
             .filter(|_| mode == PublicActionMode::Unwrap)
             .and_then(|asset| self.selected_public_unwrap_gas_error(asset, cx));
         let submit_disabled = disabled
+            || submitting
             || match mode {
                 PublicActionMode::Shield => {
-                    self.public_form.shielding
-                        || !fee_ready
-                        || self.native_shield_unavailable(mode).is_some()
+                    !fee_ready || self.native_shield_unavailable(mode).is_some()
                 }
                 PublicActionMode::Send if self.public_form.public_send_kind.is_advanced() => {
-                    self.public_form.sending
-                        || self.public_form.advanced_send_estimate_pending
+                    self.public_form.advanced_send_estimate_pending
                         || self.public_form.advanced_send_estimate.is_none()
                 }
-                PublicActionMode::Send | PublicActionMode::Wrap => {
-                    self.public_form.sending || !fee_ready
-                }
-                PublicActionMode::Unwrap => {
-                    self.public_form.sending || !fee_ready || unwrap_gas_error.is_some()
-                }
+                PublicActionMode::Send | PublicActionMode::Wrap => !fee_ready,
+                PublicActionMode::Unwrap => !fee_ready || unwrap_gas_error.is_some(),
             };
         let wrap_mode = matches!(mode, PublicActionMode::Wrap | PublicActionMode::Unwrap);
         let mut content = public_action_form(content_width, submit_disabled, move |window, cx| {
@@ -490,7 +484,7 @@ impl WalletRoot {
                                 labeled_field(
                                     format!(
                                         "Value ({})",
-                                        self.configured_native_symbol(self.selected_chain)
+                                        self.configured_native_symbol(self.last_evm_chain)
                                     ),
                                     app_input(&self.public_form.advanced_send_value_input)
                                         .disabled(disabled || self.public_form.sending),
@@ -545,16 +539,16 @@ impl WalletRoot {
                             ))
                             .child(match self.public_form.advanced_send_estimate.as_ref() {
                                 Some(estimate) => render_public_advanced_transaction_estimate(
-                                    self.effective_chain_configs.get(self.selected_chain),
+                                    self.effective_chain_configs.get(self.last_evm_chain),
                                     estimate,
                                     self.public_broadcaster_anchor_cache
                                         .cached_native_usd_micro_value(
-                                            self.selected_chain,
+                                            self.last_evm_chain,
                                             estimate.expected_gas_cost,
                                         ),
                                     self.public_broadcaster_anchor_cache
                                         .cached_native_usd_micro_value(
-                                            self.selected_chain,
+                                            self.last_evm_chain,
                                             estimate.max_gas_cost,
                                         ),
                                 ),
@@ -732,6 +726,7 @@ impl WalletRoot {
                 active_step,
                 self.public_form.action_requires_device_approval,
                 self.public_form.action_command_tx.is_some(),
+                self.tron_send_pending_detail(),
             ));
         }
 
@@ -838,7 +833,7 @@ impl WalletRoot {
         let from = account.address;
         let public_account_uuid: Arc<str> = Arc::from(account.public_account_uuid.as_str());
         let native_decimals = public_asset_decimals(
-            self.effective_chain_configs.get(self.selected_chain),
+            self.effective_chain_configs.get(self.last_evm_chain),
             PublicAssetId::Native,
             Some(&self.effective_token_registry),
         );
@@ -876,7 +871,7 @@ impl WalletRoot {
                 return;
             }
         };
-        let chain_id = self.selected_chain;
+        let chain_id = self.last_evm_chain;
         let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
             return;
         };
@@ -909,7 +904,7 @@ impl WalletRoot {
             };
             let _ = this.update(cx, |root, cx| {
                 if root.selected_wallet_id != selected_wallet_id
-                    || root.selected_chain != chain_id
+                    || root.last_evm_chain != chain_id
                     || root.public_form.selected_account_uuid.as_deref()
                         != Some(public_account_uuid.as_ref())
                     || root.public_form.advanced_send_estimate_generation != generation
@@ -1054,6 +1049,11 @@ impl WalletRoot {
         !self.public_form.action_progress.is_empty()
     }
 
+    /// Every public action shares one progress slot, so any running action blocks the others.
+    pub(in crate::root) const fn public_action_in_flight(&self) -> bool {
+        self.public_form.sending || self.public_form.shielding
+    }
+
     pub(in crate::root) fn clear_public_action_progress_state(&mut self) {
         if let Some(handle) = self.public_form.action_task_abort_handle.take() {
             handle.abort();
@@ -1074,6 +1074,7 @@ impl WalletRoot {
         self.public_form.action_fee_authorization_review = None;
         self.public_form.action_fees_authorized = false;
         self.public_form.action_action_error = None;
+        self.public_form.action_error_summary = None;
         self.public_form.action_contract_address = None;
         self.public_form.action_progress_mode = PublicActionMode::Shield;
         self.public_form.action_progress_title_override = None;
@@ -1159,7 +1160,7 @@ impl WalletRoot {
         gas_fee.refreshing = true;
         gas_fee.quote_error = None;
         let refresh_id = gas_fee.refresh_id;
-        let chain_id = self.selected_chain;
+        let chain_id = self.last_evm_chain;
         let Ok(effective_chain) = self.effective_chain_configs.enabled(chain_id).cloned() else {
             return;
         };
@@ -1308,6 +1309,7 @@ impl WalletRoot {
         self.public_form.action_fee_authorization_review = None;
         self.public_form.action_fees_authorized = fees_authorized;
         self.public_form.action_action_error = None;
+        self.public_form.action_error_summary = None;
         self.public_form.action_contract_address = None;
         self.public_form.action_progress_title_override = None;
         if states
@@ -1409,7 +1411,7 @@ impl WalletRoot {
         }
     }
 
-    pub(in crate::root) fn spawn_public_action_progress_listener(
+    fn spawn_public_action_progress_listener(
         generation: u64,
         chain_id: u64,
         active_wallet_id: Option<Arc<str>>,
@@ -1423,8 +1425,10 @@ impl WalletRoot {
                     execution.progress(&update);
                 }
                 let _ = this.update(cx, |root, cx| {
+                    // A Tron Send's updates follow it to its outcome on any EVM chain.
                     if root.selected_wallet_id != active_wallet_id
-                        || root.selected_chain != chain_id
+                        || (root.last_evm_chain != chain_id
+                            && root.tron_public.send.generation != Some(generation))
                     {
                         return;
                     }
@@ -1435,7 +1439,7 @@ impl WalletRoot {
         .detach();
     }
 
-    pub(in crate::root) fn spawn_public_action_session_event_listener(
+    fn spawn_public_action_session_event_listener(
         generation: u64,
         chain_id: u64,
         active_wallet_id: Option<Arc<str>>,
@@ -1450,7 +1454,8 @@ impl WalletRoot {
                 }
                 let _ = this.update(cx, |root, cx| {
                     if root.selected_wallet_id != active_wallet_id
-                        || root.selected_chain != chain_id
+                        || (root.last_evm_chain != chain_id
+                            && root.tron_public.send.generation != Some(generation))
                     {
                         return;
                     }
@@ -1459,6 +1464,38 @@ impl WalletRoot {
             }
         })
         .detach();
+    }
+
+    /// Routes a started action's progress and session events to the shared slot and opens
+    /// its progress dialog.
+    pub(in crate::root) fn follow_public_action_progress(
+        generation: u64,
+        chain_id: u64,
+        active_wallet_id: Option<Arc<str>>,
+        event_rx: mpsc::UnboundedReceiver<PublicActionSessionEvent>,
+        gateway_execution: Option<wallet_ops::gateway::GatewayDraftExecution>,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) -> mpsc::UnboundedSender<PublicActionProgressUpdate> {
+        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+        Self::spawn_public_action_progress_listener(
+            generation,
+            chain_id,
+            active_wallet_id.clone(),
+            progress_rx,
+            gateway_execution.clone(),
+            cx,
+        );
+        Self::spawn_public_action_session_event_listener(
+            generation,
+            chain_id,
+            active_wallet_id,
+            event_rx,
+            gateway_execution,
+            cx,
+        );
+        Self::show_public_action_progress_dialog_after_close(window, cx);
+        progress_tx
     }
 
     pub(in crate::root) fn apply_public_action_session_event(
@@ -1619,6 +1656,10 @@ impl WalletRoot {
         {
             return;
         }
+        // A Tron Send's handoff may win before its event arrives; then only its outcome ends it.
+        if self.claim_tron_send_stop_unless_handed_off() {
+            return;
+        }
         if let Some(handle) = self.public_form.action_task_abort_handle.take() {
             handle.abort();
         }
@@ -1722,25 +1763,27 @@ impl WalletRoot {
                 .w(content_width)
                 .child(app_muted_text("No active Public action."));
         }
-        let mut content =
-            div()
-                .w(content_width)
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(render_public_action_stepper(
-                    root,
-                    &self.public_form.action_progress,
-                    &self.public_form.expanded_action_error_steps,
-                    self.public_form.action_progress_asset_label.as_ref(),
-                    self.public_form.action_requires_device_approval,
-                    self.public_form.action_command_tx.is_some(),
-                    self.public_form.action_current_gas_fee,
-                    self.public_form.action_fees_authorized,
-                    self.public_form.action_action_error.as_deref(),
-                    self.public_form.action_fee_authorization_review.as_ref(),
-                    self.public_form.action_generation,
-                ));
+        let mut content = div()
+            .w(content_width)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(render_public_action_stepper(
+                root,
+                &self.public_form.action_progress,
+                &self.public_form.expanded_action_error_steps,
+                self.public_form.action_progress_asset_label.as_ref(),
+                self.public_form.action_requires_device_approval,
+                self.public_form.action_command_tx.is_some(),
+                self.public_form.action_current_gas_fee,
+                self.public_form.action_fees_authorized,
+                self.public_form.action_action_error.as_deref(),
+                self.public_form.action_fee_authorization_review.as_ref(),
+                self.public_form.action_error_summary.as_deref(),
+                self.tron_send_pending_detail(),
+                self.public_form.action_generation,
+            ))
+            .children(self.tron_send_progress_note());
 
         if let Some(contract_address) = self.public_form.action_contract_address.as_ref() {
             content = content.child(copyable_mono_field(
@@ -1947,7 +1990,7 @@ impl WalletRoot {
         let Some(public_account_uuid) = self.public_form.selected_account_uuid.clone() else {
             return;
         };
-        let chain_id = self.selected_chain;
+        let chain_id = self.last_evm_chain;
         let selected_wallet_id = self.selected_wallet_id.clone();
         let symbol = entry.asset.symbol;
         let http = self.http.clone();
@@ -1991,7 +2034,7 @@ impl WalletRoot {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
                 if root.selected_wallet_id != selected_wallet_id
-                    || root.selected_chain != chain_id
+                    || root.last_evm_chain != chain_id
                     || root.public_form.action_mode != mode
                     || root.public_form.selected_asset != Some(PublicAssetId::Native)
                     || root.public_form.selected_account_uuid.as_deref()
@@ -2090,7 +2133,7 @@ impl WalletRoot {
             quote,
             profile,
             asset,
-            self.selected_chain,
+            self.last_evm_chain,
         )
     }
 
@@ -2115,7 +2158,7 @@ impl WalletRoot {
             .flatten()
             .map(|(_, gas_limit)| gas_limit);
         PublicActionFeeDisplay::from_estimate(
-            self.effective_chain_configs.get(self.selected_chain),
+            self.effective_chain_configs.get(self.last_evm_chain),
             self.public_action_estimated_gas_cost(mode, asset, cx),
             native_shield_gas_limit,
             (mode == PublicActionMode::Shield)
@@ -2143,7 +2186,7 @@ impl WalletRoot {
         if self.native_shield_stealth_applies(mode) {
             let (raw_gas_limit, gas_limit) = self.native_shield_gas(cx)?;
             return native_shield_gas_cost_projection(
-                self.selected_chain,
+                self.last_evm_chain,
                 self.public_shield_profile(),
                 raw_gas_limit,
                 gas_limit,
@@ -2161,8 +2204,8 @@ impl WalletRoot {
                 .then_some(self.public_form.shield_gas_fee_authorization_ceiling)
                 .flatten();
         estimate_public_action_gas_cost_with_profile_and_ceiling(
-            self.selected_chain,
-            self.effective_chain_configs.get(self.selected_chain)?,
+            self.last_evm_chain,
+            self.effective_chain_configs.get(self.last_evm_chain)?,
             kind,
             asset,
             profile,
@@ -2186,7 +2229,7 @@ impl WalletRoot {
             .public_action_estimated_gas_cost(PublicActionMode::Unwrap, asset, cx)?
             .maximum_cost;
         public_unwrap_gas_error(native_balance, maximum_gas_cost, |cost| {
-            self.configured_native_amount_label(self.selected_chain, cost)
+            self.configured_native_amount_label(self.last_evm_chain, cost)
         })
     }
 
@@ -2215,7 +2258,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.public_form.sending {
+        if self.public_action_in_flight() {
             return;
         }
         self.clear_public_action_progress_state();
@@ -2256,7 +2299,7 @@ impl WalletRoot {
             cx.notify();
             return None;
         };
-        let chain_id = self.selected_chain;
+        let chain_id = self.last_evm_chain;
         let asset_decimals = public_asset_decimals(
             self.effective_chain_configs.get(chain_id),
             asset,
@@ -2514,19 +2557,19 @@ impl WalletRoot {
     ) {
         let Ok(resolved_chain) = self
             .effective_chain_configs
-            .enabled(self.selected_chain)
+            .enabled(self.last_evm_chain)
             .cloned()
         else {
             return;
         };
-        if self.public_form.sending {
+        if self.public_action_in_flight() {
             if let Some(execution) = &draft.gateway_execution {
                 execution.finish(false);
             }
             return;
         }
         if let Some(execution) = &draft.gateway_execution {
-            if self.selected_chain != draft.chain_id
+            if self.last_evm_chain != draft.chain_id
                 || self.public_form.selected_account_uuid.as_deref()
                     != Some(draft.public_account_uuid.as_ref())
                 || !self
@@ -2613,24 +2656,15 @@ impl WalletRoot {
         if let Some(execution) = &gateway_execution {
             execution.bind_generation(generation);
         }
-        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
-        Self::spawn_public_action_progress_listener(
-            generation,
-            chain_id,
-            active_wallet_id.clone(),
-            progress_rx,
-            gateway_execution.clone(),
-            cx,
-        );
-        Self::spawn_public_action_session_event_listener(
+        let progress_tx = Self::follow_public_action_progress(
             generation,
             chain_id,
             active_wallet_id.clone(),
             event_rx,
             gateway_execution.clone(),
+            window,
             cx,
         );
-        Self::show_public_action_progress_dialog_after_close(window, cx);
         let request = PublicSendRequest {
             executor_owner: self.executor_owner_for_public_chain(chain_id),
             transaction_tracking: Some(transaction_tracking),
@@ -2668,7 +2702,7 @@ impl WalletRoot {
                 execution.finish(matches!(&result, Ok(Ok(_))));
             }
             let _ = this.update(cx, |root, cx| {
-                if root.selected_wallet_id != active_wallet_id || root.selected_chain != chain_id {
+                if root.selected_wallet_id != active_wallet_id || root.last_evm_chain != chain_id {
                     return;
                 }
                 if !public_action_accepts_update(
@@ -2727,7 +2761,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.public_form.shielding {
+        if self.public_action_in_flight() {
             return;
         }
         // A fixture's wrap fallback is real; a Custom fee would otherwise let it send.
@@ -2773,7 +2807,7 @@ impl WalletRoot {
             cx.notify();
             return None;
         };
-        let chain_id = self.selected_chain;
+        let chain_id = self.last_evm_chain;
         let asset_decimals = public_asset_decimals(
             self.effective_chain_configs.get(chain_id),
             asset,
@@ -2943,19 +2977,19 @@ impl WalletRoot {
     ) {
         let Ok(resolved_chain) = self
             .effective_chain_configs
-            .railgun(self.selected_chain)
+            .railgun(self.last_evm_chain)
             .cloned()
         else {
             return;
         };
-        if self.public_form.shielding {
+        if self.public_action_in_flight() {
             if let Some(execution) = &draft.gateway_execution {
                 execution.finish(false);
             }
             return;
         }
         if let Some(execution) = &draft.gateway_execution {
-            if self.selected_chain != draft.chain_id
+            if self.last_evm_chain != draft.chain_id
                 || self.public_form.selected_account_uuid.as_deref()
                     != Some(draft.public_account_uuid.as_ref())
                 || !self
@@ -3047,24 +3081,15 @@ impl WalletRoot {
         if let Some(execution) = &gateway_execution {
             execution.bind_generation(generation);
         }
-        let (progress_tx, progress_rx) = mpsc::unbounded_channel();
-        Self::spawn_public_action_progress_listener(
-            generation,
-            chain_id,
-            active_wallet_id.clone(),
-            progress_rx,
-            gateway_execution.clone(),
-            cx,
-        );
-        Self::spawn_public_action_session_event_listener(
+        let progress_tx = Self::follow_public_action_progress(
             generation,
             chain_id,
             active_wallet_id.clone(),
             event_rx,
             gateway_execution.clone(),
+            window,
             cx,
         );
-        Self::show_public_action_progress_dialog_after_close(window, cx);
         let request = PublicShieldRequest {
             executor_owner: self.executor_owner_for_public_chain(chain_id),
             transaction_tracking: Some(transaction_tracking),
@@ -3107,7 +3132,7 @@ impl WalletRoot {
                 if root.selected_wallet_id != active_wallet_id {
                     return;
                 }
-                if root.selected_chain != chain_id {
+                if root.last_evm_chain != chain_id {
                     return;
                 }
                 if !public_action_accepts_update(

@@ -244,7 +244,7 @@ impl RpcChainRoute {
     }
 
     /// Asks `endpoint` over its transport's client for its chain ID and compares it with this
-    /// route's, without a timeout.
+    /// route's, without a timeout. A Tron endpoint's HTTP API must also report mainnet's genesis.
     async fn check_chain_id(
         &self,
         clients: &RpcClients,
@@ -252,7 +252,8 @@ impl RpcChainRoute {
     ) -> Result<(), RpcBrokerError> {
         let url = endpoint.expose_url();
         let client = clients.get(self.endpoint_transport(url)).clone();
-        let provider = ProviderBuilder::new().connect_reqwest(client, url.clone());
+        self.pace(url).await;
+        let provider = ProviderBuilder::new().connect_reqwest(client.clone(), url.clone());
         let id = provider
             .get_chain_id()
             .await
@@ -260,7 +261,8 @@ impl RpcChainRoute {
         if id != self.chain_id() {
             return Err(RpcBrokerError::InvalidResponse);
         }
-        Ok(())
+        self.check_tron_genesis(&client, endpoint, IDENTITY_TIMEOUT)
+            .await
     }
 
     /// Checks all endpoints concurrently, so slow endpoints delay the caller by at most one
@@ -291,6 +293,7 @@ impl RpcChainRoute {
         if let Some(multicall) = self.multicall() {
             route = route.with_multicall(multicall);
         }
+        route.tron.clone_from(&self.tron);
         // This snapshot is used only by the operation that awaited verification.
         Ok(route)
     }

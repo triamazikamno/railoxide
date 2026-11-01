@@ -208,7 +208,7 @@ impl WalletRoot {
         pending.set_operation_generation(operation_generation);
         let gateway_unlock = self.gateway_unlock_continuation();
         let active_wallet_generation = self.active_wallet_generation;
-        let selected_chain = self.selected_chain;
+        let selected_chain = self.last_evm_chain;
         let base_profile_uuid = pending.base_profile_uuid.clone();
         let task_base_profile_uuid = base_profile_uuid.clone();
         let join = self.runtime.spawn_blocking(move || {
@@ -312,7 +312,7 @@ impl WalletRoot {
         pending.set_operation_generation(operation_generation);
         let gateway_unlock = self.gateway_unlock_continuation();
         let active_wallet_generation = self.active_wallet_generation;
-        let selected_chain = self.selected_chain;
+        let selected_chain = self.last_evm_chain;
         let base_profile_uuid = pending.base_profile_uuid.clone();
         let join = self.runtime.spawn_blocking(move || {
             let result = store.match_software_context_with_spend_unlock_ref(
@@ -515,7 +515,7 @@ impl WalletRoot {
             return;
         };
         let active_wallet_generation = self.active_wallet_generation;
-        let selected_chain = self.selected_chain;
+        let selected_chain = self.last_evm_chain;
         let task_base_profile_uuid = target_base_profile_uuid;
         let authorization_generation = self
             .pending_software_profile_open_operation_generation
@@ -560,7 +560,7 @@ impl WalletRoot {
                 )
                     || root.pending_software_profile_open_operation_generation
                         != authorization_generation
-                    || root.selected_chain != selected_chain
+                    || root.last_evm_chain != selected_chain
                     || !matches!(root.vault_state, VaultState::ViewUnlocked)
                 {
                     return;
@@ -609,7 +609,7 @@ impl WalletRoot {
         pending.set_operation_generation(operation_generation);
         let gateway_unlock = self.gateway_unlock_continuation();
         let active_wallet_generation = self.active_wallet_generation;
-        let selected_chain = self.selected_chain;
+        let selected_chain = self.last_evm_chain;
         let base_profile_uuid = pending.base_profile_uuid.clone();
         let task_base_profile_uuid = base_profile_uuid.clone();
         let join = self.runtime.spawn_blocking(move || {
@@ -739,7 +739,7 @@ impl WalletRoot {
             pending.set_operation_generation(operation_generation);
         }
         let active_wallet_generation = self.active_wallet_generation;
-        let selected_chain = self.selected_chain;
+        let selected_chain = self.last_evm_chain;
         let effective_chains = self
             .effective_chain_configs
             .railgun_chains()
