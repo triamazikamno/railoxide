@@ -309,13 +309,16 @@
 //!   selector, with three synthesized ones and their balances, priced at a stand-in $0.25 per
 //!   TRX until Tron's price refresh replaces it: Savings holds 2,480.35 TRX and 1,250 USDT,
 //!   Trading 35.12 TRX and 312.5 USDT, and Deposit only 25 USDT, so it doesn't exist on chain.
-//!   Their balances are never read. A Send form's reads are answered in memory, with stand-in
-//!   fee parameters, 600 free bandwidth and an energy estimate of 64,285, and its Review opens
-//!   the review, whose approval ends in an error on the form. These live in
-//!   `public_account/tron_send.rs`. `accounts` opens Send forms empty; Deposit's says Send is
-//!   unavailable until the account receives TRX. `new-account` fills a form with 25 to a
-//!   receiver that doesn't exist on chain, so a TRX send's review adds the account creation
-//!   fee and says the send creates the account. `waiting`, `complete`, `failed`,
+//!   Their balances and resources are never read: the rows show 100,000 energy, 1,500 staked
+//!   and 600 free bandwidth on Savings, only 600 free bandwidth on Trading, and that Deposit
+//!   isn't on chain. A Send form's reads are answered in memory, with stand-in fee parameters,
+//!   the same resources and an energy estimate of 64,285, or 130,285 to a receiver without the
+//!   token, and its Review opens the review, whose approval ends in an error on the form. These
+//!   live in `public_account/tron_send.rs`. `accounts` opens Send forms empty; Deposit's says
+//!   Send is unavailable until the account receives TRX. `new-account` fills a form with 25 to
+//!   a receiver that doesn't exist on chain and holds no token, so a TRX send's review adds the
+//!   account creation fee and says the send creates the account, and a token send's notes that
+//!   the receiver doesn't hold the token yet. `waiting`, `complete`, `failed`,
 //!   `token-did-not-move` and `dropped` fill the form with 25 to another of the accounts and
 //!   open the progress of a synthesized send over it, handed off with its transaction id:
 //!   waiting for solidified blocks after the endpoint didn't answer the broadcast, completed,

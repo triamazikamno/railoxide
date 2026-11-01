@@ -11,6 +11,8 @@ use alloy::sol_types::SolCall;
 use eyre::{Result, WrapErr, eyre};
 
 use super::TRON_CHAIN_ID;
+use super::fees::AccountResources;
+use super::http_api::TronHttpApi;
 use crate::public_wallet::{PublicErc20, registry_balance_assets};
 use crate::settings::EffectiveTokenRegistry;
 use crate::vault::TronAccountMetadata;
@@ -29,6 +31,16 @@ pub struct TronAccountBalance {
     pub observed_at: Instant,
     /// The block the call executed at.
     pub observed_block: u64,
+    /// `None` when the read failed.
+    pub resources: Option<TronAccountResources>,
+}
+
+/// An account's energy and bandwidth, from `getaccountresource`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TronAccountResources {
+    /// The account must first receive TRX.
+    NotOnChain,
+    OnChain(AccountResources),
 }
 
 /// TRX, in sun, then each Tron token of `token_registry`.
@@ -47,7 +59,7 @@ pub fn tron_balance_assets(token_registry: &EffectiveTokenRegistry) -> Vec<Publi
 /// Reads `account`'s balances on `route`'s Sensitive endpoints, over an isolated route opened
 /// for this refresh alone, as one unsplit call at `latest`. A result from a block below
 /// `minimum` isn't current: the read moves on to the next eligible endpoint, and fails when no
-/// endpoint reaches `minimum`.
+/// endpoint reaches `minimum`. The account's resources are then read over the same client.
 pub async fn refresh_tron_balances_at_least(
     account: &TronAccountMetadata,
     route: &RpcChainRoute,
@@ -87,6 +99,17 @@ pub async fn refresh_tron_balances_at_least(
                 last_error = eyre!("Tron balance observed block does not satisfy minimum block");
             }
             Ok((observed_block, amounts)) => {
+                // Over the same isolated client. A failed read only leaves the resources unknown.
+                let resources = TronHttpApi::new(http.clone(), route.isolated(client.clone()))
+                    .account_resources(account.address)
+                    .await
+                    .ok()
+                    .map(|resources| {
+                        resources.map_or(
+                            TronAccountResources::NotOnChain,
+                            TronAccountResources::OnChain,
+                        )
+                    });
                 return Ok(TronAccountBalance {
                     account: account.clone(),
                     balances: assets
@@ -102,6 +125,7 @@ pub async fn refresh_tron_balances_at_least(
                         .collect(),
                     observed_at,
                     observed_block,
+                    resources,
                 });
             }
             Err(error) => last_error = error,
@@ -387,6 +411,61 @@ mod tests {
                 (PublicAssetId::Erc20(USDD), None),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn resources_are_read_over_the_isolated_route_and_their_failure_keeps_the_balances() {
+        let fixtures: Value = serde_json::from_str(include_str!("fixtures/http_api.json")).unwrap();
+        for (answer, expected) in [
+            (fixtures["trongrid_rate_limit"].clone(), None),
+            (json!({}), Some(TronAccountResources::NotOnChain)),
+        ] {
+            let (url, _, _node) = spawn_recording_rpc_mock(node(100)).await;
+            let genesis = fixtures["getblockbynum_0"].clone();
+            let (api, api_log, _api) = spawn_recording_rpc_mock(Arc::new(move |request: Value| {
+                if request.get("num").is_some() {
+                    genesis.clone()
+                } else {
+                    answer.clone()
+                }
+            }))
+            .await;
+            let route = tron_rpc_route(&TronSettings {
+                endpoints: Some(vec![TronEndpointSetting {
+                    json_rpc_url: url.to_string(),
+                    http_api_url: Some(api.to_string()),
+                    ..TronEndpointSetting::default()
+                }]),
+                ..TronSettings::default()
+            })
+            .unwrap();
+
+            let balance =
+                refresh_tron_balances_at_least(&account(), &route, &registry(), &http(), None)
+                    .await
+                    .unwrap();
+
+            assert_eq!(balance.resources, expected);
+            assert_eq!(
+                balance.balances[0].amount.amount(),
+                Some(U256::from(5)),
+                "balances delivered"
+            );
+            let account_reads = api_log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, body)| body.get("address").is_some())
+                .map(|(tag, _)| tag.clone())
+                .collect::<Vec<_>>();
+            assert!(
+                !account_reads.is_empty()
+                    && account_reads
+                        .iter()
+                        .all(|tag| tag.as_deref() == Some("account")),
+                "over the isolated route: {account_reads:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1378,6 +1378,14 @@ impl WalletRoot {
                     .child(shortcuts(root)),
             );
         }
+        if tron && let Some(line) = self.tron_resources_line(&account.public_account_uuid) {
+            identity = identity.child(
+                app_muted_text(line)
+                    .text_xs()
+                    .text_color(subtle)
+                    .whitespace_normal(),
+            );
+        }
         let minimum_asset_width = if balances.is_empty() {
             0.0
         } else if selected || balances.len() == 1 {

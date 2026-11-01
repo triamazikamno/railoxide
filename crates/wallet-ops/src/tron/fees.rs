@@ -49,8 +49,13 @@ pub struct TronFees {
     pub fee_limit: u64,
     /// What the transaction can burn whatever resources the account holds.
     pub maximum: u64,
-    /// What it burns with the account's current resources.
+    /// What it burns with the account's current resources: `expected_energy` plus
+    /// `expected_bandwidth`.
     pub expected: u64,
+    /// The TRX burned for the energy the account lacks.
+    pub expected_energy: u64,
+    /// The TRX burned for bandwidth, or for account creation when the send creates one.
+    pub expected_bandwidth: u64,
 }
 
 /// The bandwidth a transaction is charged for: its signed size with `ret` cleared, plus
@@ -112,6 +117,8 @@ pub const fn tron_fees(
         fee_limit,
         maximum: maximum_bandwidth.saturating_add(fee_limit),
         expected: expected_bandwidth.saturating_add(expected_energy),
+        expected_energy,
+        expected_bandwidth,
     }
 }
 

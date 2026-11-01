@@ -147,7 +147,12 @@ impl TronSendReads for TronReads {
         &self,
         account: Address,
     ) -> Result<AccountResources, RpcBrokerError> {
-        self.api.account_resources(account).await
+        // A Send has already refused a sender not on chain, and a missing account has none.
+        Ok(self
+            .api
+            .account_resources(account)
+            .await?
+            .unwrap_or_default())
     }
 
     async fn chain_fee_parameters(&self) -> Result<ChainFeeParameters, RpcBrokerError> {
@@ -235,6 +240,13 @@ pub struct TronSendReview {
     pub parameters: ChainFeeParameters,
     /// A TRX send that creates the receiver's account.
     pub creates_account: bool,
+    /// The sender's resources the fees are computed from.
+    pub resources: AccountResources,
+    /// The bandwidth the transaction is charged for.
+    pub bandwidth_bytes: u64,
+    /// A token send whose energy estimate is more than 25% above the same transfer back to the
+    /// sender, as when the receiver doesn't hold the token yet.
+    pub receiver_lacks_token: bool,
     pub trx_balance: u64,
     /// The TRX Review lacks for the amount plus the expected fee. Review is available only when
     /// this is `None`.
@@ -319,7 +331,7 @@ pub async fn submit_tron_send<R: TronSendReads + TronBlockReads + ?Sized>(
     // The reviewed fee limit must still cover the energy, and the reviewed transaction must not
     // be able to burn more than reviewed.
     let reviewed_fee_limit = fee_limit(&transfer);
-    let signed_fees = transfer_fees(&transfer, &basis, now_ms)?;
+    let (signed_fees, _) = transfer_fees(&transfer, &basis, now_ms)?;
     let signed_maximum = signed_fees
         .maximum
         .saturating_sub(signed_fees.fee_limit)
@@ -411,6 +423,7 @@ struct FeeBasis {
     resources: AccountResources,
     energy_estimate: u64,
     creates_account: bool,
+    receiver_lacks_token: bool,
 }
 
 async fn read_fee_basis<R: TronSendReads + ?Sized>(
@@ -422,17 +435,26 @@ async fn read_fee_basis<R: TronSendReads + ?Sized>(
 ) -> Result<FeeBasis, RpcBrokerError> {
     let parameters = reads.chain_fee_parameters().await?;
     let resources = reads.account_resources(sender).await?;
-    let (energy_estimate, creates_account) = match asset {
-        TronSendAsset::Trx => (0, !reads.account_exists(receiver).await?),
+    let (energy_estimate, creates_account, receiver_lacks_token) = match asset {
+        TronSendAsset::Trx => (0, !reads.account_exists(receiver).await?, false),
         TronSendAsset::Trc20(contract) => {
-            let data = PublicErc20::transferCall {
-                recipient: receiver,
-                amount,
-            }
-            .abi_encode();
+            let transfer = |recipient: Address, amount: U256| {
+                Bytes::from(PublicErc20::transferCall { recipient, amount }.abi_encode())
+            };
+            let estimate = reads
+                .energy_estimate(sender, contract, transfer(receiver, amount))
+                .await?;
+            // The sender keeps a nonzero balance after sending 1 to itself, so this is an
+            // existing holder's cost even for a send of the whole balance. It's only a hint, so
+            // a failed read shows none.
+            let baseline = reads
+                .energy_estimate(sender, contract, transfer(sender, U256::from(1)))
+                .await
+                .ok();
             (
-                reads.energy_estimate(sender, contract, data.into()).await?,
+                estimate,
                 false,
+                baseline.is_some_and(|baseline| receiver_lacks_token(estimate, baseline)),
             )
         }
     };
@@ -441,7 +463,13 @@ async fn read_fee_basis<R: TronSendReads + ?Sized>(
         resources,
         energy_estimate,
         creates_account,
+        receiver_lacks_token,
     })
+}
+
+/// A receiver's estimate more than 25% above `baseline`, an existing holder's.
+const fn receiver_lacks_token(estimate: u64, baseline: u64) -> bool {
+    estimate > baseline.saturating_add(baseline / 4)
 }
 
 fn build_review(
@@ -473,35 +501,45 @@ fn build_review(
         receiver: draft.receiver,
         asset,
     };
-    let fees = transfer_fees(&transfer, basis, now_ms)?;
+    let (fees, bandwidth_bytes) = transfer_fees(&transfer, basis, now_ms)?;
     Ok(TronSendReview {
         transfer,
         fees,
         parameters: basis.parameters,
         creates_account: basis.creates_account,
+        resources: basis.resources,
+        bandwidth_bytes,
+        receiver_lacks_token: basis.receiver_lacks_token,
         trx_balance: draft.trx_balance,
         missing_trx: missing_trx(draft.trx_balance, trx_amount, fees.expected),
     })
 }
 
-/// `transfer`'s fees under `basis`. Only the transaction's size matters here, and a placeholder
-/// block encodes to the same size as the reference block chosen at signing.
-fn transfer_fees(transfer: &TronTransfer, basis: &FeeBasis, now_ms: u64) -> eyre::Result<TronFees> {
+/// `transfer`'s fees under `basis`, and the bandwidth it's charged for. Only the transaction's
+/// size matters here, and a placeholder block encodes to the same size as the reference block
+/// chosen at signing.
+fn transfer_fees(
+    transfer: &TronTransfer,
+    basis: &FeeBasis,
+    now_ms: u64,
+) -> eyre::Result<(TronFees, u64)> {
     let block = ReferenceBlock {
         number: 0,
         hash: B256::ZERO,
         timestamp_ms: now_ms,
     };
     let transaction = UnsignedTransaction::build(transfer, &block, now_ms)?;
-    Ok(tron_fees(
+    let bandwidth_bytes = bandwidth_bytes(&transaction);
+    let fees = tron_fees(
         &basis.parameters,
         &basis.resources,
         &FeeInputs {
-            bandwidth_bytes: bandwidth_bytes(&transaction),
+            bandwidth_bytes,
             energy_estimate: basis.energy_estimate,
             creates_account: basis.creates_account,
         },
-    ))
+    );
+    Ok((fees, bandwidth_bytes))
 }
 
 const fn fee_limit(transfer: &TronTransfer) -> u64 {
@@ -708,6 +746,13 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn a_receiver_lacks_the_token_only_above_125_percent_of_a_holders_estimate() {
+        assert!(receiver_lacks_token(126, 100));
+        assert!(!receiver_lacks_token(125, 100));
+        assert!(!receiver_lacks_token(100, 100));
     }
 
     #[tokio::test]

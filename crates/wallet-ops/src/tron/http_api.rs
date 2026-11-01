@@ -72,10 +72,11 @@ impl TronHttpApi {
         decode_account_exists(&value)
     }
 
+    /// `None` for an account that doesn't exist on chain.
     pub async fn account_resources(
         &self,
         account: Address,
-    ) -> Result<AccountResources, RpcBrokerError> {
+    ) -> Result<Option<AccountResources>, RpcBrokerError> {
         let value = self
             .call(
                 RpcTrafficClass::Sensitive,
@@ -154,14 +155,18 @@ struct ResourcesWire {
     energy_used: u64,
 }
 
-fn decode_account_resources(value: Value) -> Result<AccountResources, RpcBrokerError> {
+/// `{}` is an account that doesn't exist; an existing one always carries its free bandwidth limit.
+fn decode_account_resources(value: Value) -> Result<Option<AccountResources>, RpcBrokerError> {
+    if value.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Ok(None);
+    }
     let wire: ResourcesWire =
         serde_json::from_value(value).map_err(|_| RpcBrokerError::InvalidResponse)?;
-    Ok(AccountResources {
+    Ok(Some(AccountResources {
         free_bandwidth: wire.free_net_limit.saturating_sub(wire.free_net_used),
         staked_bandwidth: wire.net_limit.saturating_sub(wire.net_used),
         energy: wire.energy_limit.saturating_sub(wire.energy_used),
-    })
+    }))
 }
 
 #[derive(Deserialize)]
@@ -292,12 +297,14 @@ mod tests {
         );
         assert_eq!(
             decode_account_resources(fixture("getaccountresource")),
-            Ok(AccountResources {
+            Ok(Some(AccountResources {
                 free_bandwidth: 600,
                 staked_bandwidth: 3_528_933,
                 energy: 1_282_988_888,
-            })
+            }))
         );
+        // An account not on chain, not one without resources.
+        assert_eq!(decode_account_resources(json!({})), Ok(None));
         assert_eq!(
             decode_chain_fee_parameters(fixture("getchainparameters")),
             Ok(ChainFeeParameters {

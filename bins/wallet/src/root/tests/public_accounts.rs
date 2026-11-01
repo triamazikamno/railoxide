@@ -1744,7 +1744,8 @@ fn clock_ms() -> u64 {
 /// With `hang`, a send stops at its reference block read, before anything is signed. Its
 /// solidified blocks include every broadcast transaction, or with `includes` false, pass their
 /// expiration without them. While `hold` is set, the solidified head isn't read yet. With
-/// `hold_next_preparation`, the next fee parameters read waits for `release_preparation`.
+/// `hold_next_preparation`, the next fee parameters read waits for `release_preparation`. Token
+/// transfers need no energy, except to [`TRON_TOKENLESS_RECEIVER`].
 struct TronSendChain {
     hang: bool,
     reached_signing: std::sync::atomic::AtomicBool,
@@ -1816,9 +1817,15 @@ impl wallet_ops::tron::send::TronSendReads for TronSendChain {
         &self,
         _sender: alloy::primitives::Address,
         _contract: alloy::primitives::Address,
-        _data: alloy::primitives::Bytes,
+        data: alloy::primitives::Bytes,
     ) -> Result<u64, wallet_ops::RpcBrokerError> {
-        Ok(0)
+        // `transfer(address,uint256)`: the recipient ends the first argument word.
+        let recipient = data.get(16..36).map(alloy::primitives::Address::from_slice);
+        Ok(if recipient == Some(TRON_TOKENLESS_RECEIVER) {
+            130_285
+        } else {
+            0
+        })
     }
 
     async fn latest_block(
@@ -2369,6 +2376,9 @@ fn a_running_shield_keeps_the_action_slot_from_a_tron_send_until_a_chain_switch_
 
 const TRON_USDT: alloy::primitives::Address =
     alloy::primitives::address!("0xa614f803b6fd780986a42c78ec9c7f77e6ded13c");
+/// A receiver that doesn't hold the token, so a transfer to it needs more energy.
+const TRON_TOKENLESS_RECEIVER: alloy::primitives::Address =
+    alloy::primitives::Address::repeat_byte(0x33);
 
 /// Replaces the Tron account's balances in the latest refresh with `trx_sun` and any USDT.
 fn set_tron_balances(root: &mut WalletRoot, trx_sun: u64, usdt: Option<U256>) {
@@ -2498,6 +2508,73 @@ fn a_late_tron_send_review_never_lands_in_another_form(cx: &mut TestAppContext) 
     root.read_with(cx, |root, _| {
         assert_eq!(root.tron_public.send.form.as_ref().unwrap().error, None);
     });
+
+    cx.update(|window, _| window.remove_window());
+    drop(root);
+    cx.run_until_parked();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[gpui::test]
+fn a_tron_token_send_notes_a_receiver_that_does_not_hold_the_token(cx: &mut TestAppContext) {
+    let path = temp_wallet_db_root("tron-send-receiver-note");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    cx.update(gpui_component::init);
+    let mut root = None;
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let wallet = fixture_root(&path, &runtime, window, cx);
+        root = Some(wallet.clone());
+        Root::new(wallet, window, cx)
+    });
+    let root = root.unwrap();
+    let chain = Arc::new(TronSendChain::new(
+        Ok(wallet_ops::tron::http_api::TronBroadcast {
+            accepted: true,
+            code: None,
+        }),
+        true,
+    ));
+    let uuid = open_tron_send(&root, cx, &runtime, &chain).account_uuid;
+    root.update_in(cx, |root, window, cx| {
+        set_tron_balances(root, 100 * TRX_SUN, Some(U256::from(5 * TRX_SUN)));
+        root.close_tron_send_form(window, cx);
+        root.open_tron_send_dialog(uuid, PublicAssetId::Erc20(TRON_USDT), window, cx);
+        root.tron_public
+            .send
+            .amount_input
+            .update(cx, |input, cx| input.set_value("1", window, cx));
+    });
+
+    // The test receiver's transfer costs what the transfer back to the sender does.
+    for (receiver, noted) in [
+        (alloy::primitives::Address::repeat_byte(0x22), false),
+        (TRON_TOKENLESS_RECEIVER, true),
+    ] {
+        root.update_in(cx, |root, window, cx| {
+            let receiver = wallet_ops::tron::address::encode_tron_address(receiver);
+            root.set_tron_receiver(&receiver, window, cx);
+        });
+        start_tron_send_preparation(cx);
+        drive_until(cx, &runtime, |cx| {
+            root.read_with(cx, |root, _| {
+                root.tron_public
+                    .send
+                    .form
+                    .as_ref()
+                    .is_some_and(|form| form.review.is_some())
+            })
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(
+            cx.debug_bounds("wallet-tron-send-receiver-note").is_some(),
+            noted,
+            "{receiver}"
+        );
+    }
 
     cx.update(|window, _| window.remove_window());
     drop(root);
@@ -2859,6 +2936,7 @@ fn a_tron_balance_refresh_keeps_the_focused_asset(cx: &mut TestAppContext) {
             balances: balances(100 * TRX_SUN),
             observed_at: std::time::Instant::now(),
             observed_block: 100,
+            resources: None,
         };
         root.apply_tron_balance_refresh_result(ticket, Ok(Ok(read)), cx);
         assert_eq!(root.public_form.focused_asset_index, Some(1));

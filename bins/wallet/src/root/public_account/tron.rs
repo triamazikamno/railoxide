@@ -3,7 +3,7 @@
 //! `PublicAccountMetadata` rows, which never enter `public_accounts`, so no EVM flow sees them.
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Weak;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -21,7 +21,7 @@ use wallet_ops::{
     tron::{
         TRON_CHAIN_ID,
         address::encode_tron_address,
-        balances::{TronAccountBalance, refresh_tron_balances_at_least},
+        balances::{TronAccountBalance, TronAccountResources, refresh_tron_balances_at_least},
         tron_rpc_route,
     },
     vault::{
@@ -35,6 +35,7 @@ use super::tron_send::TronSendState;
 use super::{next_public_account_label_number, public_account_display_label};
 use crate::root::device_auth::masked_input_with_device_auth;
 use crate::root::dialogs::PublicAccountDialogKind;
+use crate::root::public_action::format_gas_limit;
 use crate::root::vault::vault_error_kind;
 use crate::root::{SelectedNetwork, WalletRoot, format_report_chain};
 
@@ -55,6 +56,9 @@ pub(in crate::root) struct TronPublicState {
     /// Apart from the EVM cache, so a custom EVM chain with Tron's chain id never shares it.
     pub(in crate::root) balance_cache: PublicBalanceCache,
     pub(in crate::root) snapshot: Option<Arc<PublicBalanceSnapshot>>,
+    /// Each account's resources from its latest accepted refresh, by `tron_account_uuid`.
+    /// `None` when that read failed; an account without an entry hasn't been read.
+    pub(in crate::root) resources: HashMap<String, Option<TronAccountResources>>,
     pub(in crate::root) error: Option<Arc<str>>,
     pub(in crate::root) inactive_error: Option<Arc<str>>,
     pub(in crate::root) send: TronSendState,
@@ -72,6 +76,7 @@ impl TronPublicState {
             selected: None,
             balance_cache: PublicBalanceCache::default(),
             snapshot: None,
+            resources: HashMap::new(),
             error: None,
             inactive_error: None,
             send,
@@ -84,6 +89,7 @@ impl TronPublicState {
         self.selected = None;
         self.balance_cache.clear();
         self.snapshot = None;
+        self.resources.clear();
         self.error = None;
         self.inactive_error = None;
         self.send.form = None;
@@ -249,6 +255,28 @@ impl WalletRoot {
         }
     }
 
+    /// A Tron row's resource line; `None` until the account's resources have been read.
+    pub(super) fn tron_resources_line(&self, uuid: &str) -> Option<String> {
+        Some(match self.tron_public.resources.get(uuid)? {
+            None => "Resources unavailable".to_owned(),
+            Some(TronAccountResources::NotOnChain) => {
+                "Not on chain. Receive TRX before sending.".to_owned()
+            }
+            Some(TronAccountResources::OnChain(resources)) => {
+                let staked = if resources.staked_bandwidth == 0 {
+                    String::new()
+                } else {
+                    format!("{} staked, ", format_gas_limit(resources.staked_bandwidth))
+                };
+                format!(
+                    "Energy {} · Bandwidth {staked}{} free",
+                    format_gas_limit(resources.energy),
+                    format_gas_limit(resources.free_bandwidth)
+                )
+            }
+        })
+    }
+
     pub(in crate::root) const fn tron_has_pricing(&self) -> bool {
         self.tron_public.route.is_some()
             && !matches!(
@@ -278,6 +306,7 @@ impl WalletRoot {
             self.tron_public.route_warmed = false;
             self.tron_public.balance_cache.clear();
             self.tron_public.snapshot = None;
+            self.tron_public.resources.clear();
         }
         self.tron_public.settings = settings.clone();
         self.public_broadcaster_anchor_refresh
@@ -421,6 +450,10 @@ impl WalletRoot {
             .iter()
             .find(|account| ticket.includes_account(&account.tron_account_uuid))
             .map(|account| account.status);
+        let resources = match &result {
+            Ok(Ok(read)) => Some((read.account.tron_account_uuid.clone(), read.resources)),
+            _ => None,
+        };
         let (snapshot, error) = match result {
             Ok(Ok(read)) => (
                 Some(PublicBalanceSnapshot {
@@ -445,6 +478,9 @@ impl WalletRoot {
             // Keep the focused tile and any open asset menu across the refresh, as on EVM.
             let focused = self.tron_selected().then(|| self.public_focused_asset());
             self.tron_public.snapshot = cache.snapshot(&scope).map(Arc::new);
+            if let Some((uuid, resources)) = resources {
+                self.tron_public.resources.insert(uuid, resources);
+            }
             if let Some(focused) = focused
                 && self.revalidate_public_asset_focus(focused)
             {

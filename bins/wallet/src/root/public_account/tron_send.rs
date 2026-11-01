@@ -15,8 +15,8 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::signers::local::PrivateKeySigner;
 use eyre::WrapErr as _;
 use gpui::{
-    AnyElement, App, Context, Entity, Focusable as _, IntoElement as _, ParentElement as _, Pixels,
-    Styled as _, Window, div, prelude::FluentBuilder as _, rgb,
+    AnyElement, App, Context, Entity, Focusable as _, InteractiveElement as _, IntoElement as _,
+    ParentElement as _, Pixels, Styled as _, Window, div, prelude::FluentBuilder as _, rgb,
 };
 use gpui_component::{
     Disableable as _, Sizable as _, WindowExt as _,
@@ -58,9 +58,9 @@ use crate::root::private_action::{
     form_recipient_picker, recipient_suggestion_to_confirm, recipient_suggestions_for_input,
 };
 use crate::root::public_action::{
-    PublicActionMode, public_action_accepts_update, public_action_closed_status_step,
-    public_action_form, public_action_title_row, render_amount_input,
-    render_public_action_active_status_notice,
+    PublicActionMode, format_gas_limit, public_action_accepts_update,
+    public_action_closed_status_step, public_action_form, public_action_title_row,
+    render_amount_input, render_public_action_active_status_notice,
 };
 use crate::root::public_balances::{public_asset_icon_path, public_balance_entry_for_chain};
 use crate::root::spend_authorization::{
@@ -191,6 +191,50 @@ pub(in crate::root) struct TronSendIntent {
 
 fn trx(sun: u64) -> String {
     railgun_ui::tron_native_currency().format_amount(U256::from(sun))
+}
+
+/// The energy and bandwidth `review`'s transfer needs, what the account has and the TRX burned
+/// for any shortfall, then the note on a receiver that doesn't hold the token yet. Account
+/// creation replaces the bandwidth charge, and its own note covers it.
+fn resource_lines(review: &TronSendReview, symbol: &str) -> Vec<gpui::Div> {
+    let burns = |sun: u64| {
+        if sun == 0 {
+            String::new()
+        } else {
+            format!(", burns {}", trx(sun))
+        }
+    };
+    let mut lines = Vec::new();
+    if matches!(review.transfer.asset, TronAsset::Trc20 { .. }) {
+        lines.push(app_muted_text(format!(
+            "Energy: {} needed, {} available{}",
+            format_gas_limit(review.fees.energy_cap),
+            format_gas_limit(review.resources.energy),
+            burns(review.fees.expected_energy)
+        )));
+    }
+    if !review.creates_account {
+        lines.push(app_muted_text(format!(
+            "Bandwidth: {} needed, {} free, {} staked{}",
+            format_gas_limit(review.bandwidth_bytes),
+            format_gas_limit(review.resources.free_bandwidth),
+            format_gas_limit(review.resources.staked_bandwidth),
+            burns(review.fees.expected_bandwidth)
+        )));
+    }
+    if review.receiver_lacks_token {
+        lines.push(
+            app_muted_text(format!(
+                "The receiver doesn't hold {symbol} yet, so this transfer needs more energy. \
+                 Sending to an address that already holds {symbol} costs less."
+            ))
+            .debug_selector(|| "wallet-tron-send-receiver-note".into()),
+        );
+    }
+    lines
+        .into_iter()
+        .map(gpui::Styled::whitespace_normal)
+        .collect()
 }
 
 /// A fee in TRX with its USD value, as EVM fees show theirs.
@@ -1381,6 +1425,7 @@ impl WalletRoot {
         .child(labeled_field("To", picker).children(receiver_problem))
         .child(amount)
         .children(fees)
+        .children(review.map_or_else(Vec::new, |review| resource_lines(review, &form.symbol)))
         .children(review.filter(|review| review.creates_account).map(|_| {
             app_muted_text(
                 "This send creates the receiver's account. Its fee includes Tron's account \
@@ -1431,6 +1476,7 @@ mod ui_fixture {
     use gpui::{Context, Window};
     use wallet_ops::tron::TRON_CHAIN_ID;
     use wallet_ops::tron::address::encode_tron_address;
+    use wallet_ops::tron::balances::TronAccountResources;
     use wallet_ops::tron::confirmation::{
         TronBlock, TronBlockReads, TronSendFailure, TronSendOutcome,
     };
@@ -1483,12 +1529,9 @@ mod ui_fixture {
 
         async fn account_resources(
             &self,
-            _account: Address,
+            account: Address,
         ) -> Result<AccountResources, RpcBrokerError> {
-            Ok(AccountResources {
-                free_bandwidth: 600,
-                ..AccountResources::default()
-            })
+            Ok(resources(account))
         }
 
         async fn chain_fee_parameters(&self) -> Result<ChainFeeParameters, RpcBrokerError> {
@@ -1501,13 +1544,20 @@ mod ui_fixture {
             })
         }
 
+        /// A transfer to `NEW_RECEIVER`, which holds no token, costs more than to a holder.
         async fn energy_estimate(
             &self,
             _sender: Address,
             _contract: Address,
-            _data: Bytes,
+            data: Bytes,
         ) -> Result<u64, RpcBrokerError> {
-            Ok(64_285)
+            // `transfer(address,uint256)`: the recipient ends the first argument word.
+            let recipient = data.get(16..36).map(Address::from_slice);
+            Ok(if recipient == Some(NEW_RECEIVER) {
+                130_285
+            } else {
+                64_285
+            })
         }
 
         async fn latest_block(&self) -> Result<ReferenceBlock, RpcBrokerError> {
@@ -1545,6 +1595,20 @@ mod ui_fixture {
             _number: u64,
         ) -> Result<Vec<TronTransactionInfo>, RpcBrokerError> {
             Err(RpcBrokerError::Timeout)
+        }
+    }
+
+    /// Savings has energy and staked bandwidth; the others only free bandwidth.
+    fn resources(account: Address) -> AccountResources {
+        let (staked_bandwidth, energy) = if account == SAVINGS {
+            (1_500, 100_000)
+        } else {
+            (0, 0)
+        };
+        AccountResources {
+            free_bandwidth: 600,
+            staked_bandwidth,
+            energy,
         }
     }
 
@@ -1620,6 +1684,17 @@ mod ui_fixture {
                 accounts.push(account);
             }
             self.tron_public.listed = accounts.iter().map(tron_list_account).collect();
+            self.tron_public.resources = accounts
+                .iter()
+                .map(|account| {
+                    let state = if account.address == DEPOSIT {
+                        TronAccountResources::NotOnChain
+                    } else {
+                        TronAccountResources::OnChain(resources(account.address))
+                    };
+                    (account.tron_account_uuid.clone(), Some(state))
+                })
+                .collect();
             self.tron_public.accounts = accounts;
             if !self.tron_public.listed.iter().any(|account| {
                 Some(account.public_account_uuid.as_str()) == self.tron_public.selected.as_deref()
