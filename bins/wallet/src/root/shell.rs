@@ -54,6 +54,7 @@ use super::chain_load::{
 use super::private_assets::{
     format_private_asset_rows_from_snapshot, should_show_pending_poi_amount,
 };
+use super::settings::{data_folder_path, data_folder_row};
 use super::submission_route::{presence_status_color, status_presence_dot, status_presence_text};
 use super::ui_helpers::format_binary_bytes;
 use super::utxo::{
@@ -782,22 +783,35 @@ impl WalletRoot {
             Activity::Proposals => self
                 .render_governance_workspace(root, window, cx)
                 .into_any_element(),
-            Activity::Settings => self.render_settings_view().into_any_element(),
+            Activity::Settings => self.render_settings_view(root).into_any_element(),
         }
     }
 
-    fn render_settings_view(&self) -> impl IntoElement {
+    fn render_settings_view(&self, root: &Entity<Self>) -> impl IntoElement {
         let content = if let Some(editor) = self.settings_editor.as_ref() {
             div().size_full().child(editor.clone()).into_any_element()
         } else {
+            let open_root = root.clone();
             div()
                 .p(px(24.0))
+                .flex()
+                .flex_col()
+                .gap_3()
                 .text_color(rgb(theme::TEXT_MUTED))
                 .child(SharedString::from(
                     self.settings_error.as_ref().map_or_else(
                         || "Settings are unavailable".to_string(),
                         ToString::to_string,
                     ),
+                ))
+                .child(data_folder_row(
+                    &data_folder_path(&self.options.db_path),
+                    None,
+                    true,
+                    self.data_folder_open_error.clone(),
+                    move |_window, cx| {
+                        open_root.update(cx, Self::open_settings_data_folder);
+                    },
                 ))
                 .into_any_element()
         };

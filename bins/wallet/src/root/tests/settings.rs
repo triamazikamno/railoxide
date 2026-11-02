@@ -1312,6 +1312,7 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
         let editor = cx.new(|cx| {
             WalletSettingsEditor::new(
                 store.clone(),
+                &path,
                 runtime.handle().clone(),
                 saved.clone(),
                 maintenance,
@@ -1664,6 +1665,7 @@ fn settings_fields_commit_first_edit_after_sync_and_number_steps(cx: &mut gpui::
         let editor = cx.new(|cx| {
             WalletSettingsEditor::new(
                 store.clone(),
+                &path,
                 runtime.handle().clone(),
                 WalletSettings::default(),
                 maintenance,
@@ -1789,6 +1791,7 @@ fn tron_settings_refuse_submit_without_an_http_api_url(cx: &mut gpui::TestAppCon
         let editor = cx.new(|cx| {
             WalletSettingsEditor::new(
                 store.clone(),
+                &path,
                 runtime.handle().clone(),
                 saved.clone(),
                 maintenance,
@@ -1836,6 +1839,91 @@ fn tron_settings_refuse_submit_without_an_http_api_url(cx: &mut gpui::TestAppCon
     // Dropping the window and entities releases the test database before removal.
     cx.update(|window, _| window.remove_window());
     drop(owner);
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[gpui::test]
+fn data_folder_size_resets_after_maintenance_and_ignores_stale_walks(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::root::settings::DataFolderSize;
+    use gpui::{AppContext as _, IntoElement, Render, div};
+    use std::{cell::RefCell, rc::Rc};
+
+    struct EmptyHost;
+
+    impl Render for EmptyHost {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<'_, Self>,
+        ) -> impl IntoElement {
+            div()
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let path = temp_wallet_db_root("data-folder-size");
+    let store = Arc::new(DesktopVaultStore::open(path.clone()).unwrap());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let owner_slot = Rc::new(RefCell::new(None));
+    let slot = owner_slot.clone();
+    let handle = cx.add_window(|window, cx| {
+        let maintenance = cx.new(|_| WalletMaintenanceController::new(runtime.handle().clone()));
+        let editor = cx.new(|cx| {
+            WalletSettingsEditor::new(
+                store.clone(),
+                &path,
+                runtime.handle().clone(),
+                WalletSettings::default(),
+                maintenance.clone(),
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+        *slot.borrow_mut() = Some((editor, maintenance));
+        EmptyHost
+    });
+    let (editor, maintenance) = owner_slot.borrow_mut().take().unwrap();
+
+    // A reset that finishes makes a measured size stale.
+    editor.update(cx, |editor, _cx| {
+        editor.data_folder_size = DataFolderSize::Ready(1);
+    });
+    assert!(maintenance.update(cx, |controller, cx| {
+        controller.start_merkle_reset(store.as_ref(), cx)
+    }));
+    assert!(!maintenance.read_with(cx, |controller, _cx| controller.is_idle()));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !maintenance.read_with(cx, |controller, _cx| controller.is_idle()) {
+        assert!(std::time::Instant::now() < deadline, "the reset finishes");
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        editor.read_with(cx, |editor, _cx| editor.data_folder_size),
+        DataFolderSize::Unknown
+    );
+
+    // A walk superseded by a later one cannot overwrite it.
+    editor.update(cx, |editor, cx| {
+        editor.data_folder_size_generation = 2;
+        editor.data_folder_size = DataFolderSize::Calculating(2);
+        editor.finish_data_folder_size(1, DataFolderSize::Ready(99), cx);
+        assert_eq!(editor.data_folder_size, DataFolderSize::Calculating(2));
+    });
+
+    handle
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    drop(editor);
+    drop(maintenance);
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
 }

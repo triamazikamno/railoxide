@@ -456,6 +456,8 @@ pub(crate) struct WalletRoot {
     settings_editor: Option<Entity<WalletSettingsEditor>>,
     maintenance_controller: Entity<WalletMaintenanceController>,
     settings_error: Option<Arc<str>>,
+    /// The last Open failure of the data folder row shown while Settings are unavailable.
+    data_folder_open_error: Option<SharedString>,
     active_activity: Activity,
     active_wallet_tab: WalletTab,
     sidebar_manually_collapsed: bool,
@@ -1210,6 +1212,7 @@ impl WalletRoot {
                             |cx| {
                                 WalletSettingsEditor::new(
                                     store,
+                                    &options.db_path,
                                     runtime,
                                     settings,
                                     maintenance_controller,
@@ -1603,6 +1606,7 @@ impl WalletRoot {
             settings_editor,
             maintenance_controller: maintenance_controller.clone(),
             settings_error,
+            data_folder_open_error: None,
             active_activity: Activity::Wallet,
             active_wallet_tab: initial_wallet_tab,
             sidebar_manually_collapsed: false,

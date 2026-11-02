@@ -36,8 +36,8 @@ use wallet_ops::{
 
 use super::chain_load::WalletRootReplacementCleanup;
 use super::settings::{
-    StartupSettingsSummary, WalletSettingsEditor, settings_dialog_dimensions,
-    startup_settings_action_state,
+    StartupSettingsSummary, WalletSettingsEditor, data_folder_path, data_folder_row,
+    open_data_folder, settings_dialog_dimensions, startup_settings_action_state,
 };
 use super::shell::{WalletAppOptions, render_wallet_hero_screen, render_wallet_window_frame};
 use super::{WalletMaintenanceController, WalletRoot, format_report_chain, rgb_with_alpha};
@@ -123,6 +123,8 @@ pub(super) struct WalletStartupRoot {
     retained_tor_http: Option<HttpContext>,
     tor_bootstrap_recovery_available: bool,
     tor_reset_error: Option<Arc<str>>,
+    /// The last Open failure of the startup Settings dialog's data folder row.
+    data_folder_open_error: Option<SharedString>,
     _activity_keystroke_interceptor: Subscription,
 }
 
@@ -199,6 +201,7 @@ impl WalletStartupRoot {
             retained_tor_http: None,
             tor_bootstrap_recovery_available: false,
             tor_reset_error: None,
+            data_folder_open_error: None,
             _activity_keystroke_interceptor: activity_keystroke_interceptor,
         };
         if let Some(vault_store) = vault_store {
@@ -623,6 +626,22 @@ impl WalletStartupRoot {
         }
     }
 
+    fn open_settings_data_folder(&mut self, cx: &mut Context<'_, Self>) {
+        self.data_folder_open_error = None;
+        cx.notify();
+        let root = cx.weak_entity();
+        open_data_folder(
+            data_folder_path(&self.options.db_path),
+            cx,
+            move |error, cx| {
+                let _ = root.update(cx, |root, cx| {
+                    root.data_folder_open_error = Some(error);
+                    cx.notify();
+                });
+            },
+        );
+    }
+
     fn open_startup_settings_dialog(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
         window.close_all_dialogs(cx);
         let root = cx.entity();
@@ -638,6 +657,7 @@ impl WalletStartupRoot {
                             Some(cx.new(|cx| {
                                 WalletSettingsEditor::new(
                                     store,
+                                    &self.options.db_path,
                                     runtime,
                                     settings,
                                     maintenance_controller,
@@ -670,9 +690,11 @@ impl WalletStartupRoot {
         };
         let (dialog_width, content_height, dialog_max_height) = settings_dialog_dimensions(window);
         let maintenance_controller = self.maintenance_controller.clone();
+        let data_folder = data_folder_path(&self.options.db_path);
         window.open_dialog(cx, move |dialog, _window, cx| {
             let reset_root = root.clone();
             let retry_root = root.clone();
+            let open_root = root.clone();
             let content = if let Some(editor) = editor.clone() {
                 div()
                     .h(content_height)
@@ -691,6 +713,15 @@ impl WalletStartupRoot {
                         "Settings are stored in the selected wallet database and are readable before vault unlock.",
                     ))
                     .child(summary.render())
+                    .child(data_folder_row(
+                        &data_folder,
+                        None,
+                        true,
+                        root.read(cx).data_folder_open_error.clone(),
+                        move |_window, cx| {
+                            open_root.update(cx, Self::open_settings_data_folder);
+                        },
+                    ))
                     .child(
                         div()
                             .mt(px(8.0))

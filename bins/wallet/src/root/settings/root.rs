@@ -2,7 +2,8 @@ use super::{
     Arc, Context, Duration, Entity, HttpContext, ProverCacheBuildParams, ProverCacheBuildProgress,
     WalletNetworkConfig, WalletRoot, WalletSettings, WalletSettingsEditor,
     begin_prover_cache_build, build_cache_with_context_and_progress_with_session,
-    build_effective_chain_configs, build_wallet_network_context, watch,
+    build_effective_chain_configs, build_wallet_network_context, data_folder_path,
+    open_data_folder, watch,
 };
 use crate::root::PublicActionMode;
 
@@ -145,6 +146,38 @@ impl WalletRoot {
         }
     }
 
+    /// The editor outlives each Settings opening, so its folder size is measured again.
+    // GPUI requires a mutable context for Entity::update even though it is only forwarded here.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub(in crate::root) fn invalidate_settings_data_folder_size(
+        &mut self,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if let Some(editor) = self.settings_editor.clone() {
+            editor.update(cx, |editor, cx| {
+                editor.invalidate_data_folder_size();
+                cx.notify();
+            });
+        }
+    }
+
+    /// Opens the data folder from a Settings-unavailable row.
+    pub(in crate::root) fn open_settings_data_folder(&mut self, cx: &mut Context<'_, Self>) {
+        self.data_folder_open_error = None;
+        cx.notify();
+        let root = cx.weak_entity();
+        open_data_folder(
+            data_folder_path(&self.options.db_path),
+            cx,
+            move |error, cx| {
+                let _ = root.update(cx, |root, cx| {
+                    root.data_folder_open_error = Some(error);
+                    cx.notify();
+                });
+            },
+        );
+    }
+
     pub(in crate::root) fn reusable_network_context(&self) -> HttpContext {
         self.http.clone()
     }
@@ -261,6 +294,7 @@ impl WalletRoot {
                         editor.update(cx, |editor, cx| {
                             editor.cache_building = false;
                             editor.cache_build_progress = None;
+                            editor.invalidate_data_folder_size();
                             editor.status = Some(Arc::from(match result {
                                 Ok(Ok(report)) => format!(
                                     "Prover cache build complete: {}/{} variants succeeded",

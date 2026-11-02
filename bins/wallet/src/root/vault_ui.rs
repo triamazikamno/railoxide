@@ -31,7 +31,7 @@ use wallet_ops::vault::TrezorPassphraseMode;
 #[cfg(feature = "hardware")]
 use super::actions::{CycleTrezorPassphraseMode, TREZOR_PASSPHRASE_MODE_KEY_CONTEXT};
 use super::device_auth::{device_auth_buttons, masked_input_with_device_auth};
-use super::settings::settings_dialog_dimensions;
+use super::settings::{data_folder_path, data_folder_row, settings_dialog_dimensions};
 use super::shell::render_wallet_hero_screen;
 #[cfg(feature = "hardware")]
 use super::vault::{
@@ -178,12 +178,15 @@ impl WalletRoot {
         cx: &mut gpui::Context<'_, Self>,
     ) {
         self.refresh_device_auth_status();
+        self.invalidate_settings_data_folder_size(cx);
         cx.notify();
         window.close_all_dialogs(cx);
         let (dialog_width, content_height, dialog_max_height) = settings_dialog_dimensions(window);
         let editor = self.settings_editor.clone();
         let settings_error = self.settings_error.clone();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        let root = cx.entity();
+        let data_folder = data_folder_path(&self.options.db_path);
+        window.open_dialog(cx, move |dialog, _window, cx| {
             let content = if let Some(editor) = editor.clone() {
                 div()
                     .h(content_height)
@@ -191,6 +194,7 @@ impl WalletRoot {
                     .child(editor)
                     .into_any_element()
             } else {
+                let open_root = root.clone();
                 div()
                     .flex()
                     .flex_col()
@@ -202,6 +206,15 @@ impl WalletRoot {
                         || "Settings are unavailable".to_string(),
                         ToString::to_string,
                     )))
+                    .child(data_folder_row(
+                        &data_folder,
+                        None,
+                        true,
+                        root.read(cx).data_folder_open_error.clone(),
+                        move |_window, cx| {
+                            open_root.update(cx, Self::open_settings_data_folder);
+                        },
+                    ))
                     .into_any_element()
             };
             dialog
@@ -222,6 +235,7 @@ impl WalletRoot {
         if matches!(self.vault_state, VaultState::ViewUnlocked) {
             window.close_all_dialogs(cx);
             self.clear_settings_transient_status(cx);
+            self.invalidate_settings_data_folder_size(cx);
             self.refresh_device_auth_status();
             self.active_activity = Activity::Settings;
             cx.notify();

@@ -104,6 +104,13 @@ pub(in crate::root) struct WalletSettingsEditor {
     pub(in crate::root) status: Option<Arc<str>>,
     pub(in crate::root) cache_building: bool,
     pub(in crate::root) cache_build_progress: Option<ProverCacheBuildProgress>,
+    /// The absolute data folder path shown in Maintenance.
+    pub(in crate::root) data_folder: PathBuf,
+    pub(in crate::root) data_folder_size: DataFolderSize,
+    pub(in crate::root) data_folder_size_generation: u64,
+    pub(in crate::root) data_folder_open_error: Option<SharedString>,
+    /// The maintenance controller was busy at its last notification.
+    pub(in crate::root) maintenance_busy: bool,
     pub(in crate::root) maintenance_controller: Entity<WalletMaintenanceController>,
     pub(in crate::root) startup_root: Option<WeakEntity<WalletStartupRoot>>,
     pub(in crate::root) active_root: Option<WeakEntity<WalletRoot>>,

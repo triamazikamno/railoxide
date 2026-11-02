@@ -171,6 +171,7 @@ impl WalletRoot {
                             .on_click(move |_event, _window, cx| {
                                 settings_root.update(cx, |root, cx| {
                                     root.clear_settings_transient_status(cx);
+                                    root.invalidate_settings_data_folder_size(cx);
                                     root.invalidate_governance_context();
                                     root.refresh_device_auth_status();
                                     root.active_activity = Activity::Settings;

@@ -2809,9 +2809,11 @@ fn tron_settings_that_change_its_route_wait_for_an_active_tron_send(cx: &mut Tes
     let editor = cx.update(|window, cx| {
         let maintenance = cx.new(|_| WalletMaintenanceController::new(runtime.handle().clone()));
         let store = root.read(cx).vault_store.clone().unwrap();
+        let db_path = root.read(cx).options.db_path.clone();
         cx.new(|cx| {
             WalletSettingsEditor::new(
                 store,
+                &db_path,
                 runtime.handle().clone(),
                 saved.clone(),
                 maintenance,

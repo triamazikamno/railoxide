@@ -131,6 +131,7 @@ impl Render for WalletSettingsEditor {
         let poi_data_reset_editor = editor.clone();
         let merkle_forest_cache_reset_editor = editor.clone();
         let prover_cache_editor = editor.clone();
+        let data_folder_editor = editor.clone();
         let indexed_source_mode = Self::dropdown_field(
             editor.clone(),
             vec![
@@ -549,6 +550,30 @@ impl Render for WalletSettingsEditor {
                 SettingItem::new("Project ID", walletconnect_project_id).layout(Axis::Vertical),
             ));
         let maintenance_page = SettingPage::new("Maintenance")
+            .group(
+                settings_group()
+                    .item(settings_section_header("Data folder"))
+                    .item(
+                        SettingItem::new(
+                            "Location",
+                            SettingField::<SharedString>::render(move |_options, window, cx| {
+                                Self::render_data_folder_action(&data_folder_editor, window, cx)
+                            }),
+                        )
+                        .keywords([
+                            "data folder",
+                            "database",
+                            "db",
+                            "directory",
+                            "path",
+                            "storage",
+                            "disk space",
+                            "size",
+                            "file manager",
+                        ])
+                        .layout(Axis::Vertical),
+                    ),
+            )
             .group(
                 settings_group()
                     .item(settings_section_header("Prover cache"))

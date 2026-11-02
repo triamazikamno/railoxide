@@ -8,6 +8,7 @@ const WALLET_DELETION_APPLY_STATUS: &str =
 impl WalletSettingsEditor {
     pub(in crate::root) fn new(
         vault_store: Arc<DesktopVaultStore>,
+        db_path: &Path,
         runtime: Handle,
         settings: WalletSettings,
         maintenance_controller: Entity<WalletMaintenanceController>,
@@ -16,7 +17,14 @@ impl WalletSettingsEditor {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        cx.observe(&maintenance_controller, |_editor, _controller, cx| {
+        let maintenance_busy = !maintenance_controller.read(cx).is_idle();
+        cx.observe(&maintenance_controller, |editor, controller, cx| {
+            let busy = !controller.read(cx).is_idle();
+            // A finished reset may have changed the folder's contents.
+            if editor.maintenance_busy && !busy {
+                editor.invalidate_data_folder_size();
+            }
+            editor.maintenance_busy = busy;
             cx.notify();
         })
         .detach();
@@ -68,6 +76,11 @@ impl WalletSettingsEditor {
             status: None,
             cache_building: false,
             cache_build_progress: None,
+            data_folder: data_folder_path(db_path),
+            data_folder_size: DataFolderSize::Unknown,
+            data_folder_size_generation: 0,
+            data_folder_open_error: None,
+            maintenance_busy,
             maintenance_controller,
             startup_root,
             active_root,
@@ -432,6 +445,94 @@ impl WalletSettingsEditor {
         });
     }
 
+    pub(in crate::root) const fn invalidate_data_folder_size(&mut self) {
+        self.data_folder_size = DataFolderSize::Unknown;
+    }
+
+    fn start_data_folder_size(&mut self, cx: &mut Context<'_, Self>) {
+        if self.data_folder_size != DataFolderSize::Unknown {
+            return;
+        }
+        self.data_folder_size_generation += 1;
+        let generation = self.data_folder_size_generation;
+        self.data_folder_size = DataFolderSize::Calculating(generation);
+        let path = self.data_folder.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { measure_data_folder(&path) })
+                .await;
+            let _ = this.update(cx, |editor, cx| {
+                editor.finish_data_folder_size(generation, result, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Applies a walk's result unless a later invalidation or walk superseded it.
+    pub(in crate::root) fn finish_data_folder_size(
+        &mut self,
+        generation: u64,
+        result: DataFolderSize,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.data_folder_size == DataFolderSize::Calculating(generation) {
+            self.data_folder_size = result;
+            cx.notify();
+        }
+    }
+
+    pub(in crate::root) fn render_data_folder_action(
+        editor: &Entity<Self>,
+        window: &Window,
+        cx: &mut App,
+    ) -> gpui::Div {
+        let (path, size, open_error) = {
+            let state = editor.read(cx);
+            (
+                state.data_folder.clone(),
+                state.data_folder_size,
+                state.data_folder_open_error.clone(),
+            )
+        };
+        if size == DataFolderSize::Unknown {
+            // Render cannot update the editor, so the walk starts after this frame.
+            let start_editor = editor.clone();
+            window.defer(cx, move |_window, cx| {
+                start_editor.update(cx, Self::start_data_folder_size);
+            });
+        }
+        let size_label = match size {
+            DataFolderSize::Unknown | DataFolderSize::Calculating(_) => {
+                SharedString::from("Calculating...")
+            }
+            DataFolderSize::Ready(bytes) => ui::format::format_decimal_bytes(bytes).into(),
+            DataFolderSize::Missing => SharedString::from("Not created"),
+        };
+        let open_editor = editor.clone();
+        let open_path = path.clone();
+        data_folder_row(
+            &path,
+            Some(size_label),
+            size != DataFolderSize::Missing,
+            open_error,
+            move |_window, cx| {
+                open_editor.update(cx, |editor, cx| {
+                    editor.data_folder_open_error = None;
+                    cx.notify();
+                });
+                let error_editor = open_editor.downgrade();
+                open_data_folder(open_path.clone(), cx, move |error, cx| {
+                    let _ = error_editor.update(cx, |editor, cx| {
+                        editor.data_folder_open_error = Some(error);
+                        cx.notify();
+                    });
+                });
+            },
+        )
+    }
+
     pub(in crate::root) fn render_build_prover_cache_action(
         editor: &Entity<Self>,
         cx: &App,
@@ -725,6 +826,7 @@ impl WalletSettingsEditor {
                         let _ = this.update(cx, |editor, cx| {
                             editor.cache_building = false;
                             editor.cache_build_progress = None;
+                            editor.invalidate_data_folder_size();
                             editor.status = Some(Arc::from(match result {
                                 Ok(Ok(report)) => format!(
                                     "Prover cache build complete: {}/{} variants succeeded",

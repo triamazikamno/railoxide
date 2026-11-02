@@ -26,6 +26,7 @@ gpui-kit = { workspace = true }
 gpui-kit-assets = { workspace = true }
 if-addrs = "=0.15.0"
 markdown = "=1.0.0"
+open = "5.4.1"
 qrcodegen = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
