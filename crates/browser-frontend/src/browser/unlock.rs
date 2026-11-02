@@ -192,7 +192,7 @@ impl GatewayView {
                             .items_center()
                             .gap_2()
                             .child(Spinner::new())
-                            .child(note("Opening wallet…")),
+                            .child(shimmer_note("Opening wallet…")),
                     )
                 })
                 .when(input, |view| {

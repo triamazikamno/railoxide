@@ -1,7 +1,7 @@
 //! Network presentation shared by desktop and authenticated browser views.
 //! Callers own observations, popover lifetimes, and every side effect.
 
-use crate::controls::{app_button, app_muted_text, app_strong_text};
+use crate::controls::{app_button, app_muted_text, app_shimmer, app_strong_text};
 use crate::format::{
     format_compact_duration, format_compact_latency, format_decimal_byte_rate,
     format_decimal_bytes, format_relative_age,
@@ -712,7 +712,7 @@ pub fn network_status_popover_content(
                                 .text_size(gpui::rems(12.0 / 16.0))
                                 .line_height(gpui::relative(APP_TEXT_LINE_HEIGHT))
                                 .text_color(rgb(theme::TEXT_MUTED))
-                                .child("Querying exit IP through Tor...")
+                                .child(app_shimmer("Querying exit IP through Tor..."))
                                 .into_any_element(),
                             TorExitIpQueryState::Success(ip) => div()
                                 .flex()

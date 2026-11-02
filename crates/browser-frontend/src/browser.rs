@@ -33,8 +33,8 @@ use gpui_component::{
 use ui::{
     chain_select::{ChainSelectItem, ChainSelectItems, chain_select, chain_select_state},
     controls::{
-        app_button, app_button_base, app_button_label, app_input, app_muted_text, app_strong_text,
-        app_text,
+        app_button, app_button_base, app_button_label, app_input, app_muted_shimmer_text,
+        app_muted_text, app_strong_text, app_text,
     },
     theme,
 };
@@ -508,6 +508,13 @@ fn site_host(url: &str) -> &str {
 
 fn note(text: impl Into<SharedString>) -> Div {
     app_muted_text(text)
+        .text_size(px(12.0))
+        .line_height(px(17.0))
+}
+
+/// [`note`] with a loading shimmer, for a wait under way.
+fn shimmer_note(text: impl Into<SharedString>) -> Div {
+    app_muted_shimmer_text(text)
         .text_size(px(12.0))
         .line_height(px(17.0))
 }

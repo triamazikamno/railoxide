@@ -295,13 +295,22 @@ pub fn app_muted_text(label: impl Into<SharedString>) -> Div {
     app_text(label).text_color(rgb(theme::TEXT_MUTED))
 }
 
+/// Loading shimmer with the app's highlight; inherits the parent's text style.
+#[must_use]
+pub fn app_shimmer(label: impl Into<SharedString>) -> ShimmerText {
+    // The theme default only mixes 20% toward the foreground, which barely shows on muted text.
+    ShimmerText::new(label)
+        .highlight_color(rgb(0xffffff))
+        .duration(std::time::Duration::from_secs(3))
+}
+
 /// [`app_text`] with a loading shimmer, for a wait under way.
 #[must_use]
 pub fn app_shimmer_text(label: impl Into<SharedString>) -> Div {
     div()
         .text_size(APP_TEXT_SIZE)
         .line_height(relative(APP_TEXT_LINE_HEIGHT))
-        .child(ShimmerText::new(label))
+        .child(app_shimmer(label))
 }
 
 /// [`app_muted_text`] with a loading shimmer, for a wait under way.

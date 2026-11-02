@@ -2,8 +2,8 @@ use super::{
     AppContext, Arc, Context, DesktopPrivateSpendAuthorization, Disableable, Entity, ExecutorAsset,
     ExecutorOperationId, Focusable, InputEvent, InputState, ParentElement,
     SpendAuthorizationSummary, SpendAuthorizationSummaryRow, StealthAccountsView, StealthAction,
-    Styled, Task, U256, Window, app_button, app_input, app_muted_text, app_segment_button,
-    app_strong_text, div, labeled_field,
+    Styled, Task, U256, Window, app_button, app_input, app_muted_shimmer_text, app_muted_text,
+    app_segment_button, app_strong_text, div, labeled_field,
 };
 use gpui::{App, InteractiveElement as _, prelude::FluentBuilder as _};
 use gpui_component::{
@@ -337,7 +337,7 @@ impl StealthAccountsView {
             if let Some(error) = &self.recovery.fee_error {
                 form = form.child(app_muted_text(error.clone()).whitespace_normal());
             } else if self.recovery.gas_quote.is_none() {
-                form = form.child(app_muted_text("Estimating gas fees…"));
+                form = form.child(app_muted_shimmer_text("Estimating gas fees…"));
             }
         } else {
             form = form.child(self.render_recovery_broadcaster_settings(cx));

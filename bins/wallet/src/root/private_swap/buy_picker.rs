@@ -21,13 +21,13 @@ use gpui_component::{
     button::ButtonGroup,
     list::{List, ListDelegate, ListItem, ListState},
     select::SelectItem as _,
-    shimmer::ShimmerText,
     spinner::Spinner,
     tag::Tag,
     tooltip::Tooltip,
 };
 use ui::controls::{
-    app_muted_shimmer_text, app_muted_text, app_segment_button, app_strong_text, app_text,
+    app_muted_shimmer_text, app_muted_text, app_segment_button, app_shimmer, app_strong_text,
+    app_text,
 };
 use ui::dialog::WalletDialogExt as _;
 use ui::theme;
@@ -1133,7 +1133,7 @@ impl ListDelegate for BuyNetworksDelegate {
                         .children(note.map(|note| {
                             if waiting {
                                 // The id keeps one animation as the note's text changes.
-                                ShimmerText::new(note)
+                                app_shimmer(note)
                                     .id("waiting")
                                     .text_xs()
                                     .line_height(relative(theme::APP_TEXT_LINE_HEIGHT))

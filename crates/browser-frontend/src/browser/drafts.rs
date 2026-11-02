@@ -1306,7 +1306,7 @@ impl GatewayView {
 
     pub(super) fn render_draft_handoff(&self, cx: &Context<'_, Self>) -> Div {
         let Some(draft) = &self.draft else {
-            return div().child(note("Waiting for the desktop app…"));
+            return div().child(shimmer_note("Waiting for the desktop app…"));
         };
         if draft.input["wallet"].is_string() {
             return Self::render_private_draft_handoff(draft, cx);

@@ -11,7 +11,7 @@ use gpui_component::{
     scroll::ScrollableElement,
 };
 use railgun_ui::{format_token_amount, format_usd_micro_value, short_address};
-use ui::controls::{app_button, app_muted_text, app_strong_text};
+use ui::controls::{app_button, app_muted_shimmer_text, app_muted_text, app_strong_text};
 use ui::dialog::WalletDialogExt as _;
 use ui::theme::{self};
 use wallet_ops::{
@@ -738,10 +738,11 @@ impl WalletRoot {
             Some(ChainUtxoState::Error { message, .. }) => self
                 .render_chain_error_body(root, message.as_ref())
                 .into_any_element(),
-            Some(ChainUtxoState::Loading { progress }) => {
-                ui::private_assets::private_message(loading_summary(progress.latest()), None)
-                    .into_any_element()
-            }
+            Some(ChainUtxoState::Loading { progress }) => ui::private_assets::private_message_with(
+                app_muted_shimmer_text(loading_summary(progress.latest())),
+                None,
+            )
+            .into_any_element(),
             Some(
                 state @ ChainUtxoState::Syncing {
                     snapshot, progress, ..
@@ -845,16 +846,16 @@ impl WalletRoot {
             total_balance.or_else(|| (assets.is_empty() && stand_in).then(|| "$0.00".to_owned()));
         if assets.is_empty() && !stand_in {
             let message = if syncing {
-                loading_summary(progress)
+                app_muted_shimmer_text(loading_summary(progress))
             } else {
-                "No private assets found".to_string()
+                app_muted_text("No private assets found")
             };
             if pending_summary.is_some() || swap_card.is_some() {
                 let empty = if receive_available {
                     Self::render_private_empty_state(root.clone(), message, receive_available)
                         .into_any_element()
                 } else {
-                    ui::private_assets::private_message(message, None).into_any_element()
+                    ui::private_assets::private_message_with(message, None).into_any_element()
                 };
                 return div()
                     .size_full()
@@ -884,7 +885,7 @@ impl WalletRoot {
                 return Self::render_private_empty_state(root.clone(), message, receive_available)
                     .into_any_element();
             }
-            return ui::private_assets::private_message(message, None).into_any_element();
+            return ui::private_assets::private_message_with(message, None).into_any_element();
         }
         let has_total_balance = total_balance.is_some();
 
@@ -942,10 +943,10 @@ impl WalletRoot {
 
     fn render_private_empty_state(
         root: Entity<Self>,
-        message: String,
+        message: gpui::Div,
         receive_available: bool,
     ) -> gpui::Div {
-        ui::private_assets::private_message(
+        ui::private_assets::private_message_with(
             message,
             Some(
                 Self::render_private_receive_button(

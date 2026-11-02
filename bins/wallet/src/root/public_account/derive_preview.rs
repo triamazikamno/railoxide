@@ -31,7 +31,7 @@ use gpui_component::{
 use railgun_ui::short_address;
 use rand::seq::SliceRandom as _;
 use ui::chain_select::{ChainSelectItem, ChainSelectItems, chain_select, chain_select_state};
-use ui::controls::{app_button, app_input, app_muted_text, app_text};
+use ui::controls::{app_button, app_input, app_muted_shimmer_text, app_muted_text, app_text};
 use wallet_ops::hardware::{
     ConfirmedHardwarePublicAccount, HardwareDeviceKind, HardwarePublicAccountDescriptor,
 };
@@ -1745,7 +1745,9 @@ impl WalletRoot {
                                     .get(&(preview.chain_id, index))
                                     .map(|check| match check {
                                         BalanceCheck::Queued => app_muted_text("Queued"),
-                                        BalanceCheck::Loading => app_muted_text("Checking…"),
+                                        BalanceCheck::Loading => {
+                                            app_muted_shimmer_text("Checking…")
+                                        }
                                         BalanceCheck::Done(amount) => app_text(chain.map_or_else(
                                             || amount.to_string(),
                                             |chain| chain.native_currency.format_amount(*amount),

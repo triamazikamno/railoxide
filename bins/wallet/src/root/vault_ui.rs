@@ -18,8 +18,8 @@ use gpui_component::{
 };
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{
-    app_button, app_button_base, app_button_label, app_input, app_masked_input, app_muted_text,
-    app_strong_text,
+    app_button, app_button_base, app_button_label, app_input, app_masked_input,
+    app_muted_shimmer_text, app_muted_text, app_strong_text,
 };
 use ui::dialog::WalletDialogExt as _;
 #[cfg(feature = "hardware")]
@@ -149,7 +149,7 @@ impl WalletRoot {
             .items_center()
             .gap_2()
             .child(Spinner::new().small())
-            .child(app_muted_text(if delayed {
+            .child(app_muted_shimmer_text(if delayed {
                 "Opening your wallet is taking longer than expected…"
             } else {
                 "Closing the previous wallet session…"
@@ -1654,7 +1654,7 @@ fn render_hardware_profile_approval_wait(
                         .with_size(px(14.0)),
                 )
                 .child(
-                    app_muted_text(format!("Waiting for {device_label} approval..."))
+                    app_muted_shimmer_text(format!("Waiting for {device_label} approval..."))
                         .text_color(rgb(theme::SUCCESS)),
                 ),
         )

@@ -2,12 +2,13 @@ use std::sync::Arc;
 
 use alloy::primitives::{Address, U256};
 use gpui::{
-    AnyElement, Context, Entity, IntoElement, ParentElement, SharedString, Styled, div, px, rgb,
+    AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement, SharedString, Styled, div,
+    px, rgb,
 };
 use gpui_component::{IconName, Sizable, spinner::Spinner};
 use railgun_ui::format_token_amount;
 use ui::clipboard::clipboard_with_toast;
-use ui::controls::{app_muted_text, app_strong_text};
+use ui::controls::{app_muted_text, app_shimmer_text, app_strong_text};
 use ui::theme;
 use wallet_ops::{
     PublicBroadcasterCandidate, PublicBroadcasterCostEstimate, PublicBroadcasterFeeBreakdown,
@@ -993,7 +994,11 @@ pub(super) fn render_public_broadcaster_cost_status(
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(app_strong_text(title))
+                .child(
+                    app_shimmer_text(title)
+                        .text_color(rgb(theme::TEXT))
+                        .font_weight(FontWeight::MEDIUM),
+                )
                 .child(app_muted_text(detail)),
         )
 }

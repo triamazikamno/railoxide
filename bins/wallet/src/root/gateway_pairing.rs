@@ -17,7 +17,7 @@ use gpui_component::{
     input::OtpState,
 };
 use gpui_kit::base::OtpInput;
-use ui::controls::{app_button, app_muted_text, app_strong_text, app_text};
+use ui::controls::{app_button, app_muted_shimmer_text, app_muted_text, app_strong_text, app_text};
 use ui::dialog::WalletDialogExt as _;
 use ui::theme::APP_MONO_FONT_FAMILY;
 use wallet_ops::gateway::{GatewayPairingOffer, GatewaySnapshot, PeerId};
@@ -93,7 +93,7 @@ impl WalletRoot {
                         ))),
                 );
             } else if gateway.busy {
-                body = body.child(app_muted_text("Generating pairing code…"));
+                body = body.child(app_muted_shimmer_text("Generating pairing code…"));
             } else if let Some(error) = gateway.error {
                 body = body.child(Alert::error("gateway-pairing-error", error.to_string()).small());
             } else {

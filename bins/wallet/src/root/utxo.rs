@@ -24,7 +24,8 @@ use gpui_component::{
 use railgun_ui::{format_token_amount, lookup_token, short_address, token_icon_asset_path};
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{
-    app_button, app_button_base, app_input, app_muted_text, app_strong_text, app_text,
+    app_button, app_button_base, app_input, app_muted_shimmer_text, app_muted_text,
+    app_strong_text, app_text,
 };
 use ui::dialog::WalletDialogExt as _;
 use ui::icons;
@@ -980,7 +981,9 @@ impl WalletRoot {
                                 .color(rgb(theme::TEXT_MUTED).into())
                                 .with_size(px(14.0)),
                         )
-                        .child(app_muted_text("Waiting for self-broadcast confirmation...")),
+                        .child(app_muted_shimmer_text(
+                            "Waiting for self-broadcast confirmation...",
+                        )),
                 )
             });
         #[cfg(feature = "hardware")]

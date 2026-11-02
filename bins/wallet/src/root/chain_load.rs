@@ -1461,7 +1461,16 @@ fn wallet_status_bar(
                     .truncate()
                     .text_color(rgb(theme::TEXT_MUTED))
                     .text_size(APP_TEXT_SIZE)
-                    .child(SharedString::from(labels.detail)),
+                    .map(|detail| {
+                        if show_progress {
+                            // The id keeps one animation as the detail text changes.
+                            detail.child(
+                                ui::controls::app_shimmer(labels.detail).id("chain-load-detail"),
+                            )
+                        } else {
+                            detail.child(SharedString::from(labels.detail))
+                        }
+                    }),
             )
         })
         .when(!show_text, |bar| bar.child(div().flex_1()))

@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 use alloy::primitives::{Address, B256, U256};
 use futures_util::StreamExt;
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, WeakEntity,
-    Window, div, prelude::FluentBuilder as _, px, rgb,
+    AnyElement, App, AppContext as _, Context, Entity, Focusable, FontWeight, InteractiveElement,
+    IntoElement, KeyDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    WeakEntity, Window, div, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable, WindowExt,
@@ -32,8 +32,8 @@ use railgun_ui::{format_usd_micro_value, governance_contracts, short_address};
 use rand::seq::SliceRandom as _;
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{
-    app_button, app_button_base, app_button_label, app_input, app_muted_text, app_strong_text,
-    app_text,
+    app_button, app_button_base, app_button_label, app_input, app_muted_shimmer_text,
+    app_muted_text, app_shimmer_text, app_strong_text, app_text,
 };
 use ui::dialog::WalletDialogExt as _;
 use ui::format::format_compact_duration;
@@ -4017,7 +4017,7 @@ impl WalletRoot {
                     .justify_center()
                     .gap_2()
                     .child(Spinner::new().small())
-                    .child(app_muted_text("Loading staking data..."));
+                    .child(app_muted_shimmer_text("Loading staking data..."));
             }
             _ => {}
         }
@@ -4216,7 +4216,7 @@ impl WalletRoot {
                 });
             let header = render_staking_account_header(
                 identity,
-                voting_power_metric(&voting_power_display, qualifier),
+                voting_power_metric(&voting_power_display, account_view.is_none(), qualifier),
                 account_header_compact,
                 None,
             )
@@ -4354,7 +4354,7 @@ impl WalletRoot {
                         .items_center()
                         .border_t_1()
                         .border_color(rgb(theme::BORDER_SUBTLE))
-                        .child(app_muted_text("Loading account stakes...")),
+                        .child(app_muted_shimmer_text("Loading account stakes...")),
                 );
             }
             if !inactive && let Some(balance) = wallet_balance {
@@ -4437,7 +4437,7 @@ impl WalletRoot {
                     .filter(|&token| state.positive_reward_evidence(&uuid, token).is_some())
                     .collect::<Vec<_>>();
                 let positive_token_count = positive_reward_tokens.len();
-                let total_unclaimed = match reward_usd_total(
+                let (total_unclaimed, total_loading) = match reward_usd_total(
                     self.last_evm_chain,
                     &uuid,
                     &reward_token_addresses,
@@ -4445,11 +4445,12 @@ impl WalletRoot {
                     &state.current_reward_keys,
                     &self.public_broadcaster_anchor_cache,
                 ) {
-                    RewardUsdState::Loading => "Loading...".to_owned(),
-                    RewardUsdState::Unavailable => "USD unavailable".to_owned(),
-                    RewardUsdState::Value(value) => {
-                        format!("{} unclaimed", format_usd_micro_value(value))
-                    }
+                    RewardUsdState::Loading => ("Loading...".to_owned(), true),
+                    RewardUsdState::Unavailable => ("USD unavailable".to_owned(), false),
+                    RewardUsdState::Value(value) => (
+                        format!("{} unclaimed", format_usd_micro_value(value)),
+                        false,
+                    ),
                 };
                 let claim_selection = StakingActionSelection {
                     actor_uuid: uuid.clone(),
@@ -4509,7 +4510,14 @@ impl WalletRoot {
                             .gap_2()
                             .min_w(px(0.0))
                             .child(app_strong_text("Rewards").text_size(px(12.0)))
-                            .child(app_muted_text(total_unclaimed).text_size(px(11.0))),
+                            .child(
+                                if total_loading {
+                                    app_muted_shimmer_text(total_unclaimed)
+                                } else {
+                                    app_muted_text(total_unclaimed)
+                                }
+                                .text_size(px(11.0)),
+                            ),
                     )
                     .when(claim_ready, |this| {
                         this.child(
@@ -4571,7 +4579,7 @@ fn render_staking_enrollment_prompt(root: &Entity<WalletRoot>) -> gpui::Div {
         )
 }
 
-fn voting_power_metric(value: &str, qualifier: Option<String>) -> gpui::Div {
+fn voting_power_metric(value: &str, loading: bool, qualifier: Option<String>) -> gpui::Div {
     div()
         .flex()
         .flex_col()
@@ -4583,7 +4591,13 @@ fn voting_power_metric(value: &str, qualifier: Option<String>) -> gpui::Div {
                 .flex()
                 .items_baseline()
                 .gap_1()
-                .child(app_strong_text(value.to_owned()))
+                .child(if loading {
+                    app_shimmer_text(value.to_owned())
+                        .text_color(rgb(theme::TEXT))
+                        .font_weight(FontWeight::MEDIUM)
+                } else {
+                    app_strong_text(value.to_owned())
+                })
                 .child(app_muted_text("voting power")),
         )
         .when_some(qualifier, |this, qualifier| {
@@ -5359,7 +5373,16 @@ fn render_reward_row(
                 .flex()
                 .flex_col()
                 .gap_1()
-                .child(app_strong_text(amount).truncate()),
+                .child(
+                    if reward.is_none() {
+                        app_shimmer_text(amount)
+                            .text_color(rgb(theme::TEXT))
+                            .font_weight(FontWeight::MEDIUM)
+                    } else {
+                        app_strong_text(amount)
+                    }
+                    .truncate(),
+                ),
         )
         .child(
             div()
@@ -5631,7 +5654,7 @@ fn render_reward_claim_selection_form(
                 .gap_1()
                 .child(Spinner::new().small())
                 .child(
-                    app_muted_text("estimating…")
+                    app_muted_shimmer_text("estimating…")
                         .text_size(px(11.0))
                         .whitespace_nowrap(),
                 ),
@@ -5788,7 +5811,7 @@ fn render_reward_claim_selection_form(
             .items_center()
             .gap_1()
             .child(Spinner::new().small())
-            .child(app_muted_text("estimating…"))
+            .child(app_muted_shimmer_text("estimating…"))
             .into_any_element(),
         (Some(RewardSelectionEstimateState::Unavailable(reason)), _, _) => div()
             .flex()
@@ -5926,7 +5949,7 @@ fn render_reward_claim_selection_form(
                 .py(px(8.0))
                 .child(Spinner::new().small())
                 .child(
-                    app_muted_text("Refreshing rewards and estimating the exact call…")
+                    app_muted_shimmer_text("Refreshing rewards and estimating the exact call…")
                         .text_size(px(12.0)),
                 )
         } else {
@@ -5993,7 +6016,7 @@ fn render_staking_action_form(
                 .py(px(8.0))
                 .child(Spinner::new().small())
                 .child(
-                    app_muted_text(if selection.kind.is_reward_action() {
+                    app_muted_shimmer_text(if selection.kind.is_reward_action() {
                         "Refreshing rewards and estimating the exact call…"
                     } else {
                         "Checking the stake and estimating the exact call…"
@@ -6716,7 +6739,7 @@ mod tests {
                 .p_3()
                 .child(render_staking_account_header(
                     identity,
-                    voting_power_metric("123456789012345678901234 RAIL", None),
+                    voting_power_metric("123456789012345678901234 RAIL", false, None),
                     self.compact,
                     Some(self.prefix),
                 ))

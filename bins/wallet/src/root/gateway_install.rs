@@ -12,7 +12,10 @@ use gpui_component::{
     clipboard::Clipboard,
     dialog::{Cancel, Confirm, DialogFooter},
 };
-use ui::controls::{app_button, app_muted_text, app_segment_button, app_strong_text, app_text};
+use ui::controls::{
+    app_button, app_muted_shimmer_text, app_muted_text, app_segment_button, app_strong_text,
+    app_text,
+};
 use ui::dialog::WalletDialogExt as _;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 
@@ -202,7 +205,7 @@ impl WalletRoot {
                 ))
                 .child(address_rows)
                 .when(loading, |this| {
-                    this.child(app_muted_text("Finding local addresses…"))
+                    this.child(app_muted_shimmer_text("Finding local addresses…"))
                 })
                 .when(enumeration_failed, |this| {
                     this.child(app_muted_text("Could not list local addresses."))

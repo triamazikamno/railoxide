@@ -13,7 +13,10 @@ use gpui_component::{
     button::{ButtonGroup, ButtonVariants},
     input::{InputEvent, InputState},
 };
-use ui::controls::{app_button, app_input, app_muted_text, app_segment_button, app_strong_text};
+use ui::controls::{
+    app_button, app_input, app_muted_shimmer_text, app_muted_text, app_segment_button,
+    app_strong_text,
+};
 use wallet_ops::{
     DesktopPrivateSpendAuthorization, ExecutorAsset, ExecutorOwner, WalletSession,
     vault::{ExecutorOperationId, ExecutorRecord},

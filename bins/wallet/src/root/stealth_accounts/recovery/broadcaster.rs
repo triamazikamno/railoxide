@@ -18,7 +18,7 @@ use crate::root::public_broadcaster::{
 };
 use crate::root::public_broadcaster_cost::PublicBroadcasterFeeDisplay;
 use crate::root::{COST_ESTIMATE_DEBOUNCE, DeliveryMode};
-use ui::controls::app_muted_text;
+use ui::controls::{app_muted_shimmer_text, app_muted_text};
 use ui::private_action::{BroadcasterSettings, BroadcasterSettingsEvent};
 
 pub(in crate::root) struct RecoveryPickerContext {
@@ -545,7 +545,14 @@ impl StealthAccountsView {
             } else {
                 "Waiting for a compatible broadcaster for the selected fee token."
             };
-            content = content.child(app_muted_text(status.to_owned()).whitespace_normal());
+            let estimating =
+                self.recovery.fee_error.is_none() && self.recovery.estimate_task.is_some();
+            let status = if estimating {
+                app_muted_shimmer_text(status.to_owned())
+            } else {
+                app_muted_text(status.to_owned())
+            };
+            content = content.child(status.whitespace_normal());
         }
         content
     }

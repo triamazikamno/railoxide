@@ -196,6 +196,12 @@ impl PrivateAssetRow {
 
 #[must_use]
 pub fn private_message(message: impl Into<SharedString>, action: Option<AnyElement>) -> gpui::Div {
+    private_message_with(app_muted_text(message), action)
+}
+
+/// [`private_message`] around caller-built text, such as a loading shimmer.
+#[must_use]
+pub fn private_message_with(text: gpui::Div, action: Option<AnyElement>) -> gpui::Div {
     div()
         .size_full()
         .flex()
@@ -207,7 +213,7 @@ pub fn private_message(message: impl Into<SharedString>, action: Option<AnyEleme
                 .flex_col()
                 .items_center()
                 .gap_3()
-                .child(app_muted_text(message))
+                .child(text)
                 .children(action),
         )
 }

@@ -48,7 +48,7 @@ pub(in crate::root) fn data_folder_path(db_path: &Path) -> PathBuf {
 /// The data folder path with copy and Open actions, an optional size, and the last Open failure.
 pub(in crate::root) fn data_folder_row(
     path: &Path,
-    size_label: Option<SharedString>,
+    size_label: Option<gpui::Div>,
     exists: bool,
     open_error: Option<SharedString>,
     on_open: impl Fn(&mut Window, &mut App) + 'static,
@@ -79,7 +79,7 @@ pub(in crate::root) fn data_folder_row(
                         .on_click(move |_event, window, cx| on_open(window, cx)),
                 ),
         )
-        .when_some(size_label, |this, size| this.child(app_muted_text(size)))
+        .children(size_label)
         .when_some(open_error, |this, error| {
             this.child(settings_dialog_error(error))
         })

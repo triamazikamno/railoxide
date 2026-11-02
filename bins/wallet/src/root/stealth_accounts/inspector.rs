@@ -155,13 +155,18 @@ impl StealthAccountsView {
                 },
             );
             let (value, date) = self.balance_value_lines(operation, asset, cx);
-            let unavailable = self
+            let balance = self
                 .observations
                 .get(&operation)
-                .and_then(|observations| observations.assets.get(&asset))
-                .is_some_and(|balance| {
-                    balance.attempt == super::observations::CheckAttempt::Unavailable
-                });
+                .and_then(|observations| observations.assets.get(&asset));
+            let unavailable = balance.is_some_and(|balance| {
+                balance.attempt == super::observations::CheckAttempt::Unavailable
+            });
+            // With no value yet, the value line itself is the "Checking…" wait.
+            let checking = balance.is_some_and(|balance| {
+                balance.attempt == super::observations::CheckAttempt::Checking
+                    && balance.value.is_none()
+            });
             rows = rows.child(
                 TableRow::new()
                     .child(
@@ -188,7 +193,14 @@ impl StealthAccountsView {
                     .child(
                         TableCell::new().flex_1().min_w_0().child(
                             div()
-                                .child(ui::controls::app_text(value).whitespace_normal())
+                                .child(
+                                    if checking {
+                                        ui::controls::app_shimmer_text(value)
+                                    } else {
+                                        ui::controls::app_text(value)
+                                    }
+                                    .whitespace_normal(),
+                                )
                                 .children(date.map(|date| {
                                     account_caption(date)
                                         .whitespace_normal()

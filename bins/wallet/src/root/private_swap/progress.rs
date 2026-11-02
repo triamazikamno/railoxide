@@ -1033,7 +1033,7 @@ impl PrivateSwapsView {
             return Some(
                 div()
                     .debug_selector(|| "swap-detail-account-setup".into())
-                    .child(app_muted_text(confirmation).whitespace_normal()),
+                    .child(app_muted_shimmer_text(confirmation).whitespace_normal()),
             );
         }
         record.swap()?;

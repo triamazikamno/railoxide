@@ -26,7 +26,8 @@ use gpui_kit::base::{Accordion, AccordionHeader, AccordionItem, AccordionPanel, 
 use railgun_ui::format_usd_micro_value;
 use std::sync::Arc;
 use ui::controls::{
-    app_button, app_button_base, app_button_label, app_input, app_muted_text, app_strong_text,
+    app_button, app_button_base, app_button_label, app_input, app_muted_shimmer_text,
+    app_muted_text, app_strong_text,
 };
 use wallet_ops::vault::{PublicAccountSource, PublicAccountStatus};
 
@@ -463,8 +464,13 @@ impl WalletRoot {
                     .truncate()
             });
         let (status, stale) = self.public_summary_status();
-        let status = app_muted_text(status).when(stale, |text| text.text_color(cx.theme().warning));
         let refreshing = self.public_section_refreshing(PublicAccountStatus::Active);
+        let status = if refreshing {
+            app_muted_shimmer_text(status)
+        } else {
+            app_muted_text(status)
+        }
+        .when(stale, |text| text.text_color(cx.theme().warning));
         let none_included = self
             .public_global_refresh_ids(PublicAccountStatus::Active)
             .is_empty();

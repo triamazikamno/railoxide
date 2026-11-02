@@ -2,7 +2,7 @@ use alloy::primitives::Address;
 use futures_util::future::BoxFuture;
 use gpui::{ParentElement, Styled, div, px, rgb};
 use gpui_component::{IconName, Sizable, spinner::Spinner};
-use ui::controls::{app_muted_text, app_strong_text};
+use ui::controls::{app_muted_shimmer_text, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::hardware::{
     ConfirmedHardwarePublicAccount, HardwareAccountPublicKey, HardwareDeviceKind,
@@ -269,7 +269,7 @@ pub(super) fn render_hardware_public_account_confirmation_wait(
                         .with_size(px(14.0)),
                 )
                 .child(
-                    app_muted_text(format!("Waiting for {device_label} approval..."))
+                    app_muted_shimmer_text(format!("Waiting for {device_label} approval..."))
                         .text_color(rgb(theme::SUCCESS)),
                 ),
         )

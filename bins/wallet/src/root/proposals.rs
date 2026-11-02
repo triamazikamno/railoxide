@@ -33,7 +33,8 @@ use markdown::{ParseOptions, mdast::Node, to_mdast};
 use railgun_ui::short_address;
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{
-    app_button, app_button_base, app_input, app_muted_text, app_strong_text, app_text,
+    app_button, app_button_base, app_input, app_muted_shimmer_text, app_muted_text,
+    app_strong_text, app_text,
 };
 use ui::format::format_compact_duration;
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
@@ -3317,8 +3318,9 @@ fn render_proposal_participation_card(
                     );
             }
             Some(ProposalParticipationRow::Loading) => {
-                capacity_column = capacity_column
-                    .child(app_muted_text("Loading account participation…").text_size(px(11.0)));
+                capacity_column = capacity_column.child(
+                    app_muted_shimmer_text("Loading account participation…").text_size(px(11.0)),
+                );
             }
             None => {
                 capacity_column = capacity_column
@@ -3330,7 +3332,7 @@ fn render_proposal_participation_card(
     }
     if !key_matches {
         details = details.child(
-            app_muted_text("Refreshing participation for this proposal…")
+            app_muted_shimmer_text("Refreshing participation for this proposal…")
                 .text_size(px(11.0))
                 .mt(px(8.0)),
         );
@@ -3379,7 +3381,10 @@ fn render_proposal_participation_card(
                     .gap_2()
                     .py(px(6.0))
                     .child(Spinner::new().small())
-                    .child(app_muted_text("Loading account participation…").text_size(px(12.0))),
+                    .child(
+                        app_muted_shimmer_text("Loading account participation…")
+                            .text_size(px(12.0)),
+                    ),
             );
         }
         (ProposalCapacitySummaryState::NotLoaded, _) => {

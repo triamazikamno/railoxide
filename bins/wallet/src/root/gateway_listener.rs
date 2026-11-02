@@ -15,7 +15,9 @@ use gpui_component::{
     dialog::{Cancel, Confirm, DialogFooter},
     input::{InputEvent, InputState},
 };
-use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
+use ui::controls::{
+    app_button, app_input, app_muted_shimmer_text, app_muted_text, app_strong_text,
+};
 use ui::dialog::WalletDialogExt as _;
 use wallet_ops::gateway::{GatewayConfig, GatewayError};
 
@@ -152,7 +154,7 @@ impl WalletRoot {
             }
             body = body
                 .child(address_buttons)
-                .when(loading, |this| this.child(app_muted_text("Finding local addresses…")))
+                .when(loading, |this| this.child(app_muted_shimmer_text("Finding local addresses…")))
                 .when(enumeration_failed, |this| this.child(app_muted_text(
                     "Could not list local addresses. Choose a preset or enter an IP address.",
                 )));

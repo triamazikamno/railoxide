@@ -1,6 +1,7 @@
 use crate::root::ui_helpers::dialog_footer;
 
 use super::*;
+use ui::controls::app_muted_shimmer_text;
 use ui::dialog::WalletDialogExt as _;
 
 const WALLET_DELETION_APPLY_STATUS: &str =
@@ -506,10 +507,10 @@ impl WalletSettingsEditor {
         }
         let size_label = match size {
             DataFolderSize::Unknown | DataFolderSize::Calculating(_) => {
-                SharedString::from("Calculating...")
+                app_muted_shimmer_text("Calculating...")
             }
-            DataFolderSize::Ready(bytes) => ui::format::format_decimal_bytes(bytes).into(),
-            DataFolderSize::Missing => SharedString::from("Not created"),
+            DataFolderSize::Ready(bytes) => app_muted_text(ui::format::format_decimal_bytes(bytes)),
+            DataFolderSize::Missing => app_muted_text("Not created"),
         };
         let open_editor = editor.clone();
         let open_path = path.clone();

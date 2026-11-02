@@ -31,7 +31,7 @@ use alloy::primitives::Address;
 use gpui::relative;
 use gpui_component::collapsible::Collapsible;
 use railgun_ui::format_usd_micro_value;
-use ui::controls::app_button_label;
+use ui::controls::{app_button_label, app_muted_shimmer_text};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct WalletConnectRequestFooterActionState {
@@ -363,7 +363,7 @@ impl WalletRoot {
                         .child(walletconnect_kv_row("Token decimals", token.decimals.to_string()))
                         .child(app_muted_text("Confirm adding this token to the wallet. Website metadata and images are ignored.")),
                     Some(Err(message)) => content.child(app_muted_text(message.clone())),
-                    None => content.child(app_muted_text("Loading token metadata from the saved network...")),
+                    None => content.child(app_muted_shimmer_text("Loading token metadata from the saved network...")),
                 };
             }
             _ => {}
@@ -2228,7 +2228,7 @@ fn render_walletconnect_network_fee(
                 value = value.child(app_muted_text("Unavailable"));
             }
             Some(WalletConnectFeeStatus::Fetching) | None => {
-                value = value.child(app_muted_text("Fetching fee data..."));
+                value = value.child(app_muted_shimmer_text("Fetching fee data..."));
             }
             Some(
                 WalletConnectFeeStatus::EstimatedFromOperation(_)
