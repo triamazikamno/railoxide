@@ -23,10 +23,11 @@ use eyre::{Result, WrapErr};
 use gpui::App;
 use railgun_ui::DEFAULT_CHAINS;
 use tracing::metadata::LevelFilter;
+use tracing_subscriber::field::MakeExt as _;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, filter::filter_fn, fmt};
-use ui::logs::{DEFAULT_LOG_CAPACITY, LogStore, UiLogLayer};
+use ui::logs::{DEFAULT_LOG_CAPACITY, LogStore, UiLogLayer, compact_log_value};
 
 use crate::assets::WalletAssets;
 use crate::cli::Options;
@@ -262,7 +263,18 @@ fn install_tracing(logs: LogStore) -> Result<()> {
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
+    let console_fields = fmt::format::debug_fn(|writer, field, value| {
+        let value = format!("{value:?}");
+        let value = compact_log_value(&value);
+        if field.name() == "message" {
+            write!(writer, "{value}")
+        } else {
+            write!(writer, "{field}={value}")
+        }
+    })
+    .delimited(" ");
     let console_layer = fmt::layer()
+        .fmt_fields(console_fields)
         .with_target(true)
         .with_level(true)
         .with_writer(std::io::stderr);

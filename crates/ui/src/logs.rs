@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -176,7 +177,7 @@ impl MessageVisitor {
 
 impl Visit for MessageVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
-        let value = redact_log_urls(value);
+        let value = redact_log_urls(&compact_log_value(value));
         if field.name() == "message" {
             self.message.push_str(&value);
         } else {
@@ -188,7 +189,7 @@ impl Visit for MessageVisitor {
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        let value = redact_log_urls(&format!("{value:?}"));
+        let value = redact_log_urls(&compact_log_value(&format!("{value:?}")));
         if field.name() == "message" {
             self.message.push_str(&value);
         } else {
@@ -198,6 +199,35 @@ impl Visit for MessageVisitor {
             let _ = write!(&mut self.extras, "{}={value}", field.name());
         }
     }
+}
+
+/// Longest log field value kept whole.
+const MAX_LOG_FIELD_LEN: usize = 512;
+
+/// Cuts an HTML page, or whatever runs past [`MAX_LOG_FIELD_LEN`] bytes, out of a log field
+/// value. Errors such as Alloy's HTTP error carry whole response bodies: worth keeping as short
+/// JSON, noise as an HTML error page.
+#[must_use]
+pub fn compact_log_value(value: &str) -> Cow<'_, str> {
+    let html_start = ["<!doctype html", "<html"]
+        .iter()
+        .filter_map(|marker| {
+            value
+                .as_bytes()
+                .windows(marker.len())
+                .position(|window| window.eq_ignore_ascii_case(marker.as_bytes()))
+        })
+        .min();
+    if html_start.is_none() && value.len() <= MAX_LOG_FIELD_LEN {
+        return Cow::Borrowed(value);
+    }
+    let cut = value.floor_char_boundary(html_start.unwrap_or(value.len()).min(MAX_LOG_FIELD_LEN));
+    let kind = if html_start.is_some() { "HTML, " } else { "" };
+    Cow::Owned(format!(
+        "{} …[{kind}{} bytes omitted]",
+        value[..cut].trim_end(),
+        value.len() - cut
+    ))
 }
 
 fn redact_log_urls(value: &str) -> String {
@@ -909,6 +939,26 @@ mod tests {
         });
         let seqs: Vec<u64> = logs.logs().iter().map(|l| l.seq).collect();
         assert_eq!(seqs, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn compact_log_value_keeps_short_json_and_cuts_html_and_long_bodies() {
+        let json =
+            r#"HTTP error 429 with body: {"error":{"code":-32005,"message":"rate limited"}}"#;
+        assert_eq!(compact_log_value(json), json);
+
+        let html = format!(
+            "HTTP error 502 with body: \n<!DOCTYPE html><html>{}</html>",
+            "x".repeat(10)
+        );
+        assert_eq!(
+            compact_log_value(&html),
+            "HTTP error 502 with body: …[HTML, 38 bytes omitted]"
+        );
+
+        let long = format!("deserialization error: {}", "é".repeat(400));
+        let compacted = compact_log_value(&long);
+        assert!(compacted.ends_with(&format!("…[{} bytes omitted]", long.len() - 511)));
     }
 
     #[test]
