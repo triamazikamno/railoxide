@@ -12,6 +12,7 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
+use ui::dialog::WalletDialogExt as _;
 use ui::theme;
 use wallet_ops::settings::RememberedWalletKind;
 use wallet_ops::vault::{
@@ -332,7 +333,7 @@ impl WalletRoot {
         let dialog_width = (window.viewport_size().width * 0.92).min(px(680.0));
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
@@ -383,7 +384,7 @@ impl WalletRoot {
         let dialog_width = (window.viewport_size().width * 0.92).min(px(420.0));
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             dialog
                 .w(dialog_width)
@@ -477,7 +478,7 @@ impl WalletRoot {
             let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
             let dialog_max_height = dialog_max_height(window);
             let hardware_delete = target.source.is_hardware_derived();
-            window.open_alert_dialog(cx, move |dialog, _window, _cx| {
+            window.open_wallet_alert_dialog(cx, move |dialog, _window, _cx| {
                 let confirm_root = root.clone();
                 let cancel_root = root.clone();
                 let confirm_wallet_id = Arc::clone(&wallet_id);
@@ -724,7 +725,7 @@ impl WalletRoot {
     ) {
         let root = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(460.0));
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, _cx| {
             let cancel_root = root.clone();
             #[cfg(feature = "hardware")]
             let connect_root = root.clone();

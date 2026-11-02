@@ -1,5 +1,6 @@
 use super::*;
 use crate::root::actions::{PRIVATE_ACTION_FORM_KEY_CONTEXT, RefreshBroadcasterEstimate};
+use ui::dialog::WalletDialogExt as _;
 
 impl WalletRoot {
     pub(in crate::root) fn close_send_form(
@@ -68,7 +69,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let root = cx.entity();
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, window, cx| {
             let dialog_width = (window.viewport_size().width * 0.92).min(PRIVATE_ASSET_LIST_WIDTH);
             let content_width = secondary_dialog_content_width(dialog_width);
             let max_height = window.viewport_size().height * 0.88;

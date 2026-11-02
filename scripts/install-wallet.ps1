@@ -547,14 +547,16 @@ function Ensure-ExtensionDependencies {
         if (-not (Find-Python)) { Stop-Install "Python 3 is still unavailable; reopen PowerShell and rerun" }
     }
     Invoke-External "rustup" @("target", "add", "wasm32-unknown-unknown", "--toolchain", $Toolchain)
+    # The selected source pins its own helper version.
+    $bindgenVersion = (Get-Content -Raw -LiteralPath (Join-Path $SourceDir "scripts\browser-extension-tools.json") | ConvertFrom-Json).version
     $matchingBindgen = $false
     if (Test-Command "wasm-bindgen") {
         $version = & wasm-bindgen --version
-        $matchingBindgen = $LASTEXITCODE -eq 0 -and $version -eq "wasm-bindgen 0.2.126"
+        $matchingBindgen = $LASTEXITCODE -eq 0 -and $version -eq "wasm-bindgen $bindgenVersion"
     }
     if (-not $matchingBindgen) {
-        if ($NoDeps) { Stop-Install "wasm-bindgen 0.2.126 is required; -NoDeps was provided" }
-        if (-not (Confirm-Action "Download the checksum-pinned wasm-bindgen 0.2.126 build helper?")) {
+        if ($NoDeps) { Stop-Install "wasm-bindgen $bindgenVersion is required; -NoDeps was provided" }
+        if (-not (Confirm-Action "Download the checksum-pinned wasm-bindgen $bindgenVersion build helper?")) {
             Stop-Install "wasm-bindgen is required"
         }
         $toolsDir = Join-Path $SourceDir "target\browser-extension-tools"

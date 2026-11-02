@@ -11,14 +11,14 @@ sources:
   - type: archive
     only-arches:
       - x86_64
-    url: https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.126/wasm-bindgen-0.2.126-x86_64-unknown-linux-musl.tar.gz
-    sha256: 064948d58e2d6c0a745216477a639ba696216d6309aaa902939d1b865b1d869d
+    url: https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.127/wasm-bindgen-0.2.127-x86_64-unknown-linux-musl.tar.gz
+    sha256: 61d4a7dc85acfa0d2354ccc0b8361928c7e52a746d17f28ebaa795ed3dc1614a
     strip-components: 1
   - type: archive
     only-arches:
       - aarch64
-    url: https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.126/wasm-bindgen-0.2.126-aarch64-unknown-linux-musl.tar.gz
-    sha256: 2245120254a9f6c9a9adf3601f3d52bb31309219e9ceab7696e74e24885c440a
+    url: https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.127/wasm-bindgen-0.2.127-aarch64-unknown-linux-musl.tar.gz
+    sha256: 699ddbb724ece16f912b73a98b5341a75f4b8c7886ce152d40dbe09f694e46c7
     strip-components: 1
 cleanup:
   - /lib/railoxide-wasm-bindgen

@@ -12,6 +12,7 @@ use gpui_component::{
 };
 use railgun_ui::{format_token_amount, format_usd_micro_value, short_address};
 use ui::controls::{app_button, app_muted_text, app_strong_text};
+use ui::dialog::WalletDialogExt as _;
 use ui::theme::{self};
 use wallet_ops::{
     ListUtxosOutput, TokenAnchorRateCache, TokenTotal, UtxoPpoiState, WalletPpoiWorkflowStatus,
@@ -695,7 +696,7 @@ impl WalletRoot {
         let copy_id = SharedString::from("wallet-private-receive-address-copy");
         let root = cx.entity().downgrade();
         let generation = self.active_wallet_generation;
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, _cx| {
             dialog
                 .w(dialog_width)
                 .max_h(dialog_max_height)
@@ -998,7 +999,7 @@ impl WalletRoot {
         let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             let content = content_root

@@ -30,6 +30,7 @@ use ui::controls::{
     app_amount_text, app_button, app_button_base, app_muted_shimmer_text, app_muted_text,
     app_strong_text, app_text,
 };
+use ui::dialog::WalletDialogExt as _;
 use ui::hint::hint_card;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use wallet_ops::hardware::HardwareDerivationDescriptor;
@@ -3637,7 +3638,7 @@ impl WalletRoot {
         });
         let focus_content = content.clone();
         let dialog_content = content.clone();
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, window, cx| {
             let dialog_width =
                 (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
             let content_width = secondary_dialog_content_width(dialog_width);
@@ -3699,7 +3700,7 @@ impl WalletRoot {
         });
         let handed_off = Rc::new(Cell::new(false));
         let attention = Self::spend_authorization_attention_lease(window, cx);
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, window, cx| {
             let dialog_width =
                 (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
             let content_width = secondary_dialog_content_width(dialog_width);
@@ -3921,7 +3922,7 @@ impl WalletRoot {
             )
         });
         let attention = Self::spend_authorization_attention_lease(window, cx);
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, window, cx| {
             let dialog_width =
                 (window.viewport_size().width * 0.92).min(SPEND_AUTHORIZATION_DIALOG_WIDTH);
             let content_width = secondary_dialog_content_width(dialog_width);

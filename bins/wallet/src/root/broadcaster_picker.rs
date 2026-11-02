@@ -31,6 +31,7 @@ use railgun_ui::{
 };
 use ui::broadcaster_picker::BroadcasterPickerLayout;
 use ui::controls::{app_muted_text, app_strong_text};
+use ui::dialog::WalletDialogExt as _;
 use ui::theme;
 use wallet_ops::{
     BroadcasterFeePolicy, BroadcasterFeePolicyStatus, PublicBroadcasterCandidate,
@@ -782,7 +783,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let root = cx.entity();
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, window, cx| {
             let viewport_size = window.viewport_size();
             let paddings = window_paddings(window);
             let available_width = viewport_size.width - paddings.left - paddings.right;

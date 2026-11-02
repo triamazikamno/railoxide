@@ -2,6 +2,7 @@
 use super::*;
 use crate::root::ui_helpers::dialog_footer;
 use ui::chain_editor::{EndpointFlag, confirm_direct_endpoints, endpoint_flag_button};
+use ui::dialog::WalletDialogExt as _;
 use wallet_ops::settings::{NativeUsdPricing, TronEndpointSetting, TronSettings};
 use wallet_ops::tron::address::{encode_tron_address, parse_tron_address};
 
@@ -473,7 +474,7 @@ impl WalletSettingsEditor {
         let content_width = secondary_dialog_content_width(dialog_width);
         let editor = cx.entity();
         let dialog_json_rpc = json_rpc.clone();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, _cx| {
             let save_editor = editor.clone();
             let save_json_rpc = dialog_json_rpc.clone();
             let save_http_api = http_api.clone();
@@ -521,7 +522,7 @@ impl WalletSettingsEditor {
         let editor = cx.entity();
         let dialog_input = input.clone();
         let error = cx.new(|_| None::<SharedString>);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let save_editor = editor.clone();
             let save_input = dialog_input.clone();
             let save_error = error.clone();

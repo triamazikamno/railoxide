@@ -43,7 +43,7 @@ powershell -ExecutionPolicy Bypass -File .\install-wallet.ps1
 - Installs Rust `1.97.1` through `rustup` if needed.
 - Builds the wallet with hardware-wallet support enabled by default.
 - Builds and embeds the browser extension before compiling the wallet, and verifies the embedded ZIP.
-- Adds the WASM target to the selected Rust toolchain and prepares Python 3 and exactly wasm-bindgen 0.2.126. A matching helper on `PATH` is reused; otherwise the installer downloads a checksum-pinned upstream binary into the checkout's `target/browser-extension-tools` directory.
+- Adds the WASM target to the selected Rust toolchain and prepares Python 3 and exactly the wasm-bindgen version pinned by the selected source's `scripts/browser-extension-tools.json`. A matching helper on `PATH` is reused; otherwise the installer downloads a checksum-pinned upstream binary into the checkout's `target/browser-extension-tools` directory.
 - Prints the exact source commit before building.
 - Refuses to run as root on macOS/Linux.
 - Uses `sudo` only for Ubuntu/Debian system package installation.

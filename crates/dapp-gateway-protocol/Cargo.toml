@@ -16,8 +16,8 @@ zeroize.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 getrandom02 = { package = "getrandom", version = "=0.2.17", features = ["js"] }
-wasm-bindgen = "=0.2.126"
-js-sys = "=0.3.103"
+wasm-bindgen = "=0.2.127"
+js-sys = "=0.3.104"
 
 [lints]
 workspace = true

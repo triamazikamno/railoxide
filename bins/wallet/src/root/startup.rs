@@ -7,7 +7,7 @@ use broadcaster_monitor_waku::{RelayNetworkConfig, WakuMonitorConfig, WakuMonito
 use eyre::WrapErr;
 use gpui::{
     App, AppContext, Context, Entity, IntoElement, MouseDownEvent, MouseMoveEvent, ParentElement,
-    Render, ScrollWheelEvent, SharedString, Styled, Subscription, Window, canvas, div, img,
+    Render, ScrollEvent, SharedString, Styled, Subscription, Window, canvas, div, img,
     prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
@@ -17,6 +17,7 @@ use gpui_component::{
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text};
+use ui::dialog::WalletDialogExt as _;
 use ui::icons;
 use ui::logs::{LogStore, LogsPane};
 use ui::theme;
@@ -691,7 +692,7 @@ impl WalletStartupRoot {
         let (dialog_width, content_height, dialog_max_height) = settings_dialog_dimensions(window);
         let maintenance_controller = self.maintenance_controller.clone();
         let data_folder = data_folder_path(&self.options.db_path);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let reset_root = root.clone();
             let retry_root = root.clone();
             let open_root = root.clone();
@@ -1073,7 +1074,7 @@ fn register_wallet_activity_listeners(window: &mut Window, callback: WalletActiv
             cx.stop_propagation();
         }
     });
-    window.on_mouse_event(move |_: &ScrollWheelEvent, phase, window, cx| {
+    window.on_mouse_event(move |_: &ScrollEvent, phase, window, cx| {
         if phase.capture() && callback(window, cx) {
             cx.stop_propagation();
         }
@@ -1293,7 +1294,7 @@ mod activity_tests {
 
     use gpui::{
         FocusHandle, InteractiveElement as _, KeyDownEvent, Keystroke, Modifiers, MouseButton,
-        ScrollDelta, ScrollWheelEvent, TestAppContext, TouchPhase, point,
+        ScrollDelta, ScrollEvent, TestAppContext, TouchPhase, point,
     };
 
     use super::*;
@@ -1355,7 +1356,7 @@ mod activity_tests {
                             .on_key_down(|_, _, cx| cx.stop_propagation())
                             .on_mouse_move(|_, _, cx| cx.stop_propagation())
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .on_scroll_wheel(|_, _, cx| cx.stop_propagation()),
+                            .on_scroll(|_, _, cx| cx.stop_propagation()),
                     )
                 })
         }
@@ -1397,11 +1398,12 @@ mod activity_tests {
 
         cx.simulate_mouse_move(content_position, None::<MouseButton>, Modifiers::none());
         cx.simulate_mouse_down(content_position, MouseButton::Left, Modifiers::none());
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: content_position,
             delta: ScrollDelta::Pixels(point(px(0.0), px(-10.0))),
             modifiers: Modifiers::none(),
             touch_phase: TouchPhase::Moved,
+            ..Default::default()
         });
         cx.simulate_event(KeyDownEvent {
             keystroke: Keystroke::parse("a").expect("valid test keystroke"),
@@ -1426,11 +1428,12 @@ mod activity_tests {
 
         cx.simulate_mouse_move(dialog_position, None::<MouseButton>, Modifiers::none());
         cx.simulate_mouse_down(dialog_position, MouseButton::Left, Modifiers::none());
-        cx.simulate_event(ScrollWheelEvent {
+        cx.simulate_event(ScrollEvent {
             position: dialog_position,
             delta: ScrollDelta::Pixels(point(px(0.0), px(-10.0))),
             modifiers: Modifiers::none(),
             touch_phase: TouchPhase::Moved,
+            ..Default::default()
         });
         cx.simulate_event(KeyDownEvent {
             keystroke: Keystroke::parse("b").expect("valid test keystroke"),

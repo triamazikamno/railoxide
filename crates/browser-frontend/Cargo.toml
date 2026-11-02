@@ -16,9 +16,9 @@ gpui = { workspace = true }
 gpui-kit = { workspace = true }
 gpui-component = { workspace = true }
 gpui-kit-assets = { workspace = true }
-js-sys = "=0.3.103"
+js-sys = "=0.3.104"
 ui = { path = "../ui" }
-wasm-bindgen = "=0.2.126"
+wasm-bindgen = "=0.2.127"
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }

@@ -16,6 +16,7 @@ use gpui_component::{
     input::{InputEvent, InputState},
 };
 use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
+use ui::dialog::WalletDialogExt as _;
 use wallet_ops::gateway::{GatewayConfig, GatewayError};
 
 use crate::root::WalletRoot;
@@ -74,7 +75,7 @@ impl WalletRoot {
         let lease = Rc::new(());
         let identity = Rc::downgrade(&lease);
         let root = cx.entity();
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, window, cx| {
             // Only the active dialog builder owns a strong lease. Programmatic closes
             // can bypass on_close, so completion also checks the lease and focus.
             let identity = Rc::downgrade(&lease);

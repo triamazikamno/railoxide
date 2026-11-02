@@ -14,6 +14,7 @@ use gpui_component::{
 };
 use railgun_ui::short_address;
 use ui::controls::{app_button, app_input, app_muted_text, app_strong_text};
+use ui::dialog::WalletDialogExt as _;
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::{
     bridge::{NonEvmNetwork, NonEvmReceiverError},
@@ -566,7 +567,7 @@ impl WalletRoot {
                     let dialog_width =
                         (window.viewport_size().width * 0.92).min(ADDRESS_BOOK_DIALOG_WIDTH);
                     let dialog_max_height = dialog_max_height(window);
-                    window.open_alert_dialog(cx, move |dialog, _window, _cx| {
+                    window.open_wallet_alert_dialog(cx, move |dialog, _window, _cx| {
                         let confirm_root = root.clone();
                         let target = target.clone();
                         confirmation_dialog(
@@ -602,7 +603,7 @@ impl WalletRoot {
         let dialog_width = (window.viewport_size().width * 0.92).min(ADDRESS_BOOK_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             let save_root = root.clone();
@@ -672,7 +673,7 @@ impl WalletRoot {
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         let mode = AddressBookDialogMode::Edit(target.kind);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             let save_root = root.clone();

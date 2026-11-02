@@ -26,6 +26,7 @@ use gpui_component::{
 };
 use tokio::sync::mpsc;
 use ui::controls::{app_button, app_muted_text};
+use ui::dialog::WalletDialogExt as _;
 use ui::fees::estimated_network_fees;
 use ui::recipient_picker::RecipientPickerEvent;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
@@ -444,7 +445,7 @@ impl WalletRoot {
         let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACTION_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             dialog
                 .w(dialog_width)

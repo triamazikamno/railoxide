@@ -6,7 +6,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 use gpui_component::{
-    Icon, IconName, Sizable, WindowExt,
+    Icon, IconName, Sizable,
     kbd::Kbd,
     menu::{DropdownMenu, PopupMenuItem},
     select::{Select, SelectItem},
@@ -16,6 +16,7 @@ use gpui_component::{
 use ui::chain_select::NetworkSelectItem;
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button_base, app_input, app_muted_text, app_strong_text};
+use ui::dialog::WalletDialogExt as _;
 use ui::{icons, theme};
 use wallet_ops::hardware::HardwareDeviceKind;
 use wallet_ops::vault::{HardwareProfileMetadata, WalletMetadataBundle, WalletSource};
@@ -139,7 +140,7 @@ impl WalletRoot {
         let dialog_width = (window.viewport_size().width * 0.92).min(px(420.0));
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let submit_root = root.clone();
             let content_root = root.clone();
             dialog

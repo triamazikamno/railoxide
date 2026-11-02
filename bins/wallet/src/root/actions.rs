@@ -1,6 +1,10 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 
-use gpui::{App, Entity, Global, KeyBinding, WeakEntity, Window, WindowId};
+use gpui::{
+    Action, App, Entity, Global, KeyBinding, KeyBindingContextPredicate, WeakEntity, Window,
+    WindowId,
+};
 
 use super::TABLE_KEY_CONTEXT;
 use super::startup::WalletStartupRoot;
@@ -117,6 +121,20 @@ enum WalletShortcutAction {
 
 pub(super) const PUBLIC_ACCOUNT_SECTION_KEY_CONTEXT: &str = "PublicAccountSection";
 
+/// `KeyBinding::new` no longer resolves `secondary-`; `load` maps it to the host OS modifier.
+fn secondary_key_binding<A: Action>(
+    keystrokes: &str,
+    action: A,
+    context: Option<&str>,
+    app: &App,
+) -> KeyBinding {
+    let predicate = context.map(|context| {
+        Rc::new(KeyBindingContextPredicate::parse(context).expect("valid key context"))
+    });
+    KeyBinding::load(keystrokes, Box::new(action), predicate, false, None, app)
+        .expect("valid secondary keystroke")
+}
+
 pub(crate) fn install_wallet_action_bindings(app: &mut App) {
     app.bind_keys([
         // Let the focused icon activate natively instead of a parent dialog or form command.
@@ -185,14 +203,15 @@ pub(crate) fn install_wallet_action_bindings(app: &mut App) {
             CopySelectedAddress,
             Some(PUBLIC_ACCOUNT_LIST_KEY_CONTEXT),
         ),
-        KeyBinding::new(
+        secondary_key_binding(
             "secondary-e",
             RenameSelectedAccount,
             Some(PUBLIC_ACCOUNT_LIST_KEY_CONTEXT),
+            app,
         ),
-        KeyBinding::new("secondary-,", OpenSettings, None),
-        KeyBinding::new("secondary-l", LockVault, None),
-        KeyBinding::new("secondary-shift-t", ToggleNetworkStatus, None),
+        secondary_key_binding("secondary-,", OpenSettings, None, app),
+        secondary_key_binding("secondary-l", LockVault, None, app),
+        secondary_key_binding("secondary-shift-t", ToggleNetworkStatus, None, app),
         KeyBinding::new(
             "ctrl-r",
             RefreshBroadcasterEstimate,

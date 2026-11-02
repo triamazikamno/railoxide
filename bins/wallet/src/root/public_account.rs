@@ -20,6 +20,7 @@ use railgun_ui::chain_name;
 use ui::controls::{
     app_button, app_input, app_masked_input, app_muted_text, app_segment_button, app_strong_text,
 };
+use ui::dialog::WalletDialogExt as _;
 use wallet_ops::{
     PublicAssetId, PublicBalanceEntry,
     hardware::HardwareDeviceKind,
@@ -152,7 +153,7 @@ impl WalletRoot {
             }
         })
         .detach();
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let _ = &builder_alive;
             // Only the active builder owns the lease. Programmatic closure skips on_close.
             let identity = Rc::downgrade(&lease);
@@ -200,7 +201,7 @@ impl WalletRoot {
         let dialog_width = (window.viewport_size().width * 0.92).min(PUBLIC_ACCOUNT_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
@@ -272,7 +273,7 @@ impl WalletRoot {
         let receive_warning = SharedString::from(warning);
         let root = cx.entity().downgrade();
         let generation = self.active_wallet_generation;
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, _cx| {
             dialog
                 .w(dialog_width)
                 .max_h(dialog_max_height)
@@ -968,7 +969,7 @@ impl WalletRoot {
                 .unwrap_or_else(|| self.listed_short_address(&account));
             let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
             let dialog_max_height = dialog_max_height(window);
-            window.open_alert_dialog(cx, move |dialog, _window, _cx| {
+            window.open_wallet_alert_dialog(cx, move |dialog, _window, _cx| {
                 let confirm_root = root.clone();
                 let account_uuid = account_uuid.clone();
                 confirmation_dialog(

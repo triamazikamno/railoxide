@@ -26,6 +26,7 @@ use ui::clipboard::clipboard_with_toast;
 use ui::controls::{
     app_button, app_button_base, app_input, app_muted_text, app_strong_text, app_text,
 };
+use ui::dialog::WalletDialogExt as _;
 use ui::icons;
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_LINE_HEIGHT, APP_TEXT_SIZE};
 #[cfg(feature = "hardware")]
@@ -567,7 +568,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let root = cx.entity();
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, window, cx| {
             // The dialog layer is drawn outside the root's lease, so the root can be read.
             let wallet = root.read(cx);
             let state = wallet.blocked_shield_refund_dialog_state(utxo_id);
@@ -915,7 +916,7 @@ impl WalletRoot {
         let dialog_width = (window.viewport_size().width * 0.92).min(px(460.0));
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog

@@ -558,9 +558,12 @@ ensure_extension_dependencies() {
   fi
   command_exists python3 || die 'Python 3 is still unavailable'
   run rustup target add wasm32-unknown-unknown --toolchain "$toolchain"
-  if ! command_exists wasm-bindgen || [[ "$(wasm-bindgen --version)" != 'wasm-bindgen 0.2.126' ]]; then
-    [[ "$install_deps" -eq 1 ]] || die 'wasm-bindgen 0.2.126 is required; --no-deps was provided'
-    confirm 'Download the checksum-pinned wasm-bindgen 0.2.126 build helper?' || die 'wasm-bindgen is required'
+  # The selected source pins its own helper version.
+  local bindgen_version
+  bindgen_version="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' "$source_dir/scripts/browser-extension-tools.json")"
+  if ! command_exists wasm-bindgen || [[ "$(wasm-bindgen --version)" != "wasm-bindgen $bindgen_version" ]]; then
+    [[ "$install_deps" -eq 1 ]] || die "wasm-bindgen $bindgen_version is required; --no-deps was provided"
+    confirm "Download the checksum-pinned wasm-bindgen $bindgen_version build helper?" || die 'wasm-bindgen is required'
     local tools_dir="$source_dir/target/browser-extension-tools"
     run python3 "$source_dir/scripts/install-browser-extension-tools.py" "$tools_dir"
     export PATH="$tools_dir/bin:$PATH"

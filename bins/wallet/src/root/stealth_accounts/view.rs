@@ -1656,7 +1656,7 @@ mod tests {
                 cx.update(|window, cx| window.draw(cx).clear(cx));
             }
             assert_eq!(host.read_with(cx, |host, _| host.pages.page), page);
-            cx.simulate_event(gpui::ScrollWheelEvent {
+            cx.simulate_event(gpui::ScrollEvent {
                 position: gpui::point(gpui::px(100.), gpui::px(250.)),
                 delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-5000.))),
                 ..Default::default()

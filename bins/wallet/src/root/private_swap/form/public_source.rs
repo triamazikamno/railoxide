@@ -9,6 +9,7 @@ use crate::root::spend_authorization::SpendAuthorizationIntent;
 use crate::root::ui_helpers::dialog_footer;
 use crate::root::vault::hardware_device_label;
 use alloy::primitives::B256;
+use ui::dialog::WalletDialogExt as _;
 use wallet_ops::{
     AcrossPrivateDelivery, AuthorizedPublicSwapSource, PublicActionGasFeeSelection,
     PublicSwapBatchTerms, PublicSwapDelivery, PublicSwapDeliverySigning, PublicSwapOrderOutcome,
@@ -2506,7 +2507,7 @@ impl PrivateSwapsView {
             cx,
         ));
         let view = cx.entity();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_wallet_dialog(cx, move |dialog, _, _| {
             let sign = view.clone();
             let close = view.clone();
             dialog

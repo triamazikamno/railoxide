@@ -1,0 +1,4 @@
+disallowed-methods = [
+    { path = "gpui_component::WindowExt::open_dialog", reason = "use ui::dialog::WalletDialogExt::open_wallet_dialog so dismissal unmounts synchronously" },
+    { path = "gpui_component::WindowExt::open_alert_dialog", reason = "use ui::dialog::WalletDialogExt::open_wallet_alert_dialog so dismissal unmounts synchronously" },
+]

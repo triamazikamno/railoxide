@@ -14,6 +14,7 @@ use gpui_component::{
     input::{InputEvent, InputGroupButton, InputState},
 };
 use ui::controls::{app_button, app_muted_text, app_strong_text};
+use ui::dialog::WalletDialogExt as _;
 use ui::theme;
 use wallet_ops::vault::VaultError;
 use zeroize::Zeroizing;
@@ -66,7 +67,7 @@ impl ChangeVaultPasswordDialogContent {
         let dialog_width =
             (window.viewport_size().width * 0.92).min(CHANGE_VAULT_PASSWORD_DIALOG_WIDTH);
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, _cx| {
             let identity = Rc::downgrade(&lease);
             dialog
                 .w(dialog_width)

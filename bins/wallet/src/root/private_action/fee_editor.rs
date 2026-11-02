@@ -1,6 +1,7 @@
 use super::*;
 use gpui::{Render, Subscription};
 use gpui_component::ActiveTheme;
+use ui::dialog::WalletDialogExt as _;
 
 #[derive(Clone, PartialEq, Eq)]
 struct FeeEditorContext {
@@ -258,7 +259,7 @@ impl WalletRoot {
 
 fn open_fee_editor_dialog(editor: Entity<BroadcasterFeeEditor>, window: &mut Window, cx: &mut App) {
     let focus = editor.read(cx).input.clone();
-    window.open_dialog(cx, move |dialog, window, _| {
+    window.open_wallet_dialog(cx, move |dialog, window, _| {
         let apply = editor.clone();
         let automatic = editor.clone();
         let confirm = editor.clone();

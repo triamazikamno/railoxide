@@ -13,6 +13,7 @@ use gpui_component::{
     dialog::{Cancel, Confirm, DialogFooter},
 };
 use ui::controls::{app_button, app_muted_text, app_segment_button, app_strong_text, app_text};
+use ui::dialog::WalletDialogExt as _;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 
 use super::listener::local_ipv4_addresses;
@@ -156,7 +157,7 @@ impl WalletRoot {
                 .join(" ");
             (hex, SharedString::from(grouped))
         });
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, window, cx| {
             // Only the active dialog builder owns a strong lease. Programmatic closes
             // can bypass on_close, so opening a browser also checks the lease and focus.
             let identity = Rc::downgrade(&lease);

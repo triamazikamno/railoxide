@@ -1,4 +1,5 @@
 use super::*;
+use ui::dialog::WalletDialogExt as _;
 
 impl WalletRoot {
     pub(in crate::root) fn open_walletconnect_connection_dialog(
@@ -31,7 +32,7 @@ impl WalletRoot {
         let dialog_max_height = (window.viewport_size().height * 0.88).min(px(820.0));
         let content_width = secondary_dialog_content_width(dialog_width);
         window.close_all_dialogs(cx);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog

@@ -12,11 +12,11 @@ if [[ -n "$cargo_toolchain" ]]; then
 fi
 
 if ! command -v wasm-bindgen >/dev/null 2>&1; then
-  echo 'Missing wasm-bindgen 0.2.126. See docs/browser-extension.md for the pinned installation command.' >&2
+  echo 'Missing wasm-bindgen 0.2.127. See docs/browser-extension.md for the pinned installation command.' >&2
   exit 1
 fi
-if [[ "$(wasm-bindgen --version)" != 'wasm-bindgen 0.2.126' ]]; then
-  echo 'Expected exactly wasm-bindgen 0.2.126. Put the matching helper on PATH; see docs/browser-extension.md.' >&2
+if [[ "$(wasm-bindgen --version)" != 'wasm-bindgen 0.2.127' ]]; then
+  echo 'Expected exactly wasm-bindgen 0.2.127. Put the matching helper on PATH; see docs/browser-extension.md.' >&2
   exit 1
 fi
 if [[ $# -gt 0 ]]; then

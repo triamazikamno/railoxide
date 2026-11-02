@@ -1,6 +1,7 @@
 use crate::root::ui_helpers::dialog_footer;
 
 use super::*;
+use ui::dialog::WalletDialogExt as _;
 
 const WALLET_DELETION_APPLY_STATUS: &str =
     "Wait for wallet deletion to finish before applying settings";
@@ -327,7 +328,7 @@ impl WalletSettingsEditor {
         let editor = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
         let dialog_max_height = dialog_max_height(window);
-        window.open_alert_dialog(cx, move |dialog, _window, _cx| {
+        window.open_wallet_alert_dialog(cx, move |dialog, _window, _cx| {
             let confirm_editor = editor.clone();
             confirmation_dialog(
                 dialog,
@@ -369,7 +370,7 @@ impl WalletSettingsEditor {
         let editor = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
         let dialog_max_height = dialog_max_height(window);
-        window.open_alert_dialog(cx, move |dialog, _window, _cx| {
+        window.open_wallet_alert_dialog(cx, move |dialog, _window, _cx| {
             let confirm_editor = editor.clone();
             confirmation_dialog(
                 dialog,
@@ -411,7 +412,7 @@ impl WalletSettingsEditor {
         let editor = cx.entity();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(560.0));
         let dialog_max_height = dialog_max_height(window);
-        window.open_alert_dialog(cx, move |dialog, _window, _cx| {
+        window.open_wallet_alert_dialog(cx, move |dialog, _window, _cx| {
             let confirm_editor = editor.clone();
             confirmation_dialog(
                 dialog,
@@ -1234,7 +1235,7 @@ impl WalletSettingsEditor {
         let editor = cx.entity();
         let dialog_input = input.clone();
         let save_kind = kind.clone();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, _cx| {
             let save_editor = editor.clone();
             let save_input = dialog_input.clone();
             let save_kind = save_kind.clone();
@@ -1400,7 +1401,7 @@ impl WalletSettingsEditor {
         let editor = cx.entity();
         let dialog_inputs = inputs.clone();
         let save_inputs = inputs.clone();
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, _cx| {
             let save_editor = editor.clone();
             let save_inputs = save_inputs.clone();
             dialog
@@ -1607,7 +1608,7 @@ impl WalletSettingsEditor {
         let save_inputs = inputs.clone();
         let save_target = target.clone();
         let error = cx.new(|_| None::<SharedString>);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let save_editor = editor.clone();
             let save_inputs = save_inputs.clone();
             let render_inputs = save_inputs.clone();
@@ -1759,7 +1760,7 @@ impl WalletSettingsEditor {
             "Save"
         });
         let error = cx.new(|_| None::<SharedString>);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let save_editor = editor.clone();
             let save_inputs = save_inputs.clone();
             let render_inputs = save_inputs.clone();

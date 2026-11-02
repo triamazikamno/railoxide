@@ -11,6 +11,7 @@ use gpui::{
 use gpui_component::{Sizable, WindowExt, alert::Alert, button::ButtonVariants, input::InputEvent};
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_muted_text, app_strong_text};
+use ui::dialog::WalletDialogExt as _;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use wallet_ops::vault::{
     VaultError, WalletMetadataBundle, WalletSoftwareContextKind, WalletSource,
@@ -305,7 +306,7 @@ impl WalletRoot {
         let dialog_width = (window.viewport_size().width * 0.92).min(KEY_EXPORT_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
@@ -359,7 +360,7 @@ impl WalletRoot {
         let dialog_width =
             (window.viewport_size().width * 0.92).min(KEY_EXPORT_PASSWORD_DIALOG_WIDTH);
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, _cx| {
             let identity = Rc::downgrade(&lease);
             dialog
                 .w(dialog_width)

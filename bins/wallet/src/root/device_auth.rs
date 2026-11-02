@@ -27,6 +27,7 @@ use tokio::runtime::Handle;
 use ui::controls::{
     app_button, app_input, app_input_group, app_masked_input, app_muted_text, app_strong_text,
 };
+use ui::dialog::WalletDialogExt as _;
 use ui::theme;
 pub(in crate::root) use wallet_ops::device_auth::DeviceAuthMethod;
 use wallet_ops::device_auth::{DeviceAuthError, device_auth_available, device_auth_supported};
@@ -694,7 +695,7 @@ impl EnableDeviceAuthDialogContent {
         let dialog_width =
             (window.viewport_size().width * 0.92).min(ENABLE_DEVICE_AUTH_DIALOG_WIDTH);
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let identity = Rc::downgrade(&lease);
             let cancel_content = dialog_content.clone();
             let pending = dialog_content.read(cx).pending;

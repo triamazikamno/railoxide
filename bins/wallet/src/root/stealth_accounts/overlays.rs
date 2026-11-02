@@ -12,6 +12,7 @@ use gpui_component::{
     dialog::{Cancel, Confirm, Dialog, DialogFooter},
     input::InputState,
 };
+use ui::dialog::WalletDialogExt as _;
 
 impl StealthAccountsView {
     pub(super) fn open_add_token(
@@ -49,7 +50,7 @@ impl StealthAccountsView {
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.error = None;
         let view = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, window, cx| {
             let content = view
                 .update(cx, |view, cx| {
                     if !view.session_is_current(cx) {
@@ -269,7 +270,7 @@ impl StealthAccountsView {
         if let Some(focus) = &return_focus {
             focus.focus(window, cx);
         }
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, window, cx| {
             let content = view
                 .update(cx, |view, cx| {
                     if !view.session_is_current(cx) {
@@ -335,7 +336,7 @@ impl StealthAccountsView {
         }
         self.pending_authorization = None;
         let view = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, window, cx| {
             let dialog = match view.upgrade() {
                 Some(view) if view.read(cx).session_is_current(cx) => {
                     let view = view.read(cx);
@@ -570,7 +571,7 @@ mod tests {
                 gpui_component::Theme::sync_base(cx);
                 let picker = cx.new(|cx| TokenPicker::new(&registry, 1, window, cx));
                 let content = picker.clone();
-                window.open_dialog(cx, move |dialog, window, _| {
+                window.open_wallet_dialog(cx, move |dialog, window, _| {
                     dialog
                         .title("Add token to account #0")
                         .w((window.viewport_size().width * 0.92)
@@ -648,7 +649,7 @@ mod tests {
             let count = cx.new(|cx| InputState::new(window, cx).default_value("200"));
             let index = start.clone();
             let account_count = count.clone();
-            window.open_dialog(cx, move |dialog, window, cx| {
+            window.open_wallet_dialog(cx, move |dialog, window, cx| {
                 let on_review = on_review.clone();
                 restore_dialog(dialog, &index, &account_count, false, window, cx).on_ok(
                     move |_, _, _| {
@@ -694,7 +695,7 @@ mod tests {
             gpui_component::Theme::sync_base(cx);
             window.draw(cx).clear(cx);
         });
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: gpui::point(gpui::px(320.), gpui::px(300.)),
             delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-2000.))),
             ..Default::default()

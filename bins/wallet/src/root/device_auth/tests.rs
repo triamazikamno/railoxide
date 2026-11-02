@@ -447,7 +447,7 @@ fn device_auth_enrollment_refreshes_root_without_closing_or_focusing_a_newer_dia
             if replace {
                 window.close_all_dialogs(cx);
             }
-            window.open_dialog(cx, |dialog, _, _| dialog.title("Newer dialog"));
+            window.open_wallet_dialog(cx, |dialog, _, _| dialog.title("Newer dialog"));
             window.focused(cx).unwrap()
         });
         let old = dialog.downgrade();

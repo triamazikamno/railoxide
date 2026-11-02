@@ -3,10 +3,11 @@ use crate::root::{dialog_max_height, secondary_dialog_content_width, ui_helpers:
 #[cfg(feature = "hardware")]
 use gpui::{ParentElement, Styled, div, px, rgb};
 #[cfg(feature = "hardware")]
-use gpui_component::{Sizable, WindowExt, alert::Alert};
+use gpui_component::{Sizable, alert::Alert};
 #[cfg(feature = "hardware")]
 use ui::{
     controls::{app_input, app_muted_text, app_strong_text},
+    dialog::WalletDialogExt as _,
     theme,
 };
 
@@ -170,7 +171,7 @@ impl WalletRoot {
         let dialog_width = (window.viewport_size().width * 0.92).min(px(420.0));
         let dialog_max_height = dialog_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let save_root = root.clone();
             let close_root = root.clone();
             let state = root.read(cx);

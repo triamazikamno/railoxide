@@ -13,6 +13,7 @@ use gpui_component::{
 };
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text, app_text};
+use ui::dialog::WalletDialogExt as _;
 use ui::theme;
 use wallet_ops::vault::BridgeProvider;
 
@@ -74,7 +75,7 @@ impl PrivateSwapsView {
     /// swap dialog when it closes.
     pub(super) fn open_swap_disclaimer(&self, window: &mut Window, cx: &mut App) {
         let root = self.root.clone();
-        window.open_dialog(cx, move |dialog, window, _| {
+        window.open_wallet_dialog(cx, move |dialog, window, _| {
             let width = (window.viewport_size().width * 0.92).min(DISCLAIMER_WIDTH);
             let content_width = secondary_dialog_content_width(width);
             dialog

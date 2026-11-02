@@ -5,6 +5,7 @@ use gpui_component::WindowExt;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use ui::controls::{app_button, app_muted_text, app_strong_text};
+use ui::dialog::WalletDialogExt as _;
 use wallet_ops::gateway::{
     GatewayWalletState, GatewayWalletSwitchRequest, GatewayWalletSwitchTransition,
 };
@@ -128,7 +129,7 @@ impl WalletRoot {
         let displayed = request.clone();
         let width = (window.viewport_size().width * 0.92).min(px(520.0));
         let max_height = window.viewport_size().height * 0.8;
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_wallet_dialog(cx, move |dialog, _, _| {
             let _lease = Rc::clone(&lease);
             let close_root = root.clone();
             let close_request = displayed.clone();

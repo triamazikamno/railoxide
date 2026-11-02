@@ -19,6 +19,7 @@ use super::{
     wallet_options_from_metadata, wallet_select_items_from_metadata,
     wallet_select_value_for_selected_wallet,
 };
+use ui::dialog::WalletDialogExt as _;
 
 const PENDING_SOFTWARE_PROFILE_OPEN_TIMEOUT: Duration = Duration::from_mins(5);
 const WALLET_REPLACEMENT_DELAYED_THRESHOLD: Duration = Duration::from_secs(10);
@@ -201,7 +202,7 @@ impl WalletRoot {
         let content_width = secondary_dialog_content_width(dialog_width);
         let lease = Rc::new(Cell::new(true));
         self.add_wallet_dialog_lease = Rc::downgrade(&lease);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             // Builder ownership also invalidates programmatically closed dialogs.
             let identity = Rc::downgrade(&lease);
             let content_root = root.clone();

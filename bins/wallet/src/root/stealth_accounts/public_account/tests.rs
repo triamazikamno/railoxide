@@ -505,7 +505,7 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
             copy.right() <= card.right(),
             "Mined transaction is clipped at {width}px with {rem}px text: {copy:?}, {card:?}"
         );
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: card.center(),
             delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-5000.))),
             ..Default::default()
@@ -523,7 +523,7 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
             cx.read_from_clipboard().unwrap().text(),
             Some(transaction.to_string())
         );
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: card.center(),
             delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(5000.))),
             ..Default::default()
@@ -561,7 +561,7 @@ fn account_copy_controls_and_add_to_public_authorization(cx: &mut TestAppContext
         window.draw(cx).clear(cx);
     });
     let card = cx.debug_bounds("stealth-accounts-card").unwrap();
-    cx.simulate_event(gpui::ScrollWheelEvent {
+    cx.simulate_event(gpui::ScrollEvent {
         position: card.center(),
         delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(-5000.), gpui::px(0.))),
         ..Default::default()

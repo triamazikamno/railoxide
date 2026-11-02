@@ -6,6 +6,7 @@ pub mod chain_editor;
 pub mod chain_select;
 pub mod clipboard;
 pub mod controls;
+pub mod dialog;
 pub mod fees;
 pub mod format;
 pub mod gas_fee;

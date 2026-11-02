@@ -3,6 +3,8 @@ use std::{cell::Cell, rc::Rc};
 
 #[cfg(feature = "hardware")]
 use gpui::{InteractiveElement, StatefulInteractiveElement};
+#[cfg(feature = "hardware")]
+use ui::dialog::WalletDialogExt as _;
 
 #[cfg(feature = "hardware")]
 use super::{
@@ -661,7 +663,7 @@ impl WalletRoot {
         let content_width = secondary_dialog_content_width(dialog_width);
         let content_focus = cx.focus_handle();
         let dialog_content_focus = content_focus.clone();
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let identity = Rc::downgrade(&lease);
             let close_root = root.clone();
             let content_root = root.clone();

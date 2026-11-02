@@ -1,4 +1,5 @@
 use super::*;
+use ui::dialog::WalletDialogExt as _;
 
 impl WalletRoot {
     pub(in crate::root) fn open_walletconnect_sessions_dialog(
@@ -13,7 +14,7 @@ impl WalletRoot {
         let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.close_all_dialogs(cx);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let content_root = root.clone();
             dialog
                 .w(dialog_width)
@@ -52,7 +53,7 @@ impl WalletRoot {
         let content_max_height = dialog_content_max_height(window);
         let content_width = secondary_dialog_content_width(dialog_width);
         window.close_all_dialogs(cx);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let content_root = root.clone();
             let account_uuid = Arc::clone(&public_account_uuid);
             dialog

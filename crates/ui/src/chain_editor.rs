@@ -2,6 +2,7 @@
 use crate::controls::{
     app_button, app_input, app_input_group, app_muted_text, app_strong_text, app_text,
 };
+use crate::dialog::WalletDialogExt as _;
 use crate::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_LINE_HEIGHT};
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FocusHandle,
@@ -11,7 +12,6 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
-    WindowExt as _,
     alert::Alert,
     button::{Button, ButtonVariant, ButtonVariants as _},
     checkbox::Checkbox,
@@ -1633,7 +1633,7 @@ impl ChainEditor {
                 let editor = cx.entity();
                 let chain_id = chain_id.clone();
                 let name = name.clone();
-                window.open_alert_dialog(cx, move |dialog, _, _| {
+                window.open_wallet_alert_dialog(cx, move |dialog, _, _| {
                     let editor = editor.clone();
                     let chain_id = chain_id.clone();
                     dialog
@@ -1676,7 +1676,7 @@ impl ChainEditor {
                 let editor = cx.entity();
                 let chain_id = chain_id.clone();
                 let name = name.clone();
-                window.open_alert_dialog(cx, move |dialog, _, _| {
+                window.open_wallet_alert_dialog(cx, move |dialog, _, _| {
                     let editor = editor.clone();
                     let chain_id = chain_id.clone();
                     let body = format!(
@@ -1847,7 +1847,7 @@ pub fn confirm_direct_endpoints(
          linked to you.",
     );
     let on_ok = Rc::new(on_ok);
-    window.open_alert_dialog(cx, move |dialog, _, _| {
+    window.open_wallet_alert_dialog(cx, move |dialog, _, _| {
         let on_ok = on_ok.clone();
         dialog
             .width(CONFIRM_DIALOG_WIDTH)

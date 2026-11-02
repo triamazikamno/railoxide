@@ -29,6 +29,7 @@ use gpui_component::{
 use ui::controls::{
     app_muted_shimmer_text, app_muted_text, app_segment_button, app_strong_text, app_text,
 };
+use ui::dialog::WalletDialogExt as _;
 use ui::theme;
 use wallet_ops::{PublicBroadcasterCandidate, WalletSession, bridge::NonEvmNetwork};
 
@@ -1227,7 +1228,7 @@ impl PrivateSwapsView {
             select_row(&tokens, row, window, cx);
         }
         let view = cx.weak_entity();
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, window, cx| {
             let close_view = view.clone();
             let content = view.upgrade().and_then(|view| {
                 let content = view

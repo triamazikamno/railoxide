@@ -22,6 +22,7 @@ use ui::controls::{
     app_button, app_button_base, app_button_label, app_muted_text, app_segment_button,
     app_strong_text, app_text,
 };
+use ui::dialog::WalletDialogExt as _;
 use ui::theme;
 use wallet_ops::{
     SwapOrderState, WalletNetworkMode, is_swap_record,
@@ -358,7 +359,7 @@ impl PrivateSwapsView {
             }
         }
         let entity = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, window, cx| {
             let available = window.viewport_size().width * 0.92;
             let close_view = entity.clone();
             let rendered = entity.update(cx, |view, cx| {

@@ -17,6 +17,7 @@ use gpui_component::{
     input::{InputEvent, InputState},
 };
 use ui::controls::{app_button, app_input, app_masked_input, app_muted_text, app_segment_button};
+use ui::dialog::WalletDialogExt as _;
 use ui::{icons, theme};
 use wallet_ops::vault::{SoftwareContextSyncIntent, WalletMetadataBundle};
 use zeroize::Zeroizing;
@@ -69,7 +70,7 @@ impl OpenPassphraseWalletAuthorizationUi {
         let dialog_content = content.clone();
         let dialog_width = (window.viewport_size().width * 0.92).min(px(420.0));
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, _cx| {
             let identity = Rc::downgrade(&lease);
             dialog
                 .w(dialog_width)

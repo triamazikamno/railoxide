@@ -12,6 +12,7 @@ use gpui_component::{
 use tokio::sync::watch;
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{app_button, app_button_base, app_muted_text, app_strong_text};
+use ui::dialog::WalletDialogExt as _;
 use ui::theme;
 use wallet_ops::{
     DesktopSelfBroadcastResult, PublicBroadcasterCostEstimate, PublicBroadcasterResultKind,
@@ -426,7 +427,7 @@ impl WalletRoot {
             (viewport_size.width * 0.92).min(PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH);
         let dialog_max_height = viewport_size.height * 0.84;
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             // A public broadcaster submission's route chip ends the title, which truncates
@@ -967,7 +968,7 @@ impl WalletRoot {
         let dialog_width =
             (window.viewport_size().width * 0.92).min(SELF_BROADCAST_GAS_RETRY_DIALOG_WIDTH);
         let dialog_max_height = dialog_max_height(window);
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, _cx| {
             let submit_content = content.clone();
             dialog
                 .on_ok(move |_event, window, cx| {

@@ -54,7 +54,7 @@ class ExtensionPackagingTests(unittest.TestCase):
                 (wasm_directory / f'{crate}.wasm').write_bytes(b'\0asm\1\0\0\0')
             metadata = {
                 'packages': [
-                    {'id': 'kit', 'name': 'gpui-kit-assets', 'version': '0.7.3',
+                    {'id': 'kit', 'name': 'gpui-kit-assets', 'version': '0.9.0',
                      'manifest_path': str(kit / 'Cargo.toml')},
                     {'id': 'protocol', 'name': 'dapp-gateway-protocol', 'version': '0.1.0',
                      'manifest_path': str(root / 'Cargo.toml'), 'license': 'MIT'},
@@ -167,7 +167,7 @@ class SourceBuildTests(unittest.TestCase):
         self.env.pop('CARGO_TOOLCHAIN', None)
         self.env.pop('CARGO_BIN', None)
         self.env.pop('RAILOXIDE_EXTENSION_BUNDLE', None)
-        self.write_tool('wasm-bindgen', "print('wasm-bindgen 0.2.126')")
+        self.write_tool('wasm-bindgen', "print('wasm-bindgen 0.2.127')")
         self.write_tool('cargo', '''
 import json, os, pathlib, sys
 args = sys.argv[1:]

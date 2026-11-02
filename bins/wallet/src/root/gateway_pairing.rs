@@ -18,6 +18,7 @@ use gpui_component::{
 };
 use gpui_kit::base::OtpInput;
 use ui::controls::{app_button, app_muted_text, app_strong_text, app_text};
+use ui::dialog::WalletDialogExt as _;
 use ui::theme::APP_MONO_FONT_FAMILY;
 use wallet_ops::gateway::{GatewayPairingOffer, GatewaySnapshot, PeerId};
 
@@ -53,7 +54,7 @@ impl WalletRoot {
         let lease = Rc::new(());
         let identity = Rc::downgrade(&lease);
         let root = cx.entity();
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, window, cx| {
             // Programmatic closes bypass on_close. Only this builder retains the lease.
             let identity = Rc::downgrade(&lease);
             let current = root.read(cx);

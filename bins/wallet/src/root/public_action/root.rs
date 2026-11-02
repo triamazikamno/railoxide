@@ -1,4 +1,5 @@
 use super::*;
+use ui::dialog::WalletDialogExt as _;
 
 impl WalletRoot {
     /// After a Public action succeeds, only the account that submitted it changed.
@@ -45,7 +46,7 @@ impl WalletRoot {
             asset,
             Some(&self.effective_token_registry),
         );
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
@@ -1615,7 +1616,7 @@ impl WalletRoot {
         let dialog_width = (viewport_size.width * 0.92).min(PUBLIC_ACTION_DIALOG_WIDTH);
         let dialog_max_height = viewport_size.height * 0.84;
         let content_width = secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
@@ -1870,7 +1871,7 @@ impl WalletRoot {
         });
         let dialog_width = (window.viewport_size().width * 0.92).min(px(460.0));
         let dialog_max_height = dialog_max_height(window);
-        window.open_dialog(cx, move |dialog, _window, _cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, _cx| {
             let submit_content = content.clone();
             dialog
                 .on_ok(move |_event, window, cx| {

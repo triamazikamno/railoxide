@@ -5,6 +5,7 @@ use super::{
 use railgun_ui::chain_editor::{
     ChainDraft, ChainEditorCommand, ChainEditorSnapshot, NativeUsdProbe,
 };
+use ui::dialog::WalletDialogExt as _;
 use wallet_ops::settings::{
     SettingsRevision, chain_editor_mutation, chain_editor_probe_chain, chain_editor_snapshot,
     commit_wallet_settings, editor_chain_id, settings_revision,
@@ -30,7 +31,7 @@ impl super::WalletRoot {
         let dialog_editor = editor.clone();
         let width = (window.viewport_size().width * 0.92).min(window.rem_size() * 40.0);
         let height = (window.viewport_size().height * 0.65).min(window.rem_size() * 28.0);
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_wallet_dialog(cx, move |dialog, _, _| {
             dialog.title("Chain settings").w(width).child(
                 // The list renders at its natural height, so the dialog body scrolls it.
                 div()

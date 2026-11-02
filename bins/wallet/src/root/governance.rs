@@ -35,6 +35,7 @@ use ui::controls::{
     app_button, app_button_base, app_button_label, app_input, app_muted_text, app_strong_text,
     app_text,
 };
+use ui::dialog::WalletDialogExt as _;
 use ui::format::format_compact_duration;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 use wallet_ops::{
@@ -2412,7 +2413,7 @@ impl WalletRoot {
         let dialog_width = (window.viewport_size().width * 0.92).min(px(440.0));
         let dialog_max_height = super::dialog_max_height(window);
         let content_width = super::secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog
@@ -2511,7 +2512,7 @@ impl WalletRoot {
         });
         let dialog_max_height = super::dialog_max_height(window);
         let content_width = super::secondary_dialog_content_width(dialog_width);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let close_root = root.clone();
             let content_root = root.clone();
             dialog

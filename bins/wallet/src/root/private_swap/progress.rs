@@ -22,6 +22,7 @@ use ui::clipboard::clipboard_with_toast;
 use ui::controls::{
     app_button, app_button_base, app_muted_shimmer_text, app_muted_text, app_strong_text, app_text,
 };
+use ui::dialog::WalletDialogExt as _;
 use ui::theme;
 use wallet_ops::{
     DesktopPrivateSpendAuthorization, ExecutorAsset, ExecutorPaidRecoveryRequest,
@@ -2710,7 +2711,7 @@ impl PrivateSwapsView {
             .is_some_and(|job| job.operation == operation && job.kind == SwapJobKind::Setup)
             .then_some(self.job_revision);
         let view = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |dialog, _, _| {
+        window.open_wallet_alert_dialog(cx, move |dialog, _, _| {
             let view = view.clone();
             dialog
                 .title(app_strong_text("Cancel this swap's preparation?"))
@@ -3244,7 +3245,7 @@ impl PrivateSwapsView {
             "Cancelling now costs about {fee} through a broadcaster. {wait} Anyone can trigger the swap's unshield before expiry. If the order then doesn't fill, recovery costs an unshield fee and a shield fee."
         ));
         let view = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |dialog, window, _cx| {
+        window.open_wallet_alert_dialog(cx, move |dialog, window, _cx| {
             let confirm_view = view.clone();
             let cancel_view = view.clone();
             let width =

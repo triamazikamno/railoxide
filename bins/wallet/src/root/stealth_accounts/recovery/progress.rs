@@ -1,6 +1,7 @@
 use super::*;
 use gpui_component::{Sizable as _, WindowExt as _};
 use tokio::sync::watch;
+use ui::dialog::WalletDialogExt as _;
 use wallet_ops::PublicActionProgressStatus;
 
 use crate::root::{
@@ -311,7 +312,7 @@ impl StealthAccountsView {
         progress.open = true;
         let revision = progress.revision;
         let view = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, window, cx| {
             let width = (window.viewport_size().width * 0.92)
                 .min(PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH);
             let content = view

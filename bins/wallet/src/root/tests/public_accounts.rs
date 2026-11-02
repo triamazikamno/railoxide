@@ -987,7 +987,7 @@ fn wallet_view_shortcuts_switch_tabs_and_open_selectors_outside_dialogs(cx: &mut
 
     // A modal dialog owns focus, so the wallet view shortcuts must not act behind it.
     cx.update(|window, cx| {
-        gpui_component::WindowExt::open_dialog(window, cx, |dialog, _, _| dialog);
+        ui::dialog::WalletDialogExt::open_wallet_dialog(window, cx, |dialog, _, _| dialog);
         window.draw(cx).clear(cx);
     });
     cx.simulate_keystrokes("ctrl-tab");
@@ -1282,7 +1282,7 @@ fn network_status_stays_reachable_above_dialogs(cx: &mut TestAppContext) {
             .map(|value| cx.new(|cx| InputState::new(window, cx).default_value(value)));
         for (ix, input) in inputs.iter().enumerate() {
             let input = input.clone();
-            gpui_component::WindowExt::open_dialog(window, cx, move |dialog, _, _| {
+            ui::dialog::WalletDialogExt::open_wallet_dialog(window, cx, move |dialog, _, _| {
                 dialog.child(Input::new(&input)).child(
                     div()
                         .debug_selector(move || format!("test-dialog-{ix}"))

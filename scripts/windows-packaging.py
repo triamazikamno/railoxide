@@ -98,8 +98,8 @@ def build_extension(cargo):
     bindgen = shutil.which('wasm-bindgen')
     if bindgen is None or subprocess.run(
         [bindgen, '--version'], capture_output=True, text=True,
-    ).stdout.strip() != 'wasm-bindgen 0.2.126':
-        raise PackagingError('expected exactly wasm-bindgen 0.2.126 on PATH; see docs/browser-extension.md')
+    ).stdout.strip() != 'wasm-bindgen 0.2.127':
+        raise PackagingError('expected exactly wasm-bindgen 0.2.127 on PATH; see docs/browser-extension.md')
     # wasm_thread requires the unstable stdarch_wasm_atomic_wait feature on WASM.
     run(
         cargo + ['build', '-p', 'browser-frontend', '-p', 'dapp-gateway-protocol',

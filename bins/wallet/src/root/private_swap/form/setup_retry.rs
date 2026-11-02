@@ -13,6 +13,7 @@ use crate::root::private_swap::model::{
 use crate::root::private_swap::progress::{fact_row, stealth_account};
 use crate::root::private_swap::sets_up_destination;
 use crate::root::private_swap::ui_fixture;
+use ui::dialog::WalletDialogExt as _;
 
 /// What a retry says once its setup is confirmed, included, stopped or already being sent.
 const SETUP_RETRY_UNAVAILABLE: &str = "This setup can't be sent again now.";
@@ -269,7 +270,7 @@ impl PrivateSwapsView {
         let width =
             (window.viewport_size().width * 0.92).min(SELF_BROADCAST_GAS_RETRY_DIALOG_WIDTH);
         let max_height = dialog_max_height(window);
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _, cx| {
             let (continue_view, close_view) = (view.clone(), view.clone());
             let content = view
                 .update(cx, |view, cx| view.render_setup_retry(cx))

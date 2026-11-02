@@ -21,6 +21,7 @@ use ui::controls::{
     app_button, app_button_base, app_button_label, app_input, app_masked_input, app_muted_text,
     app_strong_text,
 };
+use ui::dialog::WalletDialogExt as _;
 #[cfg(feature = "hardware")]
 use ui::theme::APP_MONO_FONT_FAMILY;
 use ui::theme::{self, APP_TEXT_SIZE};
@@ -186,7 +187,7 @@ impl WalletRoot {
         let settings_error = self.settings_error.clone();
         let root = cx.entity();
         let data_folder = data_folder_path(&self.options.db_path);
-        window.open_dialog(cx, move |dialog, _window, cx| {
+        window.open_wallet_dialog(cx, move |dialog, _window, cx| {
             let content = if let Some(editor) = editor.clone() {
                 div()
                     .h(content_height)

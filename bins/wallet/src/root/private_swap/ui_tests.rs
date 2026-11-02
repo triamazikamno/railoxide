@@ -7,6 +7,7 @@ use gpui::{IntoElement, ParentElement, Render, Styled, TestAppContext, div};
 use gpui_component::{Root, WindowExt};
 use std::cell::Cell;
 use std::rc::Rc;
+use ui::dialog::WalletDialogExt as _;
 use wallet_ops::vault::ExecutorStore;
 
 /// Mount the root as an entity, as startup does. Calling its render helper through
@@ -30,7 +31,7 @@ fn swap_cost_confirmation_wraps_and_is_cleared_when_terms_change(cx: &mut TestAp
             let swaps = swaps.clone();
             // Mount the production warning with an authorized-cost message. Quote creation is
             // exercised elsewhere; this checks the control and its consent lifetime.
-            window.open_dialog(cx, move |dialog, _, cx| {
+            window.open_wallet_dialog(cx, move |dialog, _, cx| {
                 let warning = swaps.update(cx, |swaps, cx| {
                     PrivateSwapsView::render_cost_acknowledgement(
                         swaps.form.as_ref().unwrap(),
@@ -128,7 +129,7 @@ fn swap_max_starts_a_quote_for_the_exact_available_amount(cx: &mut TestAppContex
             window.close_all_dialogs(cx);
             let swaps = swaps.clone();
             // Feed the real Sell panel a spendable balance without starting private sync.
-            window.open_dialog(cx, move |dialog, _, cx| {
+            window.open_wallet_dialog(cx, move |dialog, _, cx| {
                 let panel = swaps.update(cx, |swaps, cx| {
                     swaps.render_sell_panel(
                         swaps.form.as_ref().unwrap(),
@@ -603,7 +604,7 @@ fn private_swap_progress_preserves_other_dialogs_and_can_restart_a_retired_setup
         let rendered = Rc::new(Cell::new(false));
         cx.update(|window, cx| {
             let rendered = rendered.clone();
-            window.open_dialog(cx, move |dialog, _, _| {
+            window.open_wallet_dialog(cx, move |dialog, _, _| {
                 rendered.set(true);
                 dialog.title("Unrelated form").child("Keep this form open")
             });
@@ -4044,7 +4045,7 @@ fn place_order_keeps_progress_visible_while_checking_terms_and_after_failure(
         // Another dialog can open while the request is in flight. It must keep focus
         // and remain open, even when this swap's progress is still underneath it.
         cx.update(|window, cx| {
-            window.open_dialog(cx, |dialog, _, _| dialog.title("Unrelated form"));
+            window.open_wallet_dialog(cx, |dialog, _, _| dialog.title("Unrelated form"));
             let focus = window.focused(cx);
             swaps.update(cx, |swaps, cx| {
                 swaps.apply_approved_quote(

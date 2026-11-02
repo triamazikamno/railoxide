@@ -12,9 +12,10 @@ use gpui::{
     App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, SharedString,
     Styled as _, Task, WeakEntity, Window, div, prelude::FluentBuilder as _, px, rgb,
 };
-use gpui_component::{Disableable as _, Sizable as _, WindowExt as _, button::ButtonVariants as _};
+use gpui_component::{Disableable as _, Sizable as _, button::ButtonVariants as _};
 use railgun_ui::short_address;
 use ui::controls::{app_button, app_muted_text, app_strong_text, app_text};
+use ui::dialog::WalletDialogExt as _;
 use ui::theme;
 use wallet_ops::{
     ExecutorInputLock, ExecutorInputLockKind, ExecutorInputLockReason, LockedNotes,
@@ -40,7 +41,7 @@ pub(super) fn open_locked_notes_dialog(
     cx: &mut App,
 ) {
     let view = cx.new(|cx| LockedNotesView::new(root, session, runtime, cx));
-    window.open_dialog(cx, move |dialog, window, _| {
+    window.open_wallet_dialog(cx, move |dialog, window, _| {
         let width =
             (window.viewport_size().width * 0.92).min(PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH);
         dialog
