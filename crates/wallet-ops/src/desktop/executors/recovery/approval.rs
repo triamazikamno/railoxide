@@ -299,7 +299,7 @@ mod tests {
                 reliability: 1.0,
                 available_wallets: 1,
                 version: "8.3.0".into(),
-                relay_adapt: Address::ZERO,
+                relay_adapt: None,
                 relay_adapt_7702: Some(Address::repeat_byte(3)),
                 required_poi_list_keys: Vec::new(),
                 viewing_public_key: [4; 32],

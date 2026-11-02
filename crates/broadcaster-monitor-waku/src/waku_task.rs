@@ -753,7 +753,7 @@ mod tests {
             .expect("test Railgun address"),
             available_wallets: 1,
             version: "8.2.3".to_string(),
-            relay_adapt: address!("0000000000000000000000000000000000000002"),
+            relay_adapt: Some(address!("0000000000000000000000000000000000000002")),
             relay_adapt_7702: None,
             required_poi_list_keys: (0..poi_list_key_count)
                 .map(|i| format!("poi-list-{i}"))
@@ -933,7 +933,7 @@ mod tests {
             fee_expiration,
             available_wallets: 1,
             version: Arc::from("8.2.3"),
-            relay_adapt: address!("0000000000000000000000000000000000000002"),
+            relay_adapt: Some(address!("0000000000000000000000000000000000000002")),
             relay_adapt_7702: None,
             required_poi_list_keys: Vec::new(),
             identifier: None,

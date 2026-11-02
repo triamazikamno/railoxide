@@ -702,7 +702,7 @@ async fn hardware_executor_recovery_consumes_approval_and_preserves_signed_histo
         reliability: 1.0,
         available_wallets: 1,
         version: "test".into(),
-        relay_adapt: record.delegate(),
+        relay_adapt: Some(record.delegate()),
         relay_adapt_7702: Some(earlier),
         required_poi_list_keys: Vec::new(),
         viewing_public_key: address_data.viewing_public_key,

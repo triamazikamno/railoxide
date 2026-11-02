@@ -154,7 +154,7 @@ pub(in crate::root) fn fee_row(chain_id: u64, token: Address, fees_id: &str) -> 
         fee_expiration: SystemTime::now() + Duration::from_mins(1),
         available_wallets: 1,
         version: Arc::from("8.2.3"),
-        relay_adapt: Address::ZERO,
+        relay_adapt: None,
         relay_adapt_7702: None,
         required_poi_list_keys: Vec::new(),
         identifier: Some(Arc::from(fees_id)),

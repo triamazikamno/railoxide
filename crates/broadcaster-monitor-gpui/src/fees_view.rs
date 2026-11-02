@@ -1104,7 +1104,7 @@ mod tests {
             fee_expiration: SystemTime::now(),
             available_wallets: 1,
             version: Arc::from("8.2.3"),
-            relay_adapt: address!("0000000000000000000000000000000000000002"),
+            relay_adapt: Some(address!("0000000000000000000000000000000000000002")),
             relay_adapt_7702: None,
             required_poi_list_keys: Vec::new(),
             identifier: identifier.map(Arc::from),

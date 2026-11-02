@@ -1628,7 +1628,7 @@ fn public_broadcaster_transact_payload_includes_single_chunk_poi() {
     let params = public_broadcaster_transact_params(
         &candidate,
         TransactionRequest::default()
-            .to(candidate.relay_adapt)
+            .to(candidate.relay_adapt.expect("fixture relay adapt"))
             .input(call.abi_encode().into()),
         20_000_000_000,
         sample_poi_map(&required_keys, &[txid_leaf]),
@@ -2159,7 +2159,7 @@ mod submission_nodes {
         submit_public_broadcaster_transaction(
             waku,
             TransactionRequest::default()
-                .to(broadcaster.relay_adapt)
+                .to(broadcaster.relay_adapt.expect("fixture relay adapt"))
                 .input(Bytes::from_static(&[1, 2, 3]).into()),
             BTreeMap::default(),
             broadcaster,

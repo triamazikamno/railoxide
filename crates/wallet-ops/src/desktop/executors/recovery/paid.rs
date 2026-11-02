@@ -71,7 +71,7 @@ impl ExecutorRecoveryFeeEstimate {
                 reliability: 0.9,
                 available_wallets: 1,
                 version: "8.2.3".to_owned(),
-                relay_adapt: Address::ZERO,
+                relay_adapt: None,
                 relay_adapt_7702: Some(delegate),
                 required_poi_list_keys: Vec::new(),
                 viewing_public_key: [1; 32],

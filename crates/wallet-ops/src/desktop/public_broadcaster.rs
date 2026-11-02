@@ -16,7 +16,7 @@ pub struct PublicBroadcasterCandidate {
     pub reliability: f64,
     pub available_wallets: u32,
     pub version: String,
-    pub relay_adapt: Address,
+    pub relay_adapt: Option<Address>,
     pub relay_adapt_7702: Option<Address>,
     pub required_poi_list_keys: Vec<String>,
     pub viewing_public_key: [u8; 32],
