@@ -79,6 +79,18 @@ trustless-artifacts = { git = "https://github.com/triamazikamno/railgun-rust", r
 waku = { git = "https://github.com/triamazikamno/railgun-rust", rev = "c7057b0ecd315492e8fc628e8fa0ac5dddccdd98" }
 waku-relay = { git = "https://github.com/triamazikamno/railgun-rust", rev = "c7057b0ecd315492e8fc628e8fa0ac5dddccdd98" }
 
+[patch."https://github.com/triamazikamno/railgun-rust"]
+broadcaster-core = { path = "../railgun-rust/crates/core" }
+local-db = { path = "../railgun-rust/crates/local-db" }
+merkletree = { path = "../railgun-rust/crates/merkletree" }
+poi = { path = "../railgun-rust/crates/poi" }
+public-broadcaster-protocol = { path = "../railgun-rust/crates/public-broadcaster-protocol" }
+railgun-wallet = { path = "../railgun-rust/crates/railgun-wallet" }
+sync-service = { path = "../railgun-rust/crates/sync-service" }
+trustless-artifacts = { path = "../railgun-rust/crates/trustless-artifacts" }
+waku = { path = "../railgun-rust/crates/waku" }
+waku-relay = { path = "../railgun-rust/crates/waku-relay" }
+
 [profile.release]
 opt-level = 3
 lto = "thin"
