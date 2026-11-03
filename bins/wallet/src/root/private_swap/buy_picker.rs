@@ -195,7 +195,7 @@ impl NetworkAvailability {
                 "Private balance needs private funds on {network} for the setup fee. {elsewhere}"
             ),
             Self::Unavailable(NetworkUnavailable::SetupFee) => format!(
-                "Couldn't check the setup fee on {network}. Retrying, or use Public address."
+                "Couldn't check your private funds on {network} for the setup fee yet. Retrying…"
             ),
             Self::Unavailable(NetworkUnavailable::NoBridge) => format!(
                 "No bridge serves {network} from this network. Pick a token on another network."
@@ -404,6 +404,13 @@ impl BuyPicker {
     }
 
     #[cfg(test)]
+    pub(super) fn funding_failed_for_tests(&self, network: u64) -> bool {
+        self.funding
+            .get(&network)
+            .is_some_and(|funding| funding.retry)
+    }
+
+    #[cfg(test)]
     pub(super) fn expire_funding_for_tests(&mut self, network: u64) {
         let funding = self.funding.get_mut(&network).unwrap();
         assert!(funding.task.is_none());
@@ -449,10 +456,17 @@ impl FundingInputs {
     }
 }
 
+/// How long a network's funding check stands before the form's live updates run it again.
+const FUNDING_FRESH: Duration = Duration::from_secs(30);
+/// How soon a check that couldn't run is tried again.
+const FUNDING_RETRY: Duration = Duration::from_secs(10);
+
 struct NetworkFunding {
     inputs: FundingInputs,
     checked_at: Instant,
     availability: NetworkAvailability,
+    /// The last check couldn't run, so it runs again after [`FUNDING_RETRY`].
+    retry: bool,
     task: Option<Task<()>>,
 }
 
@@ -582,9 +596,13 @@ impl PrivateSwapsView {
                 .as_ref()
                 .and_then(|form| form.picker.funding.get(&network));
             if previous.is_some_and(|funding| {
+                let fresh = if funding.retry {
+                    FUNDING_RETRY
+                } else {
+                    FUNDING_FRESH
+                };
                 funding.inputs.matches(&inputs)
-                    && (funding.task.is_some()
-                        || funding.checked_at.elapsed() < Duration::from_secs(30))
+                    && (funding.task.is_some() || funding.checked_at.elapsed() < fresh)
             }) {
                 continue;
             }
@@ -614,7 +632,22 @@ impl PrivateSwapsView {
                         .as_mut()
                         .and_then(|form| form.picker.funding.get_mut(&network))
                     {
-                        funding.availability = availability;
+                        // A check that couldn't run keeps the last answer for the same funds,
+                        // so a network hiccup doesn't drop a quote. Review estimates again.
+                        let failed = availability
+                            == NetworkAvailability::Unavailable(NetworkUnavailable::SetupFee);
+                        if !failed
+                            || !matches!(
+                                funding.availability,
+                                NetworkAvailability::Available
+                                    | NetworkAvailability::Unavailable(
+                                        NetworkUnavailable::Unfunded
+                                    )
+                            )
+                        {
+                            funding.availability = availability;
+                        }
+                        funding.retry = failed;
                         funding.checked_at = Instant::now();
                         funding.task = None;
                         cx.notify();
@@ -628,6 +661,7 @@ impl PrivateSwapsView {
                         inputs,
                         checked_at: Instant::now(),
                         availability,
+                        retry: false,
                         task: Some(task),
                     },
                 );

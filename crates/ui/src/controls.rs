@@ -313,6 +313,17 @@ pub fn app_shimmer_text(label: impl Into<SharedString>) -> Div {
         .child(app_shimmer(label))
 }
 
+/// [`app_amount_text`], muted with a loading shimmer, for an amount being updated. The
+/// highlight can't show on full-strength text.
+#[must_use]
+pub fn app_amount_shimmer_text(label: impl Into<SharedString>) -> Div {
+    div()
+        .text_size(AMOUNT_PANEL_TEXT_SIZE)
+        .line_height(relative(APP_TEXT_LINE_HEIGHT))
+        .text_color(rgb(theme::TEXT_MUTED))
+        .child(app_shimmer(label))
+}
+
 /// [`app_muted_text`] with a loading shimmer, for a wait under way.
 #[must_use]
 pub fn app_muted_shimmer_text(label: impl Into<SharedString>) -> Div {

@@ -40,9 +40,9 @@ use gpui_component::{
 };
 use ui::clipboard::{clipboard_with_toast, copy_to_clipboard_with_toast};
 use ui::controls::{
-    amount_max_button, app_amount_input, app_amount_text, app_button, app_button_base,
-    app_button_label, app_input, app_muted_shimmer_text, app_muted_text, app_segment_button,
-    app_shimmer_text, app_strong_text, app_text,
+    amount_max_button, app_amount_input, app_amount_shimmer_text, app_amount_text, app_button,
+    app_button_base, app_button_label, app_input, app_muted_shimmer_text, app_muted_text,
+    app_segment_button, app_shimmer_text, app_strong_text, app_text,
 };
 use ui::hint::hint_card;
 use ui::recipient_picker::RecipientPickerEvent;
@@ -198,6 +198,8 @@ const DESTINATION_AUTHORIZATION_MISSING: &str =
 /// wouldn't ask for less than the open one.
 const SPEED_UP_NOT_LOWER: &str =
     "This doesn't lower the open order's minimum, so it wouldn't speed the swap up.";
+/// Review…'s tooltip while the form has no quote; the line under the Buy amount says why.
+const NO_QUOTE_YET: &str = "Get a quote first. The line under the Buy amount says what it needs.";
 /// A speed-up review's note on the order it leaves in place.
 const SPEED_UP_STAYS_LIVE: &str =
     "The open order stays live until the new order invalidates it, or until it fills or expires.";
@@ -967,6 +969,14 @@ impl SetupRoute {
         })
     }
 
+    /// An estimate is under way, or the one on screen is for an offer its broadcaster no longer
+    /// makes, so a review can't approve it yet.
+    fn estimate_pending(&self) -> bool {
+        self.estimate_error.is_none()
+            && (self.estimate_task.is_some()
+                || (self.estimate.is_some() && self.offered_estimate().is_none()))
+    }
+
     /// The route holds a fee token, its options or an estimate, as one that is in use does.
     const fn is_used(&self) -> bool {
         self.fee_token.is_some()
@@ -1124,8 +1134,8 @@ enum ReceiveTo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DeliveryProblem {
     /// The form's network, kept when Receive to changed, can't take Private balance; the line
-    /// under Receive to says why. While it is `syncing`, the wallet's sync there may still
-    /// resolve it.
+    /// under Receive to says why. While it is `syncing`, the wallet's sync or setup-fee check
+    /// there may still resolve it.
     Network {
         problem: SharedString,
         syncing: bool,
@@ -1525,6 +1535,11 @@ impl SwapForm {
         strip_review(self, review).gas_share_bps() != review.gas_share_bps()
     }
 
+    /// The bridge leg is being quoted again at the pending share, so the amounts it sets shimmer.
+    fn bridge_refreshing(&self, review: &Arc<SwapReview>) -> bool {
+        self.gas_share_pending(review) && self.bridge_quote_error.is_none()
+    }
+
     /// `review` can't support the form's share and was priced at Tight instead. The user
     /// didn't choose that share, so the card selects no preset and shows no minimum, and
     /// [`Self::review_problem`] refuses the review until a share the quote supports is chosen.
@@ -1626,7 +1641,8 @@ impl SwapForm {
         )
     }
 
-    fn review_problem(&self, review: &Arc<SwapReview>) -> Option<SharedString> {
+    /// Why the form's delivery can't be quoted or reviewed.
+    fn delivery_problem(&self) -> Option<SharedString> {
         match &self.delivery {
             Err(
                 DeliveryProblem::Network { problem, .. }
@@ -1634,6 +1650,13 @@ impl SwapForm {
                 | DeliveryProblem::Account(problem),
             ) => Some(problem.clone()),
             Err(DeliveryProblem::Bridge) => Some("Choose a token the bridge delivers.".into()),
+            Ok(_) => None,
+        }
+    }
+
+    fn review_problem(&self, review: &Arc<SwapReview>) -> Option<SharedString> {
+        match &self.delivery {
+            Err(_) => self.delivery_problem(),
             Ok(delivery) if *delivery != review.plan().delivery() => {
                 Some("Wait for the quote.".into())
             }
@@ -5381,7 +5404,9 @@ impl PrivateSwapsView {
                     problem: problem.into(),
                     syncing: matches!(
                         availability,
-                        NetworkAvailability::Syncing(_) | NetworkAvailability::CheckingFee
+                        NetworkAvailability::Syncing(_)
+                            | NetworkAvailability::CheckingFee
+                            | NetworkAvailability::Unavailable(NetworkUnavailable::SetupFee)
                     ),
                 });
             }
@@ -10464,6 +10489,31 @@ impl PrivateSwapsView {
         }
     }
 
+    /// A setup fee the form's review needs is being estimated, or its offer changed.
+    fn setup_estimate_pending(&self, form: &SwapForm) -> bool {
+        [SetupSide::Origin, SetupSide::Destination]
+            .into_iter()
+            .any(|side| {
+                self.setup_chain(form, side).is_some() && form.setup_route(side).estimate_pending()
+            })
+    }
+
+    /// The line under a private swap's stealth accounts: the setup fees, or why an order waits
+    /// for its destination account, which isn't confirmed as set up.
+    fn render_setup_line(&self, form: &SwapForm, cx: &App) -> gpui::Div {
+        if !self.reviews_setup(form)
+            && let Some(problem) = self.destination_order_problem(form)
+        {
+            let retry = matches!(
+                self.reserved_destination_progress(form),
+                Some(SwapSetupProgress::NotSent | SwapSetupProgress::Failed)
+            );
+            return setup_fee_line(problem, retry, !retry);
+        }
+        let (line, problem) = self.setup_line(form, cx);
+        setup_fee_line(line, problem, self.setup_estimate_pending(form))
+    }
+
     /// Where `route`'s estimate stands while it has none, and whether that is a problem the
     /// user has to solve. A private Bridge swap names `network`, the route's own.
     fn setup_status(
@@ -10635,32 +10685,15 @@ impl PrivateSwapsView {
         cx: &Context<'_, Self>,
     ) -> gpui::AnyElement {
         let busy = self.busy();
-        let quoted = match &form.quote {
-            QuoteState::Ready(review) => form.review_problem(review).is_none(),
-            _ => false,
-        };
         match mode {
             FormMode::Setup { .. } | FormMode::SettingUp | FormMode::Order => {
-                // A review that also approves a setup needs that setup's fee: of each account
-                // the swap sets up, and of none for an existing account.
-                let ready = if self.reviews_setup(form) {
-                    quoted
-                        && [SetupSide::Origin, SetupSide::Destination]
-                            .into_iter()
-                            .all(|side| {
-                                self.setup_chain(form, side).is_none()
-                                    || form.setup_route(side).offered_estimate().is_some()
-                            })
-                } else {
-                    mode == FormMode::Order
-                        && quoted
-                        && self.destination_order_problem(form).is_none()
-                };
+                let blocker = self.review_blocker(form, mode, cx);
                 app_button("swap-form-review", "Review…")
                     .primary()
                     .flex_none()
                     .loading(busy)
-                    .disabled(busy || !ready)
+                    .disabled(busy || blocker.is_some())
+                    .when_some(blocker.filter(|_| !busy), Button::tooltip)
                     .on_click(cx.listener(|this, _, window, cx| this.form_primary(window, cx)))
                     .into_any_element()
             }
@@ -10676,6 +10709,46 @@ impl PrivateSwapsView {
                     .into_any_element()
             }
         }
+    }
+
+    /// Why Review… is off in `mode`, which its tooltip gives, or `None` when the review can
+    /// open. A review that also approves a setup needs that setup's fee: of each account the
+    /// swap sets up, and of none for an existing account.
+    fn review_blocker(&self, form: &SwapForm, mode: FormMode, cx: &App) -> Option<SharedString> {
+        let QuoteState::Ready(review) = &form.quote else {
+            return Some(form.delivery_problem().unwrap_or_else(|| {
+                if matches!(form.quote, QuoteState::Loading) {
+                    "Wait for the quote.".into()
+                } else {
+                    NO_QUOTE_YET.into()
+                }
+            }));
+        };
+        if let Some(problem) = form.review_problem(review) {
+            return Some(problem);
+        }
+        if self.reviews_setup(form) {
+            return [SetupSide::Origin, SetupSide::Destination]
+                .into_iter()
+                .find_map(|side| {
+                    let chain_id = self.setup_chain(form, side)?;
+                    let route = form.setup_route(side);
+                    if route.offered_estimate().is_some() {
+                        return None;
+                    }
+                    let network = network_name(chain_id);
+                    let (status, problem) = self.setup_status(route, side, Some(chain_id), cx);
+                    Some(if problem {
+                        format!("Setup on {network}: {status}").into()
+                    } else {
+                        format!("Wait for the setup fee on {network}.").into()
+                    })
+                });
+        }
+        if mode != FormMode::Order {
+            return Some("Wait for the stealth account's setup to be confirmed.".into());
+        }
+        self.destination_order_problem(form).map(Into::into)
     }
 
     /// The Sell panel: the amount, its token, what's available, and the amount-reduction
@@ -10842,6 +10915,9 @@ impl PrivateSwapsView {
             let strip = public_strip(form);
             // A quote that fell back from the form's share has no minimum the user chose.
             let fallback = strip.is_some_and(|strip| strip.share_bps != form.gas_share_bps);
+            // A minimum at a new share is priced locally until the bridge leg is previewed again.
+            let refreshing =
+                strip.is_some_and(|strip| strip.pending()) && form.bridge_quote_error.is_none();
             // An order's minimum at the share the strip shows, as it arrives on its network.
             // A deposit's amount is exact.
             let review = public.review.as_ref().filter(|_| !fallback);
@@ -10921,6 +10997,9 @@ impl PrivateSwapsView {
                         .gap_2()
                         .child(
                             div().flex_1().min_w_0().child(match amount {
+                                Some(amount) if refreshing => {
+                                    app_amount_shimmer_text(amount).min_w_0().truncate()
+                                }
                                 Some(amount) => app_amount_text(amount).min_w_0().truncate(),
                                 None => app_amount_text(if fallback { "—" } else { "0" })
                                     .text_color(rgb(theme::TEXT_SUBTLE)),
@@ -10979,6 +11058,7 @@ impl PrivateSwapsView {
             let minimum = strip_review(form, review).suggested_private_minimum();
             self.strip_amount(form, review, StripScale::of(review).show(minimum), cx)
         });
+        let refreshing = review.is_some_and(|review| form.bridge_refreshing(review));
         // A quote's amount is a minimum, which the label says, so the amount starts at the
         // panel's edge like the Sell amount. The form has no other network control, so the
         // label names the network the Buy asset is delivered on.
@@ -11016,6 +11096,9 @@ impl PrivateSwapsView {
                     .gap_2()
                     .child(
                         div().flex_1().min_w_0().child(match amount {
+                            Some(amount) if refreshing => {
+                                app_amount_shimmer_text(amount).min_w_0().truncate()
+                            }
                             Some(amount) => app_amount_text(amount).min_w_0().truncate(),
                             None => app_amount_text(if fallback { "—" } else { "0" })
                                 .text_color(rgb(theme::TEXT_SUBTLE)),
@@ -11687,7 +11770,7 @@ impl PrivateSwapsView {
             .children(refresh)
             .children(self.render_speed_up_minimums(form, review, shown, cx))
             .children(warning)
-            .children(self.render_source_return(review, cx))
+            .children(self.render_source_return(review, form.bridge_refreshing(review), cx))
     }
 
     /// Under a speed-up's Minimum controls: the open order's signed minimum beside the one the
@@ -12127,9 +12210,20 @@ impl PrivateSwapsView {
         ]
     }
 
-    fn render_source_return(&self, review: &SwapReview, cx: &App) -> Option<gpui::Div> {
+    fn render_source_return(
+        &self,
+        review: &SwapReview,
+        refreshing: bool,
+        cx: &App,
+    ) -> Option<gpui::Div> {
         let surplus = review.estimated_source_surplus()?;
         let token = review.plan().buy_token();
+        let value = self.with_usd(
+            format!("≈ {}", self.token_amount(token, surplus, cx)),
+            token,
+            surplus,
+            cx,
+        );
         Some(
             div()
                 .w_full()
@@ -12165,16 +12259,16 @@ impl PrivateSwapsView {
                                 .child(source_return_help(review)),
                         )
                         .child(
-                            app_text(self.with_usd(
-                                format!("≈ {}", self.token_amount(token, surplus, cx)),
-                                token,
-                                surplus,
-                                cx,
-                            ))
+                            if refreshing {
+                                app_muted_shimmer_text(value)
+                            } else {
+                                app_text(value)
+                            }
                             .flex_none(),
                         ),
                 )
                 .when_some(self.bridge_total_usd_value(review, cx), |row, total| {
+                    let total = format!("≈ {}", railgun_ui::format_usd_micro_value(total));
                     row.child(
                         div()
                             .w_full()
@@ -12183,10 +12277,11 @@ impl PrivateSwapsView {
                             .gap_2()
                             .debug_selector(|| "swap-total-received".into())
                             .child(app_text("Estimated total received"))
-                            .child(app_strong_text(format!(
-                                "≈ {}",
-                                railgun_ui::format_usd_micro_value(total)
-                            ))),
+                            .child(if refreshing {
+                                app_muted_shimmer_text(total).font_weight(FontWeight::MEDIUM)
+                            } else {
+                                app_strong_text(total)
+                            }),
                     )
                 }),
         )
@@ -13118,8 +13213,7 @@ impl PrivateSwapsView {
             FormMode::Setup { .. } | FormMode::Order
                 if self.reviews_setup(form) || reserved.is_some() =>
             {
-                let (line, problem) = self.setup_line(form, cx);
-                setup_fee_line(line, problem)
+                self.render_setup_line(form, cx)
             }
             FormMode::Order if form.reuse_account => self.render_reuse_warning(form),
             FormMode::Setup { .. } | FormMode::Order => {
@@ -13266,7 +13360,7 @@ impl PrivateSwapsView {
             (Err(DeliveryProblem::Account(problem)), _) => Some(
                 div()
                     .debug_selector(|| "swap-destination-account-problem".into())
-                    .child(setup_fee_line(problem.to_string(), true))
+                    .child(setup_fee_line(problem.to_string(), true, false))
                     .into_any_element(),
             ),
             (_, Some(account)) => Some(
@@ -13280,7 +13374,6 @@ impl PrivateSwapsView {
             ),
             _ => None,
         };
-        let (line, problem) = self.setup_line(form, cx);
         let setup = div()
             .w_full()
             .flex()
@@ -13290,7 +13383,7 @@ impl PrivateSwapsView {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(setup_fee_line(line, problem)),
+                    .child(self.render_setup_line(form, cx)),
             )
             .when(self.reviews_setup(form), |row| {
                 row.child(self.render_setup_settings(form, cx))
@@ -14699,9 +14792,13 @@ fn receive_to_problem(form: &SwapForm) -> Option<gpui::Div> {
 
 /// The line under the stealth account select while a setup is quoted. A `problem` the user has
 /// to solve is a danger Alert, like the one under Receive to.
-fn setup_fee_line(line: String, problem: bool) -> gpui::Div {
+/// A `pending` line shimmers: a fee being estimated, or a setup the order waits for.
+fn setup_fee_line(line: String, problem: bool, pending: bool) -> gpui::Div {
     if problem {
         return error_alert("swap-setup-problem", line);
+    }
+    if pending {
+        return app_muted_shimmer_text(line).text_xs().whitespace_normal();
     }
     app_muted_text(line).text_xs().whitespace_normal()
 }

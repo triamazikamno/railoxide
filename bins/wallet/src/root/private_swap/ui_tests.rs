@@ -6969,6 +6969,8 @@ fn private_bridge_quote_survives_background_funding_checks(cx: &mut TestAppConte
         Periodic,
         RenewedOffer,
         OtherTokenOffer(std::time::SystemTime),
+        /// A periodic check whose estimate can't reach the RPC.
+        FailedPeriodic,
     }
 
     let stubs = SwapStubs::start();
@@ -7073,8 +7075,21 @@ fn private_bridge_quote_survives_background_funding_checks(cx: &mut TestAppConte
                 Refresh::RenewedOffer,
                 Refresh::OtherTokenOffer(std::time::SystemTime::now() + Duration::from_secs(60)),
                 Refresh::OtherTokenOffer(std::time::UNIX_EPOCH),
+                Refresh::FailedPeriodic,
             ] {
+                let fails = matches!(refresh, Refresh::FailedPeriodic);
                 match refresh {
+                    Refresh::FailedPeriodic => {
+                        stubs.set_failing(&["/rpc"]);
+                        swaps.update(cx, |swaps, _| {
+                            swaps
+                                .form
+                                .as_mut()
+                                .unwrap()
+                                .picker
+                                .expire_funding_for_tests(137);
+                        });
+                    }
                     Refresh::Periodic => swaps.update(cx, |swaps, _| {
                         swaps
                             .form
@@ -7135,9 +7150,24 @@ fn private_bridge_quote_survives_background_funding_checks(cx: &mut TestAppConte
                     swaps.update(cx, |swaps, cx| {
                         swaps.refresh_destination_network(window, cx);
                         assert_same_quote(swaps);
+                        // A check that couldn't run keeps the last answer.
+                        assert_eq!(
+                            swaps
+                                .form
+                                .as_ref()
+                                .unwrap()
+                                .picker
+                                .funding_failed_for_tests(137),
+                            fails
+                        );
+                        assert_eq!(
+                            swaps.network_setup_availability(137, cx),
+                            NetworkAvailability::Available
+                        );
                     });
                 });
             }
+            stubs.set_failing(&[]);
             // A completed check that can no longer afford the fee must still stop review.
             offer.fee = U256::from(10).pow(U256::from(24));
             root.update(cx, |root, _| {

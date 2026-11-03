@@ -88,7 +88,7 @@ pub(super) struct PublicStrip {
 
 impl PublicStrip {
     /// The strip shows a share the bridge leg wasn't previewed at.
-    const fn pending(&self) -> bool {
+    pub(super) const fn pending(&self) -> bool {
         self.share_bps != self.reviewed_bps
     }
 }
@@ -3625,20 +3625,41 @@ impl PrivateSwapsView {
                             .tooltip("Copy address")
                     }))
             }));
-        let ready = review.is_some_and(|review| {
-            (review.price_verified() || form.price_acknowledged)
-                && (high_cost.is_none() || form.high_costs_acknowledged)
-                && !form.blocked_shield_unaccepted()
-                // Debug UI fixture: its stand-in setup fee needs no estimate.
-                && (self.destination_setup_chain(form).is_none()
-                    || form.destination_route.offered_estimate().is_some()
-                    || ui_fixture::active())
-        }) && !self
+        // Why Review… is off, which its tooltip gives.
+        let strip = public_strip(form);
+        let blocker: Option<SharedString> = if let Some(reason) = self
             .public_form_reason(form, cx)
-            .is_some_and(|reason| reason.blocks_review)
-            // A share the bridge leg wasn't previewed at, or one the quote can't support.
-            && !public_strip(form)
-                .is_some_and(|strip| strip.pending() || strip.share_bps != form.gas_share_bps);
+            .filter(|reason| reason.blocks_review)
+        {
+            Some(reason.text.into())
+        } else if let Some(review) = review {
+            if !review.price_verified() && !form.price_acknowledged {
+                Some("Accept the unverified price before you review the swap.".into())
+            } else if high_cost.is_some() && !form.high_costs_acknowledged {
+                Some("Confirm Swap anyway to accept the high swap costs.".into())
+            } else if form.blocked_shield_unaccepted() {
+                Some(BLOCKED_SHIELD_PROBLEM.into())
+            } else if let Some(chain_id) = self.destination_setup_chain(form).filter(|_| {
+                // Debug UI fixture: its stand-in setup fee needs no estimate.
+                form.destination_route.offered_estimate().is_none() && !ui_fixture::active()
+            }) {
+                Some(format!("Wait for the setup fee on {}.", network_name(chain_id)).into())
+            } else if strip.is_some_and(|strip| strip.pending()) {
+                Some(
+                    form.bridge_quote_error
+                        .clone()
+                        .unwrap_or_else(|| "Updating the bridge quote…".into()),
+                )
+            } else if strip.is_some_and(|strip| strip.share_bps != form.gas_share_bps) {
+                Some("Gas is too high for this swap right now.".into())
+            } else {
+                None
+            }
+        } else if matches!(form.quote, QuoteState::Loading) {
+            Some("Wait for the quote.".into())
+        } else {
+            Some(NO_QUOTE_YET.into())
+        };
         // Only an order is placed on CoW. A same-token deposit has no credit.
         let order = Self::public_form_path(form) != Some(PublicBridgePath::Deposit);
         let footer = div()
@@ -3669,7 +3690,8 @@ impl PrivateSwapsView {
                             .primary()
                             .flex_none()
                             .debug_selector(|| "public-swap-review".into())
-                            .disabled(self.busy() || !ready)
+                            .disabled(self.busy() || blocker.is_some())
+                            .when_some(blocker.filter(|_| !self.busy()), Button::tooltip)
                             .loading(self.public_job.is_some())
                             .on_click(cx.listener(|view, _, window, cx| {
                                 view.request_public_review(window, cx);
@@ -4528,6 +4550,7 @@ impl PrivateSwapsView {
                         network_name(setup.chain_id)
                     ),
                     false,
+                    false,
                 );
             }
             let (line, problem) = self.setup_line(form, cx);
@@ -4536,7 +4559,7 @@ impl PrivateSwapsView {
             } else {
                 line
             };
-            return setup_fee_line(line, problem);
+            return setup_fee_line(line, problem, self.setup_estimate_pending(form));
         }
         app_muted_text(match self.public_destination_setup_progress(form) {
             Some(SwapSetupProgress::Done) | None => "Already set up for this swap. No setup fee.",
