@@ -169,6 +169,7 @@ async fn spawn_workers_inner(
             .await
             .wrap_err("subscribe to fees content topics")?
     };
+    shared.write().start_fee_subscription();
 
     if let Some(shutdown) = shutdown {
         let peer_shutdown = shutdown.clone();

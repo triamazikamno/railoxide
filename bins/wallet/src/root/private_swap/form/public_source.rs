@@ -3798,7 +3798,8 @@ impl PrivateSwapsView {
         });
         let refresh = strip
             .pending()
-            .then(|| self.render_gas_pending(form, editable, cx));
+            .then(|| self.render_bridge_quote_error(form, editable, cx))
+            .flatten();
         let warning = fallback.then(|| {
             div()
                 .w_full()

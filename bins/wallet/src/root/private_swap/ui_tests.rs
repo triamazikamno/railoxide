@@ -6938,6 +6938,15 @@ fn private_network_funding_checks_the_setup_fee_against_spendable_notes(cx: &mut
                 "a compatible fee token alone is insufficient",
             );
         }
+        // Offers that haven't arrived yet don't show the funds can't pay.
+        assert_eq!(
+            runtime.block_on(buy_picker::estimate_network_funding(
+                &session,
+                Vec::new(),
+                &http,
+            )),
+            NetworkAvailability::CheckingFee,
+        );
         let invalid = PublicBroadcasterCandidate {
             relay_adapt_7702: None,
             ..candidate
@@ -7310,6 +7319,32 @@ fn private_bridge_accounts_are_chosen_independently(cx: &mut TestAppContext) {
                     Some(NetworkAvailability::CheckingFee)
                 );
             });
+            // An offer only in another token leaves setup unfunded, unless the fee subscription
+            // went live so recently that the held token's offer may still arrive.
+            root.update(cx, |root, _| {
+                root.monitor_state
+                    .write()
+                    .upsert_fee(crate::root::tests::fee_row(
+                        137,
+                        STUB_POLYGON_USDC,
+                        "other-token-offer",
+                    ));
+            });
+            swaps.read_with(cx, |swaps, cx| {
+                assert_eq!(
+                    swaps.network_availability(ReceiveTo::PrivateBalance, 137, cx),
+                    Some(NetworkAvailability::ReuseOnly)
+                );
+            });
+            root.update(cx, |root, _| {
+                root.monitor_state.write().start_fee_subscription();
+            });
+            swaps.read_with(cx, |swaps, cx| {
+                assert_eq!(
+                    swaps.network_availability(ReceiveTo::PrivateBalance, 137, cx),
+                    Some(NetworkAvailability::CheckingFee)
+                );
+            });
             root.update(cx, |root, _| {
                 root.monitor_state.write().upsert_fee(offer);
             });
@@ -7344,13 +7379,51 @@ fn private_bridge_accounts_are_chosen_independently(cx: &mut TestAppContext) {
                         .funding_checked_for_tests(137)
                 })
             });
+            swaps.read_with(cx, |swaps, cx| {
+                assert_eq!(
+                    swaps.network_setup_availability(137, cx),
+                    NetworkAvailability::Unavailable(NetworkUnavailable::SetupFee),
+                    "the actual estimator reports the RPC failure"
+                );
+            });
+            // Polygon catching up with newer blocks keeps the checked estimate, so the quote
+            // isn't dropped while the setup fee is checked again.
+            let ready = root.update(cx, |root, _| root.chain_states.remove(&137).unwrap());
+            let ChainUtxoState::Ready {
+                snapshot,
+                session: ready_session,
+                observer_token,
+                sync_tip,
+                poi_refreshing,
+                ppoi_workflow_status,
+            } = &ready
+            else {
+                panic!("ready destination session")
+            };
+            root.update(cx, |root, _| {
+                root.chain_states.insert(
+                    137,
+                    ChainUtxoState::Syncing {
+                        snapshot: Arc::clone(snapshot),
+                        progress: crate::root::chain_load::ChainSyncProgress::default(),
+                        catching_up: true,
+                        session: Arc::clone(ready_session),
+                        observer_token: observer_token.clone(),
+                        sync_tip: *sync_tip,
+                        poi_refreshing: *poi_refreshing,
+                        ppoi_workflow_status: *ppoi_workflow_status,
+                    },
+                );
+            });
+            swaps.read_with(cx, |swaps, cx| {
+                assert_eq!(
+                    swaps.network_setup_availability(137, cx),
+                    NetworkAvailability::Unavailable(NetworkUnavailable::SetupFee)
+                );
+            });
+            root.update(cx, |root, _| root.chain_states.insert(137, ready));
             cx.update(|window, cx| {
                 swaps.update(cx, |swaps, cx| {
-                    assert_eq!(
-                        swaps.network_setup_availability(137, cx),
-                        NetworkAvailability::Unavailable(NetworkUnavailable::SetupFee),
-                        "the actual estimator reports the RPC failure"
-                    );
                     swaps.refresh_destination_network(window, cx);
                     assert_eq!(chosen(swaps), (None, None));
                     assert!(swaps.form.as_ref().unwrap().quote_delivery().is_none());
@@ -8499,6 +8572,7 @@ fn private_bridge_setups_show_side_by_side_until_each_is_confirmed(cx: &mut Test
                         ChainUtxoState::Syncing {
                             snapshot,
                             progress: crate::root::chain_load::ChainSyncProgress::default(),
+                            catching_up: true,
                             session,
                             observer_token,
                             sync_tip,
@@ -8507,6 +8581,15 @@ fn private_bridge_setups_show_side_by_side_until_each_is_confirmed(cx: &mut Test
                         },
                     );
                 });
+            });
+            // A synced network's catch-up doesn't read as syncing to the swap form, which would
+            // drop its quote.
+            swaps.read_with(cx, |swaps, cx| {
+                let availability = swaps.network_availability(ReceiveTo::PrivateBalance, 137, cx);
+                assert!(
+                    availability.is_some_and(|it| !matches!(it, NetworkAvailability::Syncing(_))),
+                    "{availability:?}"
+                );
             });
             show(cx, 1000.);
             assert!(cx.debug_bounds("swap-progress-error").is_none());
@@ -9792,7 +9875,9 @@ fn buy_picker_switch_is_receive_to_and_a_kept_network_explains_itself(cx: &mut T
             });
             window.draw(cx).clear(cx);
         });
-        assert!(cx.debug_bounds("swap-receive-to-problem").is_some());
+        // The sync's progress shows where the quote will, not as a problem under Receive to.
+        assert!(cx.debug_bounds("swap-destination-progress").is_some());
+        assert!(cx.debug_bounds("swap-receive-to-problem").is_none());
 
         // The picker follows the form's Receive to, and shows the form's network.
         cx.update(|window, cx| {
@@ -12623,7 +12708,6 @@ fn bridge_share_edits_keep_the_strip_and_quote_the_bridge_leg_once(cx: &mut Test
             assert_eq!(stubs.quotes().len(), quotes, "{edit}");
             assert_eq!(across_fee_amounts(&stubs).len(), fees, "{edit}");
             assert!(cx.debug_bounds("swap-gas-strip").is_some(), "{edit}");
-            assert!(cx.debug_bounds("swap-gas-pending").is_some(), "{edit}");
             swaps.read_with(cx, |swaps, _| {
                 let form = swaps.form.as_ref().unwrap();
                 let QuoteState::Ready(quoted) = &form.quote else {
@@ -12787,7 +12871,6 @@ fn a_superseded_or_failed_bridge_refresh_keeps_the_quote(cx: &mut TestAppContext
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("swap-gas-strip").is_some());
         assert!(cx.debug_bounds("swap-bridge-quote-error").is_some());
-        assert!(cx.debug_bounds("swap-gas-pending").is_none());
         let failed = swaps.read_with(cx, |swaps, _| {
             let form = swaps.form.as_ref().unwrap();
             assert!(
@@ -18390,6 +18473,7 @@ fn public_preparation_finishing_while_the_destination_syncs_shows_the_swap(
                         ChainUtxoState::Syncing {
                             snapshot,
                             progress: crate::root::chain_load::ChainSyncProgress::default(),
+                            catching_up: true,
                             session,
                             observer_token,
                             sync_tip,

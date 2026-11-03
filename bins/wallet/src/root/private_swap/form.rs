@@ -3979,13 +3979,14 @@ impl PrivateSwapsView {
                 profile.token_eligibility(asset.token, &SwapTokenRole::Sell)
                     == SwapTokenEligibility::Eligible
             })
-            .map(|mut asset| {
-                asset.max_batched = owner
-                    .max_swap_amount(session, operation, asset.token)
-                    .unwrap_or_default();
-                asset
-            })
             .collect::<Vec<_>>();
+        let tokens = assets.iter().map(|asset| asset.token).collect::<Vec<_>>();
+        let maxima = owner
+            .max_swap_amounts(session, operation, &tokens)
+            .unwrap_or_else(|_| vec![U256::ZERO; tokens.len()]);
+        for (asset, max) in assets.iter_mut().zip(maxima) {
+            asset.max_batched = max;
+        }
         if assets.is_empty() {
             return fixture_assets();
         }
@@ -11193,6 +11194,23 @@ impl PrivateSwapsView {
             .flex_wrap()
             .items_center()
             .gap_x_2();
+        // A network still syncing or checking its setup fee shows its progress here, where
+        // the quote will.
+        if let Err(DeliveryProblem::Network {
+            problem,
+            syncing: true,
+        }) = &form.delivery
+        {
+            return line
+                .debug_selector(|| "swap-destination-progress".into())
+                .child(Spinner::new().small())
+                .child(
+                    app_muted_shimmer_text(problem.clone())
+                        .flex_1()
+                        .min_w_0()
+                        .whitespace_normal(),
+                );
+        }
         // A network that can't take the delivery kind is explained under Receive to, and a
         // destination account that can't take the swap under its select.
         if matches!(
@@ -11615,11 +11633,12 @@ impl PrivateSwapsView {
             self.form_mode(form),
             FormMode::Setup { .. } | FormMode::Order
         );
-        // A share the bridge leg wasn't quoted at: the strip's amounts are estimates until the
-        // refresh ends, and a failed refresh says why and offers a full quote.
+        // A share the bridge leg wasn't quoted at: a failed refresh says why and offers a full
+        // quote.
         let refresh = form
             .gas_share_pending(review)
-            .then(|| self.render_gas_pending(form, editable, cx));
+            .then(|| self.render_bridge_quote_error(form, editable, cx))
+            .flatten();
         // A quote that fell back from the form's share says so instead of asking consent to
         // costs the user didn't choose.
         let warning = if form.gas_share_fallback(review) {
@@ -11766,37 +11785,29 @@ impl PrivateSwapsView {
             .children(usd.map(app_muted_text))
     }
 
-    /// Under the gas strip while it shows a share the bridge leg wasn't quoted at: that the
-    /// destination amount is an estimate, or why the refresh failed, with Retry.
-    fn render_gas_pending(
+    /// Under the gas strip while it shows a share the bridge leg wasn't quoted at and the
+    /// refresh failed: why, with Retry.
+    fn render_bridge_quote_error(
         &self,
         form: &SwapForm,
         editable: bool,
         cx: &Context<'_, Self>,
-    ) -> gpui::Div {
-        match &form.bridge_quote_error {
-            None => div().w_full().child(
-                app_muted_text(
-                    "The destination amount is an estimate while the bridge quote updates.",
-                )
-                .debug_selector(|| "swap-gas-pending".into())
-                .whitespace_normal(),
-            ),
-            Some(error) => action_alert(
-                "swap-bridge-quote-error",
-                error.to_string(),
-                app_button("swap-bridge-quote-retry", "Retry")
-                    .debug_selector(|| "swap-bridge-quote-retry".into())
-                    .outline()
-                    .small()
-                    .flex_none()
-                    .disabled(!editable || self.busy())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.retry_quote(window, cx);
-                    })),
-                cx,
-            ),
-        }
+    ) -> Option<gpui::Div> {
+        let error = form.bridge_quote_error.as_ref()?;
+        Some(action_alert(
+            "swap-bridge-quote-error",
+            error.to_string(),
+            app_button("swap-bridge-quote-retry", "Retry")
+                .debug_selector(|| "swap-bridge-quote-retry".into())
+                .outline()
+                .small()
+                .flex_none()
+                .disabled(!editable || self.busy())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.retry_quote(window, cx);
+                })),
+            cx,
+        ))
     }
 
     /// The bar over the gas share, a `Slider` whose value is the knob's position in percent
@@ -12138,9 +12149,20 @@ impl PrivateSwapsView {
                         .justify_between()
                         .gap_2()
                         .child(
-                            app_muted_text(format!("Estimated return on {}", self.chain_label()))
+                            div()
                                 .min_w_0()
-                                .whitespace_normal(),
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    app_muted_text(format!(
+                                        "Estimated return on {}",
+                                        self.chain_label()
+                                    ))
+                                    .min_w_0()
+                                    .whitespace_normal(),
+                                )
+                                .child(source_return_help(review)),
                         )
                         .child(
                             app_text(self.with_usd(
@@ -12151,11 +12173,6 @@ impl PrivateSwapsView {
                             ))
                             .flex_none(),
                         ),
-                )
-                .child(
-                    app_muted_text(source_return_note(review))
-                        .text_xs()
-                        .whitespace_normal(),
                 )
                 .when_some(self.bridge_total_usd_value(review, cx), |row, total| {
                     row.child(
@@ -14192,15 +14209,25 @@ fn destination_availability(
 }
 
 /// Where the wallet's private sync of a chain stands. A chain without a session yet reads as
-/// loading: opening the Buy picker starts it.
+/// loading: opening the Buy picker starts it. A synced chain taking in newer blocks stays
+/// ready, so its quote isn't dropped for each catch-up.
 const fn network_sync(state: Option<&ChainUtxoState>) -> NetworkSync {
     match state {
-        Some(ChainUtxoState::Ready { .. }) => NetworkSync::Ready,
+        Some(
+            ChainUtxoState::Ready { .. }
+            | ChainUtxoState::Syncing {
+                catching_up: true, ..
+            },
+        ) => NetworkSync::Ready,
         Some(ChainUtxoState::Error { .. }) => NetworkSync::Failed,
         Some(state) => NetworkSync::Loading(state.sync_percent()),
         None => NetworkSync::Loading(None),
     }
 }
+
+/// How long after the fee subscription goes live a missing offer may still arrive. Offers
+/// arrived up to about 30 s after it in testing; the margin covers slower broadcasters.
+const FEE_OFFERS_SETTLE: Duration = Duration::from_mins(1);
 
 /// Whether the wallet could pay a broadcaster for a stealth account's setup on `chain`: some
 /// POI-verified, spendable private balance there is in a token that a broadcaster compatible
@@ -14234,8 +14261,16 @@ fn destination_setup_funds(root: &WalletRoot, chain: &EffectiveChainConfig) -> S
     )
     .iter()
     .any(|option| option.eligible_broadcaster_count > 0);
-    // A POI refresh or a first offer on the chain can still make the held notes pay for it.
-    let pending = state.poi_refreshing() || !rows.iter().any(|row| row.chain_id == chain_id);
+    // A POI refresh or a first offer on the chain can still make the held notes pay for it, and
+    // so can an offer from a broadcaster that hasn't announced since the fee subscription went
+    // live, as after a new Tor session.
+    let settling = root
+        .monitor_state
+        .read()
+        .fee_subscription_started()
+        .is_some_and(|started| started.elapsed() < FEE_OFFERS_SETTLE);
+    let pending =
+        state.poi_refreshing() || settling || !rows.iter().any(|row| row.chain_id == chain_id);
     if funded {
         SetupFunds::Funded
     } else if snapshot.unspent_count > 0 && pending {
@@ -14646,26 +14681,20 @@ fn new_account_item() -> SwapAccountSelectItem {
     }
 }
 
-/// Under Receive to: why the form's network can't take Private balance. A sync under way
-/// resolves by itself, so only a network that needs the user is an error.
+/// Under Receive to: why the form's network can't take Private balance. A sync or setup-fee
+/// check under way resolves by itself and shows its progress in the price line instead.
 fn receive_to_problem(form: &SwapForm) -> Option<gpui::Div> {
-    let Err(DeliveryProblem::Network { problem, syncing }) = &form.delivery else {
+    let Err(DeliveryProblem::Network {
+        problem,
+        syncing: false,
+    }) = &form.delivery
+    else {
         return None;
     };
-    let line = if *syncing {
-        div()
-            .debug_selector(|| "swap-receive-to-problem".into())
-            .child(
-                app_muted_text(problem.clone())
-                    .text_xs()
-                    .min_w_0()
-                    .whitespace_normal(),
-            )
-    } else {
-        error_alert("swap-receive-to-problem", problem.clone())
-    };
     // Under the control, past the label and the row's gap.
-    Some(line.pl(rems(ACCOUNT_LABEL_WIDTH + 0.5)))
+    Some(
+        error_alert("swap-receive-to-problem", problem.clone()).pl(rems(ACCOUNT_LABEL_WIDTH + 0.5)),
+    )
 }
 
 /// The line under the stealth account select while a setup is quoted. A `problem` the user has
@@ -14894,6 +14923,30 @@ fn shield_failure_mention(
             SpendAuthorizationLabel::on_network("Keep on", destination, "")
         }
     }
+}
+
+/// The info icon beside the estimated return, whose hover says where the return goes.
+fn source_return_help(review: &SwapReview) -> gpui::Stateful<gpui::Div> {
+    let note = source_return_note(review);
+    div()
+        .id("swap-source-return-help")
+        .flex_none()
+        .tooltip(move |window, cx| {
+            Tooltip::element(move |window, _| {
+                hint_card("Estimated return", theme::INFO, window)
+                    .w(rems(20.))
+                    .child(div().whitespace_normal().child(note))
+            })
+            .build(window, cx)
+        })
+        .child(
+            app_button_base("swap-source-return-help-trigger")
+                .ghost()
+                .xsmall()
+                .icon(IconName::Info)
+                .accessibility_label(note)
+                .debug_selector(|| "swap-source-return-help".into()),
+        )
 }
 
 fn source_return_note(review: &SwapReview) -> &'static str {

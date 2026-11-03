@@ -163,7 +163,8 @@ impl NetworkAvailability {
     }
 
     /// Why Private balance can't deliver on `network`, the form's kept one, and what to do
-    /// about it. The line shows under Receive to.
+    /// about it. The line shows under Receive to, or for a sync or setup-fee check under way,
+    /// as progress where the quote will show.
     pub(super) fn private_problem(self, network: &str) -> Option<String> {
         let elsewhere = "Pick a token on another network or use Public address.";
         Some(match self {
@@ -172,14 +173,12 @@ impl NetworkAvailability {
                 "New stealth account setup is unavailable on {network}. Select an existing stealth account there, or use Public address."
             ),
             Self::CheckingFee => {
-                format!("Checking whether your private funds on {network} cover the setup fee.")
+                format!("Checking your private funds on {network} for the setup fee…")
             }
-            Self::Syncing(None) => format!(
-                "Private balance needs {network} synced first. Wait for it, or use Public address."
-            ),
-            Self::Syncing(Some(percent)) => format!(
-                "Private balance needs {network} synced first, now at {percent}%. Wait for it, or use Public address."
-            ),
+            Self::Syncing(None) => format!("Syncing your private balance on {network}…"),
+            Self::Syncing(Some(percent)) => {
+                format!("Syncing your private balance on {network}… {percent}%")
+            }
             Self::Unavailable(NetworkUnavailable::Rpc) => {
                 format!("Private balance needs {network} enabled with RPC endpoints. {elsewhere}")
             }
@@ -472,6 +471,11 @@ pub(super) async fn estimate_network_funding(
     let Ok(client) = http.operation_http_client().await else {
         return NetworkAvailability::Unavailable(NetworkUnavailable::SetupFee);
     };
+    // Without an offer yet, as when a network's sync finishes before its broadcasters'
+    // offers arrive, nothing shows the funds can't pay. An arriving offer checks again.
+    if candidates.is_empty() {
+        return NetworkAvailability::CheckingFee;
+    }
     let mut failed = false;
     for candidate in candidates {
         match tokio::time::timeout(
@@ -496,7 +500,13 @@ impl PrivateSwapsView {
     fn network_funding_inputs(&self, network: u64, cx: &App) -> Option<FundingInputs> {
         let root = self.root.upgrade()?;
         let root = root.read(cx);
-        let super::ChainUtxoState::Ready { session, .. } = root.chain_states.get(&network)? else {
+        let (super::ChainUtxoState::Ready { session, .. }
+        | super::ChainUtxoState::Syncing {
+            session,
+            catching_up: true,
+            ..
+        }) = root.chain_states.get(&network)?
+        else {
             return None;
         };
         let (options, _, _) = self.setup_fee_route(network, None, None, false, false, cx);

@@ -3696,7 +3696,7 @@ impl ExecutorOwner {
     /// Whether the automatic attempt to place the approved order of the swap `operation`,
     /// spending `spend` of `token`, should quote now. One current snapshot of the wallet's
     /// notes answers both questions. The spend fits when it fits the notes planning would
-    /// select, as [`Self::max_swap_amount`] counts them. When it doesn't, the attempt waits
+    /// select, as [`Self::max_swap_amounts`] counts them. When it doesn't, the attempt waits
     /// while the swap's own setup can still change that: its nonce isn't settled, or a
     /// `token` note created in a transaction recorded for one of its setups is unspent with a
     /// POI state that [`crate::UtxoPpoiState::retry_eligible`] accepts. A setup without a
@@ -3723,17 +3723,21 @@ impl ExecutorOwner {
         ))
     }
 
-    /// Largest batched sell amount currently available to this swap. The same POI,
-    /// pending-spend and executor reservation filters apply as during planning.
-    pub fn max_swap_amount(
+    /// Largest batched sell amount of each of `tokens` currently available to this swap, in
+    /// their order. The same POI, pending-spend and executor reservation filters apply as
+    /// during planning. The notes and reservations are read once for all tokens.
+    pub fn max_swap_amounts(
         &self,
         session: &WalletSession,
         operation: Option<ExecutorOperationId>,
-        token: Address,
-    ) -> Result<U256> {
+        tokens: &[Address],
+    ) -> Result<Vec<U256>> {
         self.require_swap_session(session)?;
         let inputs = self.spendable_swap_inputs(session, operation)?;
-        Ok(crate::max_unshield_spendable(&inputs, token))
+        Ok(tokens
+            .iter()
+            .map(|token| crate::max_unshield_spendable(&inputs, *token))
+            .collect())
     }
 
     fn spendable_swap_inputs(

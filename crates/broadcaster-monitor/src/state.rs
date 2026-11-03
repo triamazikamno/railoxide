@@ -142,6 +142,7 @@ pub struct MonitorState {
     peer_summary: PeerSummary,
     peer_rows: Vec<PeerRow>,
     rev: AtomicU64,
+    fee_subscription_started: Option<Instant>,
 }
 
 impl MonitorState {
@@ -166,7 +167,20 @@ impl MonitorState {
             peer_summary: PeerSummary::default(),
             peer_rows: Vec::new(),
             rev: AtomicU64::new(0),
+            fee_subscription_started: None,
         }
+    }
+
+    /// Marks the fee subscription live. Broadcasters' offers arrive over the following
+    /// announcements, so an offer missing soon after may still come.
+    pub fn start_fee_subscription(&mut self) {
+        self.fee_subscription_started = Some(Instant::now());
+    }
+
+    /// When the latest fee subscription went live, or `None` before the first one.
+    #[must_use]
+    pub const fn fee_subscription_started(&self) -> Option<Instant> {
+        self.fee_subscription_started
     }
 
     /// Current user-visible state revision. Increases on changes that should redraw the UI.

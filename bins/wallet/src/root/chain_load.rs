@@ -37,6 +37,8 @@ pub(super) enum ChainUtxoState {
     Syncing {
         snapshot: Arc<ListUtxosOutput>,
         progress: ChainSyncProgress,
+        /// The session was ready before, and this sync takes in newer blocks.
+        catching_up: bool,
         session: Arc<wallet_ops::WalletSession>,
         observer_token: InstalledObserverToken,
         sync_tip: WalletSyncTip,
@@ -2418,6 +2420,7 @@ impl WalletRoot {
                     WalletReadinessDisposition::Syncing => ChainUtxoState::Syncing {
                         snapshot: initial_snapshot.clone(),
                         progress,
+                        catching_up: false,
                         session: session.clone(),
                         observer_token: observer_token.clone(),
                         sync_tip: initial_sync_tip,
@@ -2655,6 +2658,7 @@ impl WalletRoot {
                                 }
                                 ChainUtxoState::Syncing {
                                     progress,
+                                    catching_up,
                                     session,
                                     observer_token,
                                     sync_tip,
@@ -2663,6 +2667,7 @@ impl WalletRoot {
                                 } => ChainUtxoState::Syncing {
                                     snapshot: snapshot.clone(),
                                     progress,
+                                    catching_up,
                                     session,
                                     observer_token,
                                     sync_tip,
@@ -2692,6 +2697,7 @@ impl WalletRoot {
                                 } => ChainUtxoState::Syncing {
                                     snapshot: snapshot.clone(),
                                     progress: ChainSyncProgress::default(),
+                                    catching_up: true,
                                     session,
                                     observer_token,
                                     sync_tip,
