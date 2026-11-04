@@ -238,6 +238,7 @@ fn clearing_removes_matching_history_only_and_keeps_its_notes_from_reappearing()
             &StatusInputs {
                 utxos: &[],
                 running: &running_ids,
+                owned: &HashSet::new(),
             },
         )
     };

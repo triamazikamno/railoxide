@@ -178,13 +178,15 @@ pub struct StatusInputs<'a> {
     pub utxos: &'a [UtxoOutput],
     /// Entries whose submission is still running in this session.
     pub running: &'a BTreeSet<ActivityEntryId>,
+    /// Transaction hashes of the wallet's own actions, from `owned_hashes`.
+    pub owned: &'a HashSet<B256>,
 }
 
 /// The entry's status, following its final step only.
 #[must_use]
 pub fn entry_status(entry: &ActivityEntry, inputs: &StatusInputs<'_>) -> ActivityStatus {
     match &entry.match_key {
-        ActivityMatch::Inputs(notes) => private_status(entry, notes, inputs.utxos),
+        ActivityMatch::Inputs(notes) => private_status(entry, notes, inputs.utxos, inputs.owned),
         ActivityMatch::Hashes => {
             if entry.kind == ActivityKind::Shield
                 && let Some(confirmation) = shield_note(entry, inputs.utxos)
@@ -203,10 +205,13 @@ pub fn is_in_flight(entry: &ActivityEntry, inputs: &StatusInputs<'_>) -> bool {
 }
 
 /// Success comes only from the inputs being spent in the snapshot, so a rewind un-confirms it.
+/// A spend another local action owns, or a recorded failure contradicted by a foreign spend,
+/// doesn't confirm.
 fn private_status(
     entry: &ActivityEntry,
     inputs: &[ActivityInput],
     utxos: &[UtxoOutput],
+    owned: &HashSet<B256>,
 ) -> ActivityStatus {
     let spent: Option<Vec<&UtxoOutput>> = inputs
         .iter()
@@ -216,21 +221,35 @@ fn private_status(
             })
         })
         .collect();
-    if let Some(&first) = spent.as_deref().and_then(<[_]>::first) {
-        return ActivityStatus::Confirmed(
-            first
-                .spent_tx_hash
-                .as_deref()
-                .and_then(parse_hash)
-                .zip(first.spent_block_number)
-                .map(|(hash, block)| ActivityConfirmation {
+    let recorded = final_step_status(entry, true);
+    if let Some(spent) = spent.filter(|spent| !spent.is_empty()) {
+        let known: Vec<(&UtxoOutput, B256)> = spent
+            .into_iter()
+            .filter_map(|note| Some((note, note.spent_tx_hash.as_deref().and_then(parse_hash)?)))
+            .collect();
+        let shared = known.first().copied();
+        let consistent = known
+            .iter()
+            .all(|&(_, hash)| shared.is_some_and(|(_, first)| first == hash));
+        let own_main = shared.is_some_and(|(_, hash)| {
+            entry
+                .attempts
+                .iter()
+                .any(|attempt| attempt.step == ActivityStep::Main && attempt.hash == hash)
+        });
+        let unclaimed = !matches!(recorded, ActivityStatus::Failed { .. })
+            && shared.is_none_or(|(_, hash)| !owned.contains(&hash));
+        if consistent && (own_main || unclaimed) {
+            return ActivityStatus::Confirmed(shared.and_then(|(note, hash)| {
+                note.spent_block_number.map(|block| ActivityConfirmation {
                     hash,
                     block,
-                    timestamp: first.spent_block_timestamp,
-                }),
-        );
+                    timestamp: note.spent_block_timestamp,
+                })
+            }));
+        }
     }
-    match final_step_status(entry, true) {
+    match recorded {
         failed @ ActivityStatus::Failed { .. } => failed,
         _ if entry.relay_timed_out => ActivityStatus::Unconfirmed,
         _ => ActivityStatus::Submitted,

@@ -161,12 +161,15 @@ fn private_entries_confirm_only_while_their_inputs_are_spent() {
         position: 7,
     };
     let running = BTreeSet::new();
+    // 0xcc belongs to another local action.
+    let owned = HashSet::from([B256::repeat_byte(0xcc)]);
     let status = |entry: &ActivityEntry, utxos: &[UtxoOutput]| {
         entry_status(
             entry,
             &StatusInputs {
                 utxos,
                 running: &running,
+                owned: &owned,
             },
         )
     };
@@ -209,6 +212,45 @@ fn private_entries_confirm_only_while_their_inputs_are_spent() {
         status(&reverted, std::slice::from_ref(&unspent)),
         ActivityStatus::Failed { fee_spent: true }
     );
+    // A later foreign spend doesn't overturn the recorded revert.
+    let mut spent_elsewhere = unspent.clone();
+    spend(&mut spent_elsewhere, 0xcd, 22);
+    assert_eq!(
+        status(&reverted, std::slice::from_ref(&spent_elsewhere)),
+        ActivityStatus::Failed { fee_spent: true }
+    );
+
+    // Another local action's spend doesn't confirm a timed-out relay.
+    let mut timed_out = activity_entry(
+        ActivityKind::PrivateSend,
+        ActivityMatch::Inputs(vec![input]),
+        Vec::new(),
+    );
+    timed_out.relay_timed_out = true;
+    let mut spent_by_owned = unspent;
+    spend(&mut spent_by_owned, 0xcc, 23);
+    assert_eq!(
+        status(&timed_out, std::slice::from_ref(&spent_by_owned)),
+        ActivityStatus::Unconfirmed
+    );
+
+    // Inputs spent by different transactions weren't spent by one action.
+    let second = ActivityInput {
+        tree: 0,
+        position: 8,
+    };
+    let split = activity_entry(
+        ActivityKind::PrivateSend,
+        ActivityMatch::Inputs(vec![input, second]),
+        vec![activity_attempt(
+            0xaa,
+            ActivityStep::Main,
+            Some(included(20, true)),
+        )],
+    );
+    let mut other = received_note(8, 0x01, 100, ActivityUtxoClassification::PrivateOutput);
+    spend(&mut other, 0xcd, 22);
+    assert_eq!(status(&split, &[spent, other]), ActivityStatus::Submitted);
 }
 
 #[test]
@@ -218,6 +260,7 @@ fn hash_matched_entries_follow_their_final_step_only() {
         let inputs = StatusInputs {
             utxos: &[],
             running,
+            owned: &HashSet::new(),
         };
         (entry_status(entry, &inputs), is_in_flight(entry, &inputs))
     };
@@ -308,6 +351,7 @@ fn a_shield_confirms_from_its_note_in_the_viewing_wallet() {
             &StatusInputs {
                 utxos: &utxos,
                 running: &running,
+                owned: &HashSet::new(),
             },
         ),
         ActivityStatus::Confirmed(Some(ActivityConfirmation {

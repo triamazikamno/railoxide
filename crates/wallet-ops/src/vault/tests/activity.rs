@@ -14,6 +14,7 @@ use crate::{
     subscribe_activity_journal_failures,
 };
 use alloy::primitives::{Address, B256, U256};
+use std::collections::HashSet;
 
 const COUNTERPARTY: Address = Address::repeat_byte(0xc4);
 const SENT_INPUT: ActivityInput = ActivityInput {
@@ -488,6 +489,7 @@ fn relayed_private_entries_stay_unless_the_broadcaster_definitely_failed() {
             &StatusInputs {
                 utxos: std::slice::from_ref(note),
                 running: &running_activity_entries(),
+                owned: &HashSet::new(),
             },
         )
     };
@@ -588,6 +590,7 @@ fn observed_outcomes_persist_under_the_submitting_owner() {
             &StatusInputs {
                 utxos: &[],
                 running: &running,
+                owned: &HashSet::new(),
             },
         )
     };
@@ -709,6 +712,7 @@ fn tron_sends_keep_their_decided_outcome_under_the_tron_account() {
             &StatusInputs {
                 utxos: &[],
                 running: &running,
+                owned: &HashSet::new(),
             },
         )
     };

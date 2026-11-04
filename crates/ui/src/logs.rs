@@ -222,12 +222,23 @@ pub fn compact_log_value(value: &str) -> Cow<'_, str> {
         return Cow::Borrowed(value);
     }
     let cut = value.floor_char_boundary(html_start.unwrap_or(value.len()).min(MAX_LOG_FIELD_LEN));
+    // Cutting inside a URL would leave credentials that URL redaction can no longer parse.
+    let cut = split_url_start(value, cut).unwrap_or(cut);
     let kind = if html_start.is_some() { "HTML, " } else { "" };
     Cow::Owned(format!(
         "{} …[{kind}{} bytes omitted]",
         value[..cut].trim_end(),
         value.len() - cut
     ))
+}
+
+/// Start of the URL that a cut at `cut` would split.
+fn split_url_start(value: &str, cut: usize) -> Option<usize> {
+    let start = REDACTED_URL_SCHEMES
+        .iter()
+        .filter_map(|scheme| value[..cut].rfind(scheme))
+        .max()?;
+    (start + url_candidate_end(&value[start..]) > cut).then_some(start)
 }
 
 fn redact_log_urls(value: &str) -> String {
@@ -966,10 +977,15 @@ mod tests {
         let logs = LogStore::new(4);
         let layer = UiLogLayer::new(logs.clone());
         let subscriber = Registry::default().with(layer);
+        // Byte MAX_LOG_FIELD_LEN falls inside `secret`, the debug field's leading quote included.
+        let long_str = format!("{}https://user:secret@host/", "x".repeat(496));
+        let long_debug = format!("{}https://user:secret@host/", "x".repeat(495));
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(
                 rpc = "https://user:pass@example.com/private/project-id?token=secret#fragment",
                 proxy_url = "socks5h://proxy-user:proxy-pass@proxy.example:9050",
+                long_str = long_str.as_str(),
+                long_debug = ?long_debug,
                 "request failed at https://api-user:api-pass@api.example/rpc/key?api_key=secret#fragment"
             );
         });
@@ -981,7 +997,7 @@ mod tests {
         assert!(!entry.message.contains("user"));
         assert!(!entry.message.contains("pass"));
         assert!(!entry.message.contains("project-id"));
-        assert!(!entry.message.contains("secret"));
+        assert!(!entry.message.contains("sec"));
         assert!(!entry.message.contains("fragment"));
     }
 }

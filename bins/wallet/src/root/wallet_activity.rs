@@ -10,7 +10,7 @@
 //! frame.
 
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::sync::Arc;
@@ -259,10 +259,10 @@ pub(super) struct ActivityRows {
 /// swaps still in flight come first, then everything newest first.
 pub(super) fn build_activity_rows(input: &ActivityRowsInput<'_>) -> ActivityRows {
     let data = input.data;
+    let owned = owned_hashes(&data.entries, &data.records);
     let received = if input.utxos.is_empty() {
         Vec::new()
     } else {
-        let owned = owned_hashes(&data.entries, &data.records);
         received_rows(input.utxos, &owned, data.markers.received_hidden_before)
     };
     let unread = has_unread_received(
@@ -273,6 +273,7 @@ pub(super) fn build_activity_rows(input: &ActivityRowsInput<'_>) -> ActivityRows
     let status_inputs = StatusInputs {
         utxos: input.utxos,
         running: input.running,
+        owned: &owned,
     };
     let mut rows: Vec<ActivityRow> = data
         .entries
@@ -1912,6 +1913,7 @@ impl WalletRoot {
             let inputs = StatusInputs {
                 utxos: &[],
                 running: &running,
+                owned: &HashSet::new(),
             };
             journal.clear(&selection, now_unix(), &swaps, |entry| {
                 is_in_flight(entry, &inputs)
@@ -1964,6 +1966,7 @@ impl WalletRoot {
         let inputs = StatusInputs {
             utxos: &[],
             running: &stand_in.running,
+            owned: &HashSet::new(),
         };
         let mut kept = Vec::new();
         for entry in std::mem::take(&mut stand_in.data.entries) {
