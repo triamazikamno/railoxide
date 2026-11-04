@@ -35,7 +35,11 @@ impl WalletSettingsEditor {
         }
         let snapshot =
             wallet_ops::settings::chain_editor_snapshot(&settings, None).unwrap_or_default();
-        let chain_editor = cx.new(|cx| ui::chain_editor::ChainEditor::new(snapshot, cx));
+        let chain_editor = cx.new(|cx| {
+            let mut editor = ui::chain_editor::ChainEditor::new(snapshot, cx);
+            editor.set_staging(true, cx);
+            editor
+        });
         // The Chains page hands its body to the editor while a chain is open.
         cx.observe(&chain_editor, |editor, chain_editor, cx| {
             // Settings unmounts while a chain is open, which drops its selected page.
@@ -47,23 +51,7 @@ impl WalletSettingsEditor {
             cx.notify();
         })
         .detach();
-        cx.subscribe_in(
-            &chain_editor,
-            window,
-            |editor, view, event: &ui::chain_editor::ChainEditorEvent, window, cx| {
-                // A Test reads the network asynchronously and must not replace the draft.
-                if let railgun_ui::chain_editor::ChainEditorCommand::Probe { draft } =
-                    &event.command
-                {
-                    editor.handle_chain_editor_probe(draft, cx);
-                    return;
-                }
-                let result =
-                    editor.handle_chain_editor_command(&event.revision, &event.command, window, cx);
-                view.update(cx, |view, cx| view.receive(result, window, cx));
-            },
-        )
-        .detach();
+        Self::subscribe_chain_editor(&chain_editor, true, window, cx);
         let mut editor = Self {
             chain_editor,
             vault_store,
@@ -102,6 +90,7 @@ impl WalletSettingsEditor {
     pub(in crate::root) fn draft_changed(&mut self, cx: &mut Context<'_, Self>) {
         self.status = None;
         self.refresh_validation();
+        self.refresh_chain_editor(cx);
         cx.notify();
     }
 
@@ -232,6 +221,7 @@ impl WalletSettingsEditor {
         self.draft = settings;
         self.sync_fields_from_draft();
         self.refresh_validation();
+        self.refresh_chain_editor(cx);
         cx.notify();
         Ok(registry)
     }
@@ -308,6 +298,7 @@ impl WalletSettingsEditor {
         self.draft_base = self.saved.clone();
         self.sync_fields_from_draft();
         self.refresh_validation();
+        self.refresh_chain_editor(cx);
         cx.notify();
     }
 
@@ -315,6 +306,7 @@ impl WalletSettingsEditor {
         self.draft = WalletSettings::default();
         self.sync_fields_from_draft();
         self.refresh_validation();
+        self.refresh_chain_editor(cx);
         cx.notify();
     }
 

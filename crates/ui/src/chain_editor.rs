@@ -46,6 +46,10 @@ pub struct ChainEditor {
     snapshot: ChainEditorSnapshot,
     draft: Option<ChainDraft>,
     opened_draft: Option<ChainDraft>,
+    /// The form as `edit` built it, collected the same way as a save, so Back can spot edits.
+    opened_form: Option<ChainDraft>,
+    /// The host stages a confirmed chain into a larger draft instead of committing it.
+    staging: bool,
     pricing_select: Option<Entity<SelectState<Vec<PricingItem>>>>,
     pricing_status: BTreeMap<String, NativeUsdStatus>,
     pricing_preset: Option<Entity<InputState>>,
@@ -111,6 +115,8 @@ impl ChainEditor {
             snapshot,
             draft: None,
             opened_draft: None,
+            opened_form: None,
+            staging: false,
             pricing_select: None,
             pricing_status: BTreeMap::new(),
             pricing_preset: None,
@@ -133,6 +139,12 @@ impl ChainEditor {
     #[must_use]
     pub const fn is_editing(&self) -> bool {
         self.draft.is_some()
+    }
+
+    /// Set by a host that stages confirmed chains and commits them with its own Save.
+    pub fn set_staging(&mut self, staging: bool, cx: &mut Context<'_, Self>) {
+        self.staging = staging;
+        cx.notify();
     }
 
     /// Applies only a reply admitted by the host's current view/request authority.
@@ -220,6 +232,7 @@ impl ChainEditor {
         self.clear_probe();
         self.draft = None;
         self.opened_draft = None;
+        self.opened_form = None;
         self.pricing_select = None;
         self.pricing_preset = None;
         self.chain_id = None;
@@ -305,6 +318,7 @@ impl ChainEditor {
         let railgun_open = has_railgun && self.railgun_override_count(cx) > 0;
         self.advanced_open = advanced_open;
         self.railgun_open = railgun_open;
+        self.opened_form = self.collected_draft(cx);
         cx.notify();
     }
 
@@ -431,6 +445,43 @@ impl ChainEditor {
         self.clear_draft();
         self.focus.focus(window, cx);
         self.send(ChainEditorCommand::List, cx);
+    }
+
+    /// Back navigation. Unlike the Discard button, it asks before dropping edits.
+    fn back(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(draft) = self.collected_draft(cx) else {
+            return;
+        };
+        if self.opened_form.as_ref() == Some(&draft) {
+            self.discard(window, cx);
+            return;
+        }
+        let editor = cx.entity();
+        let name = display_name(&draft);
+        window.open_wallet_alert_dialog(cx, move |dialog, _, _| {
+            let editor = editor.clone();
+            dialog
+                .width(CONFIRM_DIALOG_WIDTH)
+                .title(app_strong_text(format!("Discard changes to \"{name}\"?")))
+                .child(
+                    app_muted_text("Changes on this page will be lost.")
+                        .debug_selector(|| "chain-back-confirm".into())
+                        .whitespace_normal(),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text("Discard")
+                        .ok_variant(ButtonVariant::Danger)
+                        .cancel_text("Keep editing")
+                        .cancel_variant(ButtonVariant::Secondary),
+                )
+                // After button_props, which would otherwise replace the Cancel flag.
+                .confirm()
+                .on_ok(move |_, window, cx| {
+                    editor.update(cx, |this, cx| this.discard(window, cx));
+                    true
+                })
+        });
     }
 
     fn apply_default(
@@ -586,6 +637,7 @@ impl ChainEditor {
             .child(
                 div().flex().justify_end().child(
                     app_button("chain-add", "Add chain")
+                        .debug_selector(|| "chain-add".into())
                         .icon(IconName::Plus)
                         .disabled(unavailable)
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -833,8 +885,9 @@ impl ChainEditor {
                         .icon(IconName::ChevronLeft)
                         .label("Chains")
                         .accessibility_label("Back to chains")
+                        .debug_selector(|| "chain-back".into())
                         .disabled(self.pending)
-                        .on_click(cx.listener(|this, _, window, cx| this.discard(window, cx))),
+                        .on_click(cx.listener(|this, _, window, cx| this.back(window, cx))),
                 ),
             )
             .child(self.render_editor_header(draft, cx))
@@ -1110,6 +1163,7 @@ impl ChainEditor {
         list.child(
             div().flex().child(
                 app_button("chain-add-endpoint", "Add endpoint")
+                    .debug_selector(|| "chain-add-endpoint".into())
                     .icon(IconName::Plus)
                     .small()
                     .disabled(self.pending)
@@ -1613,7 +1667,9 @@ impl ChainEditor {
     }
 
     fn save_label(&self, draft: &ChainDraft, cx: &App) -> &'static str {
-        if draft.built_in && !self.only_pricing_differs(draft, cx) {
+        if self.staging && self.existing {
+            "Done"
+        } else if draft.built_in && !self.only_pricing_differs(draft, cx) {
             "Save and restart"
         } else if self.existing {
             "Save"
@@ -2190,5 +2246,73 @@ mod pricing_tests {
                 window.remove_window();
             });
         });
+    }
+
+    #[gpui::test]
+    fn back_asks_before_dropping_edits_and_only_then(cx: &mut TestAppContext) {
+        use gpui_component::WindowExt as _;
+        cx.update(gpui_component::init);
+        let mut editor = None;
+        // No revision, so Back's List request leaves nothing pending without a host.
+        let handle = cx.add_window(|window, cx| {
+            let view = cx.new(|cx| ChainEditor::new(ChainEditorSnapshot::default(), cx));
+            editor = Some(view.clone());
+            gpui_component::Root::new(view, window, cx)
+        });
+        let editor = editor.unwrap();
+        let cx = VisualTestContext::from_window(*handle, cx).into_mut();
+        cx.simulate_resize(gpui::size(px(360.0), px(480.0)));
+        let open = |cx: &mut VisualTestContext, draft: ChainDraft, existing: bool| {
+            cx.update(|window, cx| {
+                editor.update(cx, |editor, cx| editor.edit(draft, existing, window, cx));
+            });
+            cx.run_until_parked();
+        };
+        let click_back = |cx: &mut VisualTestContext| {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let back = cx.debug_bounds("chain-back").expect("back is rendered");
+            cx.simulate_click(back.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+
+        let mut custom = ChainDraft::new();
+        custom.chain_id = "8453".into();
+        custom.fields.insert(ChainField::Name, "Custom".into());
+        custom.fields.insert(ChainField::NativeSymbol, "ETH".into());
+        custom.rpc_endpoints = vec![RpcEndpointDraft::new("https://rpc.example".into())];
+        open(cx, custom.clone(), true);
+        cx.update(|window, cx| {
+            let input = editor.read(cx).rpc_endpoints[0].0.clone();
+            input.update(cx, |input, cx| {
+                input.set_value("https://edited.example", window, cx);
+            });
+        });
+        click_back(cx);
+        cx.update(|window, cx| {
+            assert!(window.has_active_dialog(cx));
+            assert!(editor.read(cx).is_editing());
+            window.close_dialog(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            assert!(!window.has_active_dialog(cx));
+            let editor = editor.read(cx);
+            assert!(editor.is_editing());
+            assert_eq!(
+                editor.collected_endpoints(cx)[0].url,
+                "https://edited.example"
+            );
+        });
+
+        // An untouched form has inputs the opened draft lacks, which must not count as edits.
+        for (draft, existing) in [(ChainDraft::new(), false), (custom, true)] {
+            open(cx, draft, existing);
+            click_back(cx);
+            cx.update(|window, cx| {
+                assert!(!window.has_active_dialog(cx));
+                assert!(!editor.read(cx).is_editing());
+            });
+        }
+        cx.update(|window, _| window.remove_window());
     }
 }

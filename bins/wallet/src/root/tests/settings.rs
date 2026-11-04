@@ -1353,15 +1353,25 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
         wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap(),
         saved
     );
+    let stored = || wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap();
+    // Done stages the chain in the Settings draft, and only the footer's commit persists it.
+    let commit_staged = |cx: &mut VisualTestContext, expected: &WalletSettings| {
+        cx.update(|_, cx| {
+            owner.update(cx, |editor, cx| {
+                assert!(editor.is_dirty());
+                assert_eq!(&editor.draft, expected);
+                assert!(editor.persist_draft(cx));
+            });
+        });
+    };
     click(cx, "edit-chain-1");
     click(cx, "chain-enabled");
     click(cx, "chain-save");
+    assert_eq!(stored(), saved);
     saved.chains.per_chain.get_mut(&1).unwrap().enabled = false;
-    assert_eq!(
-        wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap(),
-        saved
-    );
-    // Saving returns to the list; reopen the chain before resetting it.
+    commit_staged(cx, &saved);
+    assert_eq!(stored(), saved);
+    // Done returns to the list; reopen the chain before resetting it.
     click(cx, "edit-chain-1");
     click(cx, "chain-reset");
     // Reset is destructive, so it lands only after the confirmation dialog is confirmed.
@@ -1372,11 +1382,10 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(stored(), saved);
     saved.chains.per_chain.remove(&1);
-    assert_eq!(
-        wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap(),
-        saved
-    );
+    commit_staged(cx, &saved);
+    assert_eq!(stored(), saved);
     // A newly direct endpoint waits for confirmation, and declining saves nothing.
     click(cx, "chain-endpoint-0-direct");
     click(cx, "chain-save");
@@ -1397,7 +1406,9 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    saved = wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap();
+    assert_eq!(stored(), saved);
+    cx.update(|_, cx| owner.update(cx, |editor, cx| assert!(editor.persist_draft(cx))));
+    saved = stored();
     let endpoints = &saved.chains.per_chain[&1].rpc_endpoints;
     assert!(
         endpoints[0].direct && !endpoints[0].submit,
@@ -1480,7 +1491,8 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
                 ChainField::NativeUsdOracle,
                 Address::repeat_byte(8).to_string(),
             );
-            editor.handle_chain_editor_probe(&draft, cx);
+            let target = editor.chain_editor.clone();
+            editor.handle_chain_editor_probe(&draft, &target, cx);
             assert_eq!(editor.saved, before);
             assert_eq!(
                 wallet_ops::settings::load_wallet_settings(store.db().as_ref()).unwrap(),
@@ -1569,6 +1581,8 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
                 .db()
                 .put_app_settings_record(&record.key, &record.payload)
                 .unwrap();
+            // The draft never sees outside commits, so dropping it picks up the addition.
+            editor.discard_changes(cx);
         });
     });
     assert!(
@@ -1590,6 +1604,111 @@ fn shared_chain_editor_commits_discards_resets_and_preserves_stale_settings(
         cx.debug_bounds("edit-chain-9007199254740993").is_some(),
         "saving a custom chain returns to the list"
     );
+
+    let endpoint = |settings: &WalletSettings, chain_id: u64, index: usize| {
+        wallet_ops::settings::chain_editor_draft(settings, chain_id)
+            .unwrap()
+            .rpc_endpoints
+            .swap_remove(index)
+    };
+    // Two built-in chains stage separately and persist in one footer commit.
+    let before = stored();
+    for chain in ["edit-chain-1", "edit-chain-56"] {
+        click(cx, chain);
+        click(cx, "chain-endpoint-1-general");
+        click(cx, "chain-save");
+    }
+    assert_eq!(stored(), before);
+    cx.update(|_, cx| owner.update(cx, |editor, cx| assert!(editor.persist_draft(cx))));
+    saved = stored();
+    for chain_id in [1, 56] {
+        assert!(endpoint(&before, chain_id, 1).general);
+        assert!(!endpoint(&saved, chain_id, 1).general);
+    }
+
+    // An Add chain form opened after an unrelated draft edit stages against the new draft.
+    cx.update(|_, cx| {
+        owner.update(cx, |editor, cx| {
+            editor.draft.runtime.auto_lock_timeout_secs = Some(900);
+            editor.draft_changed(cx);
+        });
+    });
+    click(cx, "chain-add");
+    cx.simulate_input("424242");
+    for value in ["Added", "Added coin", "ADD", "18"] {
+        cx.simulate_keystrokes("tab");
+        cx.simulate_input(value);
+    }
+    click(cx, "chain-add-endpoint");
+    cx.simulate_input("https://added.example");
+    click(cx, "chain-save");
+    assert!(
+        cx.debug_bounds("edit-chain-424242").is_some(),
+        "the staged chain is listed"
+    );
+    click(cx, "edit-chain-1");
+    click(cx, "chain-endpoint-1-sensitive");
+    click(cx, "chain-save");
+    assert_eq!(stored(), saved);
+    cx.update(|_, cx| {
+        owner.update(cx, |editor, cx| {
+            assert_eq!(editor.draft.runtime.auto_lock_timeout_secs, Some(900));
+            assert!(editor.draft.chains.custom.contains_key(&424_242));
+            assert!(!endpoint(&editor.draft, 1, 1).sensitive);
+            editor.discard_changes(cx);
+        });
+    });
+    // After Settings discard the list and the reopened chain show saved values again, so an
+    // untouched Done stages nothing.
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("edit-chain-424242").is_none());
+    click(cx, "edit-chain-1");
+    click(cx, "chain-save");
+    cx.update(|_, cx| {
+        owner.update(cx, |editor, _| {
+            assert!(!editor.is_dirty());
+            assert_eq!(editor.draft, saved);
+        });
+    });
+
+    // An outside commit leaves staged edits staging, and the footer then reports the conflict.
+    click(cx, "edit-chain-1");
+    click(cx, "chain-endpoint-1-sensitive");
+    click(cx, "chain-save");
+    cx.update(|_, cx| {
+        owner.update(cx, |editor, cx| {
+            let revision = wallet_ops::settings::settings_revision(&editor.saved).unwrap();
+            let mut draft = wallet_ops::settings::chain_editor_draft(&editor.saved, 137).unwrap();
+            draft.native_usd_pricing = railgun_ui::chain_editor::NativeUsdChoice::Disabled;
+            let candidate = wallet_ops::settings::chain_editor_mutation(
+                &editor.saved,
+                &ChainEditorCommand::Save {
+                    draft,
+                    existing: true,
+                },
+            )
+            .unwrap()
+            .prepare(&editor.saved)
+            .unwrap();
+            editor
+                .commit_chain_candidate(revision, candidate, cx)
+                .unwrap();
+        });
+    });
+    let external = stored();
+    assert_ne!(external, saved);
+    click(cx, "edit-chain-56");
+    click(cx, "chain-endpoint-1-sensitive");
+    click(cx, "chain-save");
+    cx.update(|_, cx| {
+        owner.update(cx, |editor, cx| {
+            assert!(!endpoint(&editor.draft, 1, 1).sensitive);
+            assert!(!endpoint(&editor.draft, 56, 1).sensitive);
+            assert!(!editor.persist_draft(cx));
+            editor.discard_changes(cx);
+        });
+    });
+    assert_eq!(stored(), external);
     cx.simulate_resize(gpui::size(px(360.0), px(480.0)));
     cx.update(|window, cx| {
         window.set_rem_size(px(22.0));
