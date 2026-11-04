@@ -33,7 +33,7 @@ use wallet_ops::{
         EffectiveChainRegistry, EffectiveTokenRegistry, WalletUiState, load_wallet_settings,
         save_wallet_ui_state,
     },
-    subscribe_prover_cache_build,
+    subscribe_activity_journal_failures, subscribe_prover_cache_build,
     vault::{
         BroadcasterPreferences, DesktopVaultStore, DesktopViewSession, DeviceAuthStatus,
         GeneratedSeedMaterial, NonEvmAddressBookEntry, PrivateAddressBookEntry,
@@ -92,6 +92,7 @@ mod ui_helpers;
 mod utxo;
 mod vault;
 mod vault_ui;
+mod wallet_activity;
 mod wallet_header;
 mod walletconnect;
 
@@ -483,6 +484,9 @@ pub(crate) struct WalletRoot {
     window_handle: gpui::AnyWindowHandle,
     chain_states: BTreeMap<u64, ChainUtxoState>,
     pending_ppoi_validation_toast: Option<(Arc<str>, u64)>,
+    /// Failed Activity journal writes, polled by the root tick for the lifetime of the root.
+    activity_journal_failures: watch::Receiver<u64>,
+    pending_activity_journal_notice: bool,
     private_pending_status_dialog_open: bool,
     private_asset_presentation_cache: RefCell<private_assets::PrivateAssetPresentationCache>,
     poi_artifact_cache_progress: BTreeMap<u64, PoiArtifactCacheProgress>,
@@ -517,6 +521,8 @@ pub(crate) struct WalletRoot {
     public_form: PublicAccountFormState,
     stealth_accounts: Option<stealth_accounts::StealthAccountsPanel>,
     private_swaps: Option<private_swap::PrivateSwapsPanel>,
+    /// The Activity tab's journal data, rows and clear dialog for the selected wallet.
+    wallet_activity: wallet_activity::WalletActivityState,
     public_balance_cache: PublicBalanceCache,
     /// Tron accounts and balances, and Tron's route.
     tron_public: TronPublicState,
@@ -1304,6 +1310,7 @@ impl WalletRoot {
                 .placeholder("paste recovery phrase")
         });
         let public_account_search_input = new_text_input(window, cx, "Search accounts");
+        let wallet_activity = wallet_activity::WalletActivityState::new(window, cx);
         let governance_participant_picker = cx.new(|cx| {
             gpui_component::combobox::ComboboxState::new(
                 SearchableVec::<governance::ParticipantChoice>::new(Vec::new()),
@@ -1628,6 +1635,8 @@ impl WalletRoot {
             window_handle: window.window_handle(),
             chain_states,
             pending_ppoi_validation_toast: None,
+            activity_journal_failures: subscribe_activity_journal_failures(),
+            pending_activity_journal_notice: false,
             private_pending_status_dialog_open: false,
             private_asset_presentation_cache: RefCell::default(),
             poi_artifact_cache_progress: BTreeMap::new(),
@@ -1667,6 +1676,7 @@ impl WalletRoot {
             public_form,
             stealth_accounts: None,
             private_swaps: None,
+            wallet_activity,
             public_balance_cache: PublicBalanceCache::default(),
             tron_public,
             public_transaction_tracker,
@@ -2242,6 +2252,15 @@ impl WalletRoot {
                     .await;
                 if this
                     .update(cx, |root, cx| {
+                        if root
+                            .activity_journal_failures
+                            .has_changed()
+                            .unwrap_or(false)
+                        {
+                            root.activity_journal_failures.borrow_and_update();
+                            root.pending_activity_journal_notice = true;
+                            cx.notify();
+                        }
                         if should_refresh_utxo_ages(
                             root.active_activity,
                             root.active_wallet_tab,
@@ -2251,6 +2270,7 @@ impl WalletRoot {
                         ) {
                             root.utxo_table.update(cx, |_table, cx| cx.notify());
                         }
+                        root.tick_wallet_activity(cx);
                         if (root.private_pending_status_dialog_open
                             || root.gateway_has_connected_browser())
                             && root.private_pending_status_has_shield_timer()

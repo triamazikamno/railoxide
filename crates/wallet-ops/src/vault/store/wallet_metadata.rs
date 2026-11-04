@@ -888,9 +888,12 @@ impl DesktopVaultStore {
         wallet_uuid: &str,
         allow_standard_children: bool,
     ) -> Result<WalletMetadataBundle, VaultError> {
-        // Prevent an executor writer holding a view session from recreating records
+        // Prevent an executor or activity writer holding a view session from recreating records
         // between collecting the deletion keys and deleting the wallet.
         let _executor_guard = crate::vault::executors::EXECUTOR_RECORD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _activity_guard = crate::vault::activity::ACTIVITY_RECORD_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let metadata = self.list_wallet_metadata_with_view_unlocked(view)?;
@@ -1053,6 +1056,12 @@ impl DesktopVaultStore {
         )? {
             keys_to_delete.push(record.key);
         }
+        for record in self.db.list_desktop_wallet_vault_records(
+            &crate::vault::activity::activity_wallet_prefix(wallet_uuid),
+        )? {
+            keys_to_delete.push(record.key);
+        }
+        keys_to_delete.push(crate::vault::activity::activity_markers_key(wallet_uuid));
 
         if !wallet_private_namespaces.is_empty() {
             let alpha_wallet_cache_key = wallet_uuid.parse::<WalletCacheKey>()?;
@@ -1076,6 +1085,7 @@ impl DesktopVaultStore {
                 keys_to_delete.push(public_account_secret_record_key(
                     &account.public_account_uuid,
                 ));
+                keys_to_delete.extend(self.activity_account_keys(&account.public_account_uuid)?);
             }
         }
         for account in self.list_tron_account_metadata_with_view(view)? {
@@ -1085,6 +1095,7 @@ impl DesktopVaultStore {
             ) {
                 keys_to_delete.push(tron_account_metadata_record_key(&account.tron_account_uuid));
                 keys_to_delete.push(tron_account_secret_record_key(&account.tron_account_uuid));
+                keys_to_delete.extend(self.activity_account_keys(&account.tron_account_uuid)?);
             }
         }
 

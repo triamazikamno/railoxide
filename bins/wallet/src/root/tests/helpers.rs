@@ -28,11 +28,61 @@ pub(super) use wallet_ops::{
     },
 };
 
+use gpui::{
+    AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
+    TestAppContext, VisualTestContext, Window, div,
+};
+use gpui_component::Root;
+
 use super::super::private_broadcaster::PrivateSubmissionProgressFlow;
 use super::super::{
-    DeliveryFormKind, PrivateBroadcasterProgressState, UnshieldAssetKey,
-    private_broadcaster_progress_steps, self_broadcast_progress_steps,
+    DeliveryFormKind, PrivateBroadcasterProgressState, UnshieldAssetKey, WalletRoot,
+    install_wallet_action_bindings, private_broadcaster_progress_steps,
+    self_broadcast_progress_steps,
 };
+use super::public_accounts::fixture_root;
+
+/// A test window that draws the root's wallet view.
+pub(super) struct WalletViewWindow(pub(super) Entity<WalletRoot>);
+
+impl Render for WalletViewWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .child(self.0.read(cx).render_wallet_view(&self.0, window, cx))
+    }
+}
+
+/// Opens a themed, key-bound window drawing a fixture root's wallet view and returns that root.
+pub(super) fn wallet_view_root<'a>(
+    path: &std::path::Path,
+    runtime: &tokio::runtime::Runtime,
+    cx: &'a mut TestAppContext,
+) -> (Entity<WalletRoot>, &'a mut VisualTestContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        ui::theme::apply_zenburn_component_theme(cx);
+        install_wallet_action_bindings(cx);
+    });
+    let (host, cx) = cx.add_window_view(|window, cx| {
+        let root = fixture_root(path, runtime, window, cx);
+        let view = cx.new(|cx| {
+            cx.observe(&root, |_, _, cx| cx.notify()).detach();
+            WalletViewWindow(root)
+        });
+        Root::new(view, window, cx)
+    });
+    let root = host.read_with(cx, |host, cx| {
+        host.view()
+            .clone()
+            .downcast::<WalletViewWindow>()
+            .unwrap()
+            .read(cx)
+            .0
+            .clone()
+    });
+    (root, cx)
+}
 
 pub(super) fn utxo_output(token: &str, value: &str, is_spent: bool) -> UtxoOutput {
     const SOURCE_TX_HASH: &str =
@@ -89,6 +139,7 @@ pub(super) fn utxo_output_with_hashes(
         local_pending_spent: false,
         spent_tx_hash: spent_tx_hash.map(str::to_string),
         spent_block_number: spent_tx_hash.map(|_| 21),
+        spent_block_timestamp: None,
     }
 }
 
@@ -128,6 +179,7 @@ pub(in crate::root) fn unshield_utxo_output(
         local_pending_spent: false,
         spent_tx_hash: None,
         spent_block_number: None,
+        spent_block_timestamp: None,
     }
 }
 

@@ -26,7 +26,10 @@ use ui::dialog::WalletDialogExt as _;
 use ui::theme;
 use wallet_ops::{
     SwapOrderState, WalletNetworkMode, is_swap_record,
-    vault::{BridgeProvider, ExecutorOperationId, ExecutorRecord, SwapDelivery, SwapOrderRecord},
+    vault::{
+        BridgeProvider, ExecutorOperationId, ExecutorRecord, SwapDelivery, SwapOrderRecord,
+        SwapUseId,
+    },
 };
 
 use super::form::SetupSide;
@@ -42,6 +45,7 @@ use crate::assets::{
     NEAR_SYMBOL_WHITE_PATH, WalletIconSource,
 };
 use crate::root::submission_route::{SubmissionRouteCard, render_submission_route_indicator};
+use crate::root::ui_helpers::{now_unix, token_icon_slot};
 use crate::root::{dialog_max_height, secondary_dialog_content_width};
 
 /// One column for the form's panels, narrower than Send and Unshield.
@@ -268,6 +272,45 @@ impl PrivateSwapsView {
         cx: &mut Context<'_, Self>,
     ) {
         self.show_view(SwapDialogView::Detail(operation), window, cx);
+    }
+
+    /// Open the swap of `swap_use` as My orders lists it, for Activity's swap rows. A swap My
+    /// orders doesn't list opens My orders.
+    pub(in crate::root) fn show_swap_use(
+        &mut self,
+        swap_use: SwapUseId,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let view = {
+            let entries = self.order_entries(cx);
+            entries
+                .iter()
+                .find_map(|entry| match entry.view {
+                    SwapDialogView::PastDetail(swap, _)
+                    | SwapDialogView::PublicDetail(swap)
+                    | SwapDialogView::CancelledPreparation(swap)
+                        if swap.swap_use == swap_use =>
+                    {
+                        Some(entry.view)
+                    }
+                    _ => None,
+                })
+                .or_else(|| {
+                    // The latest swap of an account is listed by its operation.
+                    entries.iter().find_map(|entry| match entry.view {
+                        SwapDialogView::Detail(_) if entry.record.swap_use(swap_use).is_some() => {
+                            Some(entry.view)
+                        }
+                        _ => None,
+                    })
+                })
+                .unwrap_or(SwapDialogView::Orders)
+        };
+        if view == SwapDialogView::Orders {
+            self.orders_filter = None;
+        }
+        self.show_view(view, window, cx);
     }
 
     /// Switch the open swap dialog's view. A detail replaces the form; My orders keeps it, so
@@ -600,7 +643,7 @@ impl PrivateSwapsView {
                     record,
                     claimed,
                     None,
-                    super::now_unix(),
+                    now_unix(),
                     self.attribution(record),
                     self.public_destination_balance(record, claimed),
                 ) else {
@@ -1085,7 +1128,7 @@ impl PrivateSwapsView {
                 record,
                 claimed,
                 None,
-                super::now_unix(),
+                now_unix(),
                 self.attribution(record),
                 self.public_destination_balance(record, claimed),
             )
@@ -1445,13 +1488,7 @@ fn render_order_row(row: &SwapOrderRow) -> gpui::Div {
         .flex()
         .items_center()
         .children(row.icons.iter().enumerate().map(|(index, icon)| {
-            div()
-                .size_5()
-                .flex_none()
-                .rounded_full()
-                .bg(rgb(theme::SURFACE_HOVER))
-                .when(index > 0, |slot| slot.ml(rems(-0.5)))
-                .children(icon.clone().map(|icon| img(icon).size_5().rounded_full()))
+            token_icon_slot(icon.clone()).when(index > 0, |slot| slot.ml(rems(-0.5)))
         }));
     let amount = match &row.amount {
         OrderRowAmount::None => None,

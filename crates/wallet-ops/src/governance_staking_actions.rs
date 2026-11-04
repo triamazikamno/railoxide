@@ -404,6 +404,7 @@ pub fn plan_principal_claim(
     Ok(PrincipalClaimPlan {
         intent: GovernanceActionIntent::PrincipalClaim {
             stake_id: position.id,
+            amount: position.amount,
         },
         owner: position.owner,
         recipient: position.owner,

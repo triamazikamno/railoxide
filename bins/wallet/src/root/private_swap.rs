@@ -38,6 +38,7 @@ use wallet_ops::{
 
 use super::WalletRoot;
 use super::spend_authorization::{SpendAuthorizationIntent, SpendAuthorizationSummary};
+use super::ui_helpers::{day_label, now_unix};
 
 mod dialog;
 mod disclaimer;
@@ -48,6 +49,7 @@ mod public_progress;
 mod setup_progress;
 #[cfg(debug_assertions)]
 mod ui_fixture;
+pub(super) use ui_fixture::activity as ui_fixture_activity;
 pub(super) use ui_fixture::hardware_derive as ui_fixture_hardware_derive;
 pub(super) use ui_fixture::refund_dialog_state as ui_fixture_refund_dialog_state;
 pub(super) use ui_fixture::send_asset as ui_fixture_send_asset;
@@ -75,6 +77,12 @@ mod ui_fixture {
 
     pub(in crate::root) const fn shows_utxos() -> bool {
         false
+    }
+
+    pub(in crate::root) const fn activity(
+        _chain_id: u64,
+    ) -> Option<crate::root::wallet_activity::ActivityStandIn> {
+        None
     }
 
     pub(in crate::root) const fn hardware_derive() -> bool {
@@ -4538,27 +4546,9 @@ pub(super) fn local_time_label(at: u64) -> String {
 /// Local date and time of a Unix timestamp: "Today 14:21", "Yesterday 18:05", "Sep 24 10:42",
 /// or "Sep 24, 2025 10:42" in an earlier year.
 pub(super) fn local_date_time_label(at: u64) -> String {
-    use chrono::Datelike as _;
     let at =
         chrono::DateTime::<chrono::Local>::from(std::time::UNIX_EPOCH + Duration::from_secs(at));
-    let today = chrono::Local::now().date_naive();
-    let day = at.date_naive();
-    let time = at.format("%H:%M");
-    if day == today {
-        format!("Today {time}")
-    } else if today.pred_opt() == Some(day) {
-        format!("Yesterday {time}")
-    } else if day.year() == today.year() {
-        format!("{} {time}", at.format("%b %-d"))
-    } else {
-        format!("{} {time}", at.format("%b %-d, %Y"))
-    }
-}
-
-pub(super) fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
+    format!("{} {}", day_label(at.date_naive()), at.format("%H:%M"))
 }
 
 /// What a setup says whose fee `required` in `token` is above the approved `maximum`. `control`

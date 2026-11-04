@@ -187,7 +187,7 @@ pub(super) fn dimension(value: f32) -> gpui::Rems {
 }
 
 impl WalletRoot {
-    pub(super) fn public_chain_has_pricing(&self) -> bool {
+    pub(in crate::root) fn public_chain_has_pricing(&self) -> bool {
         if self.tron_selected() {
             return self.tron_has_pricing();
         }

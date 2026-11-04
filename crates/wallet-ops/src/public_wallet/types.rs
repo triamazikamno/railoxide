@@ -325,6 +325,8 @@ pub struct PublicSendRequest {
     pub public_account_uuid: String,
     pub intent: PublicTransactionIntent,
     pub advanced_authorization: Option<PublicAdvancedTransactionAuthorization>,
+    /// The origin of the gateway draft this submits, which its journal entry is tagged with.
+    pub gateway_origin: Option<String>,
     pub gas_fee: PublicActionGasFeeSelection,
     pub command_rx: Option<PublicActionCommandReceiver>,
     pub event_tx: Option<PublicActionSessionEventSender>,
@@ -384,6 +386,8 @@ pub struct PublicShieldRequest {
     /// The stealth account operation a native shield is sent from. A retry of the same
     /// shield passes the same one.
     pub native_operation: Option<crate::vault::ExecutorOperationId>,
+    /// The origin of the gateway draft this submits, which its journal entry is tagged with.
+    pub gateway_origin: Option<String>,
     pub gas_fee: PublicActionGasFeeSelection,
     pub gas_fee_mode: PublicActionGasFeeMode,
     pub authorized_fee_ceiling: PublicActionGasFeeSelection,
@@ -499,6 +503,8 @@ pub struct WalletConnectSendTransactionRequest {
     pub trezor_app_passphrase: Option<Zeroizing<String>>,
     pub trezor_pin_matrix_provider: Option<HardwareTrezorPinMatrixProvider>,
     pub public_account_uuid: String,
+    /// The requesting dapp's name, which its journal entry is tagged with.
+    pub dapp_name: String,
     pub tx_req: TransactionRequest,
     pub decoded_transaction: Option<WalletConnectDecodedTransaction>,
     pub reviewed_transaction: Option<WalletConnectReviewedTransaction>,

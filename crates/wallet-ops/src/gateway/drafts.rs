@@ -220,6 +220,8 @@ struct ExecutionState {
     message: String,
     warning: bool,
     private: Option<super::GatewayPrivateDraftProgress>,
+    /// The paired browser the draft came from, as its journal entry names it.
+    origin: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -245,6 +247,7 @@ impl Default for GatewayDraftExecution {
             message: "Review this transaction in the desktop app.".into(),
             warning: false,
             private: None,
+            origin: None,
         })))
     }
 }
@@ -263,6 +266,25 @@ impl GatewayDraftExecution {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .private = Some(private);
         execution
+    }
+
+    /// Names the paired browser the draft came from, for the submission's journal entry.
+    #[must_use]
+    pub fn with_origin(self, origin: String) -> Self {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .origin = Some(origin);
+        self
+    }
+
+    #[must_use]
+    pub fn origin(&self) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .origin
+            .clone()
     }
 
     #[must_use]

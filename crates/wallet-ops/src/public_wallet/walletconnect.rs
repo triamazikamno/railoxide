@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use alloy::rpc::types::TransactionRequest;
 use eyre::{Result, WrapErr, eyre};
 
 use super::runtime::verified_public_chain_runtime_config;
@@ -18,9 +21,16 @@ use super::types::{
     WalletConnectSendTransactionResult, WalletConnectTypedDataSignRequest,
     is_walletconnect_hardware_typed_data_hash_fallback_confirmation_required,
 };
+use crate::desktop::{ActivitySubmission, PublicActivity};
 use crate::hardware::HardwareTypedDataSigningMode;
 use crate::hardware_typed_data::HardwareEip712Model;
-use crate::walletconnect::WalletConnectSupportedMethod;
+use crate::vault::{
+    ActivityAsset, ActivityCounterparty, ActivityDirection, ActivityKind, ActivityLeg,
+    ActivitySource, DesktopVaultStore, DesktopViewSession,
+};
+use crate::walletconnect::{
+    WalletConnectDecodedCallKind, WalletConnectDecodedTransaction, WalletConnectSupportedMethod,
+};
 use crate::{HttpContext, OperationHttpClient, report_chain_string};
 
 /// A stealth-account signer's admission reads go over `client`.
@@ -282,6 +292,15 @@ pub async fn submit_walletconnect_send_transaction(
                 request.chain_id,
                 from_address,
             );
+            let activity = walletconnect_activity(
+                &request.vault_store,
+                &request.view_session,
+                &request.public_account_uuid,
+                request.chain_id,
+                &request.dapp_name,
+                &tx_req,
+                request.decoded_transaction.as_ref(),
+            );
             let operation_gas_limit =
                 request
                     .decoded_transaction
@@ -384,6 +403,7 @@ pub async fn submit_walletconnect_send_transaction(
                     if let Some(control) = request.request_control.as_ref() {
                         control.before_broadcast()?;
                     }
+                    activity.add_attempt(attempt.tx_hash);
                     if let Some(guard) = observation.as_mut() {
                         guard.observer_mut().register(attempt.tx_hash, 0);
                     }
@@ -408,4 +428,60 @@ pub async fn submit_walletconnect_send_transaction(
             })
         })
         .await
+}
+
+/// The journal entry of a transaction `dapp` requested, by its decoded call: a token or native
+/// transfer is a public send to its recipient, anything else a contract call on its target.
+pub(crate) fn walletconnect_activity(
+    vault_store: &DesktopVaultStore,
+    view_session: &Arc<DesktopViewSession>,
+    account_uuid: &str,
+    chain_id: u64,
+    dapp: &str,
+    tx_req: &TransactionRequest,
+    decoded: Option<&WalletConnectDecodedTransaction>,
+) -> ActivitySubmission {
+    let out = |asset, amount| ActivityLeg {
+        asset,
+        amount,
+        direction: ActivityDirection::Out,
+    };
+    let target = decoded.map_or_else(
+        || tx_req.to.and_then(|to| to.to().copied()),
+        |decoded| decoded.target,
+    );
+    let value = decoded.map_or_else(
+        || tx_req.value.unwrap_or_default(),
+        |decoded| decoded.native_value,
+    );
+    let native = (!value.is_zero()).then(|| out(ActivityAsset::Native, value));
+    let (kind, legs, counterparty) = match (decoded.map(|decoded| &decoded.kind), target) {
+        (Some(WalletConnectDecodedCallKind::Erc20Transfer { recipient, amount }), Some(token)) => (
+            ActivityKind::PublicSend,
+            vec![out(ActivityAsset::Token(token), *amount)],
+            Some(*recipient),
+        ),
+        (Some(WalletConnectDecodedCallKind::NativeTransfer), _) => (
+            ActivityKind::PublicSend,
+            native.into_iter().collect(),
+            target,
+        ),
+        _ => (
+            ActivityKind::ContractCall,
+            native.into_iter().collect(),
+            target,
+        ),
+    };
+    let activity = PublicActivity {
+        account_uuid: account_uuid.to_owned(),
+        chain_id,
+        kind,
+        legs,
+        counterparty: counterparty.map(ActivityCounterparty::Evm),
+    };
+    ActivitySubmission::public(vault_store, view_session, activity).with_source(
+        ActivitySource::WalletConnect {
+            dapp: dapp.to_owned(),
+        },
+    )
 }

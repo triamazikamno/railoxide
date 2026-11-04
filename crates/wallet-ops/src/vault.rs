@@ -36,6 +36,7 @@ use crate::hardware::{
     HardwarePublicAccountDescriptor, HardwareViewAccessKey, HardwareWalletSyncIntent,
 };
 
+mod activity;
 mod core;
 mod crypto;
 mod executors;
@@ -46,6 +47,7 @@ mod unlock;
 mod view_cache;
 mod view_cache_migration;
 
+pub use activity::*;
 pub use core::*;
 pub use crypto::*;
 pub use executors::*;

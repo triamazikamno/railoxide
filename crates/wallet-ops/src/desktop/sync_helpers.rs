@@ -766,6 +766,7 @@ mod tests {
             local_pending_spent: false,
             spent_tx_hash: None,
             spent_block_number: None,
+            spent_block_timestamp: None,
         }
     }
 

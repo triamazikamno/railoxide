@@ -1,5 +1,6 @@
 use super::*;
 
+mod activity_journal;
 mod blocked_shield_rescue;
 mod chain_rpc;
 mod executor_discovery;
@@ -48,6 +49,11 @@ pub async fn initialize_created_wallet_chain_metadata_for_session(
     );
 }
 
+pub(crate) use activity_journal::{
+    ActivitySubmission, PrivateActivity, PublicActivity, activity_inputs, is_swap_step,
+    observe_activity_inclusion, observe_activity_rollback,
+};
+pub use activity_journal::{running_activity_entries, subscribe_activity_journal_failures};
 pub use blocked_shield_rescue::*;
 pub use chain_rpc::start_rpc_identity_warmup;
 pub(crate) use chain_rpc::*;
@@ -78,8 +84,7 @@ pub use self_broadcast::{
     DesktopSelfBroadcastResult, DesktopSponsoredSelfBroadcastResult, SelfBroadcastTxOutcome,
     SponsoredSelfBroadcastCommand, SponsoredSelfBroadcastCommandSender,
     SponsoredSelfBroadcastSessionOutcome, SponsoredSelfBroadcastSessionRequest,
-    SponsoredSelfBroadcastStopReason, run_sponsored_self_broadcast_session,
-    sponsored_self_broadcast_head_poll_interval,
+    SponsoredSelfBroadcastStopReason, sponsored_self_broadcast_head_poll_interval,
 };
 pub use sessions::*;
 pub use sync_helpers::fetch_current_safe_head;

@@ -1329,7 +1329,9 @@ impl Drop for RetiringNode<'_> {
 
 /// Subscribe to the response topic, publish, and until a response or `timeout` republish
 /// while the route is ready. A route lost in built-in Tor mode is recovered on new circuits
-/// with the same node, a bounded number of times.
+/// with the same node, a bounded number of times. Returned errors all occur before
+/// publication is attempted; a failed publish may still have reached peers, so it enters the
+/// response-waiting lifecycle.
 async fn deliver_public_broadcaster_request(
     node: &dyn SubmissionNode,
     operation: &OperationHttpClient,
@@ -1359,9 +1361,15 @@ async fn deliver_public_broadcaster_request(
         elapsed_ms = subscribe_started.elapsed().as_millis(),
         "subscribed to public broadcaster response topic"
     );
-    publish_public_broadcaster_payload(node, pubsub_path, transact_topic, payload, 1)
-        .await
-        .wrap_err("publish initial public broadcaster transact request")?;
+    if let Err(error) =
+        publish_public_broadcaster_payload(node, pubsub_path, transact_topic, payload, 1).await
+    {
+        tracing::warn!(
+            %error,
+            attempt = 1,
+            "publish initial public broadcaster transact request failed"
+        );
+    }
     let published = tokio::time::Instant::now();
     let deadline = published + timeout;
     let mut publishes = 1u32;

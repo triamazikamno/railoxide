@@ -8,6 +8,9 @@ use crate::desktop::executors::Transfer;
 pub(super) struct PreparedBlockedShieldRescuePlan {
     pub(super) plan: UnshieldPlan,
     pub(super) public_account_uuid: String,
+    pub(super) token: Address,
+    /// The address the refund returns the Shield's value to.
+    pub(super) origin_address: Address,
 }
 
 pub async fn resolve_blocked_shield_rescue_eligibility(

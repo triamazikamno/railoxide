@@ -9,6 +9,7 @@ use alloy::sol_types::SolCall;
 use eyre::{Result, eyre};
 use thiserror::Error;
 
+use crate::desktop::{ActivitySubmission, PublicActivity};
 use crate::governance::GovernanceContractVersion;
 use crate::http::{HttpContext, OperationHttpClient};
 use crate::public_wallet::{
@@ -20,6 +21,9 @@ use crate::public_wallet::{
     simulate_public_advanced_transaction_with_fee, submit_public_action_step_with_signer,
 };
 use crate::settings::{EffectiveChainConfig, resolve_effective_chain_rpc_route};
+use crate::vault::{
+    ActivityAsset, ActivityCounterparty, ActivityDirection, ActivityKind, ActivityLeg, ActivityStep,
+};
 use crate::{
     DEFAULT_MULTICALL_CHUNK_SIZE, MulticallChunkSize, RpcTrafficClass, StakePlan,
     UndelegateFirstPlan, continue_stake_after_approval, continue_unlock_after_undelegation,
@@ -147,6 +151,7 @@ pub enum GovernanceActionIntent {
     },
     PrincipalClaim {
         stake_id: U256,
+        amount: U256,
     },
     RewardClaim {
         reward_tokens: Vec<Address>,
@@ -356,7 +361,7 @@ impl GovernanceActionIntent {
             Self::Unlock { stake_id } => {
                 GovernanceStakingActions::unlockCall { stakeId: *stake_id }.abi_encode()
             }
-            Self::PrincipalClaim { stake_id } => {
+            Self::PrincipalClaim { stake_id, .. } => {
                 GovernanceStakingActions::claimCall { stakeId: *stake_id }.abi_encode()
             }
             Self::RewardClaim {
@@ -670,6 +675,11 @@ pub async fn submit_governance_action_with_progress(
         Some(&request.estimate),
     )
     .map_err(|error| eyre!(error))?;
+    let activity = governance_activity(
+        &request.public_send,
+        request.review.context.contract,
+        governance_legs(request.public_send.chain_id, &request.rebuilt.intent),
+    );
     let signer = admitted_public_signer_authorized(
         &request.public_send.vault_store,
         &request.public_send.view_session,
@@ -704,12 +714,69 @@ pub async fn submit_governance_action_with_progress(
                 http,
                 client,
                 request.public_send.transaction_tracking.as_ref(),
+                Some((&activity, ActivityStep::Main)),
                 &mut progress,
             )
             .await?;
             Ok(PublicSendResult { tx })
         })
         .await
+}
+
+/// The journal entry of a Governance action, owned by its Public account and targeting
+/// `contract`.
+fn governance_activity(
+    public_send: &PublicSendRequest,
+    contract: Address,
+    legs: Vec<ActivityLeg>,
+) -> ActivitySubmission {
+    ActivitySubmission::public(
+        &public_send.vault_store,
+        &public_send.view_session,
+        PublicActivity {
+            account_uuid: public_send.public_account_uuid.clone(),
+            chain_id: public_send.chain_id,
+            kind: ActivityKind::Governance,
+            legs,
+            counterparty: Some(ActivityCounterparty::Evm(contract)),
+        },
+    )
+}
+
+/// The token movements of `intent`: staked RAIL out, claimed principal and rewards in. Voting
+/// weight and stake management move no tokens.
+fn governance_legs(chain_id: u64, intent: &GovernanceActionIntent) -> Vec<ActivityLeg> {
+    let rail = |amount: &U256, direction| -> Vec<ActivityLeg> {
+        governance_contracts(chain_id)
+            .map(|contracts| ActivityLeg {
+                asset: ActivityAsset::Token(contracts.governance_token),
+                amount: *amount,
+                direction,
+            })
+            .into_iter()
+            .collect()
+    };
+    match intent {
+        GovernanceActionIntent::Stake { amount } => rail(amount, ActivityDirection::Out),
+        GovernanceActionIntent::PrincipalClaim { amount, .. } => {
+            rail(amount, ActivityDirection::In)
+        }
+        GovernanceActionIntent::RewardClaim {
+            reward_tokens,
+            expected_amounts,
+            ..
+        } => reward_tokens
+            .iter()
+            .zip(expected_amounts)
+            .filter(|(_, amount)| !amount.is_zero())
+            .map(|(token, amount)| ActivityLeg {
+                asset: ActivityAsset::Token(*token),
+                amount: *amount,
+                direction: ActivityDirection::In,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Validate workflow identity before deriving a signer or allowing any signature attempt.
@@ -793,6 +860,25 @@ pub async fn submit_governance_workflow_with_progress(
     validate_governance_workflow(&request.initial, &request.workflow)
         .map_err(|error| eyre!(error))?;
     let GovernanceWorkflowRequest { initial, workflow } = request;
+    // One entry for both transactions, the first of which is only a prerequisite.
+    let (target, first_step, legs) = match &workflow {
+        GovernanceWorkflow::StakeApproval(plan) => (
+            plan.staking,
+            ActivityStep::Approve,
+            governance_legs(
+                initial.public_send.chain_id,
+                &GovernanceActionIntent::Stake {
+                    amount: plan.amount,
+                },
+            ),
+        ),
+        GovernanceWorkflow::UndelegateThenUnlock(_) => (
+            initial.review.context.contract,
+            ActivityStep::Undelegate,
+            Vec::new(),
+        ),
+    };
+    let activity = governance_activity(&initial.public_send, target, legs);
     let signer: VaultedPublicSigner = admitted_public_signer_authorized(
         &initial.public_send.vault_store,
         &initial.public_send.view_session,
@@ -831,6 +917,7 @@ pub async fn submit_governance_workflow_with_progress(
                 http,
                 client,
                 initial.public_send.transaction_tracking.as_ref(),
+                Some((&activity, first_step)),
                 &mut progress,
             )
             .await?;
@@ -917,6 +1004,7 @@ pub async fn submit_governance_workflow_with_progress(
                 http,
                 client,
                 initial.public_send.transaction_tracking.as_ref(),
+                Some((&activity, ActivityStep::Main)),
                 &mut progress,
             )
             .await?;
@@ -1043,8 +1131,11 @@ fn append_intent(output: &mut Vec<u8>, intent: &GovernanceActionIntent) {
             output.extend_from_slice(delegate.as_slice());
         }
         GovernanceActionIntent::Undelegate { stake_id }
-        | GovernanceActionIntent::Unlock { stake_id }
-        | GovernanceActionIntent::PrincipalClaim { stake_id } => append_u256(output, *stake_id),
+        | GovernanceActionIntent::Unlock { stake_id } => append_u256(output, *stake_id),
+        GovernanceActionIntent::PrincipalClaim { stake_id, amount } => {
+            append_u256(output, *stake_id);
+            append_u256(output, *amount);
+        }
         GovernanceActionIntent::RewardClaim {
             reward_tokens,
             starting_interval,
@@ -1293,6 +1384,25 @@ mod tests {
         assert_eq!(decoded.account, ctx.actor);
         assert_eq!(decoded.proposalID, U256::from(7));
         assert_eq!(decoded.hint, U256::from(2));
+    }
+
+    #[test]
+    fn principal_claim_binds_its_amount_but_calls_with_the_stake_alone() {
+        let ctx = GovernanceActionContext {
+            contract_kind: GovernanceContractKind::Staking,
+            ..context()
+        };
+        let claim = |amount: u64| {
+            GovernanceActionIntent::PrincipalClaim {
+                stake_id: U256::from(2),
+                amount: U256::from(amount),
+            }
+            .resolve(&ctx)
+            .unwrap()
+        };
+        let (claim, other) = (claim(7), claim(8));
+        assert_eq!(claim.raw, other.raw);
+        assert_ne!(claim.fingerprint, other.fingerprint);
     }
 
     #[test]

@@ -273,6 +273,8 @@ pub enum RecordKind {
     GatewayPermission,
     ExecutorAllocation,
     ExecutorOperation,
+    ActivityEntry,
+    ActivityMarkers,
 }
 
 impl RecordKind {
@@ -308,6 +310,8 @@ impl RecordKind {
             Self::GatewayPermission => "gateway-permission",
             Self::ExecutorAllocation => "executor-allocation",
             Self::ExecutorOperation => "executor-operation",
+            Self::ActivityEntry => "activity-entry",
+            Self::ActivityMarkers => "activity-markers",
         }
     }
 

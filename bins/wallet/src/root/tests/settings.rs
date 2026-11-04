@@ -111,13 +111,18 @@ fn utxo_table_focus_is_activity_scoped() {
         Some(&state)
     ));
     assert!(!should_focus_utxo_table(
-        Activity::Broadcaster,
+        Activity::Wallet,
         WalletTab::Activity,
+        Some(&state)
+    ));
+    assert!(!should_focus_utxo_table(
+        Activity::Broadcaster,
+        WalletTab::UTXOs,
         Some(&state)
     ));
     assert!(should_focus_utxo_table(
         Activity::Wallet,
-        WalletTab::Activity,
+        WalletTab::UTXOs,
         Some(&state)
     ));
 }
@@ -131,17 +136,17 @@ fn utxo_age_refresh_is_visible_activity_scoped() {
     ));
     assert!(!should_refresh_utxo_ages(
         Activity::Broadcaster,
-        WalletTab::Activity,
+        WalletTab::UTXOs,
         true
     ));
     assert!(!should_refresh_utxo_ages(
         Activity::Wallet,
-        WalletTab::Activity,
+        WalletTab::UTXOs,
         false
     ));
     assert!(should_refresh_utxo_ages(
         Activity::Wallet,
-        WalletTab::Activity,
+        WalletTab::UTXOs,
         true
     ));
 }

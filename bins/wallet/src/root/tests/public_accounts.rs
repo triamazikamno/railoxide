@@ -899,15 +899,6 @@ fn failed_account_refresh_stays_stale_after_another_account_succeeds(cx: &mut Te
     std::fs::remove_dir_all(path).unwrap();
 }
 
-struct WalletViewWindow(Entity<WalletRoot>);
-impl Render for WalletViewWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .child(self.0.read(cx).render_wallet_view(&self.0, window, cx))
-    }
-}
-
 #[gpui::test]
 fn wallet_view_shortcuts_switch_tabs_and_open_selectors_outside_dialogs(cx: &mut TestAppContext) {
     let path = temp_wallet_db_root("wallet-tabs");
@@ -916,28 +907,7 @@ fn wallet_view_shortcuts_switch_tabs_and_open_selectors_outside_dialogs(cx: &mut
         .build()
         .unwrap();
     let _entered = runtime.enter();
-    cx.update(|cx| {
-        gpui_component::init(cx);
-        ui::theme::apply_zenburn_component_theme(cx);
-        install_wallet_action_bindings(cx);
-    });
-    let (host, cx) = cx.add_window_view(|window, cx| {
-        let root = fixture_root(&path, &runtime, window, cx);
-        let view = cx.new(|cx| {
-            cx.observe(&root, |_, _, cx| cx.notify()).detach();
-            WalletViewWindow(root)
-        });
-        Root::new(view, window, cx)
-    });
-    let root = host.read_with(cx, |host, cx| {
-        host.view()
-            .clone()
-            .downcast::<WalletViewWindow>()
-            .unwrap()
-            .read(cx)
-            .0
-            .clone()
-    });
+    let (root, cx) = wallet_view_root(&path, &runtime, cx);
     cx.update(|window, cx| {
         root.read(cx).wallet_focus.clone().focus(window, cx);
         window.draw(cx).clear(cx);
@@ -948,12 +918,21 @@ fn wallet_view_shortcuts_switch_tabs_and_open_selectors_outside_dialogs(cx: &mut
     for (keys, expected) in [
         ("ctrl-tab", WalletTab::Public),
         ("ctrl-tab", WalletTab::Activity),
+        ("ctrl-tab", WalletTab::UTXOs),
         ("ctrl-tab", WalletTab::Private),
+        ("ctrl-shift-tab", WalletTab::UTXOs),
         ("ctrl-shift-tab", WalletTab::Activity),
         ("ctrl-shift-tab", WalletTab::Public),
     ] {
         cx.simulate_keystrokes(keys);
         assert_eq!(active_tab(cx), expected, "after {keys}");
+        // Only the UTXOs tab shows the UTXO table and its controls.
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(
+            cx.debug_bounds("wallet-utxos-body").is_some(),
+            expected == WalletTab::UTXOs,
+            "UTXO table after {keys}"
+        );
     }
 
     // Header selector shortcuts open the popup with keyboard focus in it.
@@ -999,7 +978,7 @@ fn wallet_view_shortcuts_switch_tabs_and_open_selectors_outside_dialogs(cx: &mut
         window.draw(cx).clear(cx);
     });
 
-    // Private and Activity are unavailable without a Railgun deployment.
+    // Private and UTXOs are unavailable without a Railgun deployment; Activity isn't.
     cx.update(|_, cx| {
         root.update(cx, |root, cx| {
             root.effective_chain_configs = root
@@ -1014,13 +993,41 @@ fn wallet_view_shortcuts_switch_tabs_and_open_selectors_outside_dialogs(cx: &mut
             cx.notify();
         });
     });
-    for keys in ["ctrl-tab", "ctrl-shift-tab"] {
+    for (keys, expected) in [
+        ("ctrl-tab", WalletTab::Activity),
+        ("ctrl-tab", WalletTab::Public),
+        ("ctrl-shift-tab", WalletTab::Activity),
+        ("ctrl-shift-tab", WalletTab::Public),
+    ] {
         cx.simulate_keystrokes(keys);
-        assert_eq!(active_tab(cx), WalletTab::Public, "after {keys}");
+        assert_eq!(active_tab(cx), expected, "after {keys}");
     }
 
     cx.update(|window, _| window.remove_window());
-    drop(host);
+    drop(root);
+    cx.run_until_parked();
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[gpui::test]
+fn a_wallet_change_keeps_the_open_wallet_tab(cx: &mut TestAppContext) {
+    let path = temp_wallet_db_root("wallet-change-tab");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    let (root, cx) = wallet_view_root(&path, &runtime, cx);
+    root.update(cx, |root, cx| {
+        root.select_wallet_tab(WalletTab::Activity, cx);
+        root.reset_wallet_scoped_state(cx);
+    });
+    assert_eq!(
+        root.read_with(cx, |root, _| root.active_wallet_tab),
+        WalletTab::Activity
+    );
+
+    cx.update(|window, _| window.remove_window());
     drop(root);
     cx.run_until_parked();
     std::fs::remove_dir_all(path).unwrap();
@@ -1034,28 +1041,7 @@ fn selecting_tron_leaves_evm_views_unavailable_and_offers_no_action(cx: &mut Tes
         .build()
         .unwrap();
     let _entered = runtime.enter();
-    cx.update(|cx| {
-        gpui_component::init(cx);
-        ui::theme::apply_zenburn_component_theme(cx);
-        install_wallet_action_bindings(cx);
-    });
-    let (host, cx) = cx.add_window_view(|window, cx| {
-        let root = fixture_root(&path, &runtime, window, cx);
-        let view = cx.new(|cx| {
-            cx.observe(&root, |_, _, cx| cx.notify()).detach();
-            WalletViewWindow(root)
-        });
-        Root::new(view, window, cx)
-    });
-    let root = host.read_with(cx, |host, cx| {
-        host.view()
-            .clone()
-            .downcast::<WalletViewWindow>()
-            .unwrap()
-            .read(cx)
-            .0
-            .clone()
-    });
+    let (root, cx) = wallet_view_root(&path, &runtime, cx);
     cx.simulate_resize(gpui::size(gpui::px(1224.), gpui::px(900.)));
     let remembered = root.read_with(cx, |root, _| {
         assert_eq!(root.active_wallet_tab, WalletTab::Private);
@@ -1083,12 +1069,15 @@ fn selecting_tron_leaves_evm_views_unavailable_and_offers_no_action(cx: &mut Tes
         assert_eq!(root.last_evm_chain, 1);
         assert_eq!(root.ui_state.last_chain_id, remembered);
 
-        // Private and Activity stay unavailable, with Tron's reason.
+        // Private and UTXOs stay unavailable, with Tron's reason. Activity lists Tron's entries.
         assert_eq!(root.active_wallet_tab, WalletTab::Public);
         root.select_wallet_tab(WalletTab::Private, cx);
-        root.select_wallet_tab(WalletTab::Activity, cx);
+        root.select_wallet_tab(WalletTab::UTXOs, cx);
         assert_eq!(root.active_wallet_tab, WalletTab::Public);
         assert!(root.railgun_unavailable_reason().contains("Tron"));
+        root.select_wallet_tab(WalletTab::Activity, cx);
+        assert_eq!(root.active_wallet_tab, WalletTab::Activity);
+        root.select_wallet_tab(WalletTab::Public, cx);
 
         // Shield and swaps have nothing to start from.
         root.public_form.action_mode = PublicActionMode::Send;
@@ -1139,7 +1128,6 @@ fn selecting_tron_leaves_evm_views_unavailable_and_offers_no_action(cx: &mut Tes
     });
 
     cx.update(|window, _| window.remove_window());
-    drop(host);
     drop(root);
     cx.run_until_parked();
     std::fs::remove_dir_all(path).unwrap();

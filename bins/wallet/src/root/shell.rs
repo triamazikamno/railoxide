@@ -165,16 +165,18 @@ pub(super) enum WalletTab {
     Private,
     Public,
     Activity,
+    UTXOs,
 }
 
 impl WalletTab {
-    pub(super) const ALL: [Self; 3] = [Self::Private, Self::Public, Self::Activity];
+    pub(super) const ALL: [Self; 4] = [Self::Private, Self::Public, Self::Activity, Self::UTXOs];
 
     pub(super) const fn label(self) -> &'static str {
         match self {
             Self::Private => "Private",
             Self::Public => "Public",
             Self::Activity => "Activity",
+            Self::UTXOs => "UTXOs",
         }
     }
 
@@ -183,11 +185,18 @@ impl WalletTab {
             Self::Private => icons::shield_keyhole_icon_path(),
             Self::Public => icons::eye_icon_path(),
             Self::Activity => icons::activity_icon_path(),
+            Self::UTXOs => crate::assets::LIST_ICON_PATH,
         }
     }
 
     pub(super) const fn shows_utxos(self) -> bool {
-        matches!(self, Self::Activity)
+        matches!(self, Self::UTXOs)
+    }
+
+    /// Private and UTXOs show private notes, which only a chain with Railgun has. Public and
+    /// Activity work on every network.
+    pub(super) const fn needs_railgun(self) -> bool {
+        matches!(self, Self::Private | Self::UTXOs)
     }
 }
 
@@ -267,7 +276,7 @@ impl WalletRoot {
     }
 
     pub(super) fn select_wallet_tab(&mut self, tab: WalletTab, cx: &mut Context<'_, Self>) {
-        if tab != WalletTab::Public && !self.selected_chain_has_railgun() {
+        if tab.needs_railgun() && !self.selected_chain_has_railgun() {
             return;
         }
         if self.active_wallet_tab == tab {
@@ -282,6 +291,12 @@ impl WalletRoot {
         if tab == WalletTab::Public {
             self.focus_public_account_search_on_render = true;
             self.schedule_automatic_public_balance_refresh(cx);
+        }
+        if tab == WalletTab::Activity {
+            // Reading again picks up address-book labels and accounts changed since.
+            self.load_wallet_activity(cx);
+            self.mark_wallet_activity_seen(cx);
+            self.wallet_activity.request_list_focus();
         }
         cx.notify();
     }
@@ -304,7 +319,7 @@ impl WalletRoot {
                     tabs[(current + count - step) % count]
                 }
             })
-            .find(|tab| *tab == WalletTab::Public || has_railgun);
+            .find(|tab| !tab.needs_railgun() || has_railgun);
         if let Some(tab) = next {
             self.select_wallet_tab(tab, cx);
         }
@@ -365,6 +380,15 @@ impl Render for WalletRoot {
                 cx,
             );
         }
+        if std::mem::take(&mut self.pending_activity_journal_notice) {
+            window.push_notification(
+                Notification::warning(
+                    "Couldn't update Activity for a recent transaction. The transaction itself \
+                     wasn't affected.",
+                ),
+                cx,
+            );
+        }
         self.apply_public_broadcaster_error_amount_adjustments(window, cx);
         self.sync_platform_attention_for_window(window);
         self.ensure_prover_cache_build_monitor(cx);
@@ -375,6 +399,7 @@ impl Render for WalletRoot {
             self.prompt_device_auth_on_unlock_screen_if_requested(window, cx);
             self.focus_utxo_table_if_requested(window, cx);
             self.focus_public_account_search_if_requested(window, cx);
+            self.focus_wallet_activity_list_if_requested(window, cx);
         }
 
         let root = cx.entity();
@@ -1206,23 +1231,41 @@ impl WalletRoot {
                 });
             })
             .children(WalletTab::ALL.into_iter().map(|tab| {
+                let unavailable = tab.needs_railgun() && !self.selected_chain_has_railgun();
+                let icon = Icon::empty()
+                    .path(tab.icon_path())
+                    .with_size(px(18.0))
+                    .text_color(rgb(theme::TEXT));
+                let unread = tab == WalletTab::Activity
+                    && self.active_wallet_tab != WalletTab::Activity
+                    && self.wallet_activity.unread();
                 Tab::new()
-                    .disabled(tab != WalletTab::Public && !self.selected_chain_has_railgun())
-                    .when(
-                        tab != WalletTab::Public && !self.selected_chain_has_railgun(),
-                        |tab| {
-                            let reason = self.railgun_unavailable_reason();
-                            tab.tooltip(move |window, cx| Tooltip::new(reason).build(window, cx))
-                        },
-                    )
+                    .disabled(unavailable)
+                    .when(unavailable, |tab| {
+                        let reason = self.railgun_unavailable_reason();
+                        tab.tooltip(move |window, cx| Tooltip::new(reason).build(window, cx))
+                    })
+                    .when(unread, |tab| {
+                        tab.tooltip(|window, cx| {
+                            Tooltip::new("Funds received since you last opened Activity")
+                                .build(window, cx)
+                        })
+                    })
                     .min_w(px(92.0))
                     .label(tab.label())
-                    .prefix(
-                        Icon::empty()
-                            .path(tab.icon_path())
-                            .with_size(px(18.0))
-                            .text_color(rgb(theme::TEXT)),
-                    )
+                    .map(|tab| {
+                        if unread {
+                            tab.prefix(
+                                div()
+                                    .debug_selector(|| "wallet-tab-activity-unread".to_owned())
+                                    .child(
+                                        Badge::new().dot().color(rgb(theme::PRIMARY)).child(icon),
+                                    ),
+                            )
+                        } else {
+                            tab.prefix(icon)
+                        }
+                    })
                     .when(
                         tab == WalletTab::Public
                             && self.active_wallet_tab != WalletTab::Public
@@ -1269,7 +1312,11 @@ impl WalletRoot {
         match self.active_wallet_tab {
             WalletTab::Private => self.render_private_assets_body(root, cx),
             WalletTab::Public => self.render_public_wallet_body(root, window, cx),
-            WalletTab::Activity => self.render_utxo_body(root, window).into_any_element(),
+            WalletTab::Activity => self.render_wallet_activity_body(root, cx),
+            WalletTab::UTXOs => self
+                .render_utxo_body(root, window)
+                .debug_selector(|| "wallet-utxos-body".to_owned())
+                .into_any_element(),
         }
     }
 

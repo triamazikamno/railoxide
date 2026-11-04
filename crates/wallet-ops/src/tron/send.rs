@@ -18,7 +18,7 @@
 
 use super::address::parse_tron_address;
 use super::confirmation::{
-    TronBlockReads, TronReads, TronSendHandoff, TronSendOutcome, confirm_tron_send,
+    TronBlockReads, TronReads, TronSendHandoff, TronSendOutcome, confirm_tron_send_at,
 };
 use super::fees::{
     AccountResources, ChainFeeParameters, FeeInputs, TronFees, bandwidth_bytes, fee_limit_sun,
@@ -29,8 +29,12 @@ use super::transaction::{
     ReferenceBlock, SignedTransaction, TronAsset, TronTransfer, UnsignedTransaction,
 };
 use crate::bridge::NonEvmNetwork;
+use crate::desktop::ActivitySubmission;
 use crate::public_wallet::PublicErc20;
-use crate::vault::{NonEvmAddressBookEntry, TronAccountMetadata};
+use crate::vault::{
+    ActivityAsset, ActivityAttemptOutcome, ActivityDirection, ActivityLeg, DesktopVaultStore,
+    DesktopViewSession, NonEvmAddressBookEntry, TronAccountMetadata,
+};
 use crate::{
     PublicActionProgressStatus, PublicActionProgressStep, PublicActionProgressUpdate,
     PublicActionSessionEvent, PublicActionSessionEventSender, RpcBrokerError, RpcRead,
@@ -42,6 +46,7 @@ use alloy::serde::WithOtherFields;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::SolCall as _;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, thiserror::Error)]
@@ -293,15 +298,24 @@ pub enum TronSendSubmission {
     },
 }
 
+/// The submitting wallet's session, which journals the send under its Tron account.
+pub struct TronSendActivity {
+    pub vault_store: Arc<DesktopVaultStore>,
+    pub view_session: Arc<DesktopViewSession>,
+    pub tron_account_uuid: String,
+}
+
 /// Signs `review` once `signer` resolves, hands it to an endpoint and follows it to its outcome.
 /// `signer` performs authorization and any hardware approval; the transaction is built after
 /// it, on the latest block. Progress and session events follow EVM Public Send's, all on the
-/// Send step.
+/// Send step. With `activity` the send is journaled at its handoff, and its outcome once
+/// decided.
 pub async fn submit_tron_send<R: TronSendReads + TronBlockReads + ?Sized>(
     reads: &R,
     review: &TronSendReview,
     signer: impl Future<Output = eyre::Result<PrivateKeySigner>> + Send,
     event_tx: Option<&PublicActionSessionEventSender>,
+    activity: Option<TronSendActivity>,
     claim_handoff: impl FnOnce() -> bool + Send,
     mut progress: impl FnMut(PublicActionProgressUpdate) + Send,
 ) -> Result<TronSendSubmission, TronSendError> {
@@ -349,6 +363,10 @@ pub async fn submit_tron_send<R: TronSendReads + TronBlockReads + ?Sized>(
     if !claim_handoff() {
         return Err(TronSendError::Stopped);
     }
+    let activity = activity.map(|activity| tron_send_activity(activity, &transfer));
+    if let Some(activity) = &activity {
+        activity.add_attempt(signed.txid());
+    }
     if let Some(event_tx) = event_tx {
         let _ = event_tx.send(PublicActionSessionEvent::AttemptHandoff {
             step: PublicActionProgressStep::Send,
@@ -381,7 +399,10 @@ pub async fn submit_tron_send<R: TronSendReads + TronBlockReads + ?Sized>(
         reference_block: block.number,
         expiration_ms: signed.expiration_ms(),
     };
-    let outcome = confirm_tron_send(reads, &handoff).await;
+    let (outcome, decided_ms) = confirm_tron_send_at(reads, &handoff).await;
+    if let Some(activity) = &activity {
+        activity.record_outcome(handoff.txid, tron_attempt_outcome(outcome, decided_ms));
+    }
     let (status, message) = match outcome {
         TronSendOutcome::Complete { .. } => (PublicActionProgressStatus::Done, None),
         TronSendOutcome::Failed {
@@ -402,6 +423,47 @@ pub async fn submit_tron_send<R: TronSendReads + TronBlockReads + ?Sized>(
     };
     progress(send_progress(status, Some(txid), message));
     Ok(TronSendSubmission::Decided { handoff, outcome })
+}
+
+fn tron_send_activity(activity: TronSendActivity, transfer: &TronTransfer) -> ActivitySubmission {
+    let (asset, amount) = match transfer.asset {
+        TronAsset::Trx { amount_sun } => (ActivityAsset::Native, U256::from(amount_sun)),
+        TronAsset::Trc20 {
+            contract, amount, ..
+        } => (ActivityAsset::Token(contract), amount),
+    };
+    ActivitySubmission::tron(
+        &activity.vault_store,
+        &activity.view_session,
+        activity.tron_account_uuid,
+        ActivityLeg {
+            asset,
+            amount,
+            direction: ActivityDirection::Out,
+        },
+        transfer.receiver,
+    )
+}
+
+/// The journaled outcome of a send decided by a block at `decided_ms`.
+pub(crate) const fn tron_attempt_outcome(
+    outcome: TronSendOutcome,
+    decided_ms: u64,
+) -> ActivityAttemptOutcome {
+    let timestamp = decided_ms / 1_000;
+    match outcome {
+        TronSendOutcome::Complete { block, .. } => ActivityAttemptOutcome::Included {
+            block,
+            timestamp,
+            success: true,
+        },
+        TronSendOutcome::Failed { block, .. } => ActivityAttemptOutcome::Included {
+            block,
+            timestamp,
+            success: false,
+        },
+        TronSendOutcome::Dropped => ActivityAttemptOutcome::Dropped,
+    }
 }
 
 const fn send_progress(
@@ -722,9 +784,17 @@ mod tests {
     }
 
     async fn submit(chain: &Chain, review: &TronSendReview) -> TronSendSubmission {
-        submit_tron_send(chain, review, async { Ok(signer()) }, None, || true, |_| {})
-            .await
-            .unwrap()
+        submit_tron_send(
+            chain,
+            review,
+            async { Ok(signer()) },
+            None,
+            None,
+            || true,
+            |_| {},
+        )
+        .await
+        .unwrap()
     }
 
     #[test]
@@ -877,6 +947,7 @@ mod tests {
             &review,
             approval,
             None,
+            None,
             || true,
             |update| {
                 updates.push(update);
@@ -920,6 +991,7 @@ mod tests {
             &review,
             async { Ok(signer()) },
             Some(&event_tx),
+            None,
             || true,
             |_| {},
         )
@@ -1021,6 +1093,7 @@ mod tests {
                     &reads,
                     &review,
                     async { Ok(signer()) },
+                    None,
                     None,
                     || true,
                     |_| {},

@@ -179,21 +179,30 @@ pub async fn confirm_tron_send<R: TronBlockReads + ?Sized>(
     reads: &R,
     handoff: &TronSendHandoff,
 ) -> TronSendOutcome {
+    confirm_tron_send_at(reads, handoff).await.0
+}
+
+/// [`confirm_tron_send`] with the timestamp in milliseconds of the block that decided it.
+pub(crate) async fn confirm_tron_send_at<R: TronBlockReads + ?Sized>(
+    reads: &R,
+    handoff: &TronSendHandoff,
+) -> (TronSendOutcome, u64) {
     let mut next = handoff.reference_block;
     loop {
-        if let Ok(Some(outcome)) = scan_solidified(reads, handoff, &mut next).await {
-            return outcome;
+        if let Ok(Some(decided)) = scan_solidified(reads, handoff, &mut next).await {
+            return decided;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
 /// Reads blocks from `next` up to the solidified head, advancing `next` past each one read.
+/// A decided outcome comes with its block's timestamp in milliseconds.
 async fn scan_solidified<R: TronBlockReads + ?Sized>(
     reads: &R,
     handoff: &TronSendHandoff,
     next: &mut u64,
-) -> Result<Option<TronSendOutcome>, RpcBrokerError> {
+) -> Result<Option<(TronSendOutcome, u64)>, RpcBrokerError> {
     let head = reads.solidified_head().await?;
     while *next <= head.number {
         let block = if *next == head.number {
@@ -211,10 +220,11 @@ async fn scan_solidified<R: TronBlockReads + ?Sized>(
                 .into_iter()
                 .find(|info| info.id == handoff.txid)
                 .ok_or(RpcBrokerError::InvalidResponse)?;
-            return Ok(Some(outcome(&handoff.transfer, &info, block.number)));
+            let decided = outcome(&handoff.transfer, &info, block.number);
+            return Ok(Some((decided, block.timestamp_ms)));
         }
         if block.timestamp_ms > handoff.expiration_ms {
-            return Ok(Some(TronSendOutcome::Dropped));
+            return Ok(Some((TronSendOutcome::Dropped, block.timestamp_ms)));
         }
         *next += 1;
     }

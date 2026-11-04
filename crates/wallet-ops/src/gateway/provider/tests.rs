@@ -3022,6 +3022,7 @@ async fn native_transaction_request_reaches_the_chain_only_over_its_client() {
                 trezor_app_passphrase: None,
                 trezor_pin_matrix_provider: None,
                 public_account_uuid: account.public_account_uuid.clone(),
+                dapp_name: "Dapp".to_owned(),
                 tx_req: alloy::rpc::types::TransactionRequest::default()
                     .with_to(to)
                     .with_value(U256::from(7)),

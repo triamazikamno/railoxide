@@ -73,6 +73,7 @@ pub struct UtxoOutput {
     pub local_pending_spent: bool,
     pub spent_tx_hash: Option<String>,
     pub spent_block_number: Option<u64>,
+    pub spent_block_timestamp: Option<u64>,
 }
 
 impl UtxoOutput {
@@ -232,6 +233,7 @@ pub(crate) fn utxo_outputs_from_utxos(
                 local_pending_spent: false,
                 spent_tx_hash: spent.map(|source| hex::encode_prefixed(source.tx_hash)),
                 spent_block_number: spent.map(|source| source.block_number),
+                spent_block_timestamp: spent.map(|source| source.block_timestamp),
             }
         })
         .collect();
@@ -372,6 +374,7 @@ fn pending_utxo_output(wallet_utxo: WalletUtxo) -> UtxoOutput {
         local_pending_spent: false,
         spent_tx_hash: spent.map(|source| hex::encode_prefixed(source.tx_hash)),
         spent_block_number: spent.map(|source| source.block_number),
+        spent_block_timestamp: spent.map(|source| source.block_timestamp),
     }
 }
 

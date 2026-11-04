@@ -20,7 +20,9 @@ use super::types::{
     PublicAssetId, PublicShieldTransactionProfile,
 };
 use crate::block_observer::BlockObserver;
+use crate::desktop::ActivitySubmission;
 use crate::settings::EffectiveChainGasSettings;
+use crate::vault::ActivityStep;
 use crate::{
     ClassRoute, HttpContext, OperationHttpClient, SelfBroadcastResolvedGasFee, TxReceiptOutput,
     report_chain_string, self_broadcast_replacement_bumped_fee,
@@ -180,7 +182,8 @@ pub(super) fn public_action_pools(
 
 /// Each preflight, including a replacement's, quotes fees from its own candidates on the
 /// Sensitive route of `pools`, including its nonce, estimate and balance reads. Observation
-/// continues on that class and broadcast goes to the Submit pool.
+/// continues on that class and broadcast goes to the Submit pool. Each handed-off attempt joins
+/// `activity`'s entry as its step before the raw send.
 pub(super) async fn submit_public_action_step_session(
     step: PublicActionProgressStep,
     base_tx_req: TransactionRequest,
@@ -193,6 +196,7 @@ pub(super) async fn submit_public_action_step_session(
     finality_depth: u64,
     http: &HttpContext,
     transaction_tracking: Option<&crate::PublicTransactionTrackingContext>,
+    activity: Option<(&ActivitySubmission, ActivityStep)>,
     chain_id: u64,
     from_address: Address,
     gas: &EffectiveChainGasSettings,
@@ -358,6 +362,9 @@ pub(super) async fn submit_public_action_step_session(
                 if let Some(handoff) = handoff.as_deref_mut() {
                     handoff(attempt.tx_hash, &attempted_request, signed)?;
                 }
+                if let Some((activity, activity_step)) = activity {
+                    activity.add_step_attempt(attempt.tx_hash, activity_step);
+                }
                 retain_public_action_attempt(
                     observer
                         .as_mut()
@@ -507,6 +514,9 @@ pub(super) async fn submit_public_action_step_session(
                                 // A replacement is handed off as its first attempt was.
                                 if let Some(handoff) = handoff.as_deref_mut() {
                                     handoff(attempt.tx_hash, &replacement_request, signed)?;
+                                }
+                                if let Some((activity, activity_step)) = activity {
+                                    activity.add_step_attempt(attempt.tx_hash, activity_step);
                                 }
                                 retain_public_action_attempt(
                                     observer.as_mut().expect("public action observer established"),
@@ -1889,6 +1899,7 @@ mod tests {
             1,
             http,
             transaction_tracking,
+            None,
             1,
             signer.address(),
             &chain.gas,
@@ -2025,6 +2036,167 @@ mod tests {
         assert!(!logs.contains("self-broadcast tx"), "{logs}");
         drop(command_tx);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_journals_each_attempt_before_its_send_whatever_the_response() {
+        use crate::desktop::PublicActivity;
+        use crate::public_wallet::tests::{
+            TEST_IMPORTED_PRIVATE_KEY, TEST_PASSWORD, public_action_request_parts,
+        };
+        use crate::vault::{ActivityEntry, ActivityJournal, ActivityKind, ActivityOwner};
+
+        let (root_dir, db, store, view) = public_action_request_parts();
+        let account = store
+            .import_public_account(TEST_PASSWORD, &view, TEST_IMPORTED_PRIVATE_KEY, None, false)
+            .unwrap();
+        let owner = ActivityOwner::Account(account.public_account_uuid.clone());
+        let journal = ActivityJournal::new(Arc::clone(&db), Arc::clone(&view)).unwrap();
+        let activity = ActivitySubmission::public(
+            &store,
+            &view,
+            PublicActivity {
+                account_uuid: account.public_account_uuid,
+                chain_id: 1,
+                kind: ActivityKind::PublicSend,
+                legs: Vec::new(),
+                counterparty: None,
+            },
+        );
+        // Each raw send notes whether its hash was journaled first. Every send of the first
+        // attempt fails, as when the response is lost after a node accepted it.
+        let sends = Arc::new(Mutex::new(Vec::<(FixedBytes<32>, bool)>::new()));
+        let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
+            Arc::new({
+                let sends = sends.clone();
+                let journal = journal.clone();
+                let owner = owner.clone();
+                move |request: serde_json::Value| {
+                    if request["method"] == "eth_sendRawTransaction" {
+                        let raw = request["params"][0].as_str().unwrap();
+                        let hash = keccak256(alloy::hex::decode(raw).unwrap());
+                        let journaled =
+                            journal.list(&owner).unwrap().iter().any(|entry| {
+                                entry.attempts.iter().any(|attempt| attempt.hash == hash)
+                            });
+                        let mut sends = sends.lock().unwrap();
+                        sends.push((hash, journaled));
+                        if sends[0].0 == hash {
+                            return json!({"jsonrpc": "2.0", "id": request["id"], "error": {
+                                "code": -32000, "message": "submission outcome unavailable"
+                            }});
+                        }
+                    }
+                    let result = session_result(21_000, &request, &|_| {});
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+                }
+            }),
+            Arc::default(),
+            Arc::default(),
+        )
+        .await;
+        let http = HttpContext::direct_for_tests();
+        let client = http.operation_http_client().await.unwrap();
+        let chain = crate::settings::build_effective_chain_configs(
+            &crate::settings::WalletSettings::default(),
+        )
+        .unwrap()
+        .get(1)
+        .cloned()
+        .unwrap();
+        let pools = public_action_pools(&RpcChainRoute::new(1, vec![endpoint]), &http, &client)
+            .expect("route has every class");
+        let signer = VaultedPublicSigner::Software(
+            crate::signer::SoftwareEvmSigner::from_private_key([7; 32]).unwrap(),
+        );
+        let fee = |max_fee_per_gas| PublicActionGasFeeSelection::Custom {
+            max_fee_per_gas,
+            max_priority_fee_per_gas: 2,
+        };
+        // A gas retry, queued for once the first attempt is handed off.
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        command_tx
+            .send(PublicActionCommand {
+                kind: crate::PublicActionCommandKind::Replacement,
+                gas_fee: fee(200),
+            })
+            .unwrap();
+        let mut command_rx = Some(command_rx);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut on_progress = |_| {};
+        let session = Box::pin(submit_public_action_step_session(
+            PublicActionProgressStep::Send,
+            TransactionRequest::default()
+                .with_to(Address::repeat_byte(2))
+                .with_value(U256::from(1)),
+            PublicShieldTransactionProfile::Railoxide,
+            PublicAssetId::Native,
+            PublicActionGasLimitStrategy::ChainBuffer,
+            &signer,
+            "public action journal test",
+            &pools,
+            1,
+            &http,
+            None,
+            Some((&activity, ActivityStep::Main)),
+            1,
+            signer.address(),
+            &chain.gas,
+            None,
+            None,
+            None,
+            fee(100),
+            PublicActionStepFeePolicy::Custom,
+            None,
+            &mut command_rx,
+            Some(&event_tx),
+            None,
+            PublicActionStepEnd::Receipt,
+            &mut on_progress,
+        ));
+        let retried = async {
+            while !matches!(
+                event_rx.recv().await.unwrap(),
+                PublicActionSessionEvent::AttemptSubmitted { .. }
+            ) {}
+        };
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                result = session => panic!("session ended early: {:?}", result.err()),
+                () = retried => {}
+            }
+        })
+        .await
+        .expect("the gas retry is submitted");
+
+        let sends = sends.lock().unwrap().clone();
+        assert!(sends.iter().all(|(_, journaled)| *journaled), "{sends:?}");
+        let mut sent = Vec::new();
+        for (hash, _) in sends {
+            if !sent.contains(&hash) {
+                sent.push(hash);
+            }
+        }
+        assert_eq!(sent.len(), 2);
+        let [entry]: [ActivityEntry; 1] = journal.list(&owner).unwrap().try_into().unwrap();
+        assert_eq!(
+            entry
+                .attempts
+                .iter()
+                .map(|attempt| (attempt.hash, attempt.step))
+                .collect::<Vec<_>>(),
+            sent.iter()
+                .map(|hash| (*hash, ActivityStep::Main))
+                .collect::<Vec<_>>()
+        );
+        drop(command_tx);
+        server.abort();
+        drop(activity);
+        drop(journal);
+        drop(store);
+        drop(view);
+        drop(db);
+        std::fs::remove_dir_all(root_dir).unwrap();
     }
 
     #[tokio::test]
@@ -2411,6 +2583,7 @@ mod tests {
                     payload_fingerprint: estimate.payload_fingerprint,
                     gas_limit: estimate.gas_limit,
                 }),
+                gateway_origin: None,
                 gas_fee: PublicActionGasFeeSelection::Custom {
                     max_fee_per_gas: fee.max_fee_per_gas,
                     max_priority_fee_per_gas: fee.max_priority_fee_per_gas,
@@ -2432,6 +2605,9 @@ mod tests {
         };
         use crate::rpc_broker::tests::{
             RpcResponder, spawn_recording_rpc_mock, tagged_reqwest_client,
+        };
+        use crate::vault::{
+            ActivityAsset, ActivityDirection, ActivityJournal, ActivityLeg, ActivityOwner,
         };
         use crate::{GovernanceActionContext, GovernanceActionIntent, GovernanceContractKind};
 
@@ -2571,7 +2747,7 @@ mod tests {
             (&store, &view_session),
         )
         .await;
-        tokio::time::timeout(
+        let sponsored = tokio::time::timeout(
             Duration::from_secs(30),
             Box::pin(crate::submit_governance_action_with_progress(
                 sponsor,
@@ -2607,7 +2783,7 @@ mod tests {
             (&store, &view_session),
         )
         .await;
-        tokio::time::timeout(
+        let workflow = tokio::time::timeout(
             Duration::from_secs(30),
             Box::pin(crate::submit_governance_workflow_with_progress(
                 crate::GovernanceWorkflowRequest {
@@ -2622,6 +2798,122 @@ mod tests {
         .await
         .expect("the workflow ends")
         .expect("the approval and its continued stake are confirmed");
+
+        let (token0, token1, token2) = (
+            Address::repeat_byte(1),
+            Address::repeat_byte(2),
+            Address::repeat_byte(3),
+        );
+        let mut direct = Vec::new();
+        for (contract, kind, intent, step) in [
+            (
+                contracts.staking,
+                GovernanceContractKind::Staking,
+                GovernanceActionIntent::Stake {
+                    amount: U256::from(4),
+                },
+                PublicActionProgressStep::Stake,
+            ),
+            (
+                contracts.governor_rewards,
+                GovernanceContractKind::GovernorRewards,
+                GovernanceActionIntent::RewardClaim {
+                    reward_tokens: vec![token0, token1, token2],
+                    starting_interval: U256::ZERO,
+                    ending_interval: U256::from(1),
+                    snapshot_hints: vec![U256::ZERO; 2],
+                    expected_amounts: vec![U256::from(6), U256::ZERO, U256::from(8)],
+                },
+                PublicActionProgressStep::RewardClaim(0),
+            ),
+            (
+                contracts.staking,
+                GovernanceContractKind::Staking,
+                GovernanceActionIntent::PrincipalClaim {
+                    stake_id: U256::from(2),
+                    amount: U256::from(7),
+                },
+                PublicActionProgressStep::PrincipalClaim,
+            ),
+        ] {
+            let request = authorized_governance_request(
+                context(contract, kind, FixedBytes::ZERO),
+                &intent,
+                step,
+                &chain,
+                &http,
+                &client,
+                (&store, &view_session),
+            )
+            .await;
+            direct.push(
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    Box::pin(crate::submit_governance_action_with_progress(
+                        request,
+                        &http,
+                        &client,
+                        |_| {},
+                    )),
+                )
+                .await
+                .expect("the action ends")
+                .expect("the action is confirmed"),
+            );
+        }
+
+        // Each submission is one journal entry carrying the tokens it moves.
+        let entries = ActivityJournal::new(Arc::clone(&db), Arc::clone(&view_session))
+            .unwrap()
+            .list(&ActivityOwner::Account(account.public_account_uuid.clone()))
+            .unwrap();
+        assert_eq!(entries.len(), 5);
+        let legs_of = |results: &[&crate::PublicSendResult]| {
+            let hashes: Vec<FixedBytes<32>> = results
+                .iter()
+                .map(|result| result.tx.tx_hash.parse().unwrap())
+                .collect();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.attempts.iter().any(|a| a.hash == hashes[0]))
+                .expect("the submission is journaled");
+            assert!(
+                hashes
+                    .iter()
+                    .all(|hash| entry.attempts.iter().any(|a| a.hash == *hash)),
+                "every transaction of the submission is in its entry"
+            );
+            entry.legs.clone()
+        };
+        let leg = |asset, amount: u64, direction| ActivityLeg {
+            asset,
+            amount: U256::from(amount),
+            direction,
+        };
+        let rail = ActivityAsset::Token(contracts.governance_token);
+        assert!(
+            legs_of(&[&sponsored]).is_empty(),
+            "voting weight moves no tokens"
+        );
+        assert_eq!(
+            legs_of(&[&direct[0]]),
+            [leg(rail, 4, ActivityDirection::Out)]
+        );
+        assert_eq!(
+            legs_of(&workflow.transactions.iter().collect::<Vec<_>>()),
+            [leg(rail, 5, ActivityDirection::Out)]
+        );
+        assert_eq!(
+            legs_of(&[&direct[1]]),
+            [
+                leg(ActivityAsset::Token(token0), 6, ActivityDirection::In),
+                leg(ActivityAsset::Token(token2), 8, ActivityDirection::In),
+            ]
+        );
+        assert_eq!(
+            legs_of(&[&direct[2]]),
+            [leg(rail, 7, ActivityDirection::In)]
+        );
 
         assert!(
             general_requests.lock().unwrap().is_empty(),
@@ -2642,8 +2934,8 @@ mod tests {
         };
         // Estimates, the continuation's fresh reads, and each transaction's broadcast and receipt.
         assert!(count("eth_estimateGas") > 0 && count("eth_call") > 0);
-        assert_eq!(count("eth_sendRawTransaction"), 3);
-        assert_eq!(count("eth_getBlockReceipts"), 3);
+        assert_eq!(count("eth_sendRawTransaction"), 6);
+        assert_eq!(count("eth_getBlockReceipts"), 6);
         general_server.abort();
         action_server.abort();
         drop(store);

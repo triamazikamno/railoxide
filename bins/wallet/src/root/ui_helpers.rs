@@ -1,3 +1,4 @@
+use chrono::{Datelike as _, NaiveDate};
 use gpui::{
     App, ElementId, FontWeight, InteractiveElement, IntoElement, ParentElement, Pixels,
     SharedString, Styled, Window, div, img, prelude::FluentBuilder as _, px, rems, rgb,
@@ -62,6 +63,26 @@ pub(super) fn count_label(count: usize, singular: &'static str) -> String {
     }
 }
 
+pub(super) fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// "Today", "Yesterday", "Sep 24", or "Sep 24, 2025" in an earlier year, for a local date.
+pub(super) fn day_label(day: NaiveDate) -> String {
+    let today = chrono::Local::now().date_naive();
+    if day == today {
+        "Today".to_owned()
+    } else if today.pred_opt() == Some(day) {
+        "Yesterday".to_owned()
+    } else if day.year() == today.year() {
+        day.format("%b %-d").to_string()
+    } else {
+        day.format("%b %-d, %Y").to_string()
+    }
+}
+
 pub(super) fn centered_message(message: impl Into<SharedString>) -> gpui::Div {
     let message = message.into();
     div()
@@ -112,6 +133,16 @@ impl ConfirmationDialogProps {
 }
 
 pub(super) fn dialog_footer(ok_text: impl Into<SharedString>, show_cancel: bool) -> DialogFooter {
+    styled_dialog_footer(ok_text, show_cancel, ButtonVariant::Primary, false)
+}
+
+/// [`dialog_footer`] with the confirm button's variant and disabled state.
+pub(super) fn styled_dialog_footer(
+    ok_text: impl Into<SharedString>,
+    show_cancel: bool,
+    ok_variant: ButtonVariant,
+    ok_disabled: bool,
+) -> DialogFooter {
     DialogFooter::new()
         .when(show_cancel, |footer| {
             footer.child(Button::new("cancel").secondary().label("Cancel").on_click(
@@ -123,7 +154,8 @@ pub(super) fn dialog_footer(ok_text: impl Into<SharedString>, show_cancel: bool)
         .child(
             Button::new("ok")
                 .label(ok_text)
-                .primary()
+                .with_variant(ok_variant)
+                .disabled(ok_disabled)
                 .on_click(|_, window, cx| {
                     window.dispatch_action(Box::new(Confirm { secondary: false }), cx);
                 }),
@@ -359,6 +391,16 @@ pub(super) fn network_token_icon(
     size: f32,
 ) -> gpui::Div {
     badged_token_icon(icon, railgun_ui::chain_icon_asset_path(chain_id), size)
+}
+
+/// A token's icon in a fixed round slot, filled when the icon is missing.
+pub(super) fn token_icon_slot(icon: Option<WalletIconSource>) -> gpui::Div {
+    div()
+        .size_5()
+        .flex_none()
+        .rounded_full()
+        .bg(rgb(theme::SURFACE_HOVER))
+        .children(icon.map(|icon| img(icon).size_5().rounded_full()))
 }
 
 /// [`network_token_icon`] with the network icon at `badge`, for a network outside the chain

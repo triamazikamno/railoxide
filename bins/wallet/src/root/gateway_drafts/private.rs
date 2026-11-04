@@ -1192,7 +1192,8 @@ impl WalletRoot {
             let prepared = prepared.clone();
             let estimated_at = record.estimated_at;
             let execution =
-                GatewayDraftExecution::private(alloy::hex::encode(rand::random::<[u8; 16]>()));
+                GatewayDraftExecution::private(alloy::hex::encode(rand::random::<[u8; 16]>()))
+                    .with_origin(self.gateway_peer_name(peer_id));
             record.execution = Some(execution.clone());
             record.picker = None;
             drop(book);
@@ -1217,7 +1218,8 @@ impl WalletRoot {
         };
         let estimated_at = record.estimated_at;
         let execution =
-            GatewayDraftExecution::private(alloy::hex::encode(rand::random::<[u8; 16]>()));
+            GatewayDraftExecution::private(alloy::hex::encode(rand::random::<[u8; 16]>()))
+                .with_origin(self.gateway_peer_name(peer_id));
         record.execution = Some(execution.clone());
         record.picker = None;
         drop(book);

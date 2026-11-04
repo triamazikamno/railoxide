@@ -30,8 +30,12 @@ use super::types::{
     PublicShieldTransactionProfile, PublicTransactionIntent,
 };
 use crate::block_observer::resolve_source_transaction_by_block;
+use crate::desktop::{ActivitySubmission, PublicActivity};
 use crate::settings::EffectiveChainConfig;
-use crate::vault::DesktopViewSession;
+use crate::vault::{
+    ActivityAsset, ActivityCounterparty, ActivityDirection, ActivityKind, ActivityLeg,
+    ActivityStep, DesktopViewSession,
+};
 use crate::{
     HttpContext, OperationHttpClient, RpcRoute, ShieldSendOutput, WalletRpcOrigin,
     report_chain_string,
@@ -70,6 +74,16 @@ pub async fn submit_public_send_with_progress(
             "public send transaction",
         ),
     };
+    let activity = ActivitySubmission::public(
+        &request.vault_store,
+        &request.view_session,
+        public_transaction_activity(
+            &request.public_account_uuid,
+            request.chain_id,
+            &request.intent,
+        ),
+    )
+    .with_gateway_origin(request.gateway_origin.clone());
     let signer = admitted_public_signer_authorized(
         &request.vault_store,
         &request.view_session,
@@ -101,6 +115,7 @@ pub async fn submit_public_send_with_progress(
                 http,
                 client,
                 request.transaction_tracking.as_ref(),
+                Some((&activity, ActivityStep::Main)),
                 &mut progress,
             )
             .await?;
@@ -128,6 +143,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
     http: &HttpContext,
     client: &OperationHttpClient,
     transaction_tracking: Option<&crate::PublicTransactionTrackingContext>,
+    activity: Option<(&ActivitySubmission, ActivityStep)>,
     progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
 ) -> Result<crate::TxReceiptOutput> {
     validate_public_transaction_intent(intent)?;
@@ -155,6 +171,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
         chain.finality_depth,
         http,
         transaction_tracking,
+        activity,
         chain_id,
         from_address,
         &chain.gas,
@@ -177,6 +194,78 @@ pub(crate) async fn submit_public_action_step_with_signer(
         return Err(eyre!("{revert_subject} reverted ({})", tx.tx_hash));
     }
     Ok(tx)
+}
+
+const fn activity_asset(asset: PublicAssetId) -> ActivityAsset {
+    match asset {
+        PublicAssetId::Native => ActivityAsset::Native,
+        PublicAssetId::Erc20(token) => ActivityAsset::Token(token),
+    }
+}
+
+const fn activity_leg(
+    asset: ActivityAsset,
+    amount: U256,
+    direction: ActivityDirection,
+) -> ActivityLeg {
+    ActivityLeg {
+        asset,
+        amount,
+        direction,
+    }
+}
+
+/// The journal entry of `intent` sent from `account_uuid`: a transfer is a public send to its
+/// recipient, anything else a contract call to its target.
+fn public_transaction_activity(
+    account_uuid: &str,
+    chain_id: u64,
+    intent: &PublicTransactionIntent,
+) -> PublicActivity {
+    use ActivityDirection::{In, Out};
+    let (kind, legs, target) = match *intent {
+        PublicTransactionIntent::Transfer {
+            asset,
+            amount,
+            recipient,
+        } => (
+            ActivityKind::PublicSend,
+            vec![activity_leg(activity_asset(asset), amount, Out)],
+            Some(recipient),
+        ),
+        PublicTransactionIntent::Raw { to, value, .. } => (
+            ActivityKind::ContractCall,
+            if value.is_zero() {
+                Vec::new()
+            } else {
+                vec![activity_leg(ActivityAsset::Native, value, Out)]
+            },
+            to,
+        ),
+        PublicTransactionIntent::WrapNative { wrapped, amount } => (
+            ActivityKind::ContractCall,
+            vec![
+                activity_leg(ActivityAsset::Native, amount, Out),
+                activity_leg(ActivityAsset::Token(wrapped), amount, In),
+            ],
+            Some(wrapped),
+        ),
+        PublicTransactionIntent::UnwrapNative { wrapped, amount } => (
+            ActivityKind::ContractCall,
+            vec![
+                activity_leg(ActivityAsset::Token(wrapped), amount, Out),
+                activity_leg(ActivityAsset::Native, amount, In),
+            ],
+            Some(wrapped),
+        ),
+    };
+    PublicActivity {
+        account_uuid: account_uuid.to_owned(),
+        chain_id,
+        kind,
+        legs,
+        counterparty: target.map(ActivityCounterparty::Evm),
+    }
 }
 
 fn public_action_authorized_gas_limit(
@@ -281,6 +370,23 @@ pub async fn submit_public_shield_with_progress(
             "native shielding needs a fresh preparation and review"
         ));
     }
+    // Wrap, approval and shield attempts share one entry, which never names the receiving wallet.
+    let activity = ActivitySubmission::public(
+        &request.vault_store,
+        &request.view_session,
+        PublicActivity {
+            account_uuid: request.public_account_uuid.clone(),
+            chain_id: request.chain_id,
+            kind: ActivityKind::Shield,
+            legs: vec![activity_leg(
+                activity_asset(request.asset),
+                request.amount,
+                ActivityDirection::Out,
+            )],
+            counterparty: None,
+        },
+    )
+    .with_gateway_origin(request.gateway_origin.clone());
     let chain = verified_public_chain_runtime_config(
         request.chain_id,
         &request.effective_chain,
@@ -328,6 +434,7 @@ pub async fn submit_public_shield_with_progress(
             &chain,
             &pools,
             &addr_data,
+            &activity,
             http,
             client,
             &mut progress,
@@ -435,6 +542,7 @@ pub async fn submit_public_shield_with_progress(
                     chain.finality_depth,
                     http,
                     request.transaction_tracking.as_ref(),
+                    Some((&activity, ActivityStep::Wrap)),
                     request.chain_id,
                     from_address,
                     &chain.gas,
@@ -569,6 +677,7 @@ pub async fn submit_public_shield_with_progress(
                     chain.finality_depth,
                     http,
                     request.transaction_tracking.as_ref(),
+                    Some((&activity, ActivityStep::Approve)),
                     request.chain_id,
                     from_address,
                     &chain.gas,
@@ -636,6 +745,7 @@ pub async fn submit_public_shield_with_progress(
                 chain.finality_depth,
                 http,
                 request.transaction_tracking.as_ref(),
+                Some((&activity, ActivityStep::Main)),
                 request.chain_id,
                 from_address,
                 &chain.gas,
@@ -683,6 +793,7 @@ async fn submit_stealth_native_shield(
     chain: &PublicChainRuntimeConfig,
     pools: &PublicActionPools,
     recipient: &broadcaster_core::crypto::railgun::AddressData,
+    activity: &ActivitySubmission,
     http: &HttpContext,
     client: &OperationHttpClient,
     progress: &mut (impl FnMut(PublicActionProgressUpdate) + Send),
@@ -799,6 +910,7 @@ async fn submit_stealth_native_shield(
                 chain.finality_depth,
                 http,
                 request.transaction_tracking.as_ref(),
+                Some((activity, ActivityStep::Main)),
                 request.chain_id,
                 payer,
                 &chain.gas,

@@ -29,6 +29,7 @@ use super::utxo::{
 };
 use super::*;
 
+mod activity;
 mod address_book;
 mod amounts_and_balances;
 mod broadcaster_picker;

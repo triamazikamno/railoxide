@@ -24,6 +24,7 @@ struct BlockIdentity {
     number: u64,
     hash: B256,
     parent_hash: B256,
+    timestamp: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +352,12 @@ impl BlockObserver {
                                 transaction_index as u64,
                             );
                         }
+                        crate::desktop::observe_activity_inclusion(
+                            tx_hash,
+                            identity.number,
+                            identity.timestamp,
+                            receipt.status,
+                        );
                         self.record(identity);
                         self.next_block = number.saturating_add(1);
                         Ok(BlockObservation {
@@ -396,6 +403,10 @@ impl BlockObserver {
                 BlockFetch::Valid(identity, _) if identity == expected => {
                     self.history.truncate(index + 1);
                     self.next_block = expected.number.saturating_add(1);
+                    crate::desktop::observe_activity_rollback(
+                        self.registered.keys(),
+                        expected.number,
+                    );
                     return Ok(());
                 }
                 BlockFetch::Missing => {
@@ -535,6 +546,7 @@ async fn fetch_block(provider: &ProviderHandle, number: u64) -> BlockFetch {
             number,
             hash: block.header().hash(),
             parent_hash: block.header().parent_hash(),
+            timestamp: block.header().timestamp(),
         },
         transactions.clone(),
     )

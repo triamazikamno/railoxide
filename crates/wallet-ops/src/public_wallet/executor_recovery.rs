@@ -51,6 +51,7 @@ pub(crate) async fn submit_executor_recovery_step(
         chain.finality_depth,
         http,
         None,
+        None,
         chain.chain_id,
         signer.address(),
         &chain.gas,

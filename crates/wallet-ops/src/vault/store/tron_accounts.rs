@@ -227,6 +227,9 @@ impl DesktopVaultStore {
         view_session: &DesktopViewSession,
         tron_account_uuid: &str,
     ) -> Result<TronAccountMetadata, VaultError> {
+        let _activity_guard = crate::vault::activity::ACTIVITY_RECORD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let account = self
             .list_tron_accounts_for_session(view_session, false)?
             .into_iter()
@@ -236,14 +239,10 @@ impl DesktopVaultStore {
             return Err(VaultError::InvalidPublicAccountOperation);
         }
 
-        self.db
-            .delete_desktop_wallet_vault_record(&tron_account_metadata_record_key(
-                &account.tron_account_uuid,
-            ))?;
-        self.db
-            .delete_desktop_wallet_vault_record(&tron_account_secret_record_key(
-                &account.tron_account_uuid,
-            ))?;
+        let mut keys = self.activity_account_keys(&account.tron_account_uuid)?;
+        keys.push(tron_account_metadata_record_key(&account.tron_account_uuid));
+        keys.push(tron_account_secret_record_key(&account.tron_account_uuid));
+        self.db.update_desktop_wallet_vault_records(&keys, &[])?;
         Ok(account)
     }
 

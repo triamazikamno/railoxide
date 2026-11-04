@@ -850,6 +850,7 @@ fn setup_confirmation_tracks_local_inclusion_without_advancing_the_swap(cx: &mut
             local_pending_spent: false,
             spent_tx_hash: Some(transaction.to_string()),
             spent_block_number: Some(100),
+            spent_block_timestamp: None,
         };
         // The spend is already visible in private sync, but not yet safe.
         for (head, expected) in [
@@ -1410,6 +1411,7 @@ fn a_setup_under_an_order_is_read_each_pass_and_woken_by_private_sync(cx: &mut T
             local_pending_spent: false,
             spent_tx_hash: None,
             spent_block_number: None,
+            spent_block_timestamp: None,
         };
         let records = std::slice::from_ref(&record);
         assert!(synced_setup_inclusions(records, std::slice::from_ref(&utxo)).is_empty());
@@ -19974,4 +19976,25 @@ fn retrying_an_expired_public_order_starts_a_fresh_review_and_preserves_its_hist
             runtime.block_on(polygon.stop()).unwrap();
         },
     );
+}
+
+/// Activity opens a swap from a click outside any root update. Showing a cancelled swap
+/// reads the root for its tokens, which a still-leased root would turn into a panic.
+#[gpui::test]
+fn activity_opens_a_cancelled_swap_without_holding_the_root(cx: &mut TestAppContext) {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, _, cx| {
+        let swap_use = executors
+            .records()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.operation() == operation)
+            .and_then(|record| record.active_swap_use())
+            .unwrap();
+        executors.cancel_swap_use(operation, swap_use).unwrap();
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, _| swaps.reload_records());
+            crate::root::wallet_activity::open_activity_swap(root, swap_use, window, cx);
+            assert!(window.has_active_dialog(cx));
+        });
+    });
 }

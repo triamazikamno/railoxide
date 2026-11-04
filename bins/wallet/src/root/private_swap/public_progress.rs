@@ -23,9 +23,10 @@ use super::progress::{
     address_row, amount_with_note, block_label, destination_value, fact_row, hash_row,
     progress_group,
 };
-use super::{PrivateSwapsView, local_date_time_label, local_time_label, now_unix, short_receiver};
+use super::{PrivateSwapsView, local_date_time_label, local_time_label, short_receiver};
 use crate::root::public_action::PublicActionStepStatus;
 use crate::root::submission_progress::render_submission_progress_groups;
+use crate::root::ui_helpers::now_unix;
 
 /// Background status checks that fail in a row before the detail view says so.
 const PUBLIC_TRACKING_FAILURES_SHOWN: u32 = 3;

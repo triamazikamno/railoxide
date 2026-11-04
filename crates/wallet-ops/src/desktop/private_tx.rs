@@ -580,6 +580,8 @@ pub(super) async fn prepare_blocked_shield_rescue_plan(
     Ok(PreparedBlockedShieldRescuePlan {
         plan,
         public_account_uuid,
+        token,
+        origin_address,
     })
 }
 
@@ -2157,8 +2159,15 @@ pub async fn submit_prepared_desktop_sponsored_self_broadcast(
 ) -> Result<SponsoredSelfBroadcastSessionOutcome> {
     let (sensitive_route, query_rpc_pool) =
         sponsored_sensitive_route(request.chain_id, &request.effective_chain, http, client)?;
-    submit_prepared_sponsored_self_broadcast(request, http, client, sensitive_route, query_rpc_pool)
-        .await
+    submit_prepared_sponsored_self_broadcast(
+        request,
+        None,
+        http,
+        client,
+        sensitive_route,
+        query_rpc_pool,
+    )
+    .await
 }
 
 pub async fn submit_desktop_sponsored_send_self_broadcast(
@@ -2182,7 +2191,7 @@ pub async fn submit_desktop_sponsored_send_self_broadcast(
             public_account_uuid: request.public_account_uuid.clone(),
             token: request.token,
             amount: request.amount,
-            recipient: request.recipient,
+            recipient: request.recipient.clone(),
             verify_proof: request.verify_proof,
             gas_fee: request.gas_fee,
             incentive: request.incentive,
@@ -2194,6 +2203,16 @@ pub async fn submit_desktop_sponsored_send_self_broadcast(
         &query_rpc_pool,
     )
     .await?;
+    let activity = sponsored_activity(
+        &request.vault_store,
+        &request.view_session,
+        &prepared,
+        vault::ActivityKind::PrivateSend,
+        request.token,
+        request.amount,
+        vault::ActivityCounterparty::Private(request.recipient.trim().to_owned()),
+    )
+    .with_gateway_origin(request.gateway_origin);
     let outcome = submit_prepared_sponsored_self_broadcast(
         DesktopPreparedSponsoredSelfBroadcastRequest {
             transaction_tracking: request.transaction_tracking,
@@ -2212,6 +2231,7 @@ pub async fn submit_desktop_sponsored_send_self_broadcast(
             command_rx: request.command_rx,
             event_tx: request.event_tx,
         },
+        Some(&activity),
         http,
         client,
         sensitive_route,
@@ -2219,6 +2239,44 @@ pub async fn submit_desktop_sponsored_send_self_broadcast(
     )
     .await?;
     Ok(DesktopSponsoredSelfBroadcastResult { prepared, outcome })
+}
+
+/// A sponsored private action's journal entry. Gas is paid by the authorized signer, and the
+/// builder payment is the fee.
+fn sponsored_activity(
+    vault_store: &vault::DesktopVaultStore,
+    view_session: &Arc<vault::DesktopViewSession>,
+    prepared: &PreparedSponsoredCall,
+    kind: vault::ActivityKind,
+    token: Address,
+    amount: U256,
+    counterparty: vault::ActivityCounterparty,
+) -> ActivitySubmission {
+    ActivitySubmission::private(
+        vault_store,
+        view_session,
+        PrivateActivity {
+            chain_id: prepared.chain_id,
+            kind,
+            token,
+            amount,
+            counterparty,
+            fee: Some(vault::ActivityFee {
+                asset: vault::ActivityAsset::Token(prepared.authorization.wrapped_native_token),
+                amount: prepared.authorization.builder_payment,
+            }),
+            gas_payer: Some(prepared.authorization.signer),
+            inputs: prepared
+                .selected_inputs
+                .iter()
+                .map(|input| vault::ActivityInput {
+                    tree: input.tree,
+                    position: input.position,
+                })
+                .collect(),
+        },
+        false,
+    )
 }
 
 pub async fn submit_desktop_sponsored_unshield_self_broadcast(
@@ -2257,6 +2315,16 @@ pub async fn submit_desktop_sponsored_unshield_self_broadcast(
         &query_rpc_pool,
     )
     .await?;
+    let activity = sponsored_activity(
+        &request.vault_store,
+        &request.view_session,
+        &prepared,
+        vault::ActivityKind::Unshield,
+        request.token,
+        request.amount,
+        vault::ActivityCounterparty::Evm(request.recipient),
+    )
+    .with_gateway_origin(request.gateway_origin);
     let outcome = submit_prepared_sponsored_self_broadcast(
         DesktopPreparedSponsoredSelfBroadcastRequest {
             transaction_tracking: request.transaction_tracking,
@@ -2275,6 +2343,7 @@ pub async fn submit_desktop_sponsored_unshield_self_broadcast(
             command_rx: request.command_rx,
             event_tx: request.event_tx,
         },
+        Some(&activity),
         http,
         client,
         sensitive_route,
@@ -2753,6 +2822,17 @@ pub async fn submit_desktop_unshield_public_broadcaster(
     let progress_tx = request.progress_tx.clone();
     let route_tx = request.route_tx.clone();
     let session = Arc::clone(&request.session);
+    let (vault_store, view_session) = (
+        Arc::clone(&request.vault_store),
+        Arc::clone(&request.view_session),
+    );
+    let (chain_id, token, amount, recipient) = (
+        request.chain_id,
+        request.token,
+        request.amount,
+        request.recipient,
+    );
+    let gateway_origin = request.gateway_origin.clone();
     let prepared = Box::pin(prepare_desktop_unshield_public_broadcaster(request, http)).await?;
     let pending_spent_inputs = prepared.plan.input_utxos();
     let transaction = prepared.transaction.unwrap_or_else(|| {
@@ -2767,6 +2847,28 @@ pub async fn submit_desktop_unshield_public_broadcaster(
     } else {
         None
     };
+    let activity = ActivitySubmission::private(
+        &vault_store,
+        &view_session,
+        PrivateActivity {
+            chain_id,
+            kind: vault::ActivityKind::Unshield,
+            token,
+            amount,
+            counterparty: vault::ActivityCounterparty::Evm(recipient),
+            fee: Some(vault::ActivityFee {
+                asset: vault::ActivityAsset::Token(prepared.fee_token),
+                amount: prepared.fee_amount,
+            }),
+            gas_payer: None,
+            inputs: activity_inputs(&pending_spent_inputs),
+        },
+        executor.as_ref().is_some_and(|(owner, identity)| {
+            is_swap_step(&owner.records().unwrap_or_default(), identity.operation())
+        }),
+    )
+    .with_gateway_origin(gateway_origin);
+    activity.begin();
     let result = submit_public_broadcaster_plan(
         &waku,
         transaction,
@@ -2797,7 +2899,9 @@ pub async fn submit_desktop_unshield_public_broadcaster(
         timeout,
         republish_interval,
     )
-    .await?;
+    .await;
+    activity.finish_relay(result.as_ref().ok().map(|result| &result.result));
+    let result = result?;
     if let Some((owner, identity)) = &executor
         && let PublicBroadcasterResultKind::Submitted { tx_hash } = &result.result
     {
@@ -2819,6 +2923,13 @@ pub async fn submit_desktop_send_public_broadcaster(
     let progress_tx = request.progress_tx.clone();
     let route_tx = request.route_tx.clone();
     let session = Arc::clone(&request.session);
+    let (vault_store, view_session) = (
+        Arc::clone(&request.vault_store),
+        Arc::clone(&request.view_session),
+    );
+    let (chain_id, token, amount) = (request.chain_id, request.token, request.amount);
+    let recipient = request.recipient.trim().to_owned();
+    let gateway_origin = request.gateway_origin.clone();
     let prepared = prepare_desktop_send_public_broadcaster(request, http).await?;
     let pending_spent_inputs = prepared
         .plan
@@ -2826,6 +2937,26 @@ pub async fn submit_desktop_send_public_broadcaster(
         .iter()
         .map(|input| input.utxo.clone())
         .collect::<Vec<_>>();
+    let activity = ActivitySubmission::private(
+        &vault_store,
+        &view_session,
+        PrivateActivity {
+            chain_id,
+            kind: vault::ActivityKind::PrivateSend,
+            token,
+            amount,
+            counterparty: vault::ActivityCounterparty::Private(recipient),
+            fee: Some(vault::ActivityFee {
+                asset: vault::ActivityAsset::Token(prepared.fee_token),
+                amount: prepared.fee_amount,
+            }),
+            gas_payer: None,
+            inputs: activity_inputs(&pending_spent_inputs),
+        },
+        false,
+    )
+    .with_gateway_origin(gateway_origin);
+    activity.begin();
     let result = submit_public_broadcaster_plan(
         &waku,
         prepared.transaction.unwrap_or_else(|| {
@@ -2860,7 +2991,9 @@ pub async fn submit_desktop_send_public_broadcaster(
         timeout,
         republish_interval,
     )
-    .await?;
+    .await;
+    activity.finish_relay(result.as_ref().ok().map(|result| &result.result));
+    let result = result?;
     mark_submitted_inputs_pending_spent(&session, &pending_spent_inputs, &result).await;
     Ok(result)
 }
@@ -2948,7 +3081,30 @@ pub async fn submit_desktop_unshield_self_broadcast(
     if request.executor.is_some() {
         transaction.gas = request.executor_maximum_gas;
     }
+    let activity = ActivitySubmission::private(
+        &request.vault_store,
+        &request.view_session,
+        PrivateActivity {
+            chain_id: request.chain_id,
+            kind: vault::ActivityKind::Unshield,
+            token: request.token,
+            amount: request.amount,
+            counterparty: vault::ActivityCounterparty::Evm(request.recipient),
+            fee: None,
+            gas_payer: None,
+            inputs: activity_inputs(&pending_spent_inputs),
+        },
+        request.executor.as_ref().is_some_and(|executor| {
+            request
+                .session
+                .executor_owner()
+                .and_then(|owner| owner.records().ok())
+                .is_some_and(|records| is_swap_step(&records, executor.operation()))
+        }),
+    )
+    .with_gateway_origin(request.gateway_origin);
     let mut result = submit_self_broadcast_plan(
+        Some(&activity),
         request.transaction_tracking.as_ref(),
         request.chain_id,
         &request.effective_chain,
@@ -3003,7 +3159,23 @@ pub async fn submit_blocked_shield_rescue_self_broadcast(
         .iter()
         .map(|input| input.utxo.clone())
         .collect::<Vec<_>>();
+    let activity = ActivitySubmission::private(
+        &request.vault_store,
+        &request.view_session,
+        PrivateActivity {
+            chain_id: request.chain_id,
+            kind: vault::ActivityKind::Refund,
+            token: prepared.token,
+            amount: prepared.plan.unshield_note.value,
+            counterparty: vault::ActivityCounterparty::Evm(prepared.origin_address),
+            fee: None,
+            gas_payer: None,
+            inputs: activity_inputs(&pending_spent_inputs),
+        },
+        false,
+    );
     submit_self_broadcast_plan(
+        Some(&activity),
         request.transaction_tracking.as_ref(),
         request.chain_id,
         &request.effective_chain,
@@ -3077,7 +3249,24 @@ pub async fn submit_desktop_send_self_broadcast(
         .iter()
         .map(|input| input.utxo.clone())
         .collect::<Vec<_>>();
+    let activity = ActivitySubmission::private(
+        &request.vault_store,
+        &request.view_session,
+        PrivateActivity {
+            chain_id: request.chain_id,
+            kind: vault::ActivityKind::PrivateSend,
+            token: request.token,
+            amount: request.amount,
+            counterparty: vault::ActivityCounterparty::Private(recipient),
+            fee: None,
+            gas_payer: None,
+            inputs: activity_inputs(&pending_spent_inputs),
+        },
+        false,
+    )
+    .with_gateway_origin(request.gateway_origin);
     submit_self_broadcast_plan(
+        Some(&activity),
         request.transaction_tracking.as_ref(),
         request.chain_id,
         &request.effective_chain,

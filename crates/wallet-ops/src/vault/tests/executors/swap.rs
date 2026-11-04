@@ -6592,3 +6592,444 @@ fn a_public_account_has_one_open_swap_per_bought_and_sold_token_on_a_chain() {
     drop(db);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn activity_lists_each_swap_use_of_one_account_from_its_record() {
+    use crate::{ActivityStatus, swap_rows};
+
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let [operation, cancelled] = std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+    let delegate = accepted_delegate(1);
+    let executor = Address::repeat_byte(2);
+    store
+        .reserve_with_swap_approval(
+            operation,
+            delegate,
+            Some("Private swap"),
+            &[],
+            Some(approval(5, 6)),
+            None,
+        )
+        .unwrap();
+    let mut observed = set_up(&store, operation, delegate, executor);
+    store
+        .record_submission(operation, B256::repeat_byte(3), B256::repeat_byte(0x60))
+        .unwrap();
+    let notes = swap_inputs();
+    // Nothing journaled them. Two uses of the account fill and reshield; a third places its
+    // order afterwards.
+    let uses = [
+        SwapUseId::first(operation),
+        SwapUseId::random().unwrap(),
+        SwapUseId::random().unwrap(),
+    ];
+    for (step, id) in (0_u8..).zip(uses) {
+        if step > 0 {
+            store
+                .claim_swap_pair(SwapPairClaim {
+                    id,
+                    source: SwapAccountChoice::Existing(operation),
+                    delegate,
+                    purpose_summary: None,
+                    assets: Vec::new(),
+                    approval: approval(5, 6),
+                    destination: None,
+                })
+                .unwrap();
+        }
+        let nonce = 1 + 2 * u64::from(step);
+        let uid = OrderUid::new(B256::repeat_byte(30 + 10 * step), executor, 1_000);
+        store
+            .record_swap_attempt(
+                operation,
+                SwapAttempt {
+                    use_id: id,
+                    terms: SwapTerms::new(
+                        Address::repeat_byte(5),
+                        Address::repeat_byte(6),
+                        SwapRecipient::new(U256::from(7), [8; 32]),
+                        B256::repeat_byte(3),
+                    ),
+                    proof: SwapProof::new(B256::repeat_byte(20), notes.clone()),
+                    uid,
+                    submission: None,
+                    delivery: SwapDelivery::Reshield,
+                    bounds: swap_bounds(),
+                    invalidates: None,
+                    pre_hook: hook(
+                        ExecutorPayloadPurpose::SwapPreHook,
+                        nonce,
+                        31 + 10 * step,
+                        delegate,
+                        observed,
+                        notes.clone(),
+                    ),
+                    post_hook: Some(hook(
+                        ExecutorPayloadPurpose::SwapPostHook,
+                        nonce + 1,
+                        32 + 10 * step,
+                        delegate,
+                        observed,
+                        Vec::new(),
+                    )),
+                    bridge: None,
+                    speed_up: None,
+                },
+            )
+            .unwrap();
+        if step == 2 {
+            break;
+        }
+        observed = ExecutorNonceObservation::new(
+            BlockNumHash::new(14 + u64::from(step), B256::repeat_byte(14 + step)),
+            U256::from(nonce + 2),
+        );
+        store.record_account_read(operation, observed).unwrap();
+        let delivered = SwapObservation {
+            block: observed.block(),
+            transaction_hash: Some(B256::repeat_byte(0x70 + step)),
+        };
+        store
+            .record_swap_observations(
+                operation,
+                uid,
+                SwapOrderObservations {
+                    pre_hook_executed: Some(delivered),
+                    traded: Some(delivered),
+                    delivered: Some(delivered),
+                    shielded: Some(SwapShieldObservation {
+                        observation: delivered,
+                        private_amount: U256::from(9_975),
+                        fee: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    // Another account's swap is cancelled before it sent anything.
+    store
+        .reserve_with_swap_approval(
+            cancelled,
+            delegate,
+            Some("Private swap"),
+            &[],
+            Some(approval(5, 6)),
+            None,
+        )
+        .unwrap();
+    store
+        .cancel_swap_use(cancelled, SwapUseId::first(cancelled))
+        .unwrap();
+
+    let rows = swap_rows(1, &store.records().unwrap());
+    // Only the use that reserved the account fresh holds its setup.
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.id, row.status, row.in_flight, row.hashes.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                uses[0],
+                ActivityStatus::Confirmed(None),
+                false,
+                vec![B256::repeat_byte(0x60), B256::repeat_byte(0x70)],
+            ),
+            (
+                uses[1],
+                ActivityStatus::Confirmed(None),
+                false,
+                vec![B256::repeat_byte(0x71)],
+            ),
+            (uses[2], ActivityStatus::Submitted, true, Vec::new()),
+        ]
+    );
+    let token = |byte| ActivityAsset::Token(Address::repeat_byte(byte));
+    assert_eq!(
+        rows[0].legs,
+        [
+            ActivityLeg {
+                asset: token(5),
+                amount: swap_bounds().spend_amount(),
+                direction: ActivityDirection::Out,
+            },
+            ActivityLeg {
+                asset: token(6),
+                amount: U256::from(9_975),
+                direction: ActivityDirection::In,
+            },
+        ]
+    );
+    // A Reshield names no recipient.
+    assert!(
+        rows.iter()
+            .all(|row| row.network == ActivityNetwork::Evm(1) && row.recipient.is_none())
+    );
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn activity_received_rows_exclude_swap_destination_outcomes_and_cleared_stubs() {
+    use crate::tests::activity::{activity_attempt, activity_entry, received_note};
+    use crate::{ActivityUtxoClassification, owned_hashes, received_rows};
+
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    let operation = ExecutorOperationId::random().unwrap();
+    let role = SwapUseRole::Destination {
+        origin_chain: 1,
+        origin_operation: ExecutorOperationId::random().unwrap(),
+        destination_token: Address::repeat_byte(10),
+        shields: Vec::new(),
+        outcome: Some(SwapDestinationOutcome::Shielded {
+            block: BlockNumHash::new(30, B256::repeat_byte(30)),
+            transaction_hash: B256::repeat_byte(0x63),
+        }),
+    };
+    store
+        .put_operation_fixture(
+            operation,
+            &stored_record(operation, 0, (SwapUseId::random().unwrap(), role)),
+        )
+        .unwrap();
+    let mut stub = activity_entry(
+        ActivityKind::Shield,
+        ActivityMatch::Hashes,
+        vec![activity_attempt(0x64, ActivityStep::Main, None)],
+    );
+    stub.cleared = true;
+
+    let owned = owned_hashes(&[stub], &store.records().unwrap());
+    let utxos = [0x63, 0x64, 0x65]
+        .map(|source| received_note(0, source, 100, ActivityUtxoClassification::Shield));
+    assert_eq!(
+        received_rows(&utxos, &owned, 0)
+            .into_iter()
+            .map(|row| row.hash)
+            .collect::<Vec<_>>(),
+        vec![B256::repeat_byte(0x65)]
+    );
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn activity_lists_a_stopped_setup_and_each_swap_once_on_the_network_that_paid() {
+    use crate::{ActivityStatus, swap_rows};
+
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let origin = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let delivering = ExecutorStore::new(db.clone(), view.clone(), 137).unwrap();
+    let delegate = accepted_delegate(1);
+    let source = ExecutorOperationId::random().unwrap();
+    origin
+        .reserve_with_swap_approval(
+            source,
+            delegate,
+            Some("Private swap"),
+            &[],
+            Some(approval(5, 6)),
+            None,
+        )
+        .unwrap();
+    origin
+        .bind_address(source, Address::repeat_byte(2))
+        .unwrap();
+    let before_setup =
+        ExecutorNonceObservation::new(BlockNumHash::new(10, B256::repeat_byte(10)), U256::ZERO);
+    origin.record_account_read(source, before_setup).unwrap();
+    origin
+        .record_issued(
+            source,
+            hook(
+                ExecutorPayloadPurpose::Operation,
+                0,
+                3,
+                delegate,
+                before_setup,
+                swap_inputs(),
+            ),
+        )
+        .unwrap();
+    origin
+        .record_submission(source, B256::repeat_byte(3), B256::repeat_byte(0x71))
+        .unwrap();
+    // The user cancels the swap after its setup was sent and before any order.
+    origin
+        .cancel_swap_use(source, SwapUseId::first(source))
+        .unwrap();
+    // Polygon holds a private Bridge swap's destination use and the use delivering a swap a
+    // Public account paid for on Ethereum.
+    let paid = SwapUseId::random().unwrap();
+    for (index, (id, role)) in [
+        (
+            SwapUseId::random().unwrap(),
+            SwapUseRole::Destination {
+                origin_chain: 1,
+                origin_operation: source,
+                destination_token: Address::repeat_byte(10),
+                shields: Vec::new(),
+                outcome: None,
+            },
+        ),
+        (
+            paid,
+            SwapUseRole::PublicSourceDestination {
+                origin_chain: 1,
+                source: Address::repeat_byte(0x50),
+                destination_token: Address::repeat_byte(10),
+                shields: Vec::new(),
+                outcome: None,
+                swap: Box::new(stored_public_swap(public_swap_order_path()).decode()),
+            },
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let operation = ExecutorOperationId::random().unwrap();
+        delivering
+            .put_operation_fixture(
+                operation,
+                &stored_record(operation, u8::try_from(index).unwrap(), (id, role)),
+            )
+            .unwrap();
+    }
+
+    let token = |byte| ActivityAsset::Token(Address::repeat_byte(byte));
+    let stopped = swap_rows(1, &origin.records().unwrap());
+    assert_eq!(
+        stopped
+            .iter()
+            .map(|row| (row.id, row.status, row.hashes.clone(), row.legs[0].asset))
+            .collect::<Vec<_>>(),
+        [(
+            SwapUseId::first(source),
+            ActivityStatus::Incomplete,
+            vec![B256::repeat_byte(0x71)],
+            token(5),
+        )]
+    );
+    assert_eq!(
+        swap_rows(137, &delivering.records().unwrap()),
+        [crate::SwapRow {
+            id: paid,
+            network: ActivityNetwork::Evm(1),
+            started_at: 1_700_000_000,
+            legs: vec![ActivityLeg {
+                asset: token(5),
+                amount: swap_bounds().sell_amount,
+                direction: ActivityDirection::Out,
+            }],
+            hashes: vec![B256::repeat_byte(60), B256::repeat_byte(61)],
+            status: ActivityStatus::Confirmed(None),
+            in_flight: false,
+            // Paid on Ethereum, it shields into this wallet on Polygon.
+            recipient: Some(crate::SwapRowRecipient::ThisWallet { chain_id: 137 }),
+        }]
+    );
+    drop(delivering);
+    drop(origin);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_swap_step_writes_no_activity_entry_and_another_executor_unshield_writes_one() {
+    use super::super::activity::private_activity;
+    use crate::desktop::{ActivitySubmission, is_swap_step};
+
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    let delegate = accepted_delegate(1);
+    let [swap, plain] = std::array::from_fn(|_| ExecutorOperationId::random().unwrap());
+    store
+        .reserve_with_swap_approval(
+            swap,
+            delegate,
+            Some("Private swap"),
+            &[],
+            Some(approval(5, 6)),
+            None,
+        )
+        .unwrap();
+    store
+        .reserve(plain, delegate, Some("Unshield"), &[])
+        .unwrap();
+    let records = store.records().unwrap();
+    let unshield = || {
+        private_activity(
+            ActivityKind::Unshield,
+            ActivityCounterparty::Evm(Address::repeat_byte(0xc4)),
+        )
+    };
+
+    // A setup unshield of the swap use is listed under the swap's row.
+    assert!(is_swap_step(&records, swap));
+    ActivitySubmission::private(&vault, &view, unshield(), true).add_attempt(B256::repeat_byte(1));
+    // A native unwrap or top-up unshield of no swap use is an ordinary Unshield.
+    assert!(!is_swap_step(&records, plain));
+    ActivitySubmission::private(&vault, &view, unshield(), false).add_attempt(B256::repeat_byte(3));
+
+    let entries = ActivityJournal::new(db.clone(), view.clone())
+        .unwrap()
+        .list(&ActivityOwner::Wallet(TEST_WALLET_ID.to_owned()))
+        .unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| (
+                entry.kind,
+                entry.match_key.clone(),
+                entry
+                    .attempts
+                    .iter()
+                    .map(|attempt| attempt.hash)
+                    .collect::<Vec<_>>(),
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            ActivityKind::Unshield,
+            ActivityMatch::Inputs(vec![ActivityInput {
+                tree: 0,
+                position: 7,
+            }]),
+            vec![B256::repeat_byte(3)],
+        )]
+    );
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}

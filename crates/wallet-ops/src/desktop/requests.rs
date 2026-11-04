@@ -506,6 +506,8 @@ pub struct DesktopUnshieldSelfBroadcastRequest {
     pub recipient: Address,
     pub unwrap: bool,
     pub native_top_up: Option<DesktopNativeTopUpRequest>,
+    /// The origin of the gateway draft this submits, which its journal entry is tagged with.
+    pub gateway_origin: Option<String>,
     pub verify_proof: bool,
     pub gas_fee: SelfBroadcastGasFeeSelection,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
@@ -529,6 +531,8 @@ pub struct DesktopSendSelfBroadcastRequest {
     pub fee_token: Address,
     pub amount: U256,
     pub recipient: String,
+    /// The origin of the gateway draft this submits, which its journal entry is tagged with.
+    pub gateway_origin: Option<String>,
     pub verify_proof: bool,
     pub gas_fee: SelfBroadcastGasFeeSelection,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
@@ -608,6 +612,8 @@ pub struct DesktopSponsoredSendSelfBroadcastRequest {
     pub token: Address,
     pub amount: U256,
     pub recipient: String,
+    /// The origin of the gateway draft this submits, which its journal entry is tagged with.
+    pub gateway_origin: Option<String>,
     pub verify_proof: bool,
     pub gas_fee: SelfBroadcastGasFeeSelection,
     pub incentive: SponsoredIncentive,
@@ -635,6 +641,8 @@ pub struct DesktopSponsoredUnshieldSelfBroadcastRequest {
     pub recipient: Address,
     pub unwrap: bool,
     pub native_top_up: Option<DesktopNativeTopUpRequest>,
+    /// The origin of the gateway draft this submits, which its journal entry is tagged with.
+    pub gateway_origin: Option<String>,
     pub verify_proof: bool,
     pub gas_fee: SelfBroadcastGasFeeSelection,
     pub incentive: SponsoredIncentive,

@@ -438,6 +438,9 @@ impl DesktopVaultStore {
         view_session: &DesktopViewSession,
         public_account_uuid: &str,
     ) -> Result<PublicAccountMetadata, VaultError> {
+        let _activity_guard = crate::vault::activity::ACTIVITY_RECORD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let accounts = self.list_public_account_metadata_with_view(&view_session.view)?;
         let Some(account) = accounts
             .into_iter()
@@ -452,14 +455,14 @@ impl DesktopVaultStore {
             return Err(VaultError::InvalidPublicAccountOperation);
         }
 
-        self.db
-            .delete_desktop_wallet_vault_record(&public_account_metadata_record_key(
-                &account.public_account_uuid,
-            ))?;
-        self.db
-            .delete_desktop_wallet_vault_record(&public_account_secret_record_key(
-                &account.public_account_uuid,
-            ))?;
+        let mut keys = self.activity_account_keys(&account.public_account_uuid)?;
+        keys.push(public_account_metadata_record_key(
+            &account.public_account_uuid,
+        ));
+        keys.push(public_account_secret_record_key(
+            &account.public_account_uuid,
+        ));
+        self.db.update_desktop_wallet_vault_records(&keys, &[])?;
         Ok(account)
     }
 

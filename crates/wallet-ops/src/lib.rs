@@ -91,6 +91,7 @@ static ACTIVE_PROVER_CACHE_BUILDS: LazyLock<
     Mutex<HashMap<PathBuf, watch::Sender<Option<ProverCacheBuildProgress>>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+mod activity;
 mod amounts;
 mod anchors;
 mod block_observer;
@@ -124,6 +125,11 @@ pub mod settings;
 pub mod tron;
 pub mod vault;
 
+pub use activity::{
+    ActivityConfirmation, ActivityStatus, ReceivedKind, ReceivedRow, StatusInputs, SwapRow,
+    SwapRowRecipient, entry_status, has_unread_received, is_in_flight, owned_hashes, received_rows,
+    resolve_counterparty, swap_rows,
+};
 pub use amounts::{
     is_wrapped_native_token, parse_railgun_recipient, parse_send_amount, parse_unshield_amount,
 };

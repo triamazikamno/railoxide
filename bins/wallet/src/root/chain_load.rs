@@ -1602,7 +1602,10 @@ impl WalletRoot {
         self.blocked_shield_rescue_lookup_generation =
             self.blocked_shield_rescue_lookup_generation.wrapping_add(1);
         self.pending_ppoi_validation_toast = None;
-        self.active_wallet_tab = self.default_wallet_tab();
+        // The next wallet opens on the same tab, unless its chain can't show it.
+        if self.active_wallet_tab.needs_railgun() && !self.selected_chain_has_railgun() {
+            self.active_wallet_tab = self.default_wallet_tab();
+        }
         for state in self.chain_states.values_mut() {
             *state = ChainUtxoState::Idle;
         }
@@ -2470,6 +2473,7 @@ impl WalletRoot {
                         chain_id,
                         InitialSyncObservation::Ready,
                     );
+                    root.init_wallet_activity_last_seen(chain_id);
                 }
                 if initially_failed {
                     root.http.rpc_broker().invalidate_block(chain_id);
@@ -2721,6 +2725,7 @@ impl WalletRoot {
                                     chain_id,
                                     InitialSyncObservation::Ready,
                                 );
+                                root.init_wallet_activity_last_seen(chain_id);
                             }
                             if validation_completed {
                                 root.pending_ppoi_validation_toast = Some((
@@ -3052,6 +3057,7 @@ impl WalletRoot {
         self.invalidate_proposals_chain(self.last_evm_chain);
         self.invalidate_governance_context();
         self.clear_private_action_state();
+        self.refresh_wallet_activity(cx);
         if self.active_activity == super::sidebar::Activity::Proposals
             && self.governance.tab == super::governance::GovernanceTab::Proposals
         {

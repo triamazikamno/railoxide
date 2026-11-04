@@ -3158,6 +3158,7 @@ async fn shield_submission_checks_remaining_funding_before_estimation_and_signin
                 approval_mode: PublicShieldApprovalMode::Exact,
                 native_preparation: None,
                 native_operation: None,
+                gateway_origin: None,
                 gas_fee: fee(max_fee),
                 gas_fee_mode: if case == "auto_ceiling" {
                     PublicActionGasFeeMode::Auto
@@ -3285,6 +3286,7 @@ async fn shield_allowance_read_failure_waits_for_retry_and_adopts_its_fee() {
             approval_mode: PublicShieldApprovalMode::UnlimitedWhenShort,
             native_preparation: None,
             native_operation: None,
+            gateway_origin: None,
             gas_fee: fee(1),
             gas_fee_mode: PublicActionGasFeeMode::Custom,
             authorized_fee_ceiling: fee(1),
@@ -3539,6 +3541,7 @@ fn public_actions_reject_zero_amount_and_public_only_shield_before_signing() {
                 recipient,
             },
             advanced_authorization: None,
+            gateway_origin: None,
             gas_fee: PublicActionGasFeeSelection::Auto,
             command_rx: None,
             event_tx: None,
@@ -3591,6 +3594,7 @@ fn public_actions_reject_zero_amount_and_public_only_shield_before_signing() {
                 public_account_uuid: "unused".to_string(),
                 intent,
                 advanced_authorization: None,
+                gateway_origin: None,
                 gas_fee: PublicActionGasFeeSelection::Auto,
                 command_rx: None,
                 event_tx: None,
@@ -3636,6 +3640,7 @@ fn public_actions_reject_zero_amount_and_public_only_shield_before_signing() {
                 approval_mode: PublicShieldApprovalMode::Exact,
                 native_preparation: None,
                 native_operation: None,
+                gateway_origin: None,
                 gas_fee: PublicActionGasFeeSelection::Auto,
                 gas_fee_mode: PublicActionGasFeeMode::Auto,
                 authorized_fee_ceiling: PublicActionGasFeeSelection::Custom {
@@ -4655,6 +4660,7 @@ async fn dapp_send_invalidation_stops_before_baseline_or_raw_broadcast() {
                 trezor_app_passphrase: None,
                 trezor_pin_matrix_provider: None,
                 public_account_uuid: account.public_account_uuid.clone(),
+                dapp_name: "Dapp".to_owned(),
                 tx_req: TransactionRequest::default()
                     .with_to(Address::repeat_byte(2))
                     .with_value(U256::from(7)),

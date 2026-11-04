@@ -162,6 +162,7 @@ pub(super) async fn approve_walletconnect_request_task(
                             trezor_app_passphrase,
                             trezor_pin_matrix_provider,
                             public_account_uuid: account_binding.public_account_uuid.clone(),
+                            dapp_name: request.item.dapp_name.clone(),
                             tx_req,
                             decoded_transaction: request.item.decoded_transaction.clone(),
                             reviewed_transaction: reviewed_fee.reviewed_transaction(),

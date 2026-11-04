@@ -869,7 +869,8 @@ impl WalletRoot {
                 }
             }
         }
-        let execution = GatewayDraftExecution::default();
+        let execution =
+            GatewayDraftExecution::default().with_origin(self.gateway_peer_name(peer_id));
         record.execution = Some(execution.clone());
         let (intent, summary, hardware) = match &mut prepared {
             PreparedDraft::Send(draft) => {

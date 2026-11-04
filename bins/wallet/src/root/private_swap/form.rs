@@ -129,7 +129,7 @@ use crate::root::spend_authorization::{
     SpendAuthorizationSummary, SpendAuthorizationSummaryRow, spend_authorization_recipient_display,
 };
 use crate::root::stealth_accounts::{RecoveryPickerContext, same_offer};
-use crate::root::ui_helpers::badged_token_icon;
+use crate::root::ui_helpers::{badged_token_icon, now_unix};
 use crate::root::{
     COST_ESTIMATE_DEBOUNCE, DeliveryFormKind, WalletRoot, format_token_amount_ceiling_for_display,
     format_unshield_amount_input, format_value_with_usd_label, native_wrapped_output_labels,
@@ -6886,7 +6886,7 @@ impl PrivateSwapsView {
                 ),
                 reuse_account: true,
                 swap_use,
-                started_at: super::now_unix(),
+                started_at: now_unix(),
                 speeds_up: false,
             });
         let tracking = self.tracking.entry(operation).or_default();
@@ -9580,7 +9580,7 @@ impl PrivateSwapsView {
             valid_for: approval.review.valid_for(),
             reuse_account: plan.swap_executor().is_reused(),
             swap_use,
-            started_at: super::now_unix(),
+            started_at: now_unix(),
             speeds_up: speed_up.is_some(),
         };
         self.tracking.entry(operation).or_default().pending_order = Some(pending);

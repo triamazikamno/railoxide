@@ -55,8 +55,8 @@ use super::setup_progress::{SetupProgress, SetupProgressEnd};
 use super::{
     PrivateSwapsView, SWAP_BROADCASTER_REPUBLISH_INTERVAL, SWAP_BROADCASTER_RESPONSE_TIMEOUT,
     SetupRetryAvailability, SwapAction, SwapJobKind, local_date_time_label, local_time_label,
-    non_evm_amount, now_unix, sets_up_destination, short_receiver, swap_delivery,
-    swap_recovery_token, swap_tokens,
+    non_evm_amount, sets_up_destination, short_receiver, swap_delivery, swap_recovery_token,
+    swap_tokens,
 };
 use crate::assets::WalletIconSource;
 use crate::root::broadcaster_picker::broadcaster_candidate_label;
@@ -74,7 +74,7 @@ use crate::root::submission_progress::{
     SubmissionProgressGroup, SubmissionProgressStep, SubmissionProgressSubstep,
     render_submission_progress_groups, render_submission_progress_stepper,
 };
-use crate::root::ui_helpers::network_mention;
+use crate::root::ui_helpers::{network_mention, now_unix};
 use crate::root::utxo::short_hash;
 
 /// Why Cancel order… waits while a setup below the open order is unconfirmed.

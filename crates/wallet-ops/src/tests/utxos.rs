@@ -508,6 +508,7 @@ fn list_utxos_output_serializes_existing_field_names() {
                 "0x2222222222222222222222222222222222222222222222222222222222222222".to_string(),
             ),
             spent_block_number: Some(21),
+            spent_block_timestamp: None,
         }],
         totals: vec![TokenTotal {
             token: "0x0000000000000000000000000000000000000001".to_string(),
@@ -551,6 +552,7 @@ fn list_utxos_output_serializes_existing_field_names() {
                 "local_pending_spent": false,
                 "spent_tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
                 "spent_block_number": 21,
+                "spent_block_timestamp": null,
             }],
             "totals": [{
                 "token": "0x0000000000000000000000000000000000000001",

@@ -4,9 +4,9 @@
 use super::*;
 use crate::root::private_swap::public_progress::PublicSwapAction;
 use crate::root::private_swap::ui_fixture;
-use crate::root::private_swap::{local_date_time_label, local_time_label, now_unix};
+use crate::root::private_swap::{local_date_time_label, local_time_label};
 use crate::root::spend_authorization::SpendAuthorizationIntent;
-use crate::root::ui_helpers::dialog_footer;
+use crate::root::ui_helpers::{dialog_footer, now_unix};
 use crate::root::vault::hardware_device_label;
 use alloy::primitives::B256;
 use ui::dialog::WalletDialogExt as _;
@@ -5105,7 +5105,7 @@ async fn advance_public_execution(
     }
     let notes = Some(command.destination_session.as_ref() as &dyn wallet_ops::SwapShieldNotes);
     let secs = approval.bounds.valid_for_secs.unwrap_or(600);
-    let valid_to = || u32::try_from(super::super::now_unix().saturating_add(u64::from(secs)));
+    let valid_to = || u32::try_from(now_unix().saturating_add(u64::from(secs)));
     let (across, authorization) = (
         &clients.across,
         execution

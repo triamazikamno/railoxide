@@ -106,6 +106,8 @@ pub use types::{
     is_walletconnect_hardware_typed_data_hash_fallback_confirmation_required,
     walletconnect_hardware_typed_data_hash_fallback_confirmation_session,
 };
+#[cfg(test)]
+pub(crate) use walletconnect::walletconnect_activity;
 pub use walletconnect::{
     submit_walletconnect_send_transaction, walletconnect_probe_hardware_typed_data_signing_mode,
     walletconnect_sign_personal_message, walletconnect_sign_typed_data,

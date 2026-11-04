@@ -1,5 +1,6 @@
 #![allow(unused_imports)]
 
+pub(crate) mod activity;
 mod amounts;
 mod blocked_shield_rescue;
 pub(crate) mod cow_fork;

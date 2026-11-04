@@ -568,6 +568,10 @@ impl WalletRoot {
         {
             execution.bind_generation(generation_id);
         }
+        let gateway_origin = self
+            .send_forms
+            .get(&key)
+            .and_then(|form| form.gateway_execution.as_ref()?.origin());
         let (progress_tx, progress_rx) = watch::channel(TransactionGenerationStage::default());
         let sponsored = delivery_mode == DeliveryMode::SelfBroadcast
             && self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship;
@@ -713,6 +717,7 @@ impl WalletRoot {
                     fee_token,
                     amount,
                     recipient,
+                    gateway_origin,
                     verify_proof: true,
                     fee_rows,
                     selection: Self::public_broadcaster_submission_selection(
@@ -773,6 +778,7 @@ impl WalletRoot {
                         token,
                         amount,
                         recipient,
+                        gateway_origin,
                         verify_proof: true,
                         gas_fee: self_broadcast_gas_fee,
                         incentive: sponsored_incentive,
@@ -808,6 +814,7 @@ impl WalletRoot {
                         fee_token,
                         amount,
                         recipient,
+                        gateway_origin,
                         verify_proof: true,
                         gas_fee: self_broadcast_gas_fee,
                         progress_tx: Some(progress_tx),
@@ -1605,6 +1612,10 @@ impl WalletRoot {
         {
             execution.bind_generation(generation_id);
         }
+        let gateway_origin = self
+            .unshield_forms
+            .get(&key)
+            .and_then(|form| form.gateway_execution.as_ref()?.origin());
         let (progress_tx, progress_rx) = watch::channel(TransactionGenerationStage::default());
         let sponsored = delivery_mode == DeliveryMode::SelfBroadcast
             && self_broadcast_funding == SelfBroadcastFundingMode::PrivateSponsorship;
@@ -1782,6 +1793,7 @@ impl WalletRoot {
                     recipient,
                     unwrap,
                     native_top_up: native_top_up_request,
+                    gateway_origin,
                     verify_proof: true,
                     fee_rows,
                     selection: Self::public_broadcaster_submission_selection(
@@ -1845,6 +1857,7 @@ impl WalletRoot {
                         recipient,
                         unwrap,
                         native_top_up: native_top_up_request,
+                        gateway_origin,
                         verify_proof: true,
                         gas_fee: self_broadcast_gas_fee,
                         incentive: sponsored_incentive,
@@ -1889,6 +1902,7 @@ impl WalletRoot {
                         recipient,
                         unwrap,
                         native_top_up: native_top_up_request,
+                        gateway_origin,
                         verify_proof: true,
                         gas_fee: self_broadcast_gas_fee,
                         progress_tx: Some(progress_tx),

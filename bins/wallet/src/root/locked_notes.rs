@@ -22,7 +22,8 @@ use wallet_ops::{
     WalletNoteLocks, WalletSession, vault::ExecutorOperationId,
 };
 
-use super::private_swap::{local_time_label, now_unix};
+use super::private_swap::local_time_label;
+use super::ui_helpers::now_unix;
 use super::utxo::{local_pending_spent_card, local_pending_spent_summary};
 use super::{
     PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH, WalletRoot, dialog_max_height,
@@ -78,7 +79,7 @@ impl WalletRoot {
         );
     }
 
-    /// The Activity tab's summary of notes that stealth-account operations reserve.
+    /// The UTXOs tab's summary of notes that stealth-account operations reserve.
     pub(super) fn render_executor_lock_summary(&self, root: &Entity<Self>) -> Option<gpui::Div> {
         self.selected_chain_session()?.executor_owner()?;
         let count = self.executor_locked_note_count;

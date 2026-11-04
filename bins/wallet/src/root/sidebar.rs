@@ -102,6 +102,9 @@ impl WalletRoot {
                                     if root.active_wallet_tab == WalletTab::Public {
                                         root.focus_public_account_search_on_render = true;
                                     }
+                                    if root.active_wallet_tab == WalletTab::Activity {
+                                        root.mark_wallet_activity_seen(cx);
+                                    }
                                     root.focus_utxo_table_on_render = should_focus_utxo_table(
                                         root.active_activity,
                                         root.active_wallet_tab,

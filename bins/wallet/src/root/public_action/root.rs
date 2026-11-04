@@ -2684,6 +2684,9 @@ impl WalletRoot {
                     gas_limit: estimate.gas_limit,
                 }
             }),
+            gateway_origin: gateway_execution
+                .as_ref()
+                .and_then(wallet_ops::gateway::GatewayDraftExecution::origin),
             gas_fee,
             command_rx: Some(command_rx),
             event_tx: Some(event_tx),
@@ -3108,6 +3111,9 @@ impl WalletRoot {
             approval_mode,
             native_preparation,
             native_operation,
+            gateway_origin: gateway_execution
+                .as_ref()
+                .and_then(wallet_ops::gateway::GatewayDraftExecution::origin),
             gas_fee,
             gas_fee_mode,
             authorized_fee_ceiling,

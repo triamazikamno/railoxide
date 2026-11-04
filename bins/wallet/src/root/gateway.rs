@@ -417,6 +417,18 @@ impl WalletRoot {
             .any(|peer| peer.connected_sessions > 0)
     }
 
+    /// The paired browser `peer_id` as Settings names it, which its drafts' journal entries
+    /// give as their origin.
+    pub(super) fn gateway_peer_name(&self, peer_id: &str) -> String {
+        self.gateway
+            .snapshot
+            .peers
+            .iter()
+            .find(|peer| alloy::hex::encode(peer.id.to_bytes()) == peer_id)
+            .and_then(|peer| peer.label.clone())
+            .unwrap_or_else(|| short_identity(peer_id))
+    }
+
     pub(super) fn publish_gateway_summaries(&self, summaries: Vec<(String, String)>) {
         if let Some(state) = &self.gateway.desktop_state {
             state.send_if_modified(|(_, _, current)| {

@@ -219,6 +219,8 @@ impl WalletRoot {
             );
             cx.notify();
         });
+        // Activity's received rows and private statuses read the same snapshot.
+        self.refresh_wallet_activity(cx);
     }
 
     fn utxo_finality_context(&self) -> UtxoFinalityContext {
@@ -1090,13 +1092,9 @@ impl WalletRoot {
         self.focus_utxo_table_on_render = false;
     }
 
-    pub(super) fn render_utxo_body(
-        &self,
-        root: &Entity<Self>,
-        window: &Window,
-    ) -> impl IntoElement {
+    pub(super) fn render_utxo_body(&self, root: &Entity<Self>, window: &Window) -> gpui::Div {
         if self.view_session.is_none() {
-            return centered_message("Choose a wallet to view activity");
+            return centered_message("Choose a wallet to view UTXOs");
         }
         // The debug UI fixture's rows show in the table whatever the chain's state. No release
         // build has any.
@@ -1721,7 +1719,7 @@ pub(super) fn local_pending_spent_summary(count: usize) -> String {
     format!("Locally locked pending submission: {count} {noun}")
 }
 
-/// Local pending-submission locks with their two-step clear, shared by the Activity tab
+/// Local pending-submission locks with their two-step clear, shared by the UTXOs tab
 /// and the locked notes dialog. `id` prefixes the button IDs.
 pub(super) fn local_pending_spent_card(
     id: &str,

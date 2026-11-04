@@ -62,6 +62,7 @@ pub(crate) async fn submit_public_swap_step(
         chain.finality_depth,
         http,
         None,
+        None,
         chain.chain_id,
         signer.address(),
         &chain.gas,

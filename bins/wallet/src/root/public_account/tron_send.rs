@@ -38,8 +38,8 @@ use wallet_ops::tron::confirmation::{
     tron_send_refresh_accounts,
 };
 use wallet_ops::tron::send::{
-    TronSendAmount, TronSendAsset, TronSendDraft, TronSendError, TronSendReads, TronSendReview,
-    TronSendSubmission, parse_tron_receiver, prepare_tron_send, submit_tron_send,
+    TronSendActivity, TronSendAmount, TronSendAsset, TronSendDraft, TronSendError, TronSendReads,
+    TronSendReview, TronSendSubmission, parse_tron_receiver, prepare_tron_send, submit_tron_send,
     tron_receiver_suggestions,
 };
 use wallet_ops::tron::transaction::TronAsset;
@@ -975,6 +975,13 @@ impl WalletRoot {
             cx,
         );
         let review = intent.review;
+        let activity = self.vault_store.clone().zip(self.view_session.clone()).map(
+            |(vault_store, view_session)| TronSendActivity {
+                vault_store,
+                view_session,
+                tron_account_uuid: intent.account_uuid.to_string(),
+            },
+        );
         let join = self.runtime.spawn(async move {
             let claim_handoff = move || {
                 gate.compare_exchange(
@@ -992,6 +999,7 @@ impl WalletRoot {
                 &review,
                 signer,
                 Some(&event_tx),
+                activity,
                 claim_handoff,
                 move |update| {
                     let _ = progress_tx.send(update);

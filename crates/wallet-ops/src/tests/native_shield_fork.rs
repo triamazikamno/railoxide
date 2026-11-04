@@ -214,6 +214,7 @@ impl Payer {
                 .is_some()
                 .then(|| ExecutorOperationId::random().unwrap()),
             native_preparation,
+            gateway_origin: None,
             gas_fee: GAS_FEE,
             gas_fee_mode: PublicActionGasFeeMode::Custom,
             authorized_fee_ceiling: GAS_FEE,

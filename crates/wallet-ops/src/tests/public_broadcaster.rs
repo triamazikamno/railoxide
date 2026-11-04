@@ -2742,6 +2742,43 @@ mod submission_nodes {
         submission.abort();
     }
 
+    /// A failed publish may still have reached peers, so even the first one waits for a response.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_initial_publish_still_waits_for_the_response() {
+        const TIMEOUT: Duration = Duration::from_secs(7);
+        let (broadcaster, viewing) = sample_public_broadcaster_candidate(11);
+        for respond in [true, false] {
+            let mut harness = build_harness(
+                disabled_root(),
+                ClientConfig::default(),
+                tor_http(Arc::default()),
+                true,
+                false,
+            );
+            harness.route.failing.store(true, Ordering::SeqCst);
+            let submission = spawn_submission(&harness, &broadcaster, TIMEOUT);
+            let NodeEvent::Subscribed(0, responses) = next_event(&mut harness.events).await else {
+                panic!("the node subscribes before publishing");
+            };
+            let NodeEvent::Published(0, request) = next_event(&mut harness.events).await else {
+                panic!("the node publishes the request");
+            };
+
+            let expected = if respond {
+                responses
+                    .send(tx_hash_response(&viewing, &request))
+                    .await
+                    .unwrap();
+                PublicBroadcasterResultKind::Submitted {
+                    tx_hash: TxHash::repeat_byte(3).to_string(),
+                }
+            } else {
+                PublicBroadcasterResultKind::TimedOut
+            };
+            assert_eq!(submission.await.unwrap().unwrap(), expected);
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn route_recovery_stops_at_its_limit_and_the_submission_times_out_on_time() {
         const TIMEOUT: Duration = Duration::from_secs(100);

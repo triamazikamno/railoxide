@@ -35,7 +35,7 @@ impl WalletRoot {
             .is_some_and(|chain_id| self.effective_chain_configs.railgun(chain_id).is_ok())
     }
 
-    /// Why the Private and Activity tabs are unavailable on the selected network.
+    /// Why the Private and UTXOs tabs are unavailable on the selected network.
     pub(in crate::root) const fn railgun_unavailable_reason(&self) -> &'static str {
         match self.selected_network {
             crate::root::SelectedNetwork::Evm(_) => {
