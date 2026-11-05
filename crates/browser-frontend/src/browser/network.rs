@@ -242,7 +242,6 @@ impl GatewayView {
             &status,
             activity.as_ref(),
             rate,
-            px(0.0),
         );
         Popover::new("gateway-network-popover")
             .anchor(Anchor::TopRight)

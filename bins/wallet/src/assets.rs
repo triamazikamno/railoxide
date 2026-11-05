@@ -506,7 +506,6 @@ mod tests {
             ui::icons::refresh_ccw_icon_path(),
             ui::icons::tor_status_icon_path(),
             ui::icons::arrow_right_left_icon_path(),
-            ui::icons::arrow_down_to_line_icon_path(),
         ] {
             assert!(assets.load(path).expect("load ui icon").is_some(), "{path}");
         }

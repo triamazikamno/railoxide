@@ -17,18 +17,16 @@ use gpui::{FontWeight, ObjectFit};
 use gpui_component::{
     ActiveTheme, Disableable, Icon, IconName, Root, Sizable, TitleBar, WindowExt,
     badge::Badge,
-    button::ButtonVariants,
     kbd::Kbd,
     notification::Notification,
     progress::Progress as UiProgress,
-    resizable::{resizable_panel, v_resizable},
     scroll::ScrollableElement,
     tab::{Tab, TabBar},
     tooltip::Tooltip,
 };
 use tokio::runtime::Handle;
 use ui::clipboard::{clipboard_with_toast, copy_to_clipboard_with_custom_toast};
-use ui::controls::{app_button, app_button_base};
+use ui::controls::app_button;
 use ui::icons;
 use ui::logs::LogStore;
 use ui::theme::{self, APP_FONT_FAMILY, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
@@ -49,7 +47,8 @@ use super::actions::{
 use super::chain_load::{
     BalanceSyncIssue, PresenceStatus, SyncStatusContext, SyncStatusLabels, WalletStatusCounts,
     balance_sync_issue, balances_presence_status, ppoi_presence_status,
-    ppoi_validation_toast_scope_is_current, ready_status_bar, sync_status_bar, sync_status_labels,
+    ppoi_validation_toast_scope_is_current, ready_status_center, sync_status_center,
+    sync_status_labels,
 };
 use super::private_assets::{
     format_private_asset_rows_from_snapshot, should_show_pending_poi_amount,
@@ -63,9 +62,9 @@ use super::utxo::{
 };
 use super::{
     Activity, ChainUtxoState, HERO_CARD_MAX_WIDTH, HERO_MEDIUM_BREAKPOINT, HERO_STAGE_MAX_WIDTH,
-    HERO_WIDE_BREAKPOINT, LOGS_DRAWER_HEIGHT, LOGS_DRAWER_MAX_HEIGHT, LOGS_DRAWER_MIN_HEIGHT,
-    SIDEBAR_AUTO_COLLAPSE_WIDTH, VaultState, WalletRoot, WalletStartupRoot, app_status_tag,
-    chain_load_overrides, count_label, rgb_with_alpha, should_apply_background_focus,
+    HERO_WIDE_BREAKPOINT, SIDEBAR_AUTO_COLLAPSE_WIDTH, VaultState, WalletRoot, WalletStartupRoot,
+    app_status_tag, chain_load_overrides, count_label, rgb_with_alpha,
+    should_apply_background_focus,
 };
 
 pub(super) const COPY_URL_TOOLTIP: &str = "Click to copy URL to clipboard";
@@ -416,6 +415,7 @@ impl Render for WalletRoot {
         } else {
             self.sidebar_manually_collapsed
         };
+        let dialog_open = window.has_active_dialog(cx);
 
         div()
             .when(self.settings_editor.is_some(), |this| {
@@ -428,33 +428,36 @@ impl Render for WalletRoot {
             .relative()
             .size_full()
             .flex()
+            .flex_col()
             .bg(rgb(theme::SURFACE_ELEVATED))
             .text_color(rgb(theme::TEXT))
             .font_family(APP_FONT_FAMILY)
             .font_weight(FontWeight::LIGHT)
             .text_size(APP_TEXT_SIZE)
-            .child(self.render_sidebar(
-                root.clone(),
-                sidebar_collapsed,
-                sidebar_is_narrow,
-                window,
-                cx,
-            ))
             .child(
                 div()
                     .flex_1()
-                    .h_full()
-                    .min_w(px(0.0))
                     .min_h(px(0.0))
+                    .w_full()
                     .flex()
-                    .flex_col()
+                    .child(self.render_sidebar(root.clone(), sidebar_collapsed, sidebar_is_narrow))
                     .child(
                         div()
                             .flex_1()
+                            .h_full()
+                            .min_w(px(0.0))
                             .min_h(px(0.0))
-                            .child(self.render_workspace(root, window, cx)),
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .child(self.render_workspace(&root, window, cx)),
+                            ),
                     ),
             )
+            .child(self.render_bottom_block(&root, dialog_open, window))
     }
 }
 
@@ -754,45 +757,16 @@ pub(super) fn wallet_build_label() -> SharedString {
 impl WalletRoot {
     pub(super) fn render_workspace(
         &mut self,
-        root: Entity<Self>,
+        root: &Entity<Self>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> impl IntoElement {
-        let active_content = self.render_active_content(&root, window, cx);
-        if self.logs_open {
-            let logs_content = self.render_logs_drawer(root);
-            div().size_full().min_w(px(0.0)).min_h(px(0.0)).child(
-                v_resizable("wallet-logs-drawer")
-                    .with_state(&self.drawer_split)
-                    .child(
-                        resizable_panel().child(
-                            div()
-                                .size_full()
-                                .min_w(px(0.0))
-                                .min_h(px(0.0))
-                                .child(active_content),
-                        ),
-                    )
-                    .child(
-                        resizable_panel()
-                            .size(LOGS_DRAWER_HEIGHT)
-                            .size_range(LOGS_DRAWER_MIN_HEIGHT..LOGS_DRAWER_MAX_HEIGHT)
-                            .child(
-                                div()
-                                    .size_full()
-                                    .min_w(px(0.0))
-                                    .min_h(px(0.0))
-                                    .child(logs_content),
-                            ),
-                    ),
-            )
-        } else {
-            div()
-                .size_full()
-                .min_w(px(0.0))
-                .min_h(px(0.0))
-                .child(active_content)
-        }
+        let active_content = self.render_active_content(root, window, cx);
+        div()
+            .size_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .child(active_content)
     }
 
     fn render_active_content(
@@ -915,33 +889,42 @@ impl WalletRoot {
                     .p(px(12.0))
                     .child(self.render_wallet_content(root, window, cx)),
             )
-            .children(self.render_wallet_status_bar(root))
     }
 
-    fn render_wallet_status_bar(&self, root: &Entity<Self>) -> Option<gpui::AnyElement> {
-        let state = self.chain_states.get(&self.selected_evm_chain()?)?;
+    /// Status bar center (sync progress) and right chips for the selected wallet on its
+    /// selected chain, on every workspace.
+    pub(super) fn render_wallet_status(
+        &self,
+        root: &Entity<Self>,
+        dialog_open: bool,
+    ) -> (Option<gpui::Div>, Vec<gpui::AnyElement>) {
+        let Some(state) = self
+            .selected_evm_chain()
+            .and_then(|chain_id| self.chain_states.get(&chain_id))
+            .filter(|state| state.renders_table())
+        else {
+            return (None, Vec::new());
+        };
         let counts = self.wallet_status_counts(
             state.snapshot().map(AsRef::as_ref),
             state.ppoi_workflow_status(),
         );
-        let syncing = state.is_syncing();
-        if !state.renders_table() {
-            return None;
-        }
-
-        let chips = self.render_wallet_status_chips(root, state, counts);
-        if syncing {
-            let context = match state {
-                ChainUtxoState::Loading { .. } => SyncStatusContext::Loading,
-                ChainUtxoState::Syncing { .. } => SyncStatusContext::Syncing,
-                ChainUtxoState::Idle
-                | ChainUtxoState::Ready { .. }
-                | ChainUtxoState::Error { .. } => return None,
-            };
-            Some(sync_status_bar(context, state.progress(), chips).into_any_element())
-        } else {
-            Some(ready_status_bar(counts, chips).into_any_element())
-        }
+        let center = match state {
+            ChainUtxoState::Loading { .. } => Some(sync_status_center(
+                SyncStatusContext::Loading,
+                state.progress(),
+            )),
+            ChainUtxoState::Syncing { .. } => Some(sync_status_center(
+                SyncStatusContext::Syncing,
+                state.progress(),
+            )),
+            ChainUtxoState::Ready { .. } => ready_status_center(counts),
+            ChainUtxoState::Idle | ChainUtxoState::Error { .. } => None,
+        };
+        (
+            center,
+            self.render_wallet_status_chips(root, state, counts, dialog_open),
+        )
     }
 
     fn wallet_status_counts(
@@ -1146,6 +1129,7 @@ impl WalletRoot {
         root: &Entity<Self>,
         state: &ChainUtxoState,
         counts: WalletStatusCounts,
+        dialog_open: bool,
     ) -> Vec<gpui::AnyElement> {
         let ppoi_status = self.ppoi_status_for_state(state, counts);
         let balances_status = self.balances_status_for_state(state);
@@ -1157,6 +1141,7 @@ impl WalletRoot {
                 ppoi_status,
                 counts,
                 "PPOI",
+                dialog_open,
             ));
         } else {
             chips.push(
@@ -1178,14 +1163,17 @@ impl WalletRoot {
         status: PresenceStatus,
         counts: WalletStatusCounts,
         label: &'static str,
+        dialog_open: bool,
     ) -> gpui::AnyElement {
         let details_root = root.clone();
         render_ppoi_status_hover_target(root, "wallet-status-ppoi-hover")
-            .cursor_pointer()
-            .on_click(move |_event, window, cx| {
-                details_root.update(cx, |root, cx| {
-                    root.open_private_pending_status_dialog(window, cx);
-                });
+            // Above a dialog the chip keeps its hover details but opens nothing.
+            .when(!dialog_open, |this| {
+                this.cursor_pointer().on_click(move |_event, window, cx| {
+                    details_root.update(cx, |root, cx| {
+                        root.open_private_pending_status_dialog(window, cx);
+                    });
+                })
             })
             .child(
                 Badge::new()
@@ -1357,58 +1345,6 @@ impl WalletRoot {
                 )
             })
     }
-
-    fn render_logs_drawer(&self, root: Entity<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
-            .flex()
-            .flex_col()
-            .bg(rgb(theme::SURFACE_ELEVATED))
-            .border_t_1()
-            .border_color(rgb(theme::BORDER))
-            .child(
-                div()
-                    .h(px(34.0))
-                    .flex()
-                    .items_center()
-                    .px(px(12.0))
-                    .bg(rgb(theme::SURFACE))
-                    .border_b_1()
-                    .border_color(rgb(theme::BORDER))
-                    .child(img(icons::logs_icon_path()).size(px(16.0)).flex_none())
-                    .child(
-                        div()
-                            .ml(px(8.0))
-                            .text_color(rgb(theme::TEXT))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .child("Logs"),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        app_button_base("close-wallet-logs-drawer")
-                            .ghost()
-                            .xsmall()
-                            .accessibility_label("Hide logs")
-                            .tooltip("Hide logs")
-                            .icon(IconName::Close)
-                            .on_click(move |_event, _window, cx| {
-                                root.update(cx, |root, cx| {
-                                    root.logs_open = false;
-                                    cx.notify();
-                                });
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .min_h(px(0.0))
-                    .child(self.logs.clone()),
-            )
-    }
 }
 
 pub(super) const fn ppoi_retry_completion_is_current(
@@ -1489,6 +1425,8 @@ impl Render for BalancesStatusHoverCard {
         let color = presence_status_color(status);
 
         div()
+            // Presses on the card must not reach a dialog backdrop beneath it.
+            .occlude()
             .w(px(360.0))
             .rounded_md()
             .border_1()
@@ -1547,10 +1485,13 @@ fn render_ppoi_status_hover_target(
     id: &'static str,
 ) -> gpui::Stateful<gpui::Div> {
     let tooltip_root = root.clone();
-    div().id(id).hoverable_tooltip(move |_window, cx| {
-        let root = tooltip_root.clone();
-        cx.new(|cx| PpoiStatusHoverCard::new(root, cx)).into()
-    })
+    div()
+        .id(id)
+        .debug_selector(move || id.to_owned())
+        .hoverable_tooltip(move |_window, cx| {
+            let root = tooltip_root.clone();
+            cx.new(|cx| PpoiStatusHoverCard::new(root, cx)).into()
+        })
 }
 
 struct PpoiStatusHoverCard {
@@ -1565,7 +1506,7 @@ impl PpoiStatusHoverCard {
 }
 
 impl Render for PpoiStatusHoverCard {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let (status, progress, refreshing, counts, retrying) = {
             let root = self.root.read(cx);
             let state = root.chain_states.get(&root.last_evm_chain);
@@ -1588,8 +1529,10 @@ impl Render for PpoiStatusHoverCard {
         };
         let color = presence_status_color(status);
         let event_label = ppoi_event_header_label(progress.as_ref());
+        let dialog_open = window.has_active_dialog(cx);
 
         div()
+            .occlude()
             .w(px(360.0))
             .rounded_md()
             .border_1()
@@ -1691,12 +1634,19 @@ impl Render for PpoiStatusHoverCard {
                 },
             )
             .when(counts.ppoi_attention_count() > 0, |this| {
-                this.child(render_ppoi_hover_action_note(
-                    self.root.clone(),
-                    "Needs review",
-                    &ppoi_attention_detail(counts),
-                    ppoi_attention_hover_color(counts),
-                ))
+                let detail = ppoi_attention_detail(counts);
+                let color = ppoi_attention_hover_color(counts);
+                // Above a dialog the note only informs; its action would close the dialog.
+                if dialog_open {
+                    this.child(render_ppoi_hover_note("Needs review", &detail, color))
+                } else {
+                    this.child(render_ppoi_hover_action_note(
+                        self.root.clone(),
+                        "Needs review",
+                        &detail,
+                        color,
+                    ))
+                }
             })
     }
 }

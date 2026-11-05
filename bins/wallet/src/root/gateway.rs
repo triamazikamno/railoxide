@@ -42,8 +42,7 @@ use wallet_ops::gateway::{
 
 use crate::assets::RailgunSidebarIcon;
 
-use super::sidebar::{SIDEBAR_FOOTER_HORIZONTAL_INSET, SIDEBAR_STATUS_PILL_HEIGHT};
-use super::{SIDEBAR_WIDTH, VaultState, WalletRoot, app_status_tag, rgb_with_alpha};
+use super::{VaultState, WalletRoot, app_status_tag};
 #[path = "gateway_handoff.rs"]
 mod handoff;
 use handoff::{GatewaySwitchContinuation, GatewaySwitchDialog};
@@ -162,7 +161,7 @@ pub(super) struct GatewayUi {
     approval_task: Option<gpui::Task<()>>,
     operation_generation: u64,
     busy: bool,
-    popover_open: bool,
+    pub(super) popover_open: bool,
     /// A row context menu is open; keeps the popover from treating clicks
     /// on the menu (which extends past the popover bounds) as outside clicks.
     peer_menu_open: bool,
@@ -671,16 +670,15 @@ impl WalletRoot {
         })
     }
 
-    pub(super) fn render_gateway_status_pill(
+    /// Status bar icon. While a dialog is open it only shows its tooltip.
+    pub(super) fn render_gateway_status_icon(
         &self,
         root: &Entity<Self>,
-        collapsed: bool,
-    ) -> impl IntoElement {
+        dialog_open: bool,
+    ) -> gpui::AnyElement {
         let popover_root = root.clone();
         let content_root = root.clone();
         let update_available = self.gateway_update_available();
-        let width =
-            SIDEBAR_WIDTH - SIDEBAR_FOOTER_HORIZONTAL_INSET - SIDEBAR_FOOTER_HORIZONTAL_INSET;
         let total_pairings = self.gateway.snapshot.peers.len();
         let active_sessions: usize = self
             .gateway
@@ -689,97 +687,65 @@ impl WalletRoot {
             .iter()
             .map(|peer| peer.connected_sessions)
             .sum();
-        let status = div()
-            .flex_none()
-            .flex()
-            .items_center()
-            .whitespace_nowrap()
-            .text_size(px(11.0))
-            .line_height(px(16.0))
-            .text_color(rgb(theme::TEXT_MUTED));
-        let status = if matches!(
+        let (color, status) = if matches!(
             self.gateway.snapshot.error,
             Some(GatewayError::PortInUse(_))
         ) {
-            status.text_color(rgb(theme::DANGER)).child("Port in use")
+            (theme::DANGER, "Port in use".to_owned())
         } else if total_pairings > 1 {
-            status
-                .child(
-                    div()
-                        .text_color(rgb(theme::SUCCESS))
-                        .child(active_sessions.to_string()),
-                )
-                .child(format!("/{total_pairings}"))
+            let color = if active_sessions > 0 {
+                theme::SUCCESS
+            } else {
+                theme::TEXT_MUTED
+            };
+            (color, format!("{active_sessions}/{total_pairings} active"))
         } else if active_sessions > 0 {
-            status.text_color(rgb(theme::SUCCESS)).child("active")
+            (theme::SUCCESS, "active".to_owned())
         } else {
-            status.child("inactive")
+            (theme::TEXT_MUTED, "inactive".to_owned())
         };
+        let update_note = if update_available {
+            " (extension update available)"
+        } else {
+            ""
+        };
+        let description = format!("Browser pairing: {status}{update_note}");
         let trigger = Button::new("wallet-gateway-status-pill-trigger")
-            .accessibility_label("Browser pairing")
-            .text()
-            .when(collapsed, |this| this.tooltip("Browser pairing"))
-            .when(!collapsed, |this| {
-                this.w(width).min_w(px(0.0)).flex_shrink(1.0)
-            })
+            .ghost()
+            .small()
+            .px_0p5()
+            .accessibility_label(description.clone())
+            .tooltip(description)
+            .debug_selector(|| "wallet-gateway-status-icon".into())
             .child(
                 div()
-                    .id("wallet-gateway-status-pill")
-                    .w_full()
-                    .min_w(px(0.0))
-                    .h(if collapsed {
-                        px(32.0)
-                    } else {
-                        SIDEBAR_STATUS_PILL_HEIGHT
-                    })
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(theme::BORDER))
-                    .bg(rgb_with_alpha(theme::TEXT_MUTED, 0.08))
-                    .text_color(rgb(theme::TEXT_MUTED))
-                    .hover(|this| this.bg(rgb_with_alpha(theme::TEXT_MUTED, 0.14)))
-                    .line_height(px(16.0))
-                    .when(collapsed, Styled::justify_center)
+                    .relative()
+                    .flex_none()
                     .child(
                         Icon::new(RailgunSidebarIcon::BrowserExtensions)
-                            .small()
-                            .flex_none(),
+                            .size(ui::theme::STATUS_BAR_ICON_SIZE)
+                            .text_color(rgb(color)),
                     )
-                    .when(!collapsed, |this| {
+                    .when(update_available, |this| {
                         this.child(
+                            // Inside the icon's box: the button clips anything outside it.
                             div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .truncate()
-                                .text_size(px(13.0))
-                                .line_height(px(16.0))
-                                .child("Browser pairing"),
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .size(px(6.0))
+                                .rounded_full()
+                                .bg(rgb(theme::WARNING)),
                         )
-                        .child(status)
-                        .when(update_available, |this| {
-                            this.child(
-                                div()
-                                    .id("wallet-gateway-update-available")
-                                    .flex_none()
-                                    .tooltip(|window, cx| {
-                                        Tooltip::new("One or more paired extensions can be updated")
-                                            .build(window, cx)
-                                    })
-                                    .child(
-                                        Icon::empty()
-                                            .path(icons::circle_fading_arrow_up_icon_path())
-                                            .small()
-                                            .text_color(rgb(theme::WARNING)),
-                                    ),
-                            )
-                        })
                     }),
             );
-        let popover = Popover::new("wallet-gateway-status-popover")
+        if dialog_open {
+            // Inert above a dialog: a press must not take focus from the dialog either.
+            return trigger
+                .capture_any_mouse_down(|_, window, _| window.prevent_default())
+                .into_any_element();
+        }
+        Popover::new("wallet-gateway-status-popover")
             .anchor(Anchor::BottomLeft)
             .open(self.gateway.popover_open)
             .overlay_closable(!self.gateway.peer_menu_open)
@@ -819,10 +785,8 @@ impl WalletRoot {
                         root.render_gateway_controls(&content_root, &popover, max_height, cx)
                             .into_any_element()
                     }))
-            });
-        div()
-            .when(!collapsed, |this| this.w(width).min_w(px(0.0)))
-            .child(popover)
+            })
+            .into_any_element()
     }
 
     /// Title-row action: opens the install dialog once a listener address exists.

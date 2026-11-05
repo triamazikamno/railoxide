@@ -11,7 +11,6 @@ use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, Pixels, SharedSt
 use gpui_component::{
     WindowExt,
     input::{InputEvent, InputState, TextareaState},
-    resizable::ResizableState,
     select::{SearchableVec, SelectEvent, SelectState},
     table::{TableEvent, TableState},
 };
@@ -84,6 +83,7 @@ mod shell;
 mod sidebar;
 mod spend_authorization;
 mod startup;
+mod status_bar;
 mod stealth_accounts;
 mod submission_progress;
 mod submission_route;
@@ -581,7 +581,7 @@ pub(crate) struct WalletRoot {
     focus_public_account_search_on_render: bool,
     wallet_focus: FocusHandle,
     logs_open: bool,
-    drawer_split: Entity<ResizableState>,
+    logs_panel_height: Pixels,
 }
 
 struct WalletWakuRuntime {
@@ -1733,7 +1733,7 @@ impl WalletRoot {
             focus_public_account_search_on_render: false,
             wallet_focus: cx.focus_handle(),
             logs_open: false,
-            drawer_split: cx.new(|_| ResizableState::default()),
+            logs_panel_height: LOGS_DRAWER_HEIGHT,
         };
         Self::start_auto_lock_monitor(window, cx);
         cx.observe_window_activation(window, |root, window, cx| {

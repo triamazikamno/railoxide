@@ -20,7 +20,6 @@
 - `import.svg`: Lucide `import`, ISC License, https://lucide.dev/icons/import
 - `chevrons-down.svg`: Lucide `chevrons-down`, ISC License, https://lucide.dev/icons/chevrons-down
 - `arrow-right-left.svg`: Lucide `arrow-right-left`, ISC License, https://lucide.dev/icons/arrow-right-left
-- `arrow-down-to-line.svg`: Lucide `arrow-down-to-line`, ISC License, https://lucide.dev/icons/arrow-down-to-line
 - `list.svg`: Lucide `list`, ISC License, https://lucide.dev/icons/list
 - `circle-question-mark.svg`: Lucide `circle-question-mark`, unchanged from Lucide 1.43.0 as bundled in `gpui-kit-assets` 0.7.3, ISC License, https://lucide.dev/icons/circle-question-mark
 - `group.svg`: Lucide `group`, ISC License, https://lucide.dev/icons/group

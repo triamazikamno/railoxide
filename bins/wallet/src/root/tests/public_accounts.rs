@@ -1259,11 +1259,23 @@ fn network_status_stays_reachable_above_dialogs(cx: &mut TestAppContext) {
     });
     let root = root.unwrap();
     cx.simulate_resize(gpui::size(gpui::px(1400.), gpui::px(1000.)));
+    // Enough log rows for the logs panel to scroll.
+    let logs = ui::logs::LogStore::new(200);
+    for ix in 0..200 {
+        logs.push(ui::logs::LogEntry {
+            seq: 0,
+            unix_ms: 0,
+            level: tracing::Level::INFO,
+            target: "test".into(),
+            message: format!("line {ix}").into(),
+        });
+    }
     // Two stacked dialogs with entered text; the second input has focus.
     let inputs = cx.update(|window, cx| {
         root.update(cx, |root, cx| {
             root.network_health.mode = wallet_ops::WalletNetworkMode::Tor;
             root.network_health.state = wallet_ops::WalletNetworkHealthState::Ready;
+            root.logs = cx.new(|cx| ui::logs::LogsPane::new(logs, window, cx));
             cx.notify();
         });
         let inputs = ["first draft", "second draft"]
@@ -1372,12 +1384,107 @@ fn network_status_stays_reachable_above_dialogs(cx: &mut TestAppContext) {
         "shortcut closes only popover"
     );
 
-    // The lifted pill must not expose the sidebar controls beneath the dialog.
-    click(
-        cx,
-        pill.bottom_center() + gpui::point(gpui::px(0.), gpui::px(20.)),
+    // The rest of the lifted bar: nothing in it may close or change the dialogs.
+    let dialogs_intact = |cx: &mut gpui::VisualTestContext| {
+        state(cx) == (false, false, 2, true)
+            && cx.update(|_, cx| {
+                inputs
+                    .each_ref()
+                    .map(|input| input.read(cx).value().to_string())
+                    == ["first draft", "second draft"]
+            })
+    };
+    // (logs open, panel rendered)
+    let logs_state = |cx: &mut gpui::VisualTestContext| {
+        let panel = cx.debug_bounds("wallet-logs-panel").is_some();
+        (cx.update(|_, cx| root.read(cx).logs_open), panel)
+    };
+    let logs_toggle = cx
+        .debug_bounds("wallet-status-bar-logs")
+        .expect("Logs toggle is rendered");
+    click(cx, logs_toggle.center());
+    assert_eq!(logs_state(cx), (true, true), "Logs opens the panel");
+    assert!(dialogs_intact(cx), "opening logs keeps the dialogs");
+
+    let panel = cx
+        .debug_bounds("wallet-logs-panel")
+        .expect("logs panel is rendered");
+    let pane = cx.update(|_, cx| root.read(cx).logs.clone());
+    let pane_notified = std::rc::Rc::new(std::cell::Cell::new(false));
+    let _pane_observer = cx.update(|_, cx| {
+        let pane_notified = pane_notified.clone();
+        cx.observe(&pane, move |_, _| pane_notified.set(true))
+    });
+    cx.simulate_event(gpui::ScrollEvent {
+        position: panel.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(200.))),
+        ..Default::default()
+    });
+    draw(cx);
+    // The pane notifies only from its list's scroll handler here.
+    assert!(pane_notified.get(), "wheel scrolls the lifted panel");
+    assert!(dialogs_intact(cx), "scrolling keeps the dialogs");
+
+    // The center is a log row, below the header and the top resize handle.
+    click(cx, panel.center());
+    assert!(dialogs_intact(cx), "panel press keeps dialog focus");
+    click(cx, logs_toggle.center());
+    assert_eq!(logs_state(cx), (false, false), "Logs closes the panel");
+    assert!(dialogs_intact(cx), "closing logs keeps the dialogs");
+
+    let pairing = cx
+        .debug_bounds("wallet-gateway-status-icon")
+        .expect("pairing icon is rendered");
+    click(cx, pairing.center());
+    assert!(cx.update(|_, cx| !root.read(cx).gateway.popover_open));
+    assert!(dialogs_intact(cx), "pairing icon is inert above dialogs");
+
+    let bar = cx
+        .debug_bounds("wallet-status-bar")
+        .expect("status bar is rendered");
+    click(cx, bar.center());
+    assert!(
+        dialogs_intact(cx),
+        "empty bar press reaches nothing beneath"
     );
-    assert!(cx.update(|_, cx| !root.read(cx).logs_open));
+
+    cx.update(|_, cx| {
+        root.update(cx, |root, cx| {
+            root.prover_cache_build_progress =
+                Some(wallet_ops::ProverCacheBuildProgress::preparing());
+            cx.notify();
+        });
+    });
+    draw(cx);
+    let prover = cx
+        .debug_bounds("wallet-prover-cache-build-pill")
+        .expect("prover cache indicator is rendered");
+    click(cx, prover.center());
+    assert!(cx.update(|_, cx| !root.read(cx).prover_cache_build_popover_open));
+    assert!(
+        dialogs_intact(cx),
+        "prover cache indicator is inert above dialogs"
+    );
+
+    cx.update(|_, cx| {
+        root.update(cx, |root, cx| {
+            let chain_id = root.selected_evm_chain().expect("EVM chain is selected");
+            root.chain_states.insert(
+                chain_id,
+                ChainUtxoState::Loading {
+                    progress: crate::root::chain_load::ChainSyncProgress::default(),
+                },
+            );
+            cx.notify();
+        });
+    });
+    draw(cx);
+    let ppoi = cx
+        .debug_bounds("wallet-status-ppoi")
+        .expect("PPOI chip is rendered");
+    click(cx, ppoi.center());
+    assert!(cx.update(|_, cx| !root.read(cx).private_pending_status_dialog_open));
+    assert!(dialogs_intact(cx), "PPOI chip is inert above dialogs");
 
     toggle_from_shortcut(cx);
     cx.update(|window, cx| {

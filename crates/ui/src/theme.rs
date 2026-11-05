@@ -18,6 +18,8 @@ pub const ASSET_SYMBOL_TEXT_SIZE: Pixels = px(16.0);
 pub const BALANCE_TEXT_SIZE: Pixels = px(18.0);
 /// The leading amount of an amount panel, such as a swap's Sell and Buy amounts.
 pub const AMOUNT_PANEL_TEXT_SIZE: Pixels = px(28.0);
+/// Left-region icons of the desktop status bar; fits the 24px small button inside the 32px bar.
+pub const STATUS_BAR_ICON_SIZE: Pixels = px(22.0);
 pub const APP_TEXT_COLOR: u32 = TEXT;
 
 pub const BACKGROUND: u32 = 0x3f3f3f;

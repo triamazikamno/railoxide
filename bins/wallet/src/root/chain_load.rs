@@ -7,8 +7,7 @@ use std::time::{Duration, Instant};
 
 use broadcaster_monitor::{EventTx, Shared, publish_revision};
 use gpui::{
-    AnyElement, Context, ParentElement, SharedString, Styled, Window, div,
-    prelude::FluentBuilder as _, px, rgb,
+    Context, ParentElement, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{WindowExt, progress::Progress as UiProgress};
 use tokio::runtime::Handle;
@@ -1390,103 +1389,70 @@ const fn syncing_progress(progress: Option<SyncProgressUpdate>) -> Option<SyncPr
     }
 }
 
-pub(super) fn sync_status_bar(
+pub(super) fn sync_status_center(
     context: SyncStatusContext,
     progress: Option<SyncProgressUpdate>,
-    right_children: Vec<AnyElement>,
 ) -> gpui::Div {
-    let labels = sync_status_labels(context, progress);
-    wallet_status_bar(labels, true, true, right_children)
+    wallet_status_center(sync_status_labels(context, progress), true)
 }
 
-pub(super) fn ready_status_bar(
-    counts: WalletStatusCounts,
-    right_children: Vec<AnyElement>,
-) -> gpui::Div {
-    wallet_status_bar(
-        ready_wallet_status_labels(counts),
-        false,
-        ready_wallet_status_shows_text(counts),
-        right_children,
-    )
+pub(super) fn ready_status_center(counts: WalletStatusCounts) -> Option<gpui::Div> {
+    ready_wallet_status_shows_text(counts)
+        .then(|| wallet_status_center(ready_wallet_status_labels(counts), false))
 }
 
 pub(super) const fn ready_wallet_status_shows_text(_counts: WalletStatusCounts) -> bool {
     false
 }
 
-fn wallet_status_bar(
-    labels: SyncStatusLabels,
-    show_progress: bool,
-    show_text: bool,
-    right_children: Vec<AnyElement>,
-) -> gpui::Div {
+/// Sync progress for the status bar center. Only the detail shrinks, so it truncates first.
+fn wallet_status_center(labels: SyncStatusLabels, show_progress: bool) -> gpui::Div {
+    // Sized to its content so the status bar's center region can center it; it still shrinks.
     div()
-        .h(px(36.0))
-        .flex_none()
+        .min_w(px(0.0))
         .flex()
         .items_center()
         .gap_3()
-        .px(px(12.0))
-        .bg(rgb(theme::SURFACE))
-        .border_t_1()
-        .border_color(rgb(theme::BORDER))
-        .when(show_text, |bar| {
-            bar.child(
-                div()
-                    .min_w(px(170.0))
-                    .text_color(rgb(theme::TEXT))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(SharedString::from(labels.title)),
-            )
-        })
+        .child(
+            div()
+                .flex_none()
+                .text_color(rgb(theme::TEXT))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .child(SharedString::from(labels.title)),
+        )
         .when(show_progress, |bar| {
             bar.child(
                 UiProgress::new("chain-load-progress")
+                    .flex_none()
                     .w(px(190.0))
                     .h(px(6.0))
                     .value(f32::from(labels.percent)),
             )
             .child(
                 div()
+                    .flex_none()
                     .w(px(42.0))
                     .text_color(rgb(theme::INFO))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(SharedString::from(format!("{}%", labels.percent))),
             )
         })
-        .when(show_text, |bar| {
-            bar.child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_color(rgb(theme::TEXT_MUTED))
-                    .text_size(APP_TEXT_SIZE)
-                    .map(|detail| {
-                        if show_progress {
-                            // The id keeps one animation as the detail text changes.
-                            detail.child(
-                                ui::controls::app_shimmer(labels.detail).id("chain-load-detail"),
-                            )
-                        } else {
-                            detail.child(SharedString::from(labels.detail))
-                        }
-                    }),
-            )
-        })
-        .when(!show_text, |bar| bar.child(div().flex_1()))
-        .when(!right_children.is_empty(), |bar| {
-            bar.child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap_2()
-                    .children(right_children),
-            )
-        })
+        .child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .text_size(APP_TEXT_SIZE)
+                .map(|detail| {
+                    if show_progress {
+                        // The id keeps one animation as the detail text changes.
+                        detail
+                            .child(ui::controls::app_shimmer(labels.detail).id("chain-load-detail"))
+                    } else {
+                        detail.child(SharedString::from(labels.detail))
+                    }
+                }),
+        )
 }
 
 pub(super) fn progress_detail(progress: SyncProgressUpdate) -> String {

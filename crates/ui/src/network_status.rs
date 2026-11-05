@@ -122,14 +122,14 @@ pub enum NetworkStatusIntent {
 }
 
 /// Both frontends supply their own overlay and focus owner around this trigger.
+/// `compact` selects the icon-only pill; otherwise the single-line status bar layout.
 #[must_use]
 pub fn network_status_pill(
     id: impl Into<ElementId>,
-    collapsed: bool,
+    compact: bool,
     status: &NetworkStatus,
     activity: Option<&NetworkActivity>,
     rate: Option<u64>,
-    expanded_width: gpui::Pixels,
 ) -> Button {
     let setup = activity
         .and_then(|activity| activity.median_setup_duration)
@@ -139,10 +139,9 @@ pub fn network_status_pill(
         .accessibility_label(format!("Desktop network: {}", status.kind.label()))
         .tooltip(format!("Desktop network: {}", status.kind.label()))
         .child(network_status_chip(
-            collapsed,
+            compact,
             status.kind.color(),
             status.kind.label(),
-            expanded_width,
             &setup,
             rate,
             status.kind.is_tor(),
@@ -307,16 +306,15 @@ fn tor_activity_connections_row(successful: Option<u64>, failed: Option<u64>) ->
 }
 
 fn network_status_chip(
-    collapsed: bool,
+    compact: bool,
     color: u32,
     label: &'static str,
-    expanded_width: gpui::Pixels,
     setup_label: &str,
     rate: Option<u64>,
     tor_metrics_visible: bool,
     tor_reconnecting: bool,
 ) -> gpui::AnyElement {
-    if collapsed {
+    if compact {
         return div()
             .id("wallet-network-status-pill-collapsed")
             .h(gpui::rems(32.0 / 16.0))
@@ -340,137 +338,55 @@ fn network_status_chip(
             .into_any_element();
     }
 
-    if !tor_metrics_visible {
-        return div()
-            .id("wallet-network-status-pill")
-            .h_7()
-            .px_2()
+    // Tor shows its metrics on two lines instead of a label; the icon color carries the state.
+    let text = if tor_metrics_visible {
+        div()
+            .flex_none()
             .flex()
-            .items_center()
-            .gap_2()
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(color))
-            .bg(rgb_with_alpha(color, 0.08))
-            .text_color(rgb(color))
-            .cursor_pointer()
-            .hover(|this| this.bg(rgb_with_alpha(color, 0.14)))
-            .child(
-                Icon::empty()
-                    .path(crate::icons::tor_status_icon_path())
-                    .small()
-                    .text_color(rgb(color)),
-            )
-            .child(
-                div()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_size(gpui::rems(13.0 / 16.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .line_height(gpui::relative(APP_TEXT_LINE_HEIGHT))
-                    .text_color(rgb(color))
-                    .child(label),
-            )
-            .into_any_element();
-    }
-
-    let displayed_label = if tor_reconnecting { "Tor" } else { label };
+            .flex_col()
+            // Fits "999.9 kB/s", so changing values keep the pill's width.
+            .min_w(gpui::rems(3.75))
+            .font_family(theme::APP_MONO_FONT_FAMILY)
+            .text_size(px(10.0))
+            // Tight lines keep both rows inside the 32px desktop status bar.
+            .line_height(gpui::relative(1.2))
+            .text_color(rgb(theme::TEXT_MUTED))
+            .child(setup_label.to_owned())
+            .child(format_decimal_byte_rate(rate))
+    } else {
+        div()
+            .flex_none()
+            .text_xs()
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .child(label)
+    };
 
     div()
         .id("wallet-network-status-pill")
-        .h(gpui::rems(42.0 / 16.0))
-        .w(expanded_width)
-        .p_2()
+        .px_1()
         .flex()
         .items_center()
         .gap_2()
-        .rounded_lg()
-        .border_1()
-        .border_color(rgb(color))
-        .bg(rgb_with_alpha(color, 0.08))
+        .rounded_md()
+        .whitespace_nowrap()
+        .line_height(gpui::relative(APP_TEXT_LINE_HEIGHT))
         .text_color(rgb(color))
         .cursor_pointer()
         .hover(|this| this.bg(rgb_with_alpha(color, 0.14)))
         .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    Icon::empty()
-                        .path(crate::icons::tor_status_icon_path())
-                        .small()
-                        .flex_none()
-                        .text_color(rgb(color)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .when(!tor_reconnecting, gpui::Styled::flex_1)
-                                .min_w_0()
-                                .truncate()
-                                .text_size(gpui::rems(13.0 / 16.0))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .line_height(gpui::relative(APP_TEXT_LINE_HEIGHT))
-                                .text_color(rgb(color))
-                                .child(displayed_label),
-                        )
-                        .children(tor_reconnecting.then(|| {
-                            div().flex_none().child(
-                                Spinner::new()
-                                    .icon(IconName::LoaderCircle)
-                                    .color(rgb(color).into())
-                                    .xsmall(),
-                            )
-                        })),
-                ),
-        )
-        .child(
-            div()
+            Icon::empty()
+                .path(crate::icons::tor_status_icon_path())
+                .size(theme::STATUS_BAR_ICON_SIZE)
                 .flex_none()
-                .flex()
-                .flex_col()
-                .items_end()
-                .gap(gpui::rems(2.0 / 16.0))
-                .text_size(gpui::rems(11.0 / 16.0))
-                // Numeric readouts retain the native compact line box; prose uses shared leading.
-                .line_height(gpui::rems(11.0 / 16.0))
-                .text_color(rgb(color))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .whitespace_nowrap()
-                        .child(
-                            Icon::empty()
-                                .path(crate::icons::arrow_right_left_icon_path())
-                                .size(gpui::rems(9.0 / 16.0)),
-                        )
-                        .child(setup_label.to_owned()),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .whitespace_nowrap()
-                        .child(
-                            Icon::empty()
-                                .path(crate::icons::arrow_down_to_line_icon_path())
-                                .size(gpui::rems(9.0 / 16.0)),
-                        )
-                        .child(format_decimal_byte_rate(rate)),
-                ),
+                .text_color(rgb(color)),
         )
+        .child(text)
+        .children(tor_reconnecting.then(|| {
+            Spinner::new()
+                .icon(IconName::LoaderCircle)
+                .color(rgb(color).into())
+                .xsmall()
+        }))
         .into_any_element()
 }
 
@@ -845,15 +761,8 @@ mod tests {
                 .p_0()
                 .open(self.open)
                 .trigger(NetworkStatusTrigger::new(
-                    network_status_pill(
-                        "network-probe-trigger",
-                        true,
-                        &status,
-                        None,
-                        None,
-                        px(0.0),
-                    )
-                    .debug_selector(|| "network-probe-trigger".into()),
+                    network_status_pill("network-probe-trigger", true, &status, None, None)
+                        .debug_selector(|| "network-probe-trigger".into()),
                     &self.focus,
                     &status,
                 ))
