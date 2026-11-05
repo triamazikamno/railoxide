@@ -70,7 +70,8 @@ impl WalletRoot {
         window: &Window,
     ) -> gpui::Div {
         let card = self.render_vault_card(root.clone());
-        render_wallet_hero_screen(window, card).when(
+        let update_check = Self::update_check_trigger(root.clone());
+        render_wallet_hero_screen(window, card, Some(update_check)).when(
             should_show_pre_unlock_settings_action(&self.vault_state),
             |this| this.child(Self::render_pre_unlock_settings_gear(root)),
         )

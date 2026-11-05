@@ -16438,6 +16438,7 @@ dependencies = [
  "rustls-platform-verifier",
  "security-framework",
  "security-framework-sys",
+ "semver 1.0.28",
  "serde",
  "serde_json",
  "sha2 0.11.1",

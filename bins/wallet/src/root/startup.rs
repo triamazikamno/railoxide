@@ -961,7 +961,7 @@ impl WalletStartupRoot {
             })
             .into_any_element();
 
-        render_wallet_hero_screen(window, card)
+        render_wallet_hero_screen(window, card, None)
             .when(action_state.settings, |this| {
                 this.child(Self::render_startup_settings_gear(root))
             })

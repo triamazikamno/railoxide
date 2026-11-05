@@ -113,6 +113,7 @@ mod native_topup;
 mod poi_contexts;
 mod protocol_fee;
 mod public_wallet;
+pub mod release_check;
 mod rpc_broker;
 mod signer;
 mod sponsored_bundle;

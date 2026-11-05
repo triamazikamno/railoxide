@@ -30,6 +30,7 @@ use ui::controls::app_button;
 use ui::icons;
 use ui::logs::LogStore;
 use ui::theme::{self, APP_FONT_FAMILY, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
+use wallet_ops::release_check::RAILOXIDE_REPOSITORY_URL;
 use wallet_ops::{
     PoiArtifactCacheAttemptId, PoiArtifactCacheFailureKind, PoiArtifactCacheListProgress,
     PoiArtifactCachePhase, PoiArtifactCacheProgress, PublicScanSource, WalletNetworkMode,
@@ -56,6 +57,7 @@ use super::private_assets::{
 use super::settings::{data_folder_path, data_folder_row};
 use super::submission_route::{presence_status_color, status_presence_dot, status_presence_text};
 use super::ui_helpers::format_binary_bytes;
+use super::update_check::{UpdateCheckTrigger, update_check_button};
 use super::utxo::{
     blocked_shield_rescue_display_rows, ppoi_workflow_status_detail, ppoi_workflow_status_title,
     recoverable_poi_candidate_count, should_focus_utxo_table,
@@ -69,7 +71,6 @@ use super::{
 
 pub(super) const COPY_URL_TOOLTIP: &str = "Click to copy URL to clipboard";
 pub(super) const LINK_COPIED_MESSAGE: &str = "Link copied to clipboard!";
-pub(super) const RAILOXIDE_REPOSITORY_URL: &str = "https://github.com/triamazikamno/railoxide";
 pub(super) const TELEGRAM_URL: &str = "https://t.me/railoxide";
 
 #[derive(Default)]
@@ -403,6 +404,9 @@ impl Render for WalletRoot {
 
         let root = cx.entity();
         if !matches!(self.vault_state, VaultState::ViewUnlocked) {
+            // Debug UI fixture: an `update-check:` mode opens its dialog over the first frame.
+            #[cfg(debug_assertions)]
+            self.open_ui_fixture_update_check(window, cx);
             return self.render_locked_vault_screen(root, window);
         }
         self.open_next_walletconnect_request_dialog_if_idle(window, cx);
@@ -535,7 +539,11 @@ fn wallet_hero_layout(window: &Window) -> WalletHeroLayout {
     }
 }
 
-pub(super) fn render_wallet_hero_screen(window: &Window, card: gpui::AnyElement) -> gpui::Div {
+pub(super) fn render_wallet_hero_screen(
+    window: &Window,
+    card: gpui::AnyElement,
+    update_check: Option<UpdateCheckTrigger>,
+) -> gpui::Div {
     let viewport = window.viewport_size();
     let layout = wallet_hero_layout(window);
     let stage_width = (viewport.width - px(96.0))
@@ -558,7 +566,7 @@ pub(super) fn render_wallet_hero_screen(window: &Window, card: gpui::AnyElement)
             .items_center()
             .gap_6()
             .child(
-                render_wallet_brand_block(window, layout)
+                render_wallet_brand_block(window, layout, update_check)
                     .w(px(560.0))
                     .flex_none(),
             )
@@ -577,7 +585,7 @@ pub(super) fn render_wallet_hero_screen(window: &Window, card: gpui::AnyElement)
             .flex_col()
             .items_center()
             .gap_6()
-            .child(render_wallet_brand_block(window, layout).w_full())
+            .child(render_wallet_brand_block(window, layout, update_check).w_full())
             .child(div().w_full().child(card))
     };
 
@@ -610,7 +618,11 @@ pub(super) fn render_wallet_hero_screen(window: &Window, card: gpui::AnyElement)
         )
 }
 
-fn render_wallet_brand_block(window: &Window, layout: WalletHeroLayout) -> gpui::Div {
+fn render_wallet_brand_block(
+    window: &Window,
+    layout: WalletHeroLayout,
+    update_check: Option<UpdateCheckTrigger>,
+) -> gpui::Div {
     let viewport = window.viewport_size();
     let show_mineral = layout != WalletHeroLayout::Narrow;
     let mineral_size = match layout {
@@ -669,11 +681,11 @@ fn render_wallet_brand_block(window: &Window, layout: WalletHeroLayout) -> gpui:
                         .h(wordmark_height)
                         .object_fit(ObjectFit::Contain),
                 )
-                .child(render_wallet_build_metadata()),
+                .child(render_wallet_build_metadata(update_check)),
         )
 }
 
-fn render_wallet_build_metadata() -> gpui::Div {
+fn render_wallet_build_metadata(update_check: Option<UpdateCheckTrigger>) -> gpui::Div {
     let build_label = wallet_build_label();
 
     div()
@@ -700,7 +712,11 @@ fn render_wallet_build_metadata() -> gpui::Div {
                 .child(clipboard_with_toast(
                     "wallet-hero-build-info-copy",
                     build_label,
-                )),
+                ))
+                .children(
+                    update_check
+                        .map(|trigger| update_check_button("wallet-hero-update-check", trigger)),
+                ),
         )
         .child(
             div()

@@ -344,6 +344,18 @@
 //!   failed after burning 7.7142 TRX, included without moving the token after burning
 //!   0.345 TRX, or expired with no TRX spent. A swap form takes these modes as active, as it
 //!   does every mode.
+//! - `update-check:behind`, `update-check:current`, `update-check:ahead` and
+//!   `update-check:failed` open the update check dialog over the first frame of the
+//!   locked-vault screen, on a canned result placed against this build's version, with no
+//!   request to GitHub. `behind` lists three releases newer than the build, highlighted and
+//!   expanded, with notes that hold a link, an image, a code block, a list and raw HTML, then
+//!   the build's own release and eleven older ones, enough to scroll; a newer prerelease in
+//!   the canned list doesn't show. `current` has the build's release as the latest, expanded,
+//!   above the older ones, and `ahead` only the older ones, below the installed marker.
+//!   `failed` is a check GitHub rejected with 403 Forbidden, with the Tor hint when the
+//!   profile is in Tor mode. Check for updates and Retry show the canned result again, and a
+//!   later opening starts from the disclosure. A swap form doesn't take these modes as
+//!   active.
 //!
 //! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
@@ -368,6 +380,9 @@ use railgun_ui::{
 };
 use wallet_ops::bridge::{NearAssets, NonEvmBridgeDestination, NonEvmNetwork};
 use wallet_ops::cow::{CowOrderStatusHint, CowOrderStatusReport, OrderLimitError, OrderUid};
+use wallet_ops::release_check::{
+    GithubRelease, RAILOXIDE_REPOSITORY_URL, ReleaseCheckError, ReleaseTimeline, classify,
+};
 use wallet_ops::settings::SwapProfile;
 use wallet_ops::vault::{
     AcrossOrderTerms, ActivityAsset, ActivityAttempt, ActivityAttemptOutcome, ActivityCounterparty,
@@ -449,6 +464,16 @@ enum Mode {
     NonEvm(NonEvm),
     Tron(Tron),
     Activity,
+    UpdateCheck(UpdateCheck),
+}
+
+/// The canned result an `update-check:` mode shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdateCheck {
+    Behind,
+    Current,
+    Ahead,
+    Failed,
 }
 
 /// What a `tron:` mode shows of the synthesized Tron accounts.
@@ -679,6 +704,15 @@ fn parse(value: &str) -> Option<Mode> {
     if value == "hardware-derive" {
         return Some(Mode::HardwareDerive);
     }
+    if let Some(state) = value.strip_prefix("update-check:") {
+        return Some(Mode::UpdateCheck(match state {
+            "behind" => UpdateCheck::Behind,
+            "current" => UpdateCheck::Current,
+            "ahead" => UpdateCheck::Ahead,
+            "failed" => UpdateCheck::Failed,
+            _ => return None,
+        }));
+    }
     if let Some(state) = value.strip_prefix("max:") {
         return Some(Mode::Max(match state {
             "fragmented" => Max::Fragmented,
@@ -876,9 +910,9 @@ pub(super) fn route_error() -> bool {
 }
 
 /// Whether a fixture mode is on. The form of a swap paid from a Public account then works
-/// without private funds, and its jobs are scripted.
+/// without private funds, and its jobs are scripted. An `update-check:` mode leaves swaps alone.
 pub(super) fn active() -> bool {
-    mode().is_some()
+    mode().is_some_and(|mode| !matches!(mode, Mode::UpdateCheck(_)))
 }
 
 /// Whether the Buy picker holds a network's setup-fee check, and whether that check failed.
@@ -3048,6 +3082,22 @@ impl WalletRoot {
         true
     }
 
+    /// In an `update-check:` mode, open the update check dialog on its canned result the
+    /// first time the locked-vault screen renders.
+    pub(in crate::root) fn open_ui_fixture_update_check(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        static OPENED: AtomicBool = AtomicBool::new(false);
+        if !matches!(mode(), Some(Mode::UpdateCheck(_))) || OPENED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        self.open_update_check_dialog(window, cx);
+        // The fixture's check shows the canned result and sends nothing.
+        self.start_update_check(cx);
+    }
+
     /// In a `broadcaster-progress:` mode, open the progress dialog of a synthesized Send via
     /// broadcaster of `asset` in place of its form, held at the mode's state. `true` when the
     /// dialog opened.
@@ -3230,6 +3280,111 @@ pub(in crate::root) fn tron() -> Option<Tron> {
 /// `hardware-derive` mode's stand-in Ledger.
 pub(in crate::root) fn hardware_derive() -> bool {
     matches!(mode(), Some(Mode::HardwareDerive))
+}
+
+/// The result an `update-check:` mode shows in place of a check, which sends nothing. The
+/// canned releases are placed against this build's version. `None` in every other mode.
+pub(in crate::root) fn update_check() -> Option<Result<ReleaseTimeline, ReleaseCheckError>> {
+    const NEWEST_NOTES: &str = r#"## Highlights
+
+- **Update check**: see whether a newer release is out, from the build label.
+- Faster private balance sync after the wallet wakes from sleep.
+- Fixed a crash when a chain's RPC endpoint returned an empty block.
+
+![Release screenshot](https://github.com/triamazikamno/railoxide/raw/main/docs/screenshot.png)
+
+Verify the download before installing:
+
+```sh
+sha256sum -c railoxide-checksums.txt
+```
+
+<details><summary>Packaging</summary><a href="https://example.com/packages">All packages</a></details>
+
+Full changelog: [compare](https://github.com/triamazikamno/railoxide/compare/v0.0.0...v0.0.1) and https://github.com/triamazikamno/railoxide/releases"#;
+    const PATCH_NOTES: &str = "### Fixes\n\n1. Swaps no longer wait for a quote that already \
+        expired.\n2. The UTXO table keeps its scroll position after a sync.\n\nRun \
+        `railoxide --version` to see the installed build.";
+    const SECOND_PATCH_NOTES: &str = "- Tor circuits for one-off requests close as soon as \
+        the request ends.\n- <b>Hardware wallets</b>: Trezor passphrase prompts show the \
+        device name.";
+    const OLDER_NOTES: &str = "- Improves note scanning on large wallets.\n- Fixes the \
+        Activity tab's unread dot after a restart.";
+
+    let Mode::UpdateCheck(state) = mode()? else {
+        return None;
+    };
+    if state == UpdateCheck::Failed {
+        return Some(Err(ReleaseCheckError {
+            reason: "GitHub returned 403 Forbidden.".to_owned(),
+        }));
+    }
+    let part = |value: &str| value.parse::<u64>().unwrap_or(0);
+    let major = part(env!("CARGO_PKG_VERSION_MAJOR"));
+    let minor = part(env!("CARGO_PKG_VERSION_MINOR"));
+    let patch = part(env!("CARGO_PKG_VERSION_PATCH"));
+    let release = |tag: String, name: Option<&str>, day: &str, body: Option<&str>| GithubRelease {
+        html_url: format!("{RAILOXIDE_REPOSITORY_URL}/releases/tag/{tag}"),
+        name: Some(name.map_or_else(|| tag.clone(), str::to_owned)),
+        tag_name: tag,
+        body: body.map(str::to_owned),
+        published_at: Some(format!("2026-{day}T12:00:00Z")),
+        prerelease: false,
+        draft: false,
+    };
+    // shortcut: older releases sit one minor version below the build, so they order older
+    // only while the build's minor version is above 0.
+    let mut releases: Vec<GithubRelease> = (1..=11_u64)
+        .map(|index| {
+            release(
+                format!("v{major}.{}.{index}", minor.saturating_sub(1)),
+                None,
+                &format!("09-{:02}", 2 * index + 1),
+                (index % 3 != 0).then_some(OLDER_NOTES),
+            )
+        })
+        .collect();
+    if state != UpdateCheck::Ahead {
+        releases.push(release(
+            format!("v{}", env!("CARGO_PKG_VERSION")),
+            None,
+            "10-02",
+            Some(OLDER_NOTES),
+        ));
+    }
+    if state == UpdateCheck::Behind {
+        let newest = format!("v{major}.{}.0", minor + 1);
+        releases.extend([
+            release(
+                format!("v{major}.{minor}.{}", patch + 1),
+                None,
+                "10-12",
+                Some(PATCH_NOTES),
+            ),
+            release(
+                newest.clone(),
+                Some(&format!("Railoxide {newest}")),
+                "10-30",
+                Some(NEWEST_NOTES),
+            ),
+            release(
+                format!("v{major}.{minor}.{}", patch + 2),
+                None,
+                "10-20",
+                Some(SECOND_PATCH_NOTES),
+            ),
+            GithubRelease {
+                prerelease: true,
+                ..release(
+                    format!("v{major}.{}.1-rc.1", minor + 1),
+                    None,
+                    "11-02",
+                    Some(OLDER_NOTES),
+                )
+            },
+        ]);
+    }
+    Some(Ok(classify(env!("CARGO_PKG_VERSION"), releases)))
 }
 
 /// The finality the `utxos` mode counts from its own head block, in place of the network's.

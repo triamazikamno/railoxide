@@ -58,6 +58,8 @@ pub(super) use ui_fixture::shows_utxos as ui_fixture_shows_utxos;
 pub(super) use ui_fixture::stealth_accounts as ui_fixture_stealth_accounts;
 pub(super) use ui_fixture::tor_rotation as ui_fixture_tor_rotation;
 pub(super) use ui_fixture::unshield_asset as ui_fixture_unshield_asset;
+#[cfg(debug_assertions)]
+pub(super) use ui_fixture::update_check as ui_fixture_update_check;
 pub(super) use ui_fixture::utxo_finality_context as ui_fixture_utxo_finality_context;
 pub(super) use ui_fixture::utxo_rows as ui_fixture_utxo_rows;
 #[cfg(debug_assertions)]

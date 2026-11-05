@@ -9,13 +9,12 @@ use gpui_component::{
 };
 use ui::clipboard::{clipboard_with_toast, copy_to_clipboard_with_custom_toast};
 use ui::theme;
+use wallet_ops::release_check::RAILOXIDE_REPOSITORY_URL;
 
 use crate::assets::{LOGO_ICON_PATH, RailgunSidebarIcon, RailgunSocialIcon, SIDEBAR_WORDMARK_PATH};
 
-use super::shell::{
-    COPY_URL_TOOLTIP, LINK_COPIED_MESSAGE, RAILOXIDE_REPOSITORY_URL, TELEGRAM_URL,
-    wallet_build_label,
-};
+use super::shell::{COPY_URL_TOOLTIP, LINK_COPIED_MESSAGE, TELEGRAM_URL, wallet_build_label};
+use super::update_check::{UpdateCheckTrigger, update_check_button};
 use super::{
     SIDEBAR_WIDTH, WalletRoot, WalletTab, app_status_tag, rgb_with_alpha, should_focus_utxo_table,
 };
@@ -221,7 +220,9 @@ impl WalletRoot {
                                     .child(Self::render_sidebar_wordmark()),
                             ),
                     )
-                    .child(Self::render_sidebar_build_metadata())
+                    .child(Self::render_sidebar_build_metadata(Some(
+                        Self::update_check_trigger(root.clone()),
+                    )))
             })
             .when(collapsed, |this| {
                 this.child(
@@ -255,7 +256,7 @@ impl WalletRoot {
             })
     }
 
-    fn render_sidebar_build_metadata() -> gpui::Div {
+    fn render_sidebar_build_metadata(update_check: Option<UpdateCheckTrigger>) -> gpui::Div {
         let build_label = wallet_build_label();
 
         div()
@@ -285,7 +286,10 @@ impl WalletRoot {
                     .child(clipboard_with_toast(
                         "wallet-sidebar-build-info-copy",
                         build_label,
-                    )),
+                    ))
+                    .children(update_check.map(|trigger| {
+                        update_check_button("wallet-sidebar-update-check", trigger)
+                    })),
             )
             .child(
                 div()

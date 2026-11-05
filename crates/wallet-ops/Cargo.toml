@@ -54,6 +54,7 @@ rmp-serde = { workspace = true }
 # No defaults: they add `prefer-post-quantum`, which would change every client's ClientHello.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-platform-verifier = "0.7"
+semver = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

@@ -63,6 +63,7 @@ mod key_export;
 mod locked_notes;
 mod maintenance;
 mod manage_wallets;
+mod markdown_sanitize;
 mod network;
 mod participant;
 mod platform_attention;
@@ -89,6 +90,7 @@ mod submission_progress;
 mod submission_route;
 mod tokens;
 mod ui_helpers;
+mod update_check;
 mod utxo;
 mod vault;
 mod vault_ui;
@@ -469,6 +471,7 @@ pub(crate) struct WalletRoot {
     wallet_options: Vec<WalletOption>,
     manage_wallets: ManageWalletsState,
     key_export: KeyExportState,
+    update_check: update_check::UpdateCheckUi,
     manage_wallet_label_input: Entity<InputState>,
     selected_wallet_id: Option<Arc<str>>,
     active_wallet_generation: u64,
@@ -1624,6 +1627,7 @@ impl WalletRoot {
             wallet_options: Vec::new(),
             manage_wallets: ManageWalletsState::default(),
             key_export: KeyExportState::default(),
+            update_check: update_check::UpdateCheckUi::default(),
             manage_wallet_label_input,
             selected_wallet_id: None,
             active_wallet_generation: 0,
