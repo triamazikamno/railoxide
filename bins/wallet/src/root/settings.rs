@@ -72,6 +72,7 @@ mod types;
 mod ui_helpers;
 
 pub(super) use apply_mode::*;
+pub(super) use chains::chains_page_keywords;
 pub(super) use data_folder::*;
 pub(super) use network::*;
 pub(super) use tokens::*;

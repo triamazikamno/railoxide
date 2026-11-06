@@ -3,7 +3,7 @@ use std::path::Path;
 
 use super::*;
 
-/// The data folder's total size, as shown in Settings Maintenance.
+/// The data folder's total size, as shown in Settings Storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::root) enum DataFolderSize {
     Unknown,

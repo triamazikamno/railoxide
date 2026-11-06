@@ -94,6 +94,8 @@ pub(in crate::root) struct WalletSettingsEditor {
     pub(in crate::root) chain_editor_was_open: bool,
     /// Reselect the Chains page when Settings remounts after the chain editor closes.
     pub(in crate::root) reopen_chains_page: bool,
+    /// Keeps the Custom PPOI publisher selected while its values still equal the official preset.
+    pub(in crate::root) poi_custom_publisher: bool,
     pub(in crate::root) vault_store: Arc<DesktopVaultStore>,
     pub(in crate::root) runtime: Handle,
     pub(in crate::root) saved: WalletSettings,
@@ -104,7 +106,7 @@ pub(in crate::root) struct WalletSettingsEditor {
     pub(in crate::root) status: Option<Arc<str>>,
     pub(in crate::root) cache_building: bool,
     pub(in crate::root) cache_build_progress: Option<ProverCacheBuildProgress>,
-    /// The absolute data folder path shown in Maintenance.
+    /// The absolute data folder path shown in Storage.
     pub(in crate::root) data_folder: PathBuf,
     pub(in crate::root) data_folder_size: DataFolderSize,
     pub(in crate::root) data_folder_size_generation: u64,
@@ -159,7 +161,7 @@ impl SettingsUrlListKind {
     pub(in crate::root) const fn dialog_help(&self) -> &'static str {
         match self {
             Self::PoiGateway => {
-                "Enter an HTTP(S) gateway URL for POI, indexed artifact, and governance document reads."
+                "Enter an HTTP(S) gateway URL for PPOI, indexed artifact, and governance document reads."
             }
             Self::WakuDnsEnrTree => "Enter an enrtree:// DNS discovery tree URL.",
             Self::WakuDohFallback => "Enter an HTTP(S) DNS-over-HTTPS fallback endpoint.",

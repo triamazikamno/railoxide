@@ -2,39 +2,39 @@ use super::*;
 use wallet_ops::device_auth::DeviceAuthMethod;
 
 /// Position of the Chains page in the `ComponentSettings` page list below.
-const CHAINS_PAGE_INDEX: usize = 2;
+const CHAINS_PAGE_INDEX: usize = 3;
 
 const INDEXED_ARTIFACT_REPOSITORY_URL: &str = "https://github.com/triamazikamno/railgun-indexer/";
 
-fn indexed_artifact_repository_help_item() -> SettingItem {
-    SettingItem::render(move |_options, _window, _cx| {
-        div()
-            .w_full()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_1()
-            .text_size(px(13.0))
-            .line_height(px(18.0))
-            .text_color(rgb(theme::TEXT_SUBTLE))
-            .child(
-                "Chain-indexed data artifacts for wallet catch-up, public TXID cache, and Merkle quick-sync. See",
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .font_family(APP_MONO_FONT_FAMILY)
-                    .text_color(rgb(theme::TEXT_MUTED))
-                    .child(INDEXED_ARTIFACT_REPOSITORY_URL)
-                    .child(clipboard_with_toast(
-                        "wallet-settings-indexed-artifact-repository-url-copy",
-                        INDEXED_ARTIFACT_REPOSITORY_URL,
-                    )),
-            )
-            .child("for more information or if you want to run your own")
-    })
+const MIB: u64 = 1024 * 1024;
+
+fn indexed_artifact_repository_help() -> gpui::Div {
+    div()
+        .w_full()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_1()
+        .text_size(px(13.0))
+        .line_height(px(18.0))
+        .text_color(rgb(theme::TEXT_SUBTLE))
+        .child(
+            "Chain-indexed data artifacts for wallet catch-up, public TXID cache, and Merkle quick-sync. See",
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .font_family(APP_MONO_FONT_FAMILY)
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(INDEXED_ARTIFACT_REPOSITORY_URL)
+                .child(clipboard_with_toast(
+                    "wallet-settings-indexed-artifact-repository-url-copy",
+                    INDEXED_ARTIFACT_REPOSITORY_URL,
+                )),
+        )
+        .child("for more information or if you want to run your own")
 }
 
 impl Render for WalletSettingsEditor {
@@ -88,7 +88,7 @@ impl Render for WalletSettingsEditor {
                 ),
                 (
                     SharedString::from("poi-proxy"),
-                    SharedString::from("POI proxy"),
+                    SharedString::from("PPOI proxy"),
                 ),
             ],
             |settings| SharedString::from(poi_source_value(settings.poi.read_source)),
@@ -126,7 +126,32 @@ impl Render for WalletSettingsEditor {
                     wallet_ops::settings::PoiArtifactManifestSourceSetting::IpnsName(value);
             },
         );
-        let poi_reset_editor = editor.clone();
+        let poi_publisher_choice = {
+            let get_editor = editor.clone();
+            let set_editor = editor.clone();
+            // The choice is editor state, not a stored setting, so it reads the editor directly.
+            SettingField::dropdown(
+                vec![
+                    (
+                        SharedString::from("official"),
+                        SharedString::from("Official"),
+                    ),
+                    (SharedString::from("custom"), SharedString::from("Custom")),
+                ],
+                move |cx| {
+                    SharedString::from(if get_editor.read(cx).poi_custom_publisher_selected() {
+                        "custom"
+                    } else {
+                        "official"
+                    })
+                },
+                move |value, cx| {
+                    set_editor.update(cx, |editor, cx| {
+                        editor.select_poi_publisher(value.as_ref() == "custom", cx);
+                    });
+                },
+            )
+        };
         let poi_cache_reset_editor = editor.clone();
         let poi_data_reset_editor = editor.clone();
         let merkle_forest_cache_reset_editor = editor.clone();
@@ -186,13 +211,14 @@ impl Render for WalletSettingsEditor {
         };
         let indexed_byte_budget_options = NumberFieldOptions {
             min: 1.0,
-            max: f64::from(1024 * 1024 * 1024),
-            step: f64::from(1024 * 1024),
+            max: 1024.0,
+            step: 1.0,
         };
         let indexed_concurrency = Self::number_field(
             "indexed-artifact-concurrency",
             editor.clone(),
             indexed_concurrency_options,
+            None,
             |settings| {
                 settings
                     .indexed_artifacts
@@ -202,48 +228,32 @@ impl Render for WalletSettingsEditor {
             },
             |settings, value| settings.indexed_artifacts.concurrency = Some(value as usize),
         );
-        let indexed_byte_budget = Self::number_field(
-            "indexed-artifact-byte-budget",
-            editor.clone(),
-            indexed_byte_budget_options,
-            |settings| {
-                settings
-                    .indexed_artifacts
-                    .max_in_flight_bytes
-                    .unwrap_or(wallet_ops::settings::DEFAULT_INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES)
-                    as f64
-            },
-            |settings, value| settings.indexed_artifacts.max_in_flight_bytes = Some(value as u64),
-        );
+        let indexed_byte_budget =
+            Self::number_field(
+                "indexed-artifact-byte-budget",
+                editor.clone(),
+                indexed_byte_budget_options,
+                Some("MiB"),
+                |settings| {
+                    (settings.indexed_artifacts.max_in_flight_bytes.unwrap_or(
+                        wallet_ops::settings::DEFAULT_INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES,
+                    ) / MIB) as f64
+                },
+                |settings, value| {
+                    settings.indexed_artifacts.max_in_flight_bytes = Some(value as u64 * MIB);
+                },
+            );
         let indexed_reset_editor = editor.clone();
-        let waku_number_options = NumberFieldOptions {
-            min: 0.0,
-            max: f64::from(u32::MAX),
-            step: 1.0,
-        };
         let positive_number_options = NumberFieldOptions {
             min: 1.0,
             max: 86_400.0,
             step: 1.0,
         };
-        let waku_cluster = Self::number_field(
-            "waku-cluster-id",
-            editor.clone(),
-            waku_number_options.clone(),
-            |settings| f64::from(settings.waku.cluster_id),
-            |settings, value| settings.waku.cluster_id = value as u32,
-        );
-        let waku_shard = Self::number_field(
-            "waku-shard-id",
-            editor.clone(),
-            waku_number_options,
-            |settings| f64::from(settings.waku.shard_id),
-            |settings, value| settings.waku.shard_id = value as u32,
-        );
         let waku_max_peers = Self::number_field(
             "waku-max-peers",
             editor.clone(),
             positive_number_options.clone(),
+            None,
             |settings| settings.waku.max_peers as f64,
             |settings, value| settings.waku.max_peers = value as usize,
         );
@@ -251,6 +261,7 @@ impl Render for WalletSettingsEditor {
             "waku-peer-timeout-seconds",
             editor.clone(),
             positive_number_options.clone(),
+            Some("s"),
             |settings| settings.waku.peer_connection_timeout_secs as f64,
             |settings, value| settings.waku.peer_connection_timeout_secs = value as u64,
         );
@@ -258,6 +269,7 @@ impl Render for WalletSettingsEditor {
             "broadcaster-response-timeout-seconds",
             editor.clone(),
             positive_number_options.clone(),
+            Some("s"),
             |settings| settings.broadcaster.response_timeout_secs as f64,
             |settings, value| settings.broadcaster.response_timeout_secs = value as u64,
         );
@@ -265,6 +277,7 @@ impl Render for WalletSettingsEditor {
             "broadcaster-republish-interval-seconds",
             editor.clone(),
             positive_number_options,
+            Some("s"),
             |settings| settings.broadcaster.republish_interval_secs as f64,
             |settings, value| settings.broadcaster.republish_interval_secs = value as u64,
         );
@@ -300,70 +313,184 @@ impl Render for WalletSettingsEditor {
         let waku_doh_fallback_endpoints = waku_doh_fallback_kind.endpoints(&self.draft);
         let waku_doh_fallback_editor = editor.clone();
 
-        let indexed_artifact_status = format!(
+        let indexed_artifact_status = SharedString::from(format!(
             "Current index source priority order: {}",
             indexed_artifact_source_status_message(&self.draft)
-        );
+        ));
         let mut indexed_artifact_group = settings_group()
-            .item(settings_section_header("Indexed artifacts"))
-            .item(SettingItem::render(move |_options, _window, _cx| {
-                settings_info_banner(&indexed_artifact_status)
-            }))
-            .item(SettingItem::new(
-                "Indexed artifact source",
-                indexed_source_mode,
-            ))
-            .item(indexed_artifact_repository_help_item());
+            .title("Indexed artifacts")
+            .item(
+                SettingItem::new("Indexed artifact source", indexed_source_mode).keywords([
+                    "indexed artifacts",
+                    "disabled",
+                    "official",
+                    "custom",
+                    "publisher",
+                    "public key",
+                    "ipns",
+                    "concurrency",
+                    "byte budget",
+                    "quick-sync",
+                    "ipfs",
+                    "data sources",
+                ]),
+            )
+            .footer(move |_window, _cx| {
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(settings_info_banner(indexed_artifact_status.clone()))
+                    .child(indexed_artifact_repository_help())
+            });
         if should_show_indexed_artifact_custom_settings(self.draft.indexed_artifacts.source_mode) {
             indexed_artifact_group = indexed_artifact_group
                 .item(
                     SettingItem::new("Publisher public key", indexed_publisher)
+                        .keywords(["indexed artifacts", "publisher", "signing key", "custom"])
                         .layout(Axis::Vertical),
                 )
-                .item(SettingItem::new("IPNS name", indexed_ipns).layout(Axis::Vertical))
-                .item(SettingItem::new("Chunk concurrency", indexed_concurrency))
-                .item(SettingItem::new(
-                    "In-flight byte budget",
-                    indexed_byte_budget,
-                ))
-                .item(SettingItem::new(
-                    "Reset official indexed artifacts",
-                    SettingField::<SharedString>::render(move |_options, _window, _cx| {
-                        let reset_editor = indexed_reset_editor.clone();
-                        app_button(
-                            "wallet-settings-indexed-artifact-official-preset",
-                            "Reset to official",
-                        )
-                        .on_click(move |_event, _window, cx| {
-                            reset_editor.update(cx, |editor, cx| {
-                                editor.draft.indexed_artifacts =
-                                    IndexedArtifactSettings::official_preset();
-                                editor.programmatic_draft_changed(cx);
-                            });
-                        })
-                    }),
-                ));
+                .item(
+                    SettingItem::new("IPNS name", indexed_ipns)
+                        .keywords(["indexed artifacts", "ipfs", "manifest", "custom"])
+                        .layout(Axis::Vertical),
+                )
+                .item(
+                    SettingItem::new("Chunk concurrency", indexed_concurrency).keywords([
+                        "indexed artifacts",
+                        "parallel",
+                        "downloads",
+                        "chunks",
+                    ]),
+                )
+                .item(
+                    SettingItem::new("In-flight byte budget", indexed_byte_budget).keywords([
+                        "indexed artifacts",
+                        "memory",
+                        "downloads",
+                        "megabytes",
+                    ]),
+                )
+                .item(
+                    SettingItem::new(
+                        "Reset official indexed artifacts",
+                        SettingField::<SharedString>::render(move |_options, _window, _cx| {
+                            let reset_editor = indexed_reset_editor.clone();
+                            app_button(
+                                "wallet-settings-indexed-artifact-official-preset",
+                                "Reset to official",
+                            )
+                            .on_click(move |_event, _window, cx| {
+                                reset_editor.update(cx, |editor, cx| {
+                                    editor.draft.indexed_artifacts =
+                                        IndexedArtifactSettings::official_preset();
+                                    editor.programmatic_draft_changed(cx);
+                                });
+                            })
+                        }),
+                    )
+                    .keywords([
+                        "indexed artifacts",
+                        "preset",
+                        "defaults",
+                        "custom",
+                    ]),
+                );
+        }
+
+        let mut poi_group = settings_group()
+            .title("PPOI")
+            .item(
+                SettingItem::new("PPOI source", poi_source)
+                    .description("'Indexed artifacts' downloads snapshots containing PPOI data from IPFS and uses the PPOI RPC URL only to live-tail recent public PPOI events. 'PPOI proxy' mode is less private: the PPOI RPC receives requests containing blind commitment hashes associated with UTXOs you are receiving or preparing to spend. Use PPOI proxy mode only if you trust the PPOI RPC operator.")
+                    .keywords([
+                        "ppoi",
+                        "poi",
+                        "proof of innocence",
+                        "indexed artifacts",
+                        "ppoi proxy",
+                        "publisher",
+                        "public key",
+                        "ipns",
+                        "data sources",
+                    ]),
+            )
+            .item(
+                SettingItem::new("PPOI RPC URL", poi_rpc_url)
+                    .description("Used for indexed-artifact live tailing and for direct PPOI status/proof requests when PPOI proxy mode is selected.")
+                    .keywords([
+                        "ppoi",
+                        "poi",
+                        "proof of innocence",
+                        "endpoint",
+                        "live tail",
+                    ])
+                    .layout(Axis::Vertical),
+            );
+        if matches!(
+            self.draft.poi.read_source,
+            PoiReadSourceSetting::IndexedArtifacts
+        ) {
+            poi_group = poi_group.item(
+                SettingItem::new("Publisher", poi_publisher_choice).keywords([
+                    "ppoi",
+                    "poi",
+                    "proof of innocence",
+                    "official",
+                    "custom",
+                    "public key",
+                    "ipns",
+                ]),
+            );
+            if self.poi_custom_publisher_selected() {
+                poi_group = poi_group
+                    .item(
+                        SettingItem::new("Publisher public key", poi_publisher)
+                            .keywords(["ppoi", "poi", "signing key", "custom"])
+                            .layout(Axis::Vertical),
+                    )
+                    .item(
+                        SettingItem::new("IPNS name", poi_ipns)
+                            .keywords(["ppoi", "poi", "ipfs", "manifest", "custom"])
+                            .layout(Axis::Vertical),
+                    );
+            }
         }
 
         let poi_gateway_kind = SettingsUrlListKind::PoiGateway;
         let poi_gateway_endpoints = poi_gateway_kind.endpoints(&self.draft);
         let poi_gateway_editor = editor.clone();
-        let poi_gateway_group = settings_group()
-            .item(settings_section_header("Artifact gateways"))
-            .item(Self::settings_url_list_item(
+        let poi_gateway_group = settings_group().title("Artifact gateways").item(
+            Self::settings_url_list_item(
                 "Artifact gateway URLs",
                 poi_gateway_editor,
                 poi_gateway_kind,
                 poi_gateway_endpoints,
-            ));
+            )
+            .keywords([
+                "gateways",
+                "ipfs",
+                "http",
+                "ppoi",
+                "indexed artifacts",
+                "governance",
+            ]),
+        );
+        let data_sources_page = SettingPage::new("Data sources")
+            .group(indexed_artifact_group)
+            .group(poi_group)
+            .group(poi_gateway_group);
 
         let chain_editor = self.chain_editor.clone();
         let chains_page = SettingPage::new("Chains")
-            .group(settings_group().item(SettingItem::render(move |_, _, _| {
-                div().w_full().child(chain_editor.clone())
-            })))
-            .group(indexed_artifact_group);
-        let tron_page = self.tron_settings_page(&editor);
+            .group(
+                settings_group().item(
+                    SettingItem::render(move |_, _, _| div().w_full().child(chain_editor.clone()))
+                        .keywords(chains_page_keywords(&self.draft)),
+                ),
+            )
+            .groups(self.tron_settings_groups(&editor));
 
         let mut token_page = SettingPage::new("Tokens");
         let token_entries = display_token_entries(&self.draft);
@@ -377,6 +504,14 @@ impl Render for WalletSettingsEditor {
                     }),
                 )
                 .description("Known token metadata, built-in token overrides, and custom tokens.")
+                .keywords([
+                    "erc-20",
+                    "erc20",
+                    "custom token",
+                    "decimals",
+                    "symbol",
+                    "contract address",
+                ])
                 .layout(Axis::Vertical),
             ),
         );
@@ -395,6 +530,7 @@ impl Render for WalletSettingsEditor {
                     }),
                 )
                 .description("Token price anchors used to evaluate transaction fees.")
+                .keywords(["price feed", "usd", "chainlink", "fees", "tokens"])
                 .layout(Axis::Vertical),
             ),
         );
@@ -405,7 +541,17 @@ impl Render for WalletSettingsEditor {
         let apply_editor = editor.clone();
         let mut security_group = settings_group().item(
             SettingItem::new("Auto-lock vault", auto_lock_timeout)
-                .description("Lock the vault after this long without wallet activity."),
+                .description("Lock the vault after this long without wallet activity.")
+                .keywords([
+                    "timeout",
+                    "idle",
+                    "lock",
+                    "autolock",
+                    "inactivity",
+                    "disabled",
+                    "minutes",
+                    "security",
+                ]),
         );
         for method in DeviceAuthMethod::ALL {
             if let Some(setting) = self.device_auth_setting(method, cx) {
@@ -413,184 +559,255 @@ impl Render for WalletSettingsEditor {
             }
         }
         let security_page = SettingPage::new("Security").group(security_group);
-        let mut privacy_group = settings_group()
-            .item(SettingItem::new("Network mode", network_mode))
-            .item(
-                Self::settings_switch_item(
-                    "wallet-settings-mimic-railway-by-default",
-                    "Mimic Railway by default",
-                    editor.clone(),
-                    None,
-                    |settings| settings.privacy.mimic_railway_shields_by_default,
-                    |settings, value| {
-                        settings.privacy.mimic_railway_shields_by_default = value;
-                    },
-                )
-                .description(
-                    "Preselects Mimic Railway for new shields. ERC-20 shields may grant an unlimited token allowance.",
-                ),
-            )
-            .item(
-                Self::settings_switch_item(
-                    "wallet-settings-unwrap-by-default",
-                    "Unwrap by default",
-                    editor.clone(),
-                    None,
-                    |settings| settings.privacy.unwrap_unshields_by_default,
-                    |settings, value| {
-                        settings.privacy.unwrap_unshields_by_default = value;
-                    },
-                )
-                .description(
-                    "Preselects native token output when unshielding wrapped native tokens. You can change the output in each unshield form.",
-                ),
-            );
-        if should_show_proxy_waku_disclaimer(self.draft.network.mode) {
-            privacy_group = privacy_group.item(SettingItem::render(|_options, _window, _cx| {
-                settings_warning_banner(PROXY_WAKU_DISCLAIMER)
-            }));
-        }
-        if should_show_proxy_url_setting(self.draft.network.mode) {
-            privacy_group =
-                privacy_group.item(SettingItem::new("Proxy URL", proxy_url).layout(Axis::Vertical));
-        }
-        let privacy_page = SettingPage::new("Privacy")
-            .group(privacy_group)
-            .group(
-                settings_group()
-                    .item(settings_section_header("POI"))
-                    .item(SettingItem::new("POI source", poi_source).description("'Indexed artifacts' downloads snapshots containing POI data from IPFS and uses the POI RPC URL only to live-tail recent public POI events. 'POI proxy' mode is less private: the POI RPC receives requests containing blind commitment hashes associated with UTXOs you are receiving or preparing to spend. Use POI proxy mode only if you trust the POI RPC operator."))
-                    .item(SettingItem::new("POI RPC URL", poi_rpc_url).description("Used for indexed-artifact live tailing and for direct POI status/proof requests when POI proxy mode is selected.").layout(Axis::Vertical))
-                    .item(
-                        SettingItem::new("Publisher public key", poi_publisher)
-                            .layout(Axis::Vertical),
-                    )
-                    .item(
-                        SettingItem::new("IPNS name", poi_ipns)
-                            .layout(Axis::Vertical),
-                    )
-                    .item(SettingItem::new(
-                        "Reset POI artifact defaults",
-                        SettingField::<SharedString>::render(move |_options, _window, _cx| {
-                            let reset_editor = poi_reset_editor.clone();
-                            app_button("wallet-settings-poi-official-preset", "Reset to default")
-                                .on_click(move |_event, _window, cx| {
-                                    reset_editor.update(cx, |editor, cx| {
-                                        editor.draft.poi.reset_artifact_to_official_preset();
-                                        editor.programmatic_draft_changed(cx);
-                                    });
-                                })
-                        }),
-                    )),
-            )
-            .group(poi_gateway_group);
-        let public_broadcasters_page = SettingPage::new("Public Broadcasters")
-            .group(
-                settings_group()
-                    .item(Self::broadcaster_anchor_range_item(editor.clone()))
-                    .item(Self::settings_switch_item(
-                        "wallet-settings-broadcaster-allow-suspicious",
-                        "Allow suspicious by default",
-                        editor,
+
+        let general_page = SettingPage::new("General").group(
+            settings_group()
+                .item(
+                    Self::settings_switch_item(
+                        "wallet-settings-unwrap-by-default",
+                        "Unwrap by default",
+                        editor.clone(),
                         None,
-                        |settings| {
-                            settings
-                                .broadcaster
-                                .allow_suspicious_broadcasters_by_default
-                        },
+                        |settings| settings.privacy.unwrap_unshields_by_default,
                         |settings, value| {
-                            settings
-                                .broadcaster
-                                .allow_suspicious_broadcasters_by_default = value;
+                            settings.privacy.unwrap_unshields_by_default = value;
                         },
-                    ))
-                    .item(SettingItem::new(
-                        "Response timeout seconds",
-                        broadcaster_timeout,
-                    ))
-                    .item(SettingItem::new(
-                        "Republish interval seconds",
-                        broadcaster_republish_interval,
-                    )),
-            )
-            .group(
-                settings_group()
-                    .item(settings_section_header("Waku connectivity"))
-                    .item(SettingItem::new("Cluster ID", waku_cluster))
-                    .item(SettingItem::new("Shard ID", waku_shard))
-                    .item(Self::settings_url_list_item(
-                        "DNS ENR trees",
-                        waku_dns_enr_editor,
-                        waku_dns_enr_kind,
-                        waku_dns_enr_trees,
-                    ))
-                    .item(Self::waku_peer_list_item(
-                        waku_direct_peers_editor,
-                        WakuPeerList::Direct,
-                        waku_direct_peers,
-                    ))
-                    .item(Self::waku_peer_list_item(
-                        waku_backup_peers_editor,
-                        WakuPeerList::Backup,
-                        waku_backup_peers,
-                    ))
-                    .item(SettingItem::new("DoH endpoint", waku_doh).layout(Axis::Vertical))
-                    .item(Self::settings_url_list_item(
-                        "DoH fallback endpoints",
-                        waku_doh_fallback_editor,
-                        waku_doh_fallback_kind,
-                        waku_doh_fallback_endpoints,
-                    ))
-                    .item(SettingItem::new("Max peers", waku_max_peers))
-                    .item(SettingItem::new("Peer timeout seconds", waku_timeout))
-                    .item(SettingItem::new("nwaku REST URL", waku_nwaku).layout(Axis::Vertical)),
+                    )
+                    .description(
+                        "Preselects native token output when unshielding wrapped native tokens. You can change the output in each unshield form.",
+                    )
+                    .keywords(["unshield", "wrapped", "native token", "transaction defaults"]),
+                )
+                .item(
+                    Self::settings_switch_item(
+                        "wallet-settings-mimic-railway-by-default",
+                        "Mimic Railway by default",
+                        editor.clone(),
+                        None,
+                        |settings| settings.privacy.mimic_railway_shields_by_default,
+                        |settings, value| {
+                            settings.privacy.mimic_railway_shields_by_default = value;
+                        },
+                    )
+                    .description(
+                        "Preselects Mimic Railway for new shields. ERC-20 shields may grant an unlimited token allowance.",
+                    )
+                    .keywords(["shield", "allowance", "approval", "transaction defaults"]),
+                ),
+        );
+
+        let mut network_group =
+            settings_group().item(SettingItem::new("Network mode", network_mode).keywords([
+                "tor",
+                "built-in tor",
+                "proxy",
+                "direct",
+                "proxy url",
+                "socks",
+                "privacy",
+                "anonymity",
+                "connection",
+            ]));
+        if should_show_proxy_url_setting(self.draft.network.mode) {
+            network_group = network_group.item(
+                SettingItem::new("Proxy URL", proxy_url)
+                    .keywords(["socks", "socks5", "network mode", "privacy"])
+                    .layout(Axis::Vertical),
             );
-        let walletconnect_page =
-            SettingPage::new("WalletConnect").group(settings_group().item(
-                SettingItem::new("Project ID", walletconnect_project_id).layout(Axis::Vertical),
-            ));
-        let maintenance_page = SettingPage::new("Maintenance")
+        }
+        network_group = network_group.item(
+            SettingItem::new("WalletConnect project ID", walletconnect_project_id)
+                .keywords(["wallet connect", "reown", "dapp", "pairing"])
+                .layout(Axis::Vertical),
+        );
+        if should_show_proxy_waku_disclaimer(self.draft.network.mode) {
+            network_group =
+                network_group.footer(|_window, _cx| settings_warning_banner(PROXY_WAKU_DISCLAIMER));
+        }
+        let network_page = SettingPage::new("Network").group(network_group);
+
+        let broadcasters_page = SettingPage::new("Broadcasters")
             .group(
                 settings_group()
-                    .item(settings_section_header("Data folder"))
                     .item(
-                        SettingItem::new(
-                            "Location",
-                            SettingField::<SharedString>::render(move |_options, window, cx| {
-                                Self::render_data_folder_action(&data_folder_editor, window, cx)
-                            }),
+                        Self::broadcaster_anchor_range_item(editor.clone()).keywords([
+                            "broadcaster",
+                            "relayer",
+                            "fees",
+                            "suspicious",
+                            "premium",
+                            "percentage",
+                        ]),
+                    )
+                    .item(
+                        Self::settings_switch_item(
+                            "wallet-settings-broadcaster-allow-suspicious",
+                            "Allow suspicious by default",
+                            editor,
+                            None,
+                            |settings| {
+                                settings
+                                    .broadcaster
+                                    .allow_suspicious_broadcasters_by_default
+                            },
+                            |settings, value| {
+                                settings
+                                    .broadcaster
+                                    .allow_suspicious_broadcasters_by_default = value;
+                            },
                         )
                         .keywords([
-                            "data folder",
-                            "database",
-                            "db",
-                            "directory",
-                            "path",
-                            "storage",
-                            "disk space",
-                            "size",
-                            "file manager",
-                        ])
-                        .layout(Axis::Vertical),
+                            "broadcaster",
+                            "relayer",
+                            "fees",
+                            "accepted fee range",
+                        ]),
                     ),
             )
             .group(
                 settings_group()
-                    .item(settings_section_header("Prover cache"))
+                    .title("Advanced")
                     .item(
-                        SettingItem::new(
-                            "Build prover cache",
-                            SettingField::<SharedString>::render(move |_options, _window, cx| {
-                                Self::render_build_prover_cache_action(&prover_cache_editor, cx)
-                            }),
-                        )
-                        .description("Prepares prover artifacts locally so transaction proof generation can start faster.")
-                        .layout(Axis::Vertical),
+                        SettingItem::new("Response timeout", broadcaster_timeout).keywords([
+                            "broadcaster",
+                            "relayer",
+                            "seconds",
+                            "advanced",
+                        ]),
+                    )
+                    .item(
+                        SettingItem::new("Republish interval", broadcaster_republish_interval)
+                            .keywords([
+                                "broadcaster",
+                                "relayer",
+                                "resend",
+                                "retry",
+                                "seconds",
+                                "advanced",
+                            ]),
                     ),
             )
             .group(
                 settings_group()
-                    .item(settings_section_header("Local caches"))
+                    .title("Waku connectivity")
+                    .item(
+                        Self::settings_url_list_item(
+                            "DNS ENR trees",
+                            waku_dns_enr_editor,
+                            waku_dns_enr_kind,
+                            waku_dns_enr_trees,
+                        )
+                        .keywords([
+                            "waku",
+                            "waku connectivity",
+                            "discovery",
+                            "bootstrap",
+                            "enrtree",
+                            "peers",
+                        ]),
+                    )
+                    .item(
+                        Self::waku_peer_list_item(
+                            waku_direct_peers_editor,
+                            WakuPeerList::Direct,
+                            waku_direct_peers,
+                        )
+                        .keywords([
+                            "waku",
+                            "waku connectivity",
+                            "multiaddr",
+                            "peer id",
+                            "bootstrap",
+                        ]),
+                    )
+                    .item(
+                        Self::waku_peer_list_item(
+                            waku_backup_peers_editor,
+                            WakuPeerList::Backup,
+                            waku_backup_peers,
+                        )
+                        .keywords([
+                            "waku",
+                            "waku connectivity",
+                            "multiaddr",
+                            "peer id",
+                            "fallback",
+                        ]),
+                    )
+                    .item(
+                        SettingItem::new("DoH endpoint", waku_doh)
+                            .keywords(["waku", "waku connectivity", "dns over https", "resolver"])
+                            .layout(Axis::Vertical),
+                    )
+                    .item(
+                        Self::settings_url_list_item(
+                            "DoH fallback endpoints",
+                            waku_doh_fallback_editor,
+                            waku_doh_fallback_kind,
+                            waku_doh_fallback_endpoints,
+                        )
+                        .keywords([
+                            "waku",
+                            "waku connectivity",
+                            "dns over https",
+                            "resolver",
+                        ]),
+                    )
+                    .item(SettingItem::new("Max peers", waku_max_peers).keywords([
+                        "waku",
+                        "waku connectivity",
+                        "connections",
+                        "limit",
+                    ]))
+                    .item(SettingItem::new("Peer timeout", waku_timeout).keywords([
+                        "waku",
+                        "waku connectivity",
+                        "seconds",
+                        "connection",
+                    ]))
+                    .item(
+                        SettingItem::new("nwaku REST URL", waku_nwaku)
+                            .keywords(["waku", "waku connectivity", "node", "rest api", "endpoint"])
+                            .layout(Axis::Vertical),
+                    ),
+            );
+        let storage_page = SettingPage::new("Storage")
+            .group(
+                settings_group().title("Data folder").item(
+                    SettingItem::new(
+                        "Location",
+                        SettingField::<SharedString>::render(move |_options, window, cx| {
+                            Self::render_data_folder_action(&data_folder_editor, window, cx)
+                        }),
+                    )
+                    .keywords([
+                        "data folder",
+                        "database",
+                        "db",
+                        "path",
+                        "disk space",
+                        "size",
+                        "file manager",
+                    ])
+                    .layout(Axis::Vertical),
+                ),
+            )
+            .group(
+                settings_group().title("Prover cache").item(
+                    SettingItem::new(
+                        "Build prover cache",
+                        SettingField::<SharedString>::render(move |_options, _window, cx| {
+                            Self::render_build_prover_cache_action(&prover_cache_editor, cx)
+                        }),
+                    )
+                    .description("Prepares prover artifacts locally so transaction proof generation can start faster.")
+                    .keywords(["proving", "circuits", "zkey", "download", "speed"])
+                    .layout(Axis::Vertical),
+                ),
+            )
+            .group(
+                settings_group()
+                    .title("Local caches")
                     .item(
                         SettingItem::new(
                             "Reset public sync caches",
@@ -602,6 +819,7 @@ impl Render for WalletSettingsEditor {
                             }),
                         )
                         .description("Clears downloaded public sync data while preserving verified PPOI data used for wallet checks.")
+                        .keywords(["clear", "txid", "artifact chunks", "resync", "local caches"])
                         .layout(Axis::Vertical),
                     )
                     .item(
@@ -612,6 +830,7 @@ impl Render for WalletSettingsEditor {
                             }),
                         )
                         .description("Deletes verified PPOI data and downloaded PPOI chunks for all chains, then rebuilds from the current source.")
+                        .keywords(["poi", "proof of innocence", "clear", "rebuild", "local caches"])
                         .layout(Axis::Vertical),
                     )
                     .item(
@@ -624,6 +843,8 @@ impl Render for WalletSettingsEditor {
                                 )
                             }),
                         )
+                        .description("Clears local Merkle forest snapshots for all chains, then resyncs tree data before private actions are available again.")
+                        .keywords(["merkle tree", "snapshots", "clear", "resync", "local caches"])
                         .layout(Axis::Vertical),
                     ),
             );
@@ -668,14 +889,14 @@ impl Render for WalletSettingsEditor {
                             })
                             .sidebar_width(px(190.0))
                             .with_group_variant(GroupBoxVariant::Normal)
+                            .page(general_page)
                             .page(security_page)
-                            .page(privacy_page)
+                            .page(network_page)
                             .page(chains_page)
-                            .page(tron_page)
                             .page(token_page)
-                            .page(public_broadcasters_page)
-                            .page(walletconnect_page)
-                            .page(maintenance_page),
+                            .page(broadcasters_page)
+                            .page(data_sources_page)
+                            .page(storage_page),
                     ),
             )
             .child(
@@ -789,7 +1010,16 @@ impl WalletSettingsEditor {
                     })
                 }),
             )
-            .description(description),
+            .description(description)
+            .keywords([
+                "touch id",
+                "apple watch",
+                "biometric",
+                "fingerprint",
+                "device unlock",
+                "password",
+                "security",
+            ]),
         )
     }
 }

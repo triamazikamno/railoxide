@@ -1,4 +1,5 @@
-//! Tron's Settings page. Tron is not an EVM chain, so it sits beside Chains rather than in it.
+//! Tron's Settings groups. Tron is not an EVM chain, so its groups follow the EVM chain editor on
+//! the Chains page rather than living inside it.
 use super::*;
 use crate::root::ui_helpers::dialog_footer;
 use ui::chain_editor::{EndpointFlag, confirm_direct_endpoints, endpoint_flag_button};
@@ -47,7 +48,7 @@ fn native_usd_from_value(value: &str, current: NativeUsdPricing) -> NativeUsdPri
 }
 
 impl WalletSettingsEditor {
-    pub(in crate::root) fn tron_settings_page(&self, editor: &Entity<Self>) -> SettingPage {
+    pub(in crate::root) fn tron_settings_groups(&self, editor: &Entity<Self>) -> Vec<SettingGroup> {
         let endpoints = self.draft.tron.effective_endpoints();
         let customized = self.draft.tron.endpoints.is_some();
         let native_usd = Self::dropdown_field(
@@ -66,13 +67,23 @@ impl WalletSettingsEditor {
                     native_usd_from_value(value.as_ref(), settings.tron.native_usd);
             },
         );
-        let mut native_usd_group = settings_group()
-            .item(settings_section_header("Native USD"))
-            .item(
-                SettingItem::new("TRX price source", native_usd).description(
+        let mut native_usd_group = settings_group().title("Tron USD price").item(
+            SettingItem::new("TRX price source", native_usd)
+                .description(
                     "Default reads Chainlink's TRX/USD feed on Tron through General endpoints.",
-                ),
-            );
+                )
+                .keywords([
+                    "tron",
+                    "trx",
+                    "default",
+                    "disabled",
+                    "oracle",
+                    "chainlink",
+                    "oracle contract",
+                    "native usd",
+                    "price",
+                ]),
+        );
         if let NativeUsdPricing::Oracle { contract_address } = self.draft.tron.native_usd {
             let oracle = encode_tron_address(contract_address);
             let oracle_editor = editor.clone();
@@ -84,46 +95,72 @@ impl WalletSettingsEditor {
                     }),
                 )
                 .description("A Chainlink-compatible TRX/USD feed on Tron, in base58.")
+                .keywords([
+                    "tron",
+                    "trx",
+                    "oracle",
+                    "chainlink",
+                    "price feed",
+                    "contract address",
+                    "native usd",
+                ])
                 .layout(Axis::Vertical),
             );
         }
         let endpoints_editor = editor.clone();
-        SettingPage::new("Tron")
-            .group(
-                settings_group().item(
-                    Self::settings_switch_item(
-                        "wallet-settings-tron-enabled",
-                        "Enable Tron",
-                        editor.clone(),
-                        None,
-                        |settings| settings.tron.enabled,
-                        |settings, value| settings.tron.enabled = value,
-                    )
-                    .description(
-                        "Shows Tron in the network selector. Tron accounts and settings stay \
-                         stored while it is off.",
-                    ),
-                ),
+        let tron_group = settings_group()
+            .title("Tron")
+            .item(
+                Self::settings_switch_item(
+                    "wallet-settings-tron-enabled",
+                    "Enable Tron",
+                    editor.clone(),
+                    None,
+                    |settings| settings.tron.enabled,
+                    |settings, value| settings.tron.enabled = value,
+                )
+                .description(
+                    "Shows Tron in the network selector. Tron accounts and settings stay \
+                     stored while it is off.",
+                )
+                .keywords([
+                    "tron",
+                    "trx",
+                    "enable",
+                    "disable",
+                    "non-evm",
+                    "network list",
+                ]),
             )
-            .group(
-                settings_group().item(
-                    SettingItem::new(
-                        "Endpoints",
-                        SettingField::<SharedString>::render(move |_options, _window, _cx| {
-                            Self::render_tron_endpoints(
-                                &endpoints_editor,
-                                endpoints.clone(),
-                                customized,
-                            )
-                        }),
-                    )
-                    .description(
-                        "Tried in this order. Each is checked against Tron mainnet before use.",
-                    )
-                    .layout(Axis::Vertical),
-                ),
-            )
-            .group(native_usd_group)
+            .item(
+                SettingItem::new(
+                    "Endpoints",
+                    SettingField::<SharedString>::render(move |_options, _window, _cx| {
+                        Self::render_tron_endpoints(
+                            &endpoints_editor,
+                            endpoints.clone(),
+                            customized,
+                        )
+                    }),
+                )
+                .description(
+                    "Tried in this order. Each is checked against Tron mainnet before use.",
+                )
+                .keywords([
+                    "tron",
+                    "trx",
+                    "rpc",
+                    "json-rpc",
+                    "http api",
+                    "node",
+                    "submit",
+                    "broadcast",
+                    "direct",
+                    "sensitive",
+                ])
+                .layout(Axis::Vertical),
+            );
+        vec![tron_group, native_usd_group]
     }
 
     fn render_tron_endpoints(

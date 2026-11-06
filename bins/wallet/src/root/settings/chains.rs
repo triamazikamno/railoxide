@@ -2,9 +2,9 @@ use super::{
     Context, SettingsApplyMode, WalletSettings, WalletSettingsEditor, Window, WindowExt,
     classify_settings_apply_mode,
 };
-use gpui::{AppContext as _, Entity};
+use gpui::{AppContext as _, Entity, SharedString};
 use railgun_ui::chain_editor::{
-    ChainDraft, ChainEditorCommand, ChainEditorSnapshot, NativeUsdProbe,
+    ChainDraft, ChainEditorCommand, ChainEditorSnapshot, ChainField, NativeUsdProbe,
 };
 use ui::chain_editor::{ChainEditor, ChainEditorEvent};
 use ui::dialog::WalletDialogExt as _;
@@ -76,6 +76,33 @@ impl super::WalletRoot {
         })
         .detach();
     }
+}
+
+/// Search keywords for the Chains page: the name and ID of every listed chain, including draft-only
+/// custom chains, and the chain editor's setting labels.
+pub(in crate::root) fn chains_page_keywords(settings: &WalletSettings) -> Vec<SharedString> {
+    let mut keywords: Vec<SharedString> = [
+        "chains",
+        "evm",
+        "RPC endpoint",
+        "Enable quick-sync",
+        "Use preset sponsored relays",
+        "Bypass Tor for the archive endpoint",
+        "Native USD source",
+    ]
+    .into_iter()
+    .chain(ChainField::ALL.iter().copied().map(ChainField::label))
+    .map(SharedString::from)
+    .collect();
+    for chain_id in railgun_ui::built_in_chain_ids() {
+        keywords.extend(railgun_ui::chain_name(chain_id).map(SharedString::from));
+        keywords.push(chain_id.to_string().into());
+    }
+    for (chain_id, chain) in &settings.chains.custom {
+        keywords.push(chain.name.clone().into());
+        keywords.push(chain_id.to_string().into());
+    }
+    keywords
 }
 
 impl WalletSettingsEditor {

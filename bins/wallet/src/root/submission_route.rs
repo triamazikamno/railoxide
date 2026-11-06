@@ -17,7 +17,7 @@ use super::{count_label, rgb_with_alpha};
 const ISOLATED_ROUTE_DETAIL: &str = "This operation's chain reads, PPOI submissions and broadcaster request use Tor circuits of their own, separate from the rest of the wallet and from other operations. The request is sent from a one-time Waku identity.";
 const ROUTE_RECOVERY_DETAIL: &str = "If the route is lost, the wallet reconnects it on new circuits with the same identity. Submitting again after a timeout builds a new route with a new identity.";
 /// Only Direct mode submits without a route of its own: proxy mode can't submit at all.
-const NOT_ISOLATED_DETAIL: &str = "Network mode: Direct. This operation shares the wallet's connection and is not isolated from other activity. Turn on built-in Tor in Settings > Privacy to isolate it.";
+const NOT_ISOLATED_DETAIL: &str = "Network mode: Direct. This operation shares the wallet's connection and is not isolated from other activity. Turn on built-in Tor in Settings > Network to isolate it.";
 
 pub(super) fn status_presence_text(
     label: impl Into<SharedString>,

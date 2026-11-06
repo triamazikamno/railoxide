@@ -527,6 +527,11 @@ fn device_auth_settings_preserve_drafts_and_follow_enrollment(cx: &mut TestAppCo
     let editor = root.read_with(cx, |root, _| root.settings_editor.clone().unwrap());
     let draft = editor.read_with(cx, |editor, _| editor.draft.clone());
     cx.simulate_resize(gpui::size(px(1000.), px(800.)));
+    // Device unlock is on Security, the second sidebar entry.
+    cx.update(|window, cx| {
+        window.render_frame(cx);
+        window.within("settings-sidebar").click("0-1", cx);
+    });
     for (method, switch_id, submit_id, cancel_id) in [
         (
             DeviceAuthMethod::TouchId,

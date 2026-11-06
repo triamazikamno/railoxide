@@ -1754,6 +1754,7 @@ fn settings_fields_commit_first_edit_after_sync_and_number_steps(cx: &mut gpui::
                     max: 86_400.0,
                     step: 1.0,
                 },
+                None,
                 |settings| settings.broadcaster.response_timeout_secs as f64,
                 |settings, value| settings.broadcaster.response_timeout_secs = value as u64,
             );
@@ -1874,7 +1875,7 @@ fn tron_settings_refuse_submit_without_an_http_api_url(cx: &mut gpui::TestAppCon
         AppContext as _, IntoElement, ParentElement as _, Render, Styled as _, VisualTestContext,
         div,
     };
-    use gpui_component::setting::Settings as ComponentSettings;
+    use gpui_component::setting::{SettingPage, Settings as ComponentSettings};
     use std::{cell::RefCell, rc::Rc};
     use wallet_ops::settings::TronEndpointSetting;
 
@@ -1882,7 +1883,8 @@ fn tron_settings_refuse_submit_without_an_http_api_url(cx: &mut gpui::TestAppCon
 
     impl Render for TronHost {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-            let page = self.0.read(cx).tron_settings_page(&self.0);
+            let page =
+                SettingPage::new("Tron").groups(self.0.read(cx).tron_settings_groups(&self.0));
             div()
                 .size_full()
                 .child(ComponentSettings::new("test-tron-settings").page(page))
@@ -2050,6 +2052,134 @@ fn data_folder_size_resets_after_maintenance_and_ignores_stale_walks(
     drop(maintenance);
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
+}
+
+#[gpui::test]
+fn poi_publisher_choice_follows_draft_and_keeps_gateways(cx: &mut gpui::TestAppContext) {
+    use gpui::{AppContext as _, IntoElement, Render, div};
+    use std::{cell::RefCell, rc::Rc};
+    use wallet_ops::settings::PoiArtifactSettings;
+
+    struct EmptyHost;
+
+    impl Render for EmptyHost {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<'_, Self>,
+        ) -> impl IntoElement {
+            div()
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let path = temp_wallet_db_root("poi-publisher-choice");
+    let store = Arc::new(DesktopVaultStore::open(path.clone()).unwrap());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let official = PoiArtifactSettings::official_preset();
+    let custom_gateways = vec!["https://gateway.example".to_owned()];
+    let mut saved = WalletSettings::default();
+    saved.poi.artifact.publisher_pubkey = "11".repeat(32);
+    saved.poi.artifact.gateway_urls.clone_from(&custom_gateways);
+    let owner_slot = Rc::new(RefCell::new(None));
+    let slot = owner_slot.clone();
+    let handle = cx.add_window(|window, cx| {
+        let maintenance = cx.new(|_| WalletMaintenanceController::new(runtime.handle().clone()));
+        let editor = cx.new(|cx| {
+            WalletSettingsEditor::new(
+                store.clone(),
+                &path,
+                runtime.handle().clone(),
+                saved.clone(),
+                maintenance,
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+        *slot.borrow_mut() = Some(editor);
+        EmptyHost
+    });
+    let editor = owner_slot.borrow_mut().take().unwrap();
+
+    editor.update(cx, |editor, cx| {
+        // A stored publisher that differs from the official preset reads as Custom.
+        assert!(editor.poi_custom_publisher_selected());
+
+        // Official restores the publisher identity and keeps the user's gateways.
+        editor.select_poi_publisher(false, cx);
+        assert!(!editor.poi_custom_publisher_selected());
+        let artifact = &editor.draft.poi.artifact;
+        assert_eq!(artifact.publisher_pubkey, official.publisher_pubkey);
+        assert_eq!(artifact.manifest_source, official.manifest_source);
+        assert_eq!(artifact.gateway_urls, custom_gateways);
+
+        // Custom stays selected while its values still equal the official preset.
+        editor.select_poi_publisher(true, cx);
+        assert!(editor.poi_custom_publisher_selected());
+
+        // Discarding to official saved values clears the editor-only choice.
+        editor.saved = WalletSettings::default();
+        editor.discard_changes(cx);
+        assert!(!editor.poi_custom_publisher_selected());
+    });
+
+    handle
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    drop(editor);
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn chains_page_keywords_cover_listed_chains_and_editor_fields() {
+    use crate::root::settings::chains_page_keywords;
+    use railgun_ui::chain_editor::ChainField;
+    use wallet_ops::settings::{
+        ChainContractSettings, ChainGasSettings, CustomChainSettings, NativeCurrency,
+        NativeUsdPricing,
+    };
+
+    let mut draft = WalletSettings::default();
+    draft.chains.custom.insert(
+        999_999,
+        CustomChainSettings {
+            native_usd_pricing: NativeUsdPricing::default(),
+            name: "My devnet".to_owned(),
+            native_currency: NativeCurrency {
+                name: "Dev".to_owned(),
+                symbol: "DEV".to_owned(),
+                decimals: 18,
+            },
+            rpc_endpoints: vec!["https://rpc.example".to_owned().into()],
+            explorer_urls: Vec::new(),
+            enabled: true,
+            contracts: ChainContractSettings::default(),
+            finality_depth: None,
+            gas: ChainGasSettings::default(),
+        },
+    );
+    let keywords = chains_page_keywords(&draft);
+    let has = |keyword: &str| {
+        keywords
+            .iter()
+            .any(|candidate| candidate.as_ref() == keyword)
+    };
+
+    let arbitrum = railgun_ui::chain_name(42161).expect("Arbitrum is built in");
+    assert!(has(arbitrum) && has("42161"), "built-in chain name and ID");
+    assert!(
+        has("My devnet") && has("999999"),
+        "a custom chain that exists only in the draft"
+    );
+    for field in ChainField::ALL {
+        assert!(has(field.label()), "chain editor field {field:?}");
+    }
 }
 
 #[gpui::test]

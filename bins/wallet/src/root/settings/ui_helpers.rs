@@ -1,54 +1,9 @@
 use super::*;
 
 pub(in crate::root) const SETTINGS_GROUP_CONTENT_INDENT: Pixels = px(16.0);
-pub(in crate::root) const SETTINGS_GROUP_HEADER_OFFSET: Pixels = px(-16.0);
 
 pub(in crate::root) fn settings_group() -> SettingGroup {
     SettingGroup::new().pl(SETTINGS_GROUP_CONTENT_INDENT)
-}
-
-pub(in crate::root) fn settings_section_header(title: impl Into<String>) -> SettingItem {
-    let title = title.into();
-    SettingItem::render(move |_options, _window, _cx| {
-        settings_section_header_element(&title, None, None)
-    })
-}
-
-pub(in crate::root) fn settings_section_header_element(
-    title: &str,
-    description: Option<&str>,
-    chain_id: Option<u64>,
-) -> gpui::Div {
-    let mut title_row = div().flex().items_center().gap_2();
-    if let Some(path) = chain_id.and_then(chain_icon_asset_path) {
-        title_row = title_row.child(img(path).size(px(16.0)).flex_none());
-    }
-    title_row = title_row.child(
-        div()
-            .font_family(APP_MONO_FONT_FAMILY)
-            .font_weight(FontWeight::MEDIUM)
-            .text_size(px(12.0))
-            .line_height(px(16.0))
-            .text_color(rgb(theme::TEXT_MUTED))
-            .child(SharedString::from(title.to_ascii_uppercase())),
-    );
-
-    div()
-        .w_full()
-        .ml(SETTINGS_GROUP_HEADER_OFFSET)
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(title_row)
-        .when_some(description, |this, description| {
-            this.child(
-                div()
-                    .text_size(px(12.0))
-                    .line_height(px(16.0))
-                    .text_color(rgb(theme::TEXT_SUBTLE))
-                    .child(SharedString::from(description.to_string())),
-            )
-        })
 }
 
 pub(in crate::root) fn settings_danger_banner(message: impl Into<SharedString>) -> gpui::Div {

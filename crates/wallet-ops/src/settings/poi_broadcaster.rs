@@ -38,10 +38,6 @@ impl Default for PoiSettings {
 }
 
 impl PoiSettings {
-    pub fn reset_artifact_to_official_preset(&mut self) {
-        self.artifact = PoiArtifactSettings::official_preset();
-    }
-
     pub(super) fn validate(&self, errors: &mut Vec<String>) {
         self.artifact.validate_gateway_urls(errors);
         match self.read_source {

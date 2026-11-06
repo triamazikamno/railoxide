@@ -61,6 +61,7 @@ impl WalletSettingsEditor {
             draft: settings,
             chain_editor_was_open: false,
             reopen_chains_page: false,
+            poi_custom_publisher: false,
             field_sync_revision: 0,
             validation_error: None,
             status: None,
@@ -296,6 +297,7 @@ impl WalletSettingsEditor {
     pub(in crate::root) fn discard_changes(&mut self, cx: &mut Context<'_, Self>) {
         self.draft = settings_draft_after_discard(&self.saved);
         self.draft_base = self.saved.clone();
+        self.poi_custom_publisher = false;
         self.sync_fields_from_draft();
         self.refresh_validation();
         self.refresh_chain_editor(cx);
@@ -304,10 +306,38 @@ impl WalletSettingsEditor {
 
     pub(in crate::root) fn reset_defaults(&mut self, cx: &mut Context<'_, Self>) {
         self.draft = WalletSettings::default();
+        self.poi_custom_publisher = false;
         self.sync_fields_from_draft();
         self.refresh_validation();
         self.refresh_chain_editor(cx);
         cx.notify();
+    }
+
+    /// The PPOI publisher choice reads Custom while selected or while the draft's publisher
+    /// differs from the official preset.
+    pub(in crate::root) fn poi_custom_publisher_selected(&self) -> bool {
+        let official = wallet_ops::settings::PoiArtifactSettings::official_preset();
+        let artifact = &self.draft.poi.artifact;
+        self.poi_custom_publisher
+            || artifact.publisher_pubkey != official.publisher_pubkey
+            || artifact.manifest_source != official.manifest_source
+    }
+
+    /// Official restores only the publisher identity; gateways and manifest age stay as drafted.
+    pub(in crate::root) fn select_poi_publisher(
+        &mut self,
+        custom: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.poi_custom_publisher = custom;
+        if custom {
+            cx.notify();
+            return;
+        }
+        let official = wallet_ops::settings::PoiArtifactSettings::official_preset();
+        self.draft.poi.artifact.publisher_pubkey = official.publisher_pubkey;
+        self.draft.poi.artifact.manifest_source = official.manifest_source;
+        self.programmatic_draft_changed(cx);
     }
 
     pub(in crate::root) fn open_local_poi_cache_reset_dialog(
@@ -1076,6 +1106,7 @@ impl WalletSettingsEditor {
         field_id: impl Into<String>,
         editor: Entity<Self>,
         options: NumberFieldOptions,
+        suffix: Option<&'static str>,
         get: impl Fn(&WalletSettings) -> f64 + 'static,
         set: impl Fn(&mut WalletSettings, f64) + 'static,
     ) -> SettingField<SharedString> {
@@ -1178,9 +1209,15 @@ impl WalletSettingsEditor {
             NumberInput::new(&input)
                 .bg(rgb(theme::SURFACE))
                 .with_size(render_options.size())
+                .when_some(suffix, |this, suffix| this.suffix(app_muted_text(suffix)))
                 .map(|this| {
                     if matches!(render_options.layout(), Axis::Horizontal) {
-                        this.w_32()
+                        // A unit suffix takes room from the value.
+                        if suffix.is_some() {
+                            this.w_40()
+                        } else {
+                            this.w_32()
+                        }
                     } else {
                         this.w_full()
                     }
