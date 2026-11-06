@@ -268,16 +268,16 @@ impl WalletRoot {
         let device_auth_root = root.clone();
         body.child(app_masked_input(&self.new_password_input, false))
             .child(app_masked_input(&self.confirm_password_input, false))
-            .when(self.touch_id_supported, |this| {
+            .when_some(self.vault_creation_device_auth_method(), |this, method| {
                 this.child(
-                    Checkbox::new("create-wallet-vault-touch-id")
-                        .label("Also unlock with Touch ID on this Mac")
-                        .checked(self.enable_touch_id_on_create)
+                    Checkbox::new("create-wallet-vault-device-auth")
+                        .label(format!("Also unlock with {} on this Mac", method.label()))
+                        .checked(self.enable_device_auth_on_create)
                         .small()
                         .on_click(move |checked, _window, cx| {
                             let checked = *checked;
                             device_auth_root.update(cx, |root, cx| {
-                                root.set_enable_touch_id_on_create(checked, cx);
+                                root.set_enable_device_auth_on_create(checked, cx);
                             });
                         }),
                 )

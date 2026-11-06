@@ -202,7 +202,7 @@ impl WalletRoot {
 
         match store.create_vault(password.as_str()) {
             Ok(created) => {
-                self.enable_touch_id_after_vault_creation(&password, cx);
+                self.enable_device_auth_after_vault_creation(&password, window, cx);
                 Self::defer_wallet_name_input(PRIMARY_WALLET_LABEL.to_owned(), window, cx);
                 self.install_vault_view_unlock(Arc::new(created.view));
                 self.setup_password = Some(password);

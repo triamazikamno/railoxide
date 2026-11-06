@@ -626,32 +626,52 @@ impl WalletRoot {
         }
     }
 
+    /// The method offered when creating a vault: Touch ID first, else Apple Watch.
+    pub(in crate::root) fn vault_creation_device_auth_method(&self) -> Option<DeviceAuthMethod> {
+        DeviceAuthMethod::ALL
+            .into_iter()
+            .find(|&method| self.device_auth_available(method))
+    }
+
     /// Seals the password that just created the vault when the user opted in.
-    pub(in crate::root) fn enable_touch_id_after_vault_creation(
+    pub(in crate::root) fn enable_device_auth_after_vault_creation(
         &self,
         password: &Zeroizing<String>,
+        window: &Window,
         cx: &Context<'_, Self>,
     ) {
-        if !(self.touch_id_supported && self.enable_touch_id_on_create) {
+        if !self.enable_device_auth_on_create {
             return;
         }
+        let Some(method) = self.vault_creation_device_auth_method() else {
+            return;
+        };
         let Some(store) = self.vault_store.clone() else {
             return;
         };
         let password = password.clone();
-        let join = self.runtime.spawn_blocking(move || {
-            store.enable_device_auth(
-                wallet_ops::device_auth::DeviceAuthMethod::TouchId,
-                password.as_str(),
-            )
-        });
-        cx.spawn(async move |this, cx| {
-            match join.await {
-                Ok(Ok(())) => {}
+        let join = self
+            .runtime
+            .spawn_blocking(move || store.enable_device_auth(method, password.as_str()));
+        cx.spawn_in(window, async move |this, cx| {
+            let failure = match join.await {
+                Ok(Ok(())) => None,
                 Ok(Err(error)) => {
-                    tracing::warn!(%error, "failed to turn on Touch ID for the new vault");
+                    tracing::warn!(%error, ?method, "failed to turn on device unlock for the new vault");
+                    Some(enable_device_auth_error_message(method, &error))
                 }
-                Err(error) => tracing::warn!(%error, "turn on Touch ID task failed"),
+                Err(error) => {
+                    tracing::warn!(%error, ?method, "turn on device unlock task failed");
+                    Some(Arc::from(format!(
+                        "Failed to turn on {}. Try again in Settings.",
+                        method.label()
+                    )))
+                }
+            };
+            if let Some(message) = failure {
+                let _ = cx.update(|window, cx| {
+                    window.push_notification(Notification::error(message.to_string()), cx);
+                });
             }
             let _ = this.update(cx, |root, cx| {
                 root.refresh_device_auth_status();
@@ -661,12 +681,12 @@ impl WalletRoot {
         .detach();
     }
 
-    pub(in crate::root) fn set_enable_touch_id_on_create(
+    pub(in crate::root) fn set_enable_device_auth_on_create(
         &mut self,
         enabled: bool,
         cx: &mut Context<'_, Self>,
     ) {
-        self.enable_touch_id_on_create = enabled;
+        self.enable_device_auth_on_create = enabled;
         cx.notify();
     }
 }

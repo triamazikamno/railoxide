@@ -584,7 +584,7 @@ pub(crate) struct WalletRoot {
     apple_watch_status: DeviceAuthStatus,
     device_auth_in_progress: bool,
     touch_id_unlock_on_render: bool,
-    enable_touch_id_on_create: bool,
+    enable_device_auth_on_create: bool,
     /// Weak identity of the active add-wallet dialog; its builder owns the lease.
     add_wallet_dialog_lease: std::rc::Weak<Cell<bool>>,
     /// The vault password device authentication supplied for the add-wallet form, if any.
@@ -1750,7 +1750,7 @@ impl WalletRoot {
             apple_watch_status,
             device_auth_in_progress: false,
             touch_id_unlock_on_render,
-            enable_touch_id_on_create: true,
+            enable_device_auth_on_create: true,
             add_wallet_dialog_lease: std::rc::Weak::new(),
             add_wallet_device_auth_password: None,
             #[cfg(feature = "hardware")]
