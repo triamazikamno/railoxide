@@ -50,6 +50,8 @@ mod setup_progress;
 #[cfg(debug_assertions)]
 mod ui_fixture;
 pub(super) use ui_fixture::activity as ui_fixture_activity;
+#[cfg(debug_assertions)]
+pub(super) use ui_fixture::fill_logs as ui_fixture_fill_logs;
 pub(super) use ui_fixture::hardware_derive as ui_fixture_hardware_derive;
 pub(super) use ui_fixture::refund_dialog_state as ui_fixture_refund_dialog_state;
 pub(super) use ui_fixture::send_asset as ui_fixture_send_asset;

@@ -292,7 +292,7 @@ fn activity_pane_shows_the_selected_row_while_the_search_keeps_it(cx: &mut TestA
         root.select_wallet_tab(WalletTab::Activity, cx);
     });
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    let input = root.read_with(cx, |root, _| root.wallet_activity.search_input());
+    let input = root.read_with(cx, |root, cx| root.wallet_activity.search_input(cx));
     cx.update(|window, cx| {
         input.read(cx).focus_handle(cx).focus(window, cx);
         window.draw(cx).clear(cx);
@@ -307,15 +307,15 @@ fn activity_pane_shows_the_selected_row_while_the_search_keeps_it(cx: &mut TestA
     // Running the search records it for this wallet session only. The next session starts
     // with an empty field that shows every row.
     root.update(cx, super::super::WalletRoot::search_wallet_activity_text);
-    root.read_with(cx, |root, _| {
-        assert_eq!(root.wallet_activity.recent_searches().len(), 1);
+    root.read_with(cx, |root, cx| {
+        assert_eq!(root.wallet_activity.recent_searches(cx).len(), 1);
     });
     root.update(cx, |root, cx| {
         root.install_wallet_activity_stand_in(stand_in, cx);
     });
     cx.run_until_parked();
-    root.read_with(cx, |root, _| {
-        assert_eq!(root.wallet_activity.recent_searches().len(), 0);
+    root.read_with(cx, |root, cx| {
+        assert_eq!(root.wallet_activity.recent_searches(cx).len(), 0);
     });
     cx.update(|_, cx| assert_eq!(input.read(cx).value(), ""));
     assert_eq!(row_ids(&root, cx), [shield_id, send_id]);

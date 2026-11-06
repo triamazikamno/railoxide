@@ -6,6 +6,11 @@ use gpui::{
     WindowId,
 };
 
+use ui::logs::{
+    ClearLineSelection, CopySelectedLines, ExtendSelectionDown, ExtendSelectionUp, FocusLogsSearch,
+    LOGS_PANE_KEY_CONTEXT, SelectAllShownLines, SelectNextLine, SelectPreviousLine,
+};
+
 use super::TABLE_KEY_CONTEXT;
 use super::startup::WalletStartupRoot;
 
@@ -120,6 +125,9 @@ enum WalletShortcutAction {
 }
 
 pub(super) const PUBLIC_ACCOUNT_SECTION_KEY_CONTEXT: &str = "PublicAccountSection";
+
+/// The logs panel around its title bar and [`LOGS_PANE_KEY_CONTEXT`] list.
+pub(super) const LOGS_PANEL_KEY_CONTEXT: &str = "WalletLogsPanel";
 
 /// `KeyBinding::new` no longer resolves `secondary-`; `load` maps it to the host OS modifier.
 fn secondary_key_binding<A: Action>(
@@ -238,6 +246,35 @@ pub(crate) fn install_wallet_action_bindings(app: &mut App) {
             "ctrl-shift-c",
             OpenChainSelector,
             Some(WALLET_WORKSPACE_KEY_CONTEXT),
+        ),
+        KeyBinding::new("up", SelectPreviousLine, Some(LOGS_PANE_KEY_CONTEXT)),
+        KeyBinding::new("down", SelectNextLine, Some(LOGS_PANE_KEY_CONTEXT)),
+        KeyBinding::new("shift-up", ExtendSelectionUp, Some(LOGS_PANE_KEY_CONTEXT)),
+        KeyBinding::new(
+            "shift-down",
+            ExtendSelectionDown,
+            Some(LOGS_PANE_KEY_CONTEXT),
+        ),
+        KeyBinding::new("escape", ClearLineSelection, Some(LOGS_PANE_KEY_CONTEXT)),
+        // Escape on the panel's buttons reaches the panel's handler as from an empty selection.
+        KeyBinding::new("escape", ClearLineSelection, Some(LOGS_PANEL_KEY_CONTEXT)),
+        secondary_key_binding(
+            "secondary-a",
+            SelectAllShownLines,
+            Some(LOGS_PANE_KEY_CONTEXT),
+            app,
+        ),
+        secondary_key_binding(
+            "secondary-c",
+            CopySelectedLines,
+            Some(LOGS_PANE_KEY_CONTEXT),
+            app,
+        ),
+        secondary_key_binding(
+            "secondary-f",
+            FocusLogsSearch,
+            Some(LOGS_PANE_KEY_CONTEXT),
+            app,
         ),
     ]);
     app.on_action(|_: &OpenSettings, cx| {

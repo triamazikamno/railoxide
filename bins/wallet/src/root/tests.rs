@@ -38,6 +38,7 @@ mod chain_loading;
 mod gateway_private_view;
 mod helpers;
 mod key_export;
+mod logs;
 mod private_assets;
 mod private_display;
 mod progress;

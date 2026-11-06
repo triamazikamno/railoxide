@@ -61,6 +61,7 @@ mod governance;
 mod governance_action;
 mod key_export;
 mod locked_notes;
+mod logs_search;
 mod maintenance;
 mod manage_wallets;
 mod markdown_sanitize;
@@ -79,6 +80,7 @@ mod public_broadcaster;
 mod public_broadcaster_cost;
 mod public_transactions;
 mod retry;
+mod search_field;
 mod settings;
 mod shell;
 mod sidebar;
@@ -121,6 +123,7 @@ use chain_load::{
 use gas_fee::Eip1559GasFeeEditorState;
 use governance::GovernanceState;
 use key_export::KeyExportState;
+use logs_search::LogsSearchSource;
 use maintenance::WalletMaintenanceController;
 use manage_wallets::ManageWalletsState;
 use network::TorExitIpQueryState;
@@ -144,6 +147,7 @@ use public_broadcaster::{
     unshield_form_max_entered_amount, unshield_max_entered_amount_for_mode,
     unshield_max_fill_amount,
 };
+use search_field::{SearchField, SearchFieldEvent};
 use settings::WalletSettingsEditor;
 use shell::{PoiArtifactCacheRetryAttempts, WalletTab};
 #[cfg(test)]
@@ -456,6 +460,14 @@ pub(crate) struct WalletRoot {
     public_broadcaster_anchor_refresh: TokenAnchorRefreshHandle,
     monitor: Entity<broadcaster_monitor_gpui::BroadcasterMonitorPane>,
     logs: Entity<LogsPane>,
+    logs_search: Entity<SearchField<LogsSearchSource>>,
+    /// Tracks focus within the logs panel.
+    logs_panel_focus: FocusHandle,
+    /// Holds the logs panel's focus trap while a dialog is open.
+    logs_panel_trap: FocusHandle,
+    /// Where focus was before the logs panel took it above a dialog, given back by Escape
+    /// or closing the panel.
+    logs_return_focus: Option<FocusHandle>,
     settings_editor: Option<Entity<WalletSettingsEditor>>,
     maintenance_controller: Entity<WalletMaintenanceController>,
     settings_error: Option<Arc<str>>,
@@ -1314,6 +1326,12 @@ impl WalletRoot {
         });
         let public_account_search_input = new_text_input(window, cx, "Search accounts");
         let wallet_activity = wallet_activity::WalletActivityState::new(window, cx);
+        let log_store = logs.read(cx).store().clone();
+        // Debug UI fixture: the `logs` mode fills the buffer with representative lines.
+        #[cfg(debug_assertions)]
+        private_swap::ui_fixture_fill_logs(&log_store);
+        let logs_search =
+            cx.new(|cx| SearchField::new(LogsSearchSource { store: log_store }, window, cx));
         let governance_participant_picker = cx.new(|cx| {
             gpui_component::combobox::ComboboxState::new(
                 SearchableVec::<governance::ParticipantChoice>::new(Vec::new()),
@@ -1613,6 +1631,10 @@ impl WalletRoot {
             public_broadcaster_anchor_refresh,
             monitor,
             logs,
+            logs_search,
+            logs_panel_focus: cx.focus_handle(),
+            logs_panel_trap: cx.focus_handle(),
+            logs_return_focus: None,
             settings_editor,
             maintenance_controller: maintenance_controller.clone(),
             settings_error,
@@ -1751,6 +1773,23 @@ impl WalletRoot {
         .detach();
         cx.on_focus_lost(window, |root, window, cx| {
             root.focus_wallet_view_after_focus_loss(window, cx);
+        })
+        .detach();
+        cx.subscribe(
+            &root.logs_search,
+            |root, search, _: &SearchFieldEvent, cx| {
+                let filter = logs_search::log_filter(search.read(cx).filter());
+                root.logs.update(cx, |logs, cx| logs.set_filter(filter, cx));
+            },
+        )
+        .detach();
+        cx.subscribe_in(&root.logs, window, Self::logs_pane_event)
+            .detach();
+        // The open panel's title bar shows the pane's line counts.
+        cx.observe(&root.logs, |root, _, cx| {
+            if root.logs_open {
+                cx.notify();
+            }
         })
         .detach();
         cx.subscribe(&tx_search_input, |this, input, event: &InputEvent, cx| {

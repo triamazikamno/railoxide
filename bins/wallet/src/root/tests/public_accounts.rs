@@ -1425,9 +1425,23 @@ fn network_status_stays_reachable_above_dialogs(cx: &mut TestAppContext) {
     assert!(pane_notified.get(), "wheel scrolls the lifted panel");
     assert!(dialogs_intact(cx), "scrolling keeps the dialogs");
 
-    // The center is a log row, below the header and the top resize handle.
+    click(
+        cx,
+        gpui::point(panel.center().x, panel.top() + gpui::px(2.)),
+    );
+    assert!(dialogs_intact(cx), "resize edge press keeps dialog focus");
+    let title_bar = cx
+        .debug_bounds("wallet-logs-title-bar")
+        .expect("logs title bar is rendered");
+    click(
+        cx,
+        gpui::point(title_bar.left() + gpui::px(4.), title_bar.center().y),
+    );
+    assert!(dialogs_intact(cx), "title bar press keeps dialog focus");
+    // The center is a log row, below the header and the top resize handle. It takes focus,
+    // and closing the panel gives focus back to the dialog.
     click(cx, panel.center());
-    assert!(dialogs_intact(cx), "panel press keeps dialog focus");
+    assert!(!dialogs_intact(cx), "row press takes focus");
     click(cx, logs_toggle.center());
     assert_eq!(logs_state(cx), (false, false), "Logs closes the panel");
     assert!(dialogs_intact(cx), "closing logs keeps the dialogs");

@@ -13,6 +13,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -67,13 +68,14 @@ use crate::assets::WalletIconSource;
 
 mod search;
 
-use search::ActivitySearchState;
+use super::search_field::{SearchField, SearchFieldEvent};
 pub(super) use search::row_matches;
 #[cfg(test)]
 pub(super) use search::{
     ActivityChip, ActivityFacet, ActivityFilter, ActivitySearch, ActivityStatusChoice,
     ActivitySuggestionAction, activity_suggestions,
 };
+use search::{ActivitySearchField, ActivitySearchSource};
 
 const CLEAR_DIALOG_WIDTH: gpui::Pixels = px(460.0);
 const DEFAULT_CLEAR_DAYS: &str = "30";
@@ -1250,9 +1252,9 @@ pub(super) struct WalletActivityState {
     error: Option<SharedString>,
     stand_in: Option<ActivityStandIn>,
     /// The selected network's rows, before the toolbar's search and filters.
-    rows: Vec<ActivityRow>,
+    rows: Rc<[ActivityRow]>,
     /// The tokens `rows` move, with their symbols and icons, which the token filter lists.
-    assets: Vec<(ActivityAsset, String, Option<WalletIconSource>)>,
+    assets: Rc<[(ActivityAsset, String, Option<WalletIconSource>)]>,
     /// The network `rows` were built for.
     network: Option<ActivityNetwork>,
     newest_received_block: Option<u64>,
@@ -1262,7 +1264,7 @@ pub(super) struct WalletActivityState {
     /// The price revision the rows were valued at.
     rates_revision: u64,
     pub(super) list: Entity<ListState<ActivityListDelegate>>,
-    search: ActivitySearchState,
+    search: Entity<ActivitySearchField>,
     focus_list_on_render: bool,
     /// The journal read in progress; replacing it drops a superseded one.
     load: Task<()>,
@@ -1280,14 +1282,19 @@ impl WalletActivityState {
     /// Activity's list and search field, made with the root's window.
     pub(super) fn new(window: &mut Window, cx: &mut Context<'_, WalletRoot>) -> Self {
         let list = cx.new(|cx| ListState::new(ActivityListDelegate::default(), window, cx));
-        let search = ActivitySearchState::new(window, cx);
+        let search = cx.new(|cx| SearchField::new(ActivitySearchSource::empty(), window, cx));
+        cx.subscribe(&search, |root, _, _: &SearchFieldEvent, cx| {
+            root.sync_wallet_activity_list(cx);
+            cx.notify();
+        })
+        .detach();
         Self {
             key: None,
             data: None,
             error: None,
             stand_in: None,
-            rows: Vec::new(),
-            assets: Vec::new(),
+            rows: Rc::default(),
+            assets: Rc::default(),
             network: None,
             newest_received_block: None,
             unread: false,
@@ -1321,13 +1328,13 @@ impl WalletActivityState {
     }
 
     #[cfg(test)]
-    pub(super) fn recent_searches(&self) -> &[ActivitySearch] {
-        self.search.recent()
+    pub(super) fn recent_searches<'a>(&self, cx: &'a App) -> &'a [ActivitySearch] {
+        self.search.read(cx).recent()
     }
 
     #[cfg(test)]
-    pub(super) fn search_input(&self) -> Entity<InputState> {
-        self.search.input().clone()
+    pub(super) fn search_input(&self, cx: &App) -> Entity<InputState> {
+        self.search.read(cx).input().clone()
     }
 
     /// Asks the next frame to focus the list, so the arrow keys move the selection.
@@ -1335,18 +1342,18 @@ impl WalletActivityState {
         self.focus_list_on_render = true;
     }
 
-    fn reset(&mut self, window: gpui::AnyWindowHandle, cx: &mut App) {
+    fn reset(&mut self, cx: &mut App) {
         self.key = None;
         self.data = None;
         self.error = None;
-        self.rows.clear();
+        self.rows = Rc::default();
         self.network = None;
         self.newest_received_block = None;
         self.unread = false;
         self.load = Task::ready(());
         self.journal_changes = None;
         self.executor_changes = None;
-        self.search.end_session(window, cx);
+        self.search.update(cx, ActivitySearchField::end_session);
     }
 }
 
@@ -1427,7 +1434,7 @@ impl WalletRoot {
     /// session changed, and rebuilds the rows.
     pub(super) fn refresh_wallet_activity(&mut self, cx: &mut Context<'_, Self>) {
         if self.view_session.is_none() {
-            self.wallet_activity.reset(self.window_handle, cx);
+            self.wallet_activity.reset(cx);
             self.wallet_activity.stand_in = None;
             return;
         }
@@ -1444,7 +1451,7 @@ impl WalletRoot {
         }
         let key = self.wallet_activity_load_key();
         if self.wallet_activity.stand_in.is_none() && key != self.wallet_activity.key {
-            self.wallet_activity.reset(self.window_handle, cx);
+            self.wallet_activity.reset(cx);
             self.wallet_activity.key = key;
             if key.is_some() {
                 self.watch_wallet_activity_changes();
@@ -1460,7 +1467,7 @@ impl WalletRoot {
         stand_in: ActivityStandIn,
         cx: &mut Context<'_, Self>,
     ) {
-        self.wallet_activity.reset(self.window_handle, cx);
+        self.wallet_activity.reset(cx);
         self.wallet_activity.key = self.wallet_activity_load_key();
         self.wallet_activity.list.update(cx, |list, _| {
             list.delegate_mut().selected = stand_in.selected;
@@ -1548,15 +1555,15 @@ impl WalletRoot {
         let network = self.selected_activity_network();
         if self.wallet_activity.network != Some(network) {
             self.wallet_activity.network = Some(network);
-            self.wallet_activity.search.change_network();
+            search::change_network(&self.wallet_activity.search, cx);
         }
         if self.wallet_activity.data.is_none() {
             let state = &mut self.wallet_activity;
-            state.rows.clear();
-            state.assets.clear();
+            state.rows = Rc::default();
+            state.assets = Rc::default();
             state.newest_received_block = None;
             state.unread = false;
-            state.search.refresh(&state.rows, &state.assets, network);
+            search::refresh(&state.search, &state.rows, &state.assets, network, cx);
             self.sync_wallet_activity_list(cx);
             return;
         }
@@ -1623,23 +1630,18 @@ impl WalletRoot {
         let rates_revision = self.activity_rates_revision();
         let state = &mut self.wallet_activity;
         state.rates_revision = rates_revision;
-        state.assets.clear();
+        let mut assets: Vec<(ActivityAsset, String, Option<WalletIconSource>)> = Vec::new();
         for amount in built.rows.iter().flat_map(|row| &row.amounts) {
-            if state
-                .assets
-                .iter()
-                .all(|(asset, ..)| *asset != amount.asset)
-            {
-                state
-                    .assets
-                    .push((amount.asset, amount.symbol.clone(), amount.icon.clone()));
+            if assets.iter().all(|(asset, ..)| *asset != amount.asset) {
+                assets.push((amount.asset, amount.symbol.clone(), amount.icon.clone()));
             }
         }
-        state.rows = built.rows;
+        state.assets = assets.into();
+        state.rows = built.rows.into();
         state.newest_received_block = built.newest_received_block;
         state.unread = built.unread;
         state.running = running;
-        state.search.refresh(&state.rows, &state.assets, network);
+        search::refresh(&state.search, &state.rows, &state.assets, network, cx);
         self.sync_wallet_activity_list(cx);
         if self.wallet_activity_visible() {
             self.mark_wallet_activity_seen(cx);
@@ -1650,10 +1652,11 @@ impl WalletRoot {
     /// selected while it is still shown.
     fn sync_wallet_activity_list(&self, cx: &mut Context<'_, Self>) {
         let state = &self.wallet_activity;
+        let filter = state.search.read(cx).filter();
         let rows: Vec<ActivityRow> = state
             .rows
             .iter()
-            .filter(|row| row_matches(row, &state.search.filter))
+            .filter(|row| row_matches(row, filter))
             .cloned()
             .collect();
         let has_rows = !state.rows.is_empty();
@@ -2147,7 +2150,7 @@ impl WalletRoot {
             .px(px(14.0))
             .pt(px(12.0))
             .pb(px(8.0))
-            .child(self.render_wallet_activity_search(root, cx))
+            .child(state.search.clone())
             .child(
                 app_button("wallet-activity-clear", "Clear history…")
                     .outline()

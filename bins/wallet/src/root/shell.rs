@@ -461,7 +461,7 @@ impl Render for WalletRoot {
                             ),
                     ),
             )
-            .child(self.render_bottom_block(&root, dialog_open, window))
+            .child(self.render_bottom_block(&root, dialog_open, window, cx))
     }
 }
 

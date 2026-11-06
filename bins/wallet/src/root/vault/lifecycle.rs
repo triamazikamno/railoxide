@@ -1259,6 +1259,8 @@ impl WalletRoot {
         self.clear_address_books();
         self.set_broadcaster_preferences(wallet_ops::vault::BroadcasterPreferences::default(), cx);
         self.broadcaster_preference_error = None;
+        self.logs_search
+            .update(cx, crate::root::search_field::SearchField::end_session);
         self.address_book.search_query = Arc::from("");
         self.address_book
             .search_input

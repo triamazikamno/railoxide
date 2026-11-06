@@ -356,6 +356,13 @@
 //!   profile is in Tor mode. Check for updates and Retry show the canned result again, and a
 //!   later opening starts from the disclosure. A swap form doesn't take these modes as
 //!   active.
+//! - `logs` fills the logs panel's buffer once with 300 synthesized lines, one a second over
+//!   the five minutes before the wallet opened: every level, the sibling targets
+//!   `arti_client::client`, `arti_client::status` and `arti_client::dirmgr`,
+//!   `wallet_ops::rpc_broker` with its submodule `wallet_ops::rpc_broker::warmup` beside
+//!   `wallet_ops::rpc_broker_metrics`, and `wallet_ops::poi`, with long messages that wrap and
+//!   endpoint URLs in their redacted form. The wallet's own lines follow them. A swap form
+//!   doesn't take this mode as active.
 //!
 //! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
@@ -465,6 +472,7 @@ enum Mode {
     Tron(Tron),
     Activity,
     UpdateCheck(UpdateCheck),
+    Logs,
 }
 
 /// The canned result an `update-check:` mode shows.
@@ -698,6 +706,9 @@ fn parse(value: &str) -> Option<Mode> {
     if value == "activity" {
         return Some(Mode::Activity);
     }
+    if value == "logs" {
+        return Some(Mode::Logs);
+    }
     if value == "unshield" {
         return Some(Mode::Unshield);
     }
@@ -910,9 +921,10 @@ pub(super) fn route_error() -> bool {
 }
 
 /// Whether a fixture mode is on. The form of a swap paid from a Public account then works
-/// without private funds, and its jobs are scripted. An `update-check:` mode leaves swaps alone.
+/// without private funds, and its jobs are scripted. An `update-check:` or `logs` mode leaves
+/// swaps alone.
 pub(super) fn active() -> bool {
-    mode().is_some_and(|mode| !matches!(mode, Mode::UpdateCheck(_)))
+    mode().is_some_and(|mode| !matches!(mode, Mode::UpdateCheck(_) | Mode::Logs))
 }
 
 /// Whether the Buy picker holds a network's setup-fee check, and whether that check failed.
@@ -3266,6 +3278,88 @@ pub(in crate::root) fn tor_rotation() -> Option<bool> {
 /// whatever the network's sync state.
 pub(in crate::root) fn shows_utxos() -> bool {
     matches!(mode(), Some(Mode::Utxos))
+}
+
+/// In the `logs` mode, pushes the mode's 300 lines into `logs`, once per process.
+pub(in crate::root) fn fill_logs(logs: &ui::logs::LogStore) {
+    use tracing::Level;
+    const LINES: [(Level, &str, &str); 12] = [
+        (
+            Level::INFO,
+            "arti_client::client",
+            "Connected to the Tor network",
+        ),
+        (
+            Level::DEBUG,
+            "arti_client::dirmgr",
+            "Loaded 7,203 microdescriptors from the directory cache",
+        ),
+        (
+            Level::TRACE,
+            "arti_client::status",
+            "Bootstrap status: 100% done",
+        ),
+        (
+            Level::WARN,
+            "arti_client::status",
+            "Circuit build timed out after 60 s on guard $A3F2…; retrying with another guard, which can take a while on a slow or filtered network",
+        ),
+        (
+            Level::INFO,
+            "wallet_ops::rpc_broker",
+            "eth_blockNumber answered by https://eth.example/ in 182 ms",
+        ),
+        (
+            Level::WARN,
+            "wallet_ops::rpc_broker",
+            "https://rpc.example/ timed out after 10 s on eth_getLogs for blocks 21480000..21480215; trying the next endpoint for chain 1",
+        ),
+        (
+            Level::DEBUG,
+            "wallet_ops::rpc_broker::warmup",
+            "Warming 3 endpoints for chain 42161",
+        ),
+        (
+            Level::TRACE,
+            "wallet_ops::rpc_broker_metrics",
+            "latency p50=140ms p95=610ms over 64 requests",
+        ),
+        (
+            Level::INFO,
+            "wallet_ops::poi",
+            "Submitted proofs of innocence for 2 outputs",
+        ),
+        (
+            Level::ERROR,
+            "wallet_ops::poi",
+            "https://poi.example/ refused the proof submission: list 0x55ae…0aa1 is not yet synced; the outputs stay pending and the request is retried in 5 minutes",
+        ),
+        (
+            Level::DEBUG,
+            "wallet_ops::poi",
+            "Fetched 128 blinded commitments",
+        ),
+        (
+            Level::INFO,
+            "wallet_ops::rpc_broker",
+            "Chain 8453 head 24,118,307 from https://base.example/",
+        ),
+    ];
+    const COUNT: u64 = 300;
+    static FILLED: AtomicBool = AtomicBool::new(false);
+    if !matches!(mode(), Some(Mode::Logs)) || FILLED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let start = ui::logs::now_unix_ms().saturating_sub(COUNT * 1_000);
+    for (ix, (level, target, message)) in (0..COUNT).zip(LINES.into_iter().cycle()) {
+        logs.push(ui::logs::LogEntry {
+            seq: 0,
+            unix_ms: start + ix * 1_000,
+            level,
+            target: target.into(),
+            message: message.into(),
+        });
+    }
 }
 
 /// The `tron:` mode, whose Tron accounts, reads and send progress are staged.
