@@ -18,11 +18,13 @@ use super::{
     OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY, OFFICIAL_POI_ARTIFACT_GATEWAYS,
     OFFICIAL_POI_ARTIFACT_IPNS_NAME, OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY,
     PoiArtifactManifestSourceSetting, PoiReadSourceSetting, RememberedWalletKind,
-    WALLET_SETTINGS_KEY, WALLET_SETTINGS_VERSION, WALLET_UI_STATE_KEY, WALLET_UI_STATE_VERSION,
-    WakuDirectPeerSetting, WalletSettings, WalletSettingsError, WalletUiState, WalletUiStateError,
+    WALLET_FIRST_START_KEY, WALLET_FIRST_START_VERSION, WALLET_SETTINGS_KEY,
+    WALLET_SETTINGS_VERSION, WALLET_UI_STATE_KEY, WALLET_UI_STATE_VERSION, WakuDirectPeerSetting,
+    WalletFirstStart, WalletSettings, WalletSettingsError, WalletUiState, WalletUiStateError,
     build_effective_chain_configs, build_effective_token_registry, decode_wallet_settings,
-    decode_wallet_ui_state, encode_wallet_settings, load_wallet_settings, load_wallet_ui_state,
-    resolve_effective_chain_rpc_route, save_wallet_settings, save_wallet_ui_state,
+    decode_wallet_ui_state, encode_wallet_settings, load_first_start, load_wallet_settings,
+    load_wallet_ui_state, resolve_effective_chain_rpc_route, save_first_start,
+    save_wallet_settings, save_wallet_ui_state,
 };
 use crate::WALLETCONNECT_DEFAULT_PROJECT_ID;
 use crate::{RpcChainRoute, RpcTransport};
@@ -1140,6 +1142,61 @@ fn stored_invalid_settings_load_for_repair_but_cannot_be_saved() {
             .expect("invalid settings record"),
         payload,
         "loading and rejected saving must not rewrite a current-version record"
+    );
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn first_start_record_loads_incomplete_until_saved_and_survives_settings_saves() {
+    let root_dir = temp_db_root();
+    let store = DbStore::open(DbConfig {
+        root_dir: root_dir.clone(),
+    })
+    .expect("open db");
+
+    assert_eq!(
+        load_first_start(&store).expect("load missing record"),
+        WalletFirstStart::default()
+    );
+    assert!(
+        store
+            .get_app_settings_record(WALLET_FIRST_START_KEY)
+            .expect("read raw record")
+            .is_none()
+    );
+
+    store
+        .put_app_settings_record(WALLET_FIRST_START_KEY, b"not a record")
+        .expect("store undecodable record");
+    let undecodable = load_first_start(&store).expect("load undecodable record");
+    assert!(!undecodable.setup_complete);
+    assert_eq!(undecodable.accepted_notice_version, 0);
+
+    let record = WalletFirstStart {
+        version: 0,
+        setup_complete: true,
+        accepted_notice_version: 3,
+    };
+    save_first_start(&store, &record).expect("save record");
+    let saved = store
+        .get_app_settings_record(WALLET_FIRST_START_KEY)
+        .expect("read saved record")
+        .expect("saved record");
+    save_wallet_settings(&store, &WalletSettings::default()).expect("save default settings");
+    assert_eq!(
+        store
+            .get_app_settings_record(WALLET_FIRST_START_KEY)
+            .expect("read record after settings save"),
+        Some(saved)
+    );
+    assert_eq!(
+        load_first_start(&store).expect("load saved record"),
+        WalletFirstStart {
+            version: WALLET_FIRST_START_VERSION,
+            ..record
+        }
     );
 
     drop(store);

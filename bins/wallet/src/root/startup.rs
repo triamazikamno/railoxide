@@ -43,6 +43,8 @@ use super::settings::{
 use super::shell::{WalletAppOptions, render_wallet_hero_screen, render_wallet_window_frame};
 use super::{WalletMaintenanceController, WalletRoot, format_report_chain, rgb_with_alpha};
 
+mod first_start;
+
 struct WalletStartupReady {
     http: HttpContext,
     waku_config: WakuMonitorConfig,
@@ -126,6 +128,8 @@ pub(super) struct WalletStartupRoot {
     tor_reset_error: Option<Arc<str>>,
     /// The last Open failure of the startup Settings dialog's data folder row.
     data_folder_open_error: Option<SharedString>,
+    /// First-start setup, shown instead of network startup until it is saved.
+    setup: Option<first_start::FirstStartSetup>,
     _activity_keystroke_interceptor: Subscription,
 }
 
@@ -184,7 +188,7 @@ impl WalletStartupRoot {
                     cx.stop_propagation();
                 }
             });
-        let root = Self {
+        let mut root = Self {
             options,
             runtime,
             monitor_state,
@@ -203,9 +207,12 @@ impl WalletStartupRoot {
             tor_bootstrap_recovery_available: false,
             tor_reset_error: None,
             data_folder_open_error: None,
+            setup: None,
             _activity_keystroke_interceptor: activity_keystroke_interceptor,
         };
-        if let Some(vault_store) = vault_store {
+        if let Some(vault_store) = vault_store
+            && root.first_start_admits_startup(&vault_store, window, cx)
+        {
             let (progress_tx, progress_rx) = watch::channel(root.progress.clone());
             root.spawn_startup_tasks(
                 1,
@@ -494,6 +501,11 @@ impl WalletStartupRoot {
                 return;
             }
         };
+        // An active root means setup already finished on this data folder.
+        if self.wallet_root.is_none() && !self.first_start_admits_startup(&vault_store, window, cx)
+        {
+            return;
+        }
         let settings = match load_validated_startup_settings(&vault_store) {
             Ok(settings) => settings,
             Err(error) => {
@@ -994,6 +1006,8 @@ impl WalletStartupRoot {
             root.update(cx, |root, cx| {
                 root.open_settings_from_shortcut(window, cx);
             });
+        } else if self.setup.is_some() {
+            self.open_first_start_settings(None, window, cx);
         } else {
             self.open_startup_settings_dialog(window, cx);
         }
@@ -1024,6 +1038,9 @@ impl Render for WalletStartupRoot {
             .map_or(theme::BACKGROUND, |root| root.read(cx).titlebar_color());
         let content = if let Some(root) = self.wallet_root.as_ref() {
             div().size_full().child(root.clone()).into_any_element()
+        } else if self.setup.is_some() {
+            self.sync_first_start_proxy_input(window, cx);
+            self.render_first_start(window, cx)
         } else {
             self.render_splash(window, cx)
         };

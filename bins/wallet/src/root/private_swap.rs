@@ -52,6 +52,7 @@ mod ui_fixture;
 pub(super) use ui_fixture::activity as ui_fixture_activity;
 #[cfg(debug_assertions)]
 pub(super) use ui_fixture::fill_logs as ui_fixture_fill_logs;
+pub(super) use ui_fixture::first_start_old_notice as ui_fixture_first_start_old_notice;
 pub(super) use ui_fixture::hardware_derive as ui_fixture_hardware_derive;
 pub(super) use ui_fixture::refund_dialog_state as ui_fixture_refund_dialog_state;
 pub(super) use ui_fixture::send_asset as ui_fixture_send_asset;
@@ -90,6 +91,10 @@ mod ui_fixture {
     }
 
     pub(in crate::root) const fn hardware_derive() -> bool {
+        false
+    }
+
+    pub(in crate::root) const fn first_start_old_notice() -> bool {
         false
     }
 

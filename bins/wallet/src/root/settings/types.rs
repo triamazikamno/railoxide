@@ -92,8 +92,10 @@ pub(in crate::root) struct WalletSettingsEditor {
     pub(in crate::root) chain_editor: Entity<ui::chain_editor::ChainEditor>,
     /// The chain editor owned the Settings body last frame.
     pub(in crate::root) chain_editor_was_open: bool,
-    /// Reselect the Chains page when Settings remounts after the chain editor closes.
-    pub(in crate::root) reopen_chains_page: bool,
+    /// Page to select when Settings next mounts, such as Chains after the chain editor closes.
+    pub(in crate::root) open_page: Option<usize>,
+    /// Opened from first-start setup: no network context exists, so Save persists every change.
+    pub(in crate::root) pre_start: bool,
     /// Keeps the Custom PPOI publisher selected while its values still equal the official preset.
     pub(in crate::root) poi_custom_publisher: bool,
     pub(in crate::root) vault_store: Arc<DesktopVaultStore>,
@@ -136,11 +138,14 @@ pub(in crate::root) struct SyncedAnchorRangeSliderState {
     pub(in crate::root) _subscription: Subscription,
 }
 
+/// Position of the Chains page in the `ComponentSettings` page list in `render.rs`.
+pub(in crate::root) const CHAINS_PAGE_INDEX: usize = 3;
+
 pub(in crate::root) const ANCHOR_BPS_SLIDER_MIN: f32 = 0.0;
 pub(in crate::root) const ANCHOR_BPS_SLIDER_MAX: f32 = 100_000.0;
 pub(in crate::root) const ANCHOR_BPS_SLIDER_STEP: f32 = 10.0;
 pub(in crate::root) const ANCHOR_BPS_SLIDER_MAX_BPS: u64 = 100_000;
-pub(in crate::root) const PROXY_WAKU_DISCLAIMER: &str = "Proxy mode disables Waku's embedded libp2p transport to prevent proxy bypass. Broadcaster discovery and public broadcaster delivery are unavailable in Proxy mode.";
+pub(in crate::root) const PROXY_WAKU_DISCLAIMER: &str = "Broadcasters are disabled in proxy mode because their connections may bypass the proxy and expose your IP address.";
 
 #[derive(Clone)]
 pub(in crate::root) enum SettingsUrlListKind {

@@ -2055,6 +2055,79 @@ fn data_folder_size_resets_after_maintenance_and_ignores_stale_walks(
 }
 
 #[gpui::test]
+fn pre_start_editor_saves_network_changes_that_save_otherwise_refuses(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::{AppContext as _, IntoElement, Render, div};
+    use std::{cell::RefCell, rc::Rc};
+
+    struct EmptyHost;
+
+    impl Render for EmptyHost {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<'_, Self>,
+        ) -> impl IntoElement {
+            div()
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let path = temp_wallet_db_root("pre-start-save");
+    let store = Arc::new(DesktopVaultStore::open(path.clone()).unwrap());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let owner_slot = Rc::new(RefCell::new(None));
+    let slot = owner_slot.clone();
+    let handle = cx.add_window(|window, cx| {
+        let maintenance = cx.new(|_| WalletMaintenanceController::new(runtime.handle().clone()));
+        let editor = cx.new(|cx| {
+            WalletSettingsEditor::new(
+                store.clone(),
+                &path,
+                runtime.handle().clone(),
+                WalletSettings::default(),
+                maintenance,
+                None,
+                None,
+                window,
+                cx,
+            )
+        });
+        *slot.borrow_mut() = Some(editor);
+        EmptyHost
+    });
+    let editor = owner_slot.borrow_mut().take().unwrap();
+    let stored_mode = || {
+        wallet_ops::settings::load_wallet_settings(store.db().as_ref())
+            .unwrap()
+            .network
+            .mode
+    };
+
+    editor.update(cx, |editor, cx| {
+        editor.set_draft_network_mode(NetworkModeSetting::Direct, cx);
+        assert!(!editor.save_draft(cx), "a running wallet must Apply this");
+    });
+    assert_eq!(stored_mode(), NetworkModeSetting::Tor);
+    editor.update(cx, |editor, cx| {
+        editor.set_pre_start(cx);
+        assert!(editor.save_draft(cx));
+    });
+    assert_eq!(stored_mode(), NetworkModeSetting::Direct);
+
+    handle
+        .update(cx, |_, window, _| window.remove_window())
+        .unwrap();
+    drop(editor);
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[gpui::test]
 fn poi_publisher_choice_follows_draft_and_keeps_gateways(cx: &mut gpui::TestAppContext) {
     use gpui::{AppContext as _, IntoElement, Render, div};
     use std::{cell::RefCell, rc::Rc};

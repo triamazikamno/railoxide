@@ -56,6 +56,8 @@ pub struct ChainEditor {
     /// The last Test reply and the draft source it read, so a stale result stays hidden.
     probe: Option<NativeUsdProbe>,
     probe_source: Option<String>,
+    /// Set by a host that can't reach the network yet; Test stays disabled and shows it.
+    probe_disabled_reason: Option<SharedString>,
     chain_id: Option<Entity<InputState>>,
     fields: BTreeMap<ChainField, FieldInput>,
     /// One URL input per RPC endpoint with its flags. The input owns the URL until collection.
@@ -122,6 +124,7 @@ impl ChainEditor {
             pricing_preset: None,
             probe: None,
             probe_source: None,
+            probe_disabled_reason: None,
             chain_id: None,
             fields: BTreeMap::new(),
             rpc_endpoints: Vec::new(),
@@ -144,6 +147,16 @@ impl ChainEditor {
     /// Set by a host that stages confirmed chains and commits them with its own Save.
     pub fn set_staging(&mut self, staging: bool, cx: &mut Context<'_, Self>) {
         self.staging = staging;
+        cx.notify();
+    }
+
+    /// Disables the native USD Test and shows `reason` beside it while set.
+    pub fn set_probe_disabled_reason(
+        &mut self,
+        reason: Option<SharedString>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.probe_disabled_reason = reason;
         cx.notify();
     }
 
@@ -1482,7 +1495,10 @@ impl ChainEditor {
                             .disabled(self.pending)
                             .addon(self.render_test_addon(source.is_none(), cx)),
                         )
-                        .child(subtle_text("Use a Chainlink-compatible feed on this chain, quoting USD per whole native coin.").whitespace_normal());
+                        .child(subtle_text("Use a Chainlink-compatible feed on this chain, quoting USD per whole native coin.").whitespace_normal())
+                        .when_some(self.probe_disabled_reason.clone(), |section, reason| {
+                            section.child(subtle_text(reason).whitespace_normal())
+                        });
                 }
             }
             NativeUsdChoice::Default => {
@@ -1496,7 +1512,10 @@ impl ChainEditor {
                         .child(
                             subtle_text("Inherits this chain's preset USD feed.")
                                 .whitespace_normal(),
-                        );
+                        )
+                        .when_some(self.probe_disabled_reason.clone(), |section, reason| {
+                            section.child(subtle_text(reason).whitespace_normal())
+                        });
                 } else {
                     section = section.child(
                         subtle_text("No preset feed. Native amounts have no USD value.")
@@ -1579,7 +1598,7 @@ impl ChainEditor {
                 InputGroupButton::new("chain-pricing-test")
                     .label("Test")
                     .debug_selector(|| "chain-pricing-test".into())
-                    .disabled(self.pending || empty)
+                    .disabled(self.pending || empty || self.probe_disabled_reason.is_some())
                     .loading(testing)
                     // The spinner takes the icon slot, so the slot has to exist while
                     // the test runs. This icon itself is never drawn.

@@ -1,8 +1,9 @@
 use super::{
     ChainSettingsOverride, DEFAULT_AUTO_LOCK_TIMEOUT_SECS, DbStore,
     OFFICIAL_INDEXED_ARTIFACT_GATEWAYS, OFFICIAL_POI_ARTIFACT_GATEWAYS, RailgunSettingsOverride,
-    RememberedWalletKind, Url, WALLET_SETTINGS_KEY, WALLET_SETTINGS_VERSION, WALLET_UI_STATE_KEY,
-    WALLET_UI_STATE_VERSION, WalletSettings, WalletSettingsError, WalletUiState,
+    RememberedWalletKind, Url, WALLET_FIRST_START_KEY, WALLET_FIRST_START_VERSION,
+    WALLET_SETTINGS_KEY, WALLET_SETTINGS_VERSION, WALLET_UI_STATE_KEY, WALLET_UI_STATE_VERSION,
+    WalletFirstStart, WalletFirstStartError, WalletSettings, WalletSettingsError, WalletUiState,
     WalletUiStateError,
 };
 
@@ -225,6 +226,38 @@ pub fn save_wallet_ui_state(
 ) -> Result<(), WalletUiStateError> {
     let payload = encode_wallet_ui_state(state)?;
     store.put_app_settings_record(WALLET_UI_STATE_KEY, &payload)?;
+    Ok(())
+}
+
+/// A missing, undecodable or unsupported record loads as incomplete setup and is not rewritten.
+pub fn load_first_start(store: &DbStore) -> Result<WalletFirstStart, WalletFirstStartError> {
+    let Some(payload) = store.get_app_settings_record(WALLET_FIRST_START_KEY)? else {
+        return Ok(WalletFirstStart::default());
+    };
+    match rmp_serde::from_slice::<WalletFirstStart>(&payload) {
+        Ok(record) if record.version == WALLET_FIRST_START_VERSION => Ok(record),
+        Ok(record) => {
+            tracing::warn!(
+                version = record.version,
+                "ignoring unsupported first-start setup record"
+            );
+            Ok(WalletFirstStart::default())
+        }
+        Err(error) => {
+            tracing::warn!(%error, "ignoring invalid first-start setup record");
+            Ok(WalletFirstStart::default())
+        }
+    }
+}
+
+pub fn save_first_start(
+    store: &DbStore,
+    record: &WalletFirstStart,
+) -> Result<(), WalletFirstStartError> {
+    let mut record = record.clone();
+    record.version = WALLET_FIRST_START_VERSION;
+    let payload = rmp_serde::to_vec_named(&record)?;
+    store.put_app_settings_record(WALLET_FIRST_START_KEY, &payload)?;
     Ok(())
 }
 

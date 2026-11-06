@@ -45,7 +45,7 @@ impl WalletSettingsEditor {
             // Settings unmounts while a chain is open, which drops its selected page.
             let open = chain_editor.read(cx).is_editing();
             if editor.chain_editor_was_open && !open {
-                editor.reopen_chains_page = true;
+                editor.open_page = Some(CHAINS_PAGE_INDEX);
             }
             editor.chain_editor_was_open = open;
             cx.notify();
@@ -60,7 +60,8 @@ impl WalletSettingsEditor {
             draft_base: settings.clone(),
             draft: settings,
             chain_editor_was_open: false,
-            reopen_chains_page: false,
+            open_page: None,
+            pre_start: false,
             poi_custom_publisher: false,
             field_sync_revision: 0,
             validation_error: None,
@@ -104,6 +105,53 @@ impl WalletSettingsEditor {
         self.draft_changed(cx);
     }
 
+    /// Marks an editor owned by first-start setup, before any network context exists.
+    pub(in crate::root) fn set_pre_start(&mut self, cx: &mut Context<'_, Self>) {
+        self.pre_start = true;
+        self.chain_editor.update(cx, |editor, cx| {
+            editor.set_probe_disabled_reason(Some("Test is available after setup.".into()), cx);
+        });
+        cx.notify();
+    }
+
+    /// Selects `page_ix` the next time Settings mounts.
+    pub(in crate::root) const fn open_on_page(&mut self, page_ix: usize) {
+        self.open_page = Some(page_ix);
+    }
+
+    pub(in crate::root) fn set_draft_network_mode(
+        &mut self,
+        mode: NetworkModeSetting,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.draft.network.mode = mode;
+        if !should_show_proxy_url_setting(mode) {
+            self.draft.network.proxy_url = None;
+        }
+        self.programmatic_draft_changed(cx);
+    }
+
+    /// Typed input owns its text, so this leaves the other fields unsynced like a typed field.
+    pub(in crate::root) fn set_draft_proxy_url(&mut self, value: &str, cx: &mut Context<'_, Self>) {
+        self.draft.network.proxy_url = non_empty_setting(value);
+        self.draft_changed(cx);
+    }
+
+    pub(in crate::root) fn set_draft_chain_enabled(
+        &mut self,
+        chain_id: u64,
+        enabled: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.draft
+            .chains
+            .per_chain
+            .entry(chain_id)
+            .or_insert_with(|| wallet_ops::settings::ChainSettingsOverride::for_chain(chain_id))
+            .enabled = enabled;
+        self.programmatic_draft_changed(cx);
+    }
+
     pub(in crate::root) fn is_dirty(&self) -> bool {
         self.draft != self.draft_base
     }
@@ -131,10 +179,12 @@ impl WalletSettingsEditor {
             ("Saved", theme::SUCCESS)
         } else {
             match classify_settings_apply_mode(&self.saved, &self.draft) {
-                SettingsApplyMode::NetworkingRestart => ("Restart required", theme::WARNING),
-                SettingsApplyMode::NewRequests | SettingsApplyMode::FutureSessions => {
-                    ("Unsaved", theme::WARNING)
+                SettingsApplyMode::NetworkingRestart if !self.pre_start => {
+                    ("Restart required", theme::WARNING)
                 }
+                SettingsApplyMode::NetworkingRestart
+                | SettingsApplyMode::NewRequests
+                | SettingsApplyMode::FutureSessions => ("Unsaved", theme::WARNING),
                 SettingsApplyMode::Clean => ("Saved", theme::SUCCESS),
             }
         };
@@ -235,8 +285,9 @@ impl WalletSettingsEditor {
             cx.notify();
             return false;
         }
-        if classify_settings_apply_mode(&self.saved, &self.draft)
-            == SettingsApplyMode::NetworkingRestart
+        if !self.pre_start
+            && classify_settings_apply_mode(&self.saved, &self.draft)
+                == SettingsApplyMode::NetworkingRestart
         {
             self.status = Some(Arc::from(
                 "Use Apply and restart networking for networking changes",
@@ -561,9 +612,13 @@ impl WalletSettingsEditor {
         editor: &Entity<Self>,
         cx: &App,
     ) -> gpui::Div {
-        let (building, invalid) = {
+        let (building, invalid, pre_start) = {
             let state = editor.read(cx);
-            (state.cache_building, state.validation_error.is_some())
+            (
+                state.cache_building,
+                state.validation_error.is_some(),
+                state.pre_start,
+            )
         };
         let label = if building {
             "Building..."
@@ -571,15 +626,23 @@ impl WalletSettingsEditor {
             "Build prover cache"
         };
         let build_editor = editor.clone();
-        div().flex().items_center().child(
-            app_button("wallet-settings-build-cache", label)
-                .disabled(building || invalid)
-                .on_click(move |_event, _window, cx| {
-                    build_editor.update(cx, |editor, cx| {
-                        editor.build_prover_cache(cx);
-                    });
-                }),
-        )
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                app_button("wallet-settings-build-cache", label)
+                    // The build opens its own network context.
+                    .disabled(building || invalid || pre_start)
+                    .on_click(move |_event, _window, cx| {
+                        build_editor.update(cx, |editor, cx| {
+                            editor.build_prover_cache(cx);
+                        });
+                    }),
+            )
+            .when(pre_start, |row| {
+                row.child(app_muted_text("Available after setup."))
+            })
     }
 
     pub(in crate::root) fn render_local_poi_cache_reset_action(

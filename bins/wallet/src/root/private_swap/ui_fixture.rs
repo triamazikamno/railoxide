@@ -363,6 +363,10 @@
 //!   `wallet_ops::rpc_broker_metrics`, and `wallet_ops::poi`, with long messages that wrap and
 //!   endpoint URLs in their redacted form. The wallet's own lines follow them. A swap form
 //!   doesn't take this mode as active.
+//! - `first-start:old-notice` treats the accepted responsibility notice as version 0 the first
+//!   time the setup record is read, so a profile that finished first-start setup shows only
+//!   the notice step again. The fixture writes no record; the notice's Continue saves the
+//!   current version as it always does. A swap form doesn't take this mode as active.
 //!
 //! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
@@ -473,6 +477,7 @@ enum Mode {
     Activity,
     UpdateCheck(UpdateCheck),
     Logs,
+    FirstStartOldNotice,
 }
 
 /// The canned result an `update-check:` mode shows.
@@ -709,6 +714,9 @@ fn parse(value: &str) -> Option<Mode> {
     if value == "logs" {
         return Some(Mode::Logs);
     }
+    if value == "first-start:old-notice" {
+        return Some(Mode::FirstStartOldNotice);
+    }
     if value == "unshield" {
         return Some(Mode::Unshield);
     }
@@ -921,10 +929,22 @@ pub(super) fn route_error() -> bool {
 }
 
 /// Whether a fixture mode is on. The form of a swap paid from a Public account then works
-/// without private funds, and its jobs are scripted. An `update-check:` or `logs` mode leaves
-/// swaps alone.
+/// without private funds, and its jobs are scripted. An `update-check:`, `logs` or
+/// `first-start:` mode leaves swaps alone.
 pub(super) fn active() -> bool {
-    mode().is_some_and(|mode| !matches!(mode, Mode::UpdateCheck(_) | Mode::Logs))
+    mode().is_some_and(|mode| {
+        !matches!(
+            mode,
+            Mode::UpdateCheck(_) | Mode::Logs | Mode::FirstStartOldNotice
+        )
+    })
+}
+
+/// Whether this read of the first-start setup record treats its accepted notice as version 0.
+/// Only the first read of a session does, so the notice's Continue can start the wallet.
+pub(in crate::root) fn first_start_old_notice() -> bool {
+    static USED: AtomicBool = AtomicBool::new(false);
+    matches!(mode(), Some(Mode::FirstStartOldNotice)) && !USED.swap(true, Ordering::Relaxed)
 }
 
 /// Whether the Buy picker holds a network's setup-fee check, and whether that check failed.

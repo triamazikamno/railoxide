@@ -1,8 +1,11 @@
 use super::{
     BTreeMap, ChainGasSettings, Deserialize, MAX_BLOCK_RANGE, MAX_FINALITY_DEPTH,
-    MAX_INTERVAL_SECS, SUPPORTED_PROXY_SCHEMES, Serialize, WalletNetworkMode, supported_chain_id,
-    validate_optional_address, validate_optional_range, validate_url_scheme,
+    MAX_INTERVAL_SECS, SUPPORTED_PROXY_SCHEMES, Serialize, Url, WalletNetworkMode,
+    supported_chain_id, validate_optional_address, validate_optional_range, validate_url_scheme,
 };
+
+/// The validation error for Proxy mode without an address, which setup shows as a hint instead.
+pub const PROXY_URL_REQUIRED: &str = "Enter your proxy address.";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -42,11 +45,20 @@ impl Default for NetworkSettings {
 impl NetworkSettings {
     pub(super) fn validate(&self, errors: &mut Vec<String>) {
         match (self.mode, self.proxy_url.as_deref()) {
-            (NetworkModeSetting::Proxy, Some(proxy)) => {
-                validate_url_scheme("network.proxy_url", proxy, SUPPORTED_PROXY_SCHEMES, errors);
-            }
+            // Shown under the proxy field in setup and Settings, so worded for users.
+            (NetworkModeSetting::Proxy, Some(proxy)) => match Url::parse(proxy) {
+                Ok(url) if SUPPORTED_PROXY_SCHEMES.contains(&url.scheme()) => {}
+                Ok(_) => errors.push(
+                    "Proxy addresses must start with socks5h://, socks5://, http:// or https://."
+                        .to_string(),
+                ),
+                Err(_) => errors.push(
+                    "This isn't a valid proxy address. Example: socks5h://127.0.0.1:9050"
+                        .to_string(),
+                ),
+            },
             (NetworkModeSetting::Proxy, None) => {
-                errors.push("network.proxy_url is required when network.mode is proxy".to_string());
+                errors.push(PROXY_URL_REQUIRED.to_string());
             }
             (NetworkModeSetting::Tor | NetworkModeSetting::Direct, Some(_)) => {
                 errors.push(

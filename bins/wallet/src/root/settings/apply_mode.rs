@@ -40,7 +40,7 @@ pub(in crate::root) fn auto_lock_timeout_from_value(value: &str) -> Option<u64> 
         .flatten()
 }
 
-fn format_auto_lock_timeout(timeout_secs: u64) -> String {
+pub(in crate::root) fn format_auto_lock_timeout(timeout_secs: u64) -> String {
     if timeout_secs.is_multiple_of(60 * 60) {
         let hours = timeout_secs / (60 * 60);
         format!("{hours} hour{}", if hours == 1 { "" } else { "s" })

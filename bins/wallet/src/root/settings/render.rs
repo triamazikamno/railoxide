@@ -1,9 +1,6 @@
 use super::*;
 use wallet_ops::device_auth::DeviceAuthMethod;
 
-/// Position of the Chains page in the `ComponentSettings` page list below.
-const CHAINS_PAGE_INDEX: usize = 3;
-
 const INDEXED_ARTIFACT_REPOSITORY_URL: &str = "https://github.com/triamazikamno/railgun-indexer/";
 
 const MIB: u64 = 1024 * 1024;
@@ -43,7 +40,13 @@ impl Render for WalletSettingsEditor {
         let editor = cx.entity();
         let root_replacement_allowed = self.root_replacement_is_allowed(cx);
         let chain_editing = self.chain_editor.read(cx).is_editing();
-        let reopen_chains_page = std::mem::take(&mut self.reopen_chains_page);
+        let open_page = self.open_page.take();
+        // Before network startup nothing needs restarting, so Save takes every valid change.
+        let save_enabled = if self.pre_start {
+            self.validation_error.is_none() && self.draft != self.saved
+        } else {
+            settings_save_action_enabled(&self.saved, &self.draft, self.validation_error.is_some())
+        };
         let auto_lock_timeout = Self::dropdown_field(
             editor.clone(),
             auto_lock_timeout_options(),
@@ -881,9 +884,9 @@ impl Render for WalletSettingsEditor {
                     .overflow_hidden()
                     .child(
                         ComponentSettings::new("wallet-settings-editor")
-                            .when(reopen_chains_page, |settings| {
+                            .when_some(open_page, |settings, page_ix| {
                                 settings.default_selected_index(SelectIndex {
-                                    page_ix: CHAINS_PAGE_INDEX,
+                                    page_ix,
                                     group_ix: None,
                                 })
                             })
@@ -926,38 +929,39 @@ impl Render for WalletSettingsEditor {
                     )
                     .child(
                         app_button("wallet-settings-save", "Save")
+                            .when(self.pre_start, ButtonVariants::primary)
                             .disabled(
-                                !self.maintenance_controller.read(cx).is_idle()
-                                    || !settings_save_action_enabled(
-                                        &self.saved,
-                                        &self.draft,
-                                        self.validation_error.is_some(),
-                                    ),
+                                !self.maintenance_controller.read(cx).is_idle() || !save_enabled,
                             )
-                            .on_click(move |_event, _window, cx| {
+                            .on_click(move |_event, window, cx| {
                                 save_editor.update(cx, |editor, cx| {
-                                    editor.save_draft(cx);
+                                    // Setup shows the saved values once Settings closes.
+                                    if editor.save_draft(cx) && editor.pre_start {
+                                        window.close_all_dialogs(cx);
+                                    }
                                 });
                             }),
                     )
-                    .child(
-                        app_button("wallet-settings-apply-restart", "Apply")
-                            .primary()
-                            .disabled(
-                                !self.maintenance_controller.read(cx).is_idle()
-                                    || !settings_restart_action_enabled(
-                                        &self.saved,
-                                        &self.draft,
-                                        self.validation_error.is_some(),
-                                        root_replacement_allowed,
-                                    ),
-                            )
-                            .on_click(move |_event, window, cx| {
-                                apply_editor.update(cx, |editor, cx| {
-                                    editor.apply_and_restart(window, cx);
-                                });
-                            }),
-                    ),
+                    .when(!self.pre_start, |footer| {
+                        footer.child(
+                            app_button("wallet-settings-apply-restart", "Apply")
+                                .primary()
+                                .disabled(
+                                    !self.maintenance_controller.read(cx).is_idle()
+                                        || !settings_restart_action_enabled(
+                                            &self.saved,
+                                            &self.draft,
+                                            self.validation_error.is_some(),
+                                            root_replacement_allowed,
+                                        ),
+                                )
+                                .on_click(move |_event, window, cx| {
+                                    apply_editor.update(cx, |editor, cx| {
+                                        editor.apply_and_restart(window, cx);
+                                    });
+                                }),
+                        )
+                    }),
             )
     }
 }

@@ -12,6 +12,8 @@ pub const WALLET_SETTINGS_KEY: &str = "wallet-settings";
 pub const WALLET_SETTINGS_VERSION: u32 = 11;
 pub const WALLET_UI_STATE_KEY: &str = "wallet-ui-state";
 pub const WALLET_UI_STATE_VERSION: u32 = 5;
+pub const WALLET_FIRST_START_KEY: &str = "wallet-first-start";
+pub const WALLET_FIRST_START_VERSION: u32 = 1;
 pub const OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY: &str =
     "0x4fa849f01e8983c4393eee6e7482f60d4f9702e2d7917101a0edeb001369d5c5";
 pub const LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME: &str =
@@ -60,6 +62,14 @@ pub enum WalletUiStateError {
     Decode(#[from] rmp_serde::decode::Error),
     #[error("unsupported wallet UI state version {version}")]
     UnsupportedVersion { version: u32 },
+}
+
+#[derive(Debug, Error)]
+pub enum WalletFirstStartError {
+    #[error(transparent)]
+    Db(#[from] local_db::DbError),
+    #[error("encode first-start setup record: {0}")]
+    Encode(#[from] rmp_serde::encode::Error),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +155,25 @@ pub enum PublicAccountSort {
     Value,
     Name,
     Added,
+}
+
+/// Plaintext first-start setup record. It stays out of `WalletSettings` so a reset keeps it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WalletFirstStart {
+    pub version: u32,
+    pub setup_complete: bool,
+    pub accepted_notice_version: u32,
+}
+
+impl Default for WalletFirstStart {
+    fn default() -> Self {
+        Self {
+            version: WALLET_FIRST_START_VERSION,
+            setup_complete: false,
+            accepted_notice_version: 0,
+        }
+    }
 }
 
 impl Default for WalletUiState {
