@@ -972,7 +972,8 @@ impl PrivateSwapsView {
         // The setup's account reads go over the swap's route.
         let route = self.swap_route(&http, operation);
         // Only this account's stages start over. The other account's stay as they ended.
-        let (progress, route_tx) = self.start_setup_progress(operation, side, cx);
+        let (progress, route_tx) =
+            self.start_setup_progress(operation, side, retry.candidate.clone(), cx);
         let replaces_own = retry.replaces && side == SetupSide::Origin;
         let (replacements, followed) = Self::follow_replacements(cx);
         self.start_job(

@@ -1900,8 +1900,9 @@ impl PrivateSwapsView {
 
     /// Stop waiting for broadcaster answers in the running setup job of the swap `operation`,
     /// as its timeout would: its requests are no longer re-sent, and each setup that waited
-    /// ends unanswered, which can still be included. The swap still places its order once its
-    /// setups are confirmed.
+    /// ends unanswered, which can still be included. A setup whose submission already ended
+    /// was answered, and its answer ends with the job, so it keeps no stages and its record
+    /// tells how it went. The swap still places its order once its setups are confirmed.
     fn stop_setup_wait(&mut self, operation: ExecutorOperationId) {
         if !self.submitting_setup(operation) {
             return;
@@ -1911,10 +1912,16 @@ impl PrivateSwapsView {
         }
         self.job_revision = self.job_revision.wrapping_add(1);
         for side in [SetupSide::Origin, SetupSide::Destination] {
+            let answered = self
+                .tracking
+                .get(&operation)
+                .and_then(|tracking| tracking.setup_progress(side))
+                .and_then(SetupProgress::route)
+                .is_some_and(|route| route.state == wallet_ops::SubmissionRouteState::Closed);
             self.finish_setup_progress(
                 operation,
                 side,
-                Some(Ok(&PublicBroadcasterResultKind::TimedOut)),
+                (!answered).then_some(Ok(&PublicBroadcasterResultKind::TimedOut)),
             );
         }
     }

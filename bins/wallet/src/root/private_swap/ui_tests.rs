@@ -1757,7 +1757,12 @@ fn stale_setup_read_is_dropped_and_a_failed_read_records_its_error(cx: &mut Test
                 }
                 // No broadcaster answered the setup this session sent, which its stages keep
                 // telling. A read that fails afterwards is told as the swap's error.
-                drop(swaps.start_setup_progress(operation, SetupSide::Origin, cx));
+                drop(swaps.start_setup_progress(
+                    operation,
+                    SetupSide::Origin,
+                    setup_broadcaster(),
+                    cx,
+                ));
                 swaps.finish_setup_progress(
                     operation,
                     SetupSide::Origin,
@@ -2134,12 +2139,14 @@ fn setup_whose_nonce_is_recorded_as_consumed_is_approved_and_needs_no_setup_page
 /// the order after that. Without this session's stages, as after a restart, one step stands
 /// for the sending. While the setup's job runs, its six stages and the confirmation show, and
 /// no step of the order. A ready swap lists the order's steps without the setup and names the
-/// account among its facts. A retired account's swap shows its setup again.
+/// account among its facts. A retired account's swap shows its setup again. Only this
+/// session's stages name the setup's broadcaster, which offers to become a favorite once it
+/// submitted the setup.
 #[gpui::test]
 fn swap_detail_shows_the_setup_until_its_account_is_ready(cx: &mut TestAppContext) {
     use alloy::eips::BlockNumHash;
     use wallet_ops::vault::ExecutorNonceObservation;
-    with_approved_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
         pending_setup(executors, operation);
         executors
             .record_swap_approval(operation, SwapUseId::first(operation), test_approval())
@@ -2167,6 +2174,10 @@ fn swap_detail_shows_the_setup_until_its_account_is_ready(cx: &mut TestAppContex
         let retry = cx.debug_bounds("swap-setup-retry-origin").unwrap();
         let waiting = cx.debug_bounds(setup_row("confirm").leak()).unwrap();
         assert!(waiting.contains(&retry.center()));
+        assert!(
+            cx.debug_bounds("swap-setup-broadcaster-origin").is_none(),
+            "a setup sent in an earlier session names no broadcaster"
+        );
 
         // This session sends it again.
         let (stages, _routes) = swaps.update(cx, |swaps, cx| {
@@ -2175,7 +2186,7 @@ fn swap_detail_shows_the_setup_until_its_account_is_ready(cx: &mut TestAppContex
                 kind: SwapJobKind::Setup,
                 abort: runtime.spawn(std::future::pending::<()>()).abort_handle(),
             });
-            swaps.start_setup_progress(operation, SetupSide::Origin, cx)
+            swaps.start_setup_progress(operation, SetupSide::Origin, setup_broadcaster(), cx)
         });
         stages
             .send(TransactionGenerationStage::ProvingTransaction)
@@ -2197,6 +2208,43 @@ fn swap_detail_shows_the_setup_until_its_account_is_ready(cx: &mut TestAppContex
             cx.debug_bounds("swap-setup-retry-origin").is_none(),
             "a setup that is being sent has no retry"
         );
+        assert!(cx.debug_bounds("swap-setup-broadcaster-origin").is_some());
+        assert!(
+            cx.debug_bounds("swap-setup-broadcaster-favorite-origin")
+                .is_none()
+        );
+
+        // Its broadcaster submitted it, so it can become a favorite.
+        swaps.update(cx, |swaps, _| {
+            assert!(swaps.finish_setup_progress(
+                operation,
+                SetupSide::Origin,
+                Some(Ok(&PublicBroadcasterResultKind::Submitted {
+                    tx_hash: "0x01".to_owned(),
+                })),
+            ));
+        });
+        show(cx);
+        let favorite = cx
+            .debug_bounds("swap-setup-broadcaster-favorite-origin")
+            .unwrap();
+        cx.simulate_click(favorite.center(), gpui::Modifiers::none());
+        show(cx);
+        assert!(root.read_with(cx, |root, _| {
+            root.is_favorite_broadcaster(SETUP_BROADCASTER)
+        }));
+        assert!(
+            cx.debug_bounds("swap-setup-broadcaster-favorite-origin")
+                .is_none()
+        );
+        assert!(
+            cx.debug_bounds("swap-setup-broadcaster-favorited-origin")
+                .is_some()
+        );
+        // The rest follows the records alone, as after a restart.
+        swaps.update(cx, |swaps, _| {
+            swaps.finish_setup_progress(operation, SetupSide::Origin, None);
+        });
 
         // The setup is confirmed, so the order's steps follow.
         swaps.update(cx, |swaps, _| {
@@ -2224,7 +2272,9 @@ fn swap_detail_shows_the_setup_until_its_account_is_ready(cx: &mut TestAppContex
 /// A setup that waits for a broadcaster's answer is offered again once its request was
 /// re-sent five times: Retry setup… sits on its waiting row, and stops that wait as the
 /// timeout would, so the setup ends unanswered and can still be included, before the retry's
-/// dialog opens. The swap still places its order once the setup is confirmed.
+/// dialog opens. The swap still places its order once the setup is confirmed. From then on
+/// its Broadcaster row also offers Ban, which bans that broadcaster and leaves the wait
+/// running.
 #[gpui::test]
 fn a_setup_waiting_for_five_resends_offers_its_retry(cx: &mut TestAppContext) {
     use std::cell::Cell;
@@ -2233,7 +2283,7 @@ fn a_setup_waiting_for_five_resends_offers_its_retry(cx: &mut TestAppContext) {
 
     use super::super::setup_progress::{SetupProgress, SetupProgressEnd};
 
-    with_approved_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+    with_approved_swap_view(cx, |root, swaps, executors, operation, runtime, cx| {
         executors
             .bind_address(operation, Address::repeat_byte(3))
             .unwrap();
@@ -2260,7 +2310,7 @@ fn a_setup_waiting_for_five_resends_offers_its_retry(cx: &mut TestAppContext) {
                 let tracking = swaps.tracking.entry(operation).or_default();
                 tracking.auto_place = true;
                 *tracking.setup_progress_mut(SetupSide::Origin) = Some(
-                    SetupProgress::running(receiver, route, None)
+                    SetupProgress::running(setup_broadcaster(), receiver, route, None)
                         .waiting_since(Rc::clone(&waiting_since)),
                 );
                 (stages, routes)
@@ -2271,10 +2321,33 @@ fn a_setup_waiting_for_five_resends_offers_its_retry(cx: &mut TestAppContext) {
         routes.send_modify(|route| route.publishes = 3);
         cx.update(|window, cx| window.draw(cx).clear(cx));
         assert!(cx.debug_bounds("swap-setup-retry-origin").is_none());
+        assert!(cx.debug_bounds("swap-setup-broadcaster-origin").is_some());
+        assert!(
+            cx.debug_bounds("swap-setup-broadcaster-ban-origin")
+                .is_none()
+        );
 
-        // Re-sent five times: its row offers the retry, while its job runs.
+        // Re-sent five times: its row offers the retry and Ban, while its job runs.
         routes.send_modify(|route| route.publishes = 6);
         cx.update(|window, cx| window.draw(cx).clear(cx));
+        let ban = cx
+            .debug_bounds("swap-setup-broadcaster-ban-origin")
+            .unwrap();
+        cx.simulate_click(ban.center(), gpui::Modifiers::none());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(root.read_with(cx, |root, _| root.is_banned_broadcaster(SETUP_BROADCASTER)));
+        assert!(
+            cx.debug_bounds("swap-setup-broadcaster-ban-origin")
+                .is_none()
+        );
+        assert!(
+            cx.debug_bounds("swap-setup-broadcaster-banned-origin")
+                .is_some()
+        );
+        assert!(
+            swaps.read_with(cx, |swaps, _| swaps.job.is_some()),
+            "the ban left the wait running"
+        );
         let retry = cx.debug_bounds("swap-setup-retry-origin").unwrap();
         cx.simulate_click(retry.center(), gpui::Modifiers::none());
         cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -2331,7 +2404,12 @@ fn a_replaced_account_keeps_the_swap_and_its_open_detail(cx: &mut TestAppContext
                 });
                 swaps.show_detail(operation, window, cx);
                 (
-                    swaps.start_setup_progress(operation, SetupSide::Origin, cx),
+                    swaps.start_setup_progress(
+                        operation,
+                        SetupSide::Origin,
+                        setup_broadcaster(),
+                        cx,
+                    ),
                     PrivateSwapsView::follow_replacements(cx),
                 )
             })
@@ -2801,7 +2879,7 @@ fn retry_setup_sits_on_the_failed_stage_while_the_setup_can_be_sent_again(cx: &m
         // No broadcaster answered the setup this session sent.
         pending_setup(executors, operation);
         swaps.update(cx, |swaps, cx| {
-            drop(swaps.start_setup_progress(operation, SetupSide::Origin, cx));
+            drop(swaps.start_setup_progress(operation, SetupSide::Origin, setup_broadcaster(), cx));
             swaps.finish_setup_progress(
                 operation,
                 SetupSide::Origin,
@@ -2890,7 +2968,7 @@ fn a_setup_failure_is_told_on_its_stage_or_as_the_swaps_error(cx: &mut TestAppCo
                 if stages {
                     // The setup reported its first stage before its job failed.
                     swaps
-                        .start_setup_progress(operation, SetupSide::Origin, cx)
+                        .start_setup_progress(operation, SetupSide::Origin, setup_broadcaster(), cx)
                         .0
                         .send(TransactionGenerationStage::SelectingPrivateNotes)
                         .unwrap();
@@ -7668,6 +7746,14 @@ fn setup_offer(
     }
 }
 
+/// The broadcaster a test's setup progress was sent to.
+fn setup_broadcaster() -> PublicBroadcasterCandidate {
+    crate::root::private_swap::setup_progress::stand_in_setup_broadcaster(1, None)
+}
+
+// The address of `setup_broadcaster`.
+use crate::root::private_swap::setup_progress::STAND_IN_SETUP_BROADCASTER as SETUP_BROADCASTER;
+
 /// The wallet's operation client, as the form opens one for each fee estimate.
 fn operation_client(
     root: &Entity<WalletRoot>,
@@ -7688,8 +7774,18 @@ fn setup_progress_of_each_side_advances_and_ends_by_itself(cx: &mut TestAppConte
         let ((origin, _origin_route), (destination, _destination_route)) =
             swaps.update(cx, |swaps, cx| {
                 (
-                    swaps.start_setup_progress(operation, SetupSide::Origin, cx),
-                    swaps.start_setup_progress(operation, SetupSide::Destination, cx),
+                    swaps.start_setup_progress(
+                        operation,
+                        SetupSide::Origin,
+                        setup_broadcaster(),
+                        cx,
+                    ),
+                    swaps.start_setup_progress(
+                        operation,
+                        SetupSide::Destination,
+                        setup_broadcaster(),
+                        cx,
+                    ),
                 )
             });
         let running = |side, cx: &mut gpui::VisualTestContext| {
@@ -7729,6 +7825,48 @@ fn setup_progress_of_each_side_advances_and_ends_by_itself(cx: &mut TestAppConte
             running(SetupSide::Destination, cx),
             Some(TransactionGenerationStage::PublishingToBroadcaster)
         );
+    });
+}
+
+/// Stopping a private Bridge swap's setup wait ends the setup that still waited unanswered.
+/// The other one's submission already ended, so its broadcaster answered: the job's stop
+/// loses that answer, and the setup keeps no stages that would claim none came.
+#[gpui::test]
+fn stopping_a_setup_wait_leaves_an_answered_setup_to_its_record(cx: &mut TestAppContext) {
+    use super::super::setup_progress::{SetupProgress, SetupProgressEnd};
+
+    with_swap_view(cx, |_, swaps, _, operation, runtime, cx| {
+        let [(_origin, origin_route), _destination] = swaps.update(cx, |swaps, cx| {
+            swaps.job = Some(SwapJob {
+                operation,
+                kind: SwapJobKind::Setup,
+                abort: runtime.spawn(std::future::pending::<()>()).abort_handle(),
+            });
+            [SetupSide::Origin, SetupSide::Destination].map(|side| {
+                let (stages, route) =
+                    swaps.start_setup_progress(operation, side, setup_broadcaster(), cx);
+                stages
+                    .send(TransactionGenerationStage::WaitingForBroadcasterResponse)
+                    .unwrap();
+                (stages, route)
+            })
+        });
+        // The origin's broadcaster answered: its submission closed its route, and its job
+        // still waits for the destination's.
+        origin_route.send_modify(|route| route.state = wallet_ops::SubmissionRouteState::Closed);
+
+        swaps.update(cx, |swaps, _| swaps.stop_setup_wait(operation));
+        swaps.read_with(cx, |swaps, _| {
+            assert!(swaps.job.is_none());
+            let tracking = &swaps.tracking[&operation];
+            assert!(tracking.setup_progress(SetupSide::Origin).is_none());
+            assert_eq!(
+                tracking
+                    .setup_progress(SetupSide::Destination)
+                    .and_then(SetupProgress::end),
+                Some(SetupProgressEnd::TimedOut)
+            );
+        });
     });
 }
 
@@ -8553,7 +8691,12 @@ fn private_bridge_setups_show_side_by_side_until_each_is_confirmed(cx: &mut Test
                 ),
             );
             swaps.update(cx, |swaps, cx| {
-                drop(swaps.start_setup_progress(source, SetupSide::Destination, cx));
+                drop(swaps.start_setup_progress(
+                    source,
+                    SetupSide::Destination,
+                    setup_broadcaster(),
+                    cx,
+                ));
                 swaps.finish_setup_progress(
                     source,
                     SetupSide::Destination,
@@ -8774,7 +8917,7 @@ fn retrying_the_destination_setup_keeps_the_source_setups_progress(cx: &mut Test
                     swaps.reload_destinations(cx);
                     // No broadcaster answered either setup, and each account was read since.
                     for side in [SetupSide::Origin, SetupSide::Destination] {
-                        drop(swaps.start_setup_progress(source, side, cx));
+                        drop(swaps.start_setup_progress(source, side, setup_broadcaster(), cx));
                         swaps.finish_setup_progress(
                             source,
                             side,

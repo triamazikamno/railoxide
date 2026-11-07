@@ -12,8 +12,8 @@ use std::time::Instant;
 use gpui::Task;
 use tokio::sync::watch;
 use wallet_ops::{
-    PublicBroadcasterResultKind, SubmissionRouteProgress, SubmissionRouteState,
-    TransactionGenerationStage,
+    PublicBroadcasterCandidate, PublicBroadcasterResultKind, SubmissionRouteProgress,
+    SubmissionRouteState, TransactionGenerationStage,
 };
 
 use super::form::broadcaster_result_problem;
@@ -54,12 +54,15 @@ pub(super) struct SetupProgress {
     watch: Option<Task<()>>,
     /// When the setup began to wait for a broadcaster's answer, as its watch saw it.
     waiting_since: Rc<Cell<Option<Instant>>>,
+    /// The broadcaster the setup was sent to.
+    broadcaster: PublicBroadcasterCandidate,
 }
 
 impl SetupProgress {
-    /// A setup whose job reports its stages through `receiver`, and its submission's route
-    /// through `route`.
+    /// A setup sent to `broadcaster` whose job reports its stages through `receiver`, and its
+    /// submission's route through `route`.
     pub(super) fn running(
+        broadcaster: PublicBroadcasterCandidate,
         receiver: watch::Receiver<TransactionGenerationStage>,
         route: watch::Receiver<SubmissionRouteProgress>,
         watch: Option<Task<()>>,
@@ -71,7 +74,13 @@ impl SetupProgress {
             end: None,
             watch,
             waiting_since: Rc::default(),
+            broadcaster,
         }
+    }
+
+    /// The broadcaster the setup was sent to, while its job runs and after it ended.
+    pub(super) const fn broadcaster(&self) -> &PublicBroadcasterCandidate {
+        &self.broadcaster
     }
 
     /// The setup with `waiting_since`, which its watch sets once the setup waits for a
@@ -82,9 +91,13 @@ impl SetupProgress {
     }
 
     /// Whether the setup still waits for a broadcaster's answer after the re-sends that offer
-    /// to send it again, `SWAP_SETUP_RETRY_RESENDS`.
+    /// to send it again, `SWAP_SETUP_RETRY_RESENDS`. A setup whose submission ended, its route
+    /// closed, no longer waits, even before its job ends.
     pub(super) fn wait_outlasted(&self) -> bool {
         self.stage() == Some(TransactionGenerationStage::WaitingForBroadcasterResponse)
+            && self
+                .route()
+                .is_some_and(|route| route.state != SubmissionRouteState::Closed)
             && self.resends() >= SWAP_SETUP_RETRY_RESENDS
     }
 
@@ -227,6 +240,39 @@ pub(super) fn setup_route_card<'a>(
     })
 }
 
+/// The address of [`stand_in_setup_broadcaster`].
+#[cfg(any(test, debug_assertions))]
+pub(super) const STAND_IN_SETUP_BROADCASTER: &str = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecrtxlp8lemrv7j6fe3z53ll0jm7u592n0hr8elesd0xzv6y9jpdvsyln80m95jcxhvnmagfqg5p6e9mp";
+
+/// A broadcaster on `chain_id` that a setup can name without one having been chosen, for the
+/// debug UI fixture and tests. `name` is its identifier.
+#[cfg(any(test, debug_assertions))]
+pub(super) fn stand_in_setup_broadcaster(
+    chain_id: u64,
+    name: Option<&str>,
+) -> PublicBroadcasterCandidate {
+    let address_data = wallet_ops::parse_railgun_recipient(STAND_IN_SETUP_BROADCASTER)
+        .expect("the stand-in broadcaster's address parses");
+    PublicBroadcasterCandidate {
+        chain_id,
+        railgun_address: STAND_IN_SETUP_BROADCASTER.to_owned(),
+        identifier: name.map(str::to_owned),
+        token: alloy::primitives::Address::ZERO,
+        fee: alloy::primitives::U256::ZERO,
+        fees_id: "stand-in".to_owned(),
+        fee_expiration: std::time::SystemTime::now(),
+        reliability: 1.0,
+        available_wallets: 1,
+        version: "8.2.3".to_owned(),
+        relay_adapt: None,
+        relay_adapt_7702: None,
+        required_poi_list_keys: Vec::new(),
+        viewing_public_key: address_data.viewing_public_key,
+        address_data,
+        fee_policy_status: wallet_ops::BroadcasterFeePolicyStatus::UnknownAnchor,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::PublicActionStepStatus::{Done, Error, NotStarted, Pending};
@@ -245,7 +291,12 @@ mod tests {
         stages.send(stage).unwrap();
         let (routes, route_receiver) = watch::channel(route);
         (
-            SetupProgress::running(receiver, route_receiver, None),
+            SetupProgress::running(
+                stand_in_setup_broadcaster(1, None),
+                receiver,
+                route_receiver,
+                None,
+            ),
             stages,
             routes,
         )
@@ -315,7 +366,8 @@ mod tests {
     }
 
     /// Retry setup… waits for five re-sends the route made: a route that reconnected through
-    /// more than five republish intervals re-sent fewer.
+    /// more than five republish intervals re-sent fewer. A submission that ended, as one side
+    /// of a paired job does before the job ends, no longer waits.
     #[test]
     fn the_retry_waits_for_five_actual_resends() {
         let (progress, _stages, routes) = running(
@@ -329,6 +381,8 @@ mod tests {
         assert!(!progress.wait_outlasted());
         routes.send_modify(|route| route.publishes = 6);
         assert!(progress.wait_outlasted());
+        routes.send_modify(|route| route.state = SubmissionRouteState::Closed);
+        assert!(!progress.wait_outlasted());
     }
 
     /// One chip covers a swap's running setups: the least ready route, with the peers of
@@ -411,7 +465,8 @@ mod tests {
     fn a_failure_before_the_first_stage_is_no_stages_failure() {
         let (_sender, receiver) = watch::channel(TransactionGenerationStage::SelectingPrivateNotes);
         let (_routes, route) = watch::channel(SubmissionRouteProgress::default());
-        let mut progress = SetupProgress::running(receiver, route, None);
+        let mut progress =
+            SetupProgress::running(stand_in_setup_broadcaster(1, None), receiver, route, None);
         assert!(!progress.finish(Err("The account can't be used.".to_owned())));
         assert_eq!(progress.end(), None);
         assert_eq!(progress.problem(), None);
@@ -467,5 +522,10 @@ mod tests {
         assert_eq!(statuses(&submitted), [Done; 6]);
         assert!(messages(&submitted).iter().all(Option::is_none));
         assert_eq!(submitted.problem(), None);
+        // The broadcaster stays named after the job ended, for its preference control.
+        assert_eq!(
+            submitted.broadcaster().railgun_address,
+            STAND_IN_SETUP_BROADCASTER
+        );
     }
 }

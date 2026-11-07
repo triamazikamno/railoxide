@@ -62,9 +62,11 @@ use crate::assets::WalletIconSource;
 use crate::root::broadcaster_picker::broadcaster_candidate_label;
 use crate::root::dialog_max_height;
 use crate::root::private_broadcaster::{
-    private_broadcaster_stage_detail, private_broadcaster_stage_id, private_broadcaster_stage_label,
+    broadcaster_preference_control, private_broadcaster_stage_detail, private_broadcaster_stage_id,
+    private_broadcaster_stage_label, render_broadcaster_preference_control,
 };
 use crate::root::public_action::PublicActionStepStatus;
+use crate::root::public_broadcaster_cost::private_broadcaster_context_row_with_action;
 use crate::root::spend_authorization::{
     SpendAuthorizationSteps, SpendAuthorizationSummary, SpendAuthorizationSummaryRow,
     render_spend_authorization_steps,
@@ -868,12 +870,23 @@ impl PrivateSwapsView {
                             )
                             .into_any_element()
                     });
-            render_submission_progress_stepper(setup_steps(
+            let stepper = render_submission_progress_stepper(setup_steps(
                 operation,
                 setup,
                 self.shown_setup_progress(operation, side),
                 retry,
-            ))
+            ));
+            match self.render_setup_broadcaster(operation, side, cx) {
+                Some(broadcaster) => div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(stepper)
+                    .child(broadcaster),
+                None => stepper,
+            }
         };
         let mut steppers = setups.iter().zip(retries).map(stepper);
         if let [setup] = setups
@@ -924,6 +937,71 @@ impl PrivateSwapsView {
                     }))
                     .child(stepper)
             }))
+    }
+
+    /// The Broadcaster row under `side`'s stages: the broadcaster this session sent the setup
+    /// to, with its preference state, and Ban once the setup's wait outlasted its re-sends.
+    /// A setup without this session's stages has none.
+    fn render_setup_broadcaster(
+        &self,
+        operation: ExecutorOperationId,
+        side: SetupSide,
+        cx: &Context<'_, Self>,
+    ) -> Option<gpui::Div> {
+        use crate::root::private_broadcaster::BroadcasterPreferenceControl::{
+            AddFavorite, Ban, Banned, Favorited,
+        };
+
+        let progress = self.shown_setup_progress(operation, side)?;
+        let broadcaster = progress.broadcaster();
+        let address = broadcaster.railgun_address.as_str();
+        let control = {
+            let root = self.root.upgrade()?;
+            let root = root.read(cx);
+            broadcaster_preference_control(
+                root.is_banned_broadcaster(address),
+                root.is_favorite_broadcaster(address),
+                progress.end() == Some(SetupProgressEnd::Submitted),
+                progress.wait_outlasted(),
+            )
+        };
+        let side_id = match side {
+            SetupSide::Origin => "origin",
+            SetupSide::Destination => "destination",
+        };
+        let action = control.map(|control| {
+            let state = match control {
+                Banned => "banned",
+                Favorited => "favorited",
+                AddFavorite => "favorite",
+                Ban => "ban",
+            };
+            let view = cx.weak_entity();
+            div()
+                .flex_none()
+                .debug_selector(move || format!("swap-setup-broadcaster-{state}-{side_id}"))
+                .child(render_broadcaster_preference_control(
+                    control,
+                    SharedString::from(format!(
+                        "swap-setup-broadcaster-{}-{side_id}",
+                        operation.opaque_id()
+                    )),
+                    address,
+                    self.root.clone(),
+                    move |cx| {
+                        let _ = view.update(cx, |_, cx| cx.notify());
+                    },
+                ))
+                .into_any_element()
+        });
+        Some(
+            private_broadcaster_context_row_with_action(
+                "Broadcaster",
+                broadcaster_candidate_label(broadcaster),
+                action,
+            )
+            .debug_selector(move || format!("swap-setup-broadcaster-{side_id}")),
+        )
     }
 
     /// The stealth accounts of a swap that set one up, as facts: the swap's own, or for a

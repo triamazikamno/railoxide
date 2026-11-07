@@ -6856,11 +6856,23 @@ impl PrivateSwapsView {
             .clear_setup_progress();
         let (progress, route_tx) = approval
             .origin
-            .is_some()
-            .then(|| self.start_setup_progress(operation, SetupSide::Origin, cx))
+            .as_ref()
+            .map(|origin| {
+                self.start_setup_progress(
+                    operation,
+                    SetupSide::Origin,
+                    origin.candidate.clone(),
+                    cx,
+                )
+            })
             .unzip();
-        let (destination_progress, destination_route_tx) = sends_destination
-            .then(|| self.start_setup_progress(operation, SetupSide::Destination, cx))
+        let (destination_progress, destination_route_tx) = destination
+            .as_ref()
+            .and_then(|destination| destination.plan.setup())
+            .map(|setup| setup.candidate.clone())
+            .map(|candidate| {
+                self.start_setup_progress(operation, SetupSide::Destination, candidate, cx)
+            })
             .unzip();
         let bounds = &approval.approval.bounds;
         // An existing account's swap has no order yet for its progress to show, so its draft
@@ -7341,13 +7353,15 @@ impl PrivateSwapsView {
         cx.notify();
     }
 
-    /// Start a new attempt's progress for `side` of the swap `operation` in place of what an
-    /// earlier attempt left, and return the senders its setup reports its stages and its
-    /// route through. The view redraws on each stage and each change of the route.
+    /// Start a new attempt's progress for `side` of the swap `operation`, sent to
+    /// `broadcaster`, in place of what an earlier attempt left, and return the senders its
+    /// setup reports its stages and its route through. The view redraws on each stage and each
+    /// change of the route.
     fn start_setup_progress(
         &mut self,
         operation: ExecutorOperationId,
         side: SetupSide,
+        broadcaster: PublicBroadcasterCandidate,
         cx: &Context<'_, Self>,
     ) -> (
         tokio::sync::watch::Sender<TransactionGenerationStage>,
@@ -7392,7 +7406,7 @@ impl PrivateSwapsView {
         });
         let tracking = self.tracking.entry(operation).or_default();
         *tracking.setup_progress_mut(side) = Some(
-            SetupProgress::running(receiver, route_receiver, Some(watch))
+            SetupProgress::running(broadcaster, receiver, route_receiver, Some(watch))
                 .waiting_since(waiting_since),
         );
         (progress, route)

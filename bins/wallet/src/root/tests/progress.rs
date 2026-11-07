@@ -1,5 +1,6 @@
 use super::*;
 use crate::root::private_broadcaster::{
+    BroadcasterPreferenceControl, broadcaster_preference_control,
     cancel_private_broadcaster_progress, gateway_self_broadcast_result,
     private_broadcaster_progress_dialog_close_behavior, private_broadcaster_progress_is_terminal,
     private_broadcaster_route_card, request_sponsored_session_cancel,
@@ -1377,5 +1378,30 @@ fn test_self_broadcast_result(status: bool) -> DesktopSelfBroadcastResult {
         }),
         attempts: Vec::new(),
         native_top_up: None,
+    }
+}
+
+/// Banned wins over every other state, the favorite state shows only after submission, and
+/// Ban only while the flow offers it before a submission.
+#[test]
+fn broadcaster_preference_control_follows_ban_then_submission() {
+    use BroadcasterPreferenceControl::{AddFavorite, Ban, Banned, Favorited};
+    // (banned, favorite, submitted, ban_offered)
+    let cases = [
+        ((true, true, true, true), Some(Banned)),
+        ((true, false, false, false), Some(Banned)),
+        ((false, true, true, true), Some(Favorited)),
+        ((false, false, true, true), Some(AddFavorite)),
+        ((false, true, false, false), None),
+        ((false, true, false, true), Some(Ban)),
+        ((false, false, false, true), Some(Ban)),
+        ((false, false, false, false), None),
+    ];
+    for ((banned, favorite, submitted, ban_offered), expected) in cases {
+        assert_eq!(
+            broadcaster_preference_control(banned, favorite, submitted, ban_offered),
+            expected,
+            "banned={banned} favorite={favorite} submitted={submitted} ban_offered={ban_offered}"
+        );
     }
 }

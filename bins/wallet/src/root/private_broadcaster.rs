@@ -1185,41 +1185,80 @@ impl WalletRoot {
         root: &Entity<Self>,
         progress: &PrivateBroadcasterProgressState,
     ) -> Option<gpui::AnyElement> {
-        use ui::private_submission::OperationControl;
-
         let address = public_broadcaster_progress_address(progress)?;
-        if self.is_banned_broadcaster(address) {
-            return Some(
-                render_broadcaster_preference_progress_chip("Banned", theme::DANGER, None)
-                    .into_any_element(),
-            );
-        }
-
         let submitted = progress.result.as_ref().is_some_and(|result| {
             matches!(
                 &result.result,
                 PublicBroadcasterResultKind::Submitted { .. }
             )
         });
-        if submitted && self.is_favorite_broadcaster(address) {
-            return Some(
-                render_broadcaster_preference_progress_chip(
-                    "Favorited",
-                    theme::WARNING,
-                    Some(IconName::Star),
-                )
-                .into_any_element(),
-            );
+        let control = broadcaster_preference_control(
+            self.is_banned_broadcaster(address),
+            self.is_favorite_broadcaster(address),
+            submitted,
+            public_broadcaster_waiting_can_stop(progress) && !progress.stop_available,
+        )?;
+        Some(render_broadcaster_preference_control(
+            control,
+            delivery_element_id(progress.key, progress.kind, "broadcaster-preference"),
+            address,
+            root.downgrade(),
+            |_| {},
+        ))
+    }
+}
+
+/// What a submission's progress shows of its broadcaster's preference state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::root) enum BroadcasterPreferenceControl {
+    Banned,
+    Favorited,
+    AddFavorite,
+    Ban,
+}
+
+/// The preference indicator or control of a submission's broadcaster: Banned whenever it is
+/// banned, the favorite state once it `submitted`, and Ban while the flow has `ban_offered`.
+pub(in crate::root) const fn broadcaster_preference_control(
+    banned: bool,
+    favorite: bool,
+    submitted: bool,
+    ban_offered: bool,
+) -> Option<BroadcasterPreferenceControl> {
+    match (banned, submitted, favorite, ban_offered) {
+        (true, ..) => Some(BroadcasterPreferenceControl::Banned),
+        (false, true, true, _) => Some(BroadcasterPreferenceControl::Favorited),
+        (false, true, false, _) => Some(BroadcasterPreferenceControl::AddFavorite),
+        (false, false, _, true) => Some(BroadcasterPreferenceControl::Ban),
+        (false, false, _, false) => None,
+    }
+}
+
+/// Draw `control` for the broadcaster at `address`. Its buttons' IDs start with `id_prefix`,
+/// and a click changes `root`'s preferences, then calls `on_change`.
+pub(in crate::root) fn render_broadcaster_preference_control(
+    control: BroadcasterPreferenceControl,
+    id_prefix: SharedString,
+    address: &str,
+    root: gpui::WeakEntity<WalletRoot>,
+    on_change: impl Fn(&mut App) + 'static,
+) -> AnyElement {
+    use ui::private_submission::OperationControl;
+
+    let address = address.to_owned();
+    match control {
+        BroadcasterPreferenceControl::Banned => {
+            render_broadcaster_preference_progress_chip("Banned", theme::DANGER, None)
+                .into_any_element()
         }
-        let action_root = root.clone();
-        let address = address.to_owned();
-        if submitted {
-            return Some(
-                app_button_base(delivery_element_id(
-                    progress.key,
-                    progress.kind,
-                    "broadcaster-preference-favorite",
-                ))
+        BroadcasterPreferenceControl::Favorited => render_broadcaster_preference_progress_chip(
+            "Favorited",
+            theme::WARNING,
+            Some(IconName::Star),
+        )
+        .into_any_element(),
+        BroadcasterPreferenceControl::AddFavorite => {
+            app_button_base(SharedString::from(format!("{id_prefix}-favorite")))
                 .outline()
                 .xsmall()
                 .flex_none()
@@ -1229,30 +1268,25 @@ impl WalletRoot {
                     "Save this broadcaster to your favorites so future transactions can prefer it.",
                 )
                 .on_click(move |_event, _window, cx| {
-                    action_root.update(cx, |root, cx| {
+                    let _ = root.update(cx, |root, cx| {
                         root.add_favorite_broadcaster(&address, cx);
                     });
+                    on_change(cx);
                 })
-                .into_any_element(),
-            );
+                .into_any_element()
         }
-        let can_ban = public_broadcaster_waiting_can_stop(progress) && !progress.stop_available;
-        if !can_ban {
-            return None;
-        }
-        Some(
-            ui::private_submission::operation_controls(
-                delivery_element_id(progress.key, progress.kind, "broadcaster-preference"),
-                [OperationControl::Ban],
-                move |_control, _, cx| {
-                    action_root.update(cx, |root, cx| {
-                        root.add_banned_broadcaster(&address, cx);
-                    });
-                },
-            )
-            .flex_none()
-            .into_any_element(),
+        BroadcasterPreferenceControl::Ban => ui::private_submission::operation_controls(
+            id_prefix,
+            [OperationControl::Ban],
+            move |_control, _, cx| {
+                let _ = root.update(cx, |root, cx| {
+                    root.add_banned_broadcaster(&address, cx);
+                });
+                on_change(cx);
+            },
         )
+        .flex_none()
+        .into_any_element(),
     }
 }
 
@@ -1328,7 +1362,7 @@ fn public_broadcaster_progress_address(progress: &PrivateBroadcasterProgressStat
     )
 }
 
-fn render_broadcaster_preference_progress_chip(
+pub(in crate::root) fn render_broadcaster_preference_progress_chip(
     label: &'static str,
     color: u32,
     icon: Option<IconName>,

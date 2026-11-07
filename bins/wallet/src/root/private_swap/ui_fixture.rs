@@ -2322,7 +2322,12 @@ fn running_setup_progress(
     let _ = sender.send(stage);
     let (route_sender, route) = tokio::sync::watch::channel(route);
     hold_route(route_sender);
-    SetupProgress::running(receiver, route, None)
+    // A long identifier shows how the Broadcaster row wraps in a narrow column.
+    let broadcaster = super::setup_progress::stand_in_setup_broadcaster(
+        SWAP_ORIGIN,
+        Some("fixture-relay.example"),
+    );
+    SetupProgress::running(broadcaster, receiver, route, None)
 }
 
 /// Keep a mode's route sender for as long as the wallet runs, as a running job keeps its own,
