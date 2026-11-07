@@ -10,20 +10,20 @@ sources:
   - type: archive
     only-arches:
       - x86_64
-    url: https://static.rust-lang.org/dist/2026-07-16/rust-1.97.1-x86_64-unknown-linux-gnu.tar.xz
-    sha256: 88f28fa9af20594179f85d6df67078dfd6fa93e2f6da5e1e9b0ac4997988ca4f
+    url: https://static.rust-lang.org/dist/2026-10-15/rust-1.99.1-x86_64-unknown-linux-gnu.tar.xz
+    sha256: 231fcae47ee950621374725b5fc3b5441d2fbda2955ac45dd7dc816d8876cfe7
     dest: rust-toolchain
     strip-components: 1
   - type: archive
-    url: https://static.rust-lang.org/dist/2026-07-16/rust-std-1.97.1-wasm32-unknown-unknown.tar.xz
-    sha256: fa0edb6e9f34faae5735554d62d50875eded839dc707d0f1c01467a918d8453b
+    url: https://static.rust-lang.org/dist/2026-10-15/rust-std-1.99.1-wasm32-unknown-unknown.tar.xz
+    sha256: 5f628f857dd00a8aa3fcac2e275665d2782066a5795274ed124c5b560f46423c
     dest: rust-wasm-std
     strip-components: 1
   - type: archive
     only-arches:
       - aarch64
-    url: https://static.rust-lang.org/dist/2026-07-16/rust-1.97.1-aarch64-unknown-linux-gnu.tar.xz
-    sha256: 9a7a2c336b4787f1b72f6bab7c35d5b7af2fd03cbd39b4fc721466a70d402a7d
+    url: https://static.rust-lang.org/dist/2026-10-15/rust-1.99.1-aarch64-unknown-linux-gnu.tar.xz
+    sha256: a48fb1e853be56ce9b8e2751f5464dbd5e16440cd81e237920f3a5e7e806333e
     dest: rust-toolchain
     strip-components: 1
 cleanup:
