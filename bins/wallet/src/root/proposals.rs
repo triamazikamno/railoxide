@@ -4708,6 +4708,8 @@ fn render_proposal_blocks(
                 source.clone(),
             )
             .selectable(true)
+            // A link that survives sanitizing must not open the browser outside Tor.
+            .on_link_click(|_, _, _, _| {})
             .into_any_element(),
             ProposalBlock::Table(table) => {
                 let scroll = table_scroll_handles
@@ -4725,7 +4727,8 @@ fn render_proposal_blocks(
                 .w(px(f32::from(table.render_width_px)))
                 .min_w_full()
                 .flex_none()
-                .selectable(true);
+                .selectable(true)
+                .on_link_click(|_, _, _, _| {});
                 let mut table_scroller = div()
                     .id(SharedString::from(format!("{table_id}-scroll")))
                     .w_full()

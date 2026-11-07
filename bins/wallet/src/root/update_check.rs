@@ -597,6 +597,8 @@ fn render_release_notes(tag: &str, body: Option<&str>) -> AnyElement {
         source,
     )
     .selectable(true)
+    // A link that survives sanitizing must not open the browser outside Tor.
+    .on_link_click(|_, _, _, _| {})
     .into_any_element()
 }
 
