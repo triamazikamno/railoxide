@@ -6823,15 +6823,15 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
                         .into_iter()
                         .chain(non_evm)
                         .collect::<Vec<_>>(),
-                    "the same order, with the Public-address-only chains after, then Bitcoin, \
-                     Solana and Tron last"
+                    "the same order, with the Public-address-only chains after, then the \
+                     non-EVM networks last"
                 );
                 let content = swaps.buy_picker_content(swaps.form.as_ref().unwrap(), cx);
                 assert_eq!(content.receive_to, ReceiveTo::PrivateBalance);
                 assert_eq!(
                     content.network_counts,
-                    (2, 7),
-                    "Gnosis, the added chain and the three non-EVM networks take a Public \
+                    (2, 8),
+                    "Gnosis, the added chain and the four non-EVM networks take a Public \
                      address only"
                 );
             });
@@ -6855,7 +6855,7 @@ fn buy_picker_lists_chains_without_railgun_for_a_public_address(cx: &mut TestApp
                 let content = swaps.buy_picker_content(swaps.form.as_ref().unwrap(), cx);
                 assert_eq!(
                     content.network_counts,
-                    (2, 7),
+                    (2, 8),
                     "the counts don't depend on the delivery kind"
                 );
 
@@ -12297,13 +12297,38 @@ fn non_evm_networks_list_1click_tokens_and_take_their_own_receivers(cx: &mut Tes
 }
 
 /// A Bitcoin receiver is checked as a mainnet address, and a new one is saved to the non-EVM
-/// address book with network Bitcoin while the field keeps it.
+/// address book with network Bitcoin while the field keeps it. Zcash explains its own rules.
 #[gpui::test]
 fn new_bitcoin_receiver_saves_to_the_non_evm_address_book(cx: &mut TestAppContext) {
     const RECEIVER: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
     let stubs = SwapStubs::start();
     with_swap_view_and_rpc(cx, Some(stubs.rpc()), |root, swaps, _, _, runtime, cx| {
         open_bridge_form(root, swaps, &stubs, runtime, cx);
+        show_non_evm_network(swaps, NonEvmNetwork::Zcash, runtime, cx);
+        cx.update(|window, cx| {
+            swaps.update(cx, |swaps, cx| {
+                swaps.pick_non_evm_token(None, window, cx);
+                for (receiver, message) in [
+                    // A `t1` address with its last character changed.
+                    (
+                        "t1TD3bn8rTPyM8DJjMCM3vs1dhrtrspoDmi",
+                        "This isn't a valid Zcash address. Check it, including its checksum.",
+                    ),
+                    (
+                        "zs1z7rejlpsa98s2rrrfkwmaxu53e4ue0ulcrw0h4x5g8jl04tak0d3mm47vdtahatqrlkngh9slya",
+                        "The bridge can't pay a Sapling-only address. Enter a t1… address, or a \
+                         unified address (u1…) with an Orchard or transparent receiver.",
+                    ),
+                ] {
+                    set_receiver_text(swaps, receiver, window, cx);
+                    assert_eq!(
+                        swaps.form.as_ref().unwrap().delivery,
+                        Err(DeliveryProblem::Receiver(message.into()))
+                    );
+                }
+                swaps.open_buy_picker(window, cx);
+            });
+        });
         show_non_evm_network(swaps, NonEvmNetwork::Bitcoin, runtime, cx);
         cx.update(|window, cx| {
             swaps.update(cx, |swaps, cx| {
@@ -16450,6 +16475,7 @@ fn stub_bridge_list(path: &str) -> serde_json::Value {
             non_evm("sol", "USDC", Some(STUB_SOLANA_USDC), 6),
             non_evm("sol", "sUSDC", Some(STUB_SOLANA_SUSDC), 6),
             non_evm("btc", "BTC", None, 8),
+            non_evm("zec", "ZEC", None, 8),
         ])
     } else {
         serde_json::json!({})

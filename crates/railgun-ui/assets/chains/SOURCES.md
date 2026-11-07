@@ -33,3 +33,4 @@ Chain icon sources:
 - `bitcoin.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/networks/branded/bitcoin.svg` (MIT, `0xa3k5/web3icons`)
 - `solana.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/networks/branded/solana.svg` (MIT, `0xa3k5/web3icons`)
 - `tron.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/networks/branded/tron.svg` (MIT, `0xa3k5/web3icons`)
+- `zcash.svg`: `https://raw.githubusercontent.com/0xa3k5/web3icons/main/raw-svgs/tokens/branded/ZEC.svg` (MIT, `0xa3k5/web3icons`; the token icon, as it has no Zcash network icon)

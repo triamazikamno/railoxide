@@ -1332,15 +1332,7 @@ impl PrivateSwapsView {
                 let copy_id = SharedString::from(format!("swap-deposit-{id}-copy"));
                 hash_row("Deposit ID", id, copy_id, "Copy Across deposit ID")
             })
-            .or_else(|| {
-                near.map(|near| {
-                    address_row(
-                        "Deposit address",
-                        near.deposit_address,
-                        "Copy deposit address",
-                    )
-                })
-            });
+            .or_else(|| near.map(|near| near_deposit_row(near.deposit_address)));
         let settlement = attempts
             .and_then(|attempts| attempts.traded)
             .and_then(|traded| traded.observations().traded?.transaction_hash)
@@ -1498,7 +1490,7 @@ impl PrivateSwapsView {
                 rows.extend([destination, provider_row]);
                 rows.extend(settlement);
                 note = Some(format!(
-                    "Give {provider} support the deposit address. If 1Click refunds it, the {} goes to the stealth account on {origin}, and Check status finds it for recovery.",
+                    "Search the deposit address on explorer.near-intents.org to see where the swap is, and give {provider} support the address. If 1Click refunds it, the {} goes to the stealth account on {origin}, and Check status finds it for recovery.",
                     buy.map_or_else(|| "deposit".to_owned(), |buy| self.token_symbol(buy, cx))
                 ));
             }
@@ -1650,13 +1642,7 @@ impl PrivateSwapsView {
             "Provider",
             provider_mention(BridgeProvider::NearIntents, app_text),
         );
-        let deposit = near.map(|near| {
-            address_row(
-                "Deposit address",
-                near.deposit_address,
-                "Copy deposit address",
-            )
-        });
+        let deposit = near.map(|near| near_deposit_row(near.deposit_address));
         let settlement = attempts
             .and_then(|attempts| attempts.traded)
             .and_then(|traded| traded.observations().traded?.transaction_hash)
@@ -1744,7 +1730,7 @@ impl PrivateSwapsView {
                 rows.extend([receiver, destination, provider_row]);
                 rows.extend(settlement);
                 note = Some(format!(
-                    "Give {provider} support the deposit address. If 1Click refunds it, the {} goes to the stealth account on {origin}, and Check status finds it for recovery.",
+                    "Search the deposit address on explorer.near-intents.org to see where the swap is, and give {provider} support the address. If 1Click refunds it, the {} goes to the stealth account on {origin}, and Check status finds it for recovery.",
                     buy.map_or_else(|| "deposit".to_owned(), |buy| self.token_symbol(buy, cx))
                 ));
             }
@@ -3743,6 +3729,25 @@ pub(super) fn address_row(
             .child(app_strong_text(short).font_family(theme::APP_MONO_FONT_FAMILY))
             .child(clipboard_with_toast(copy_id, address).tooltip(tooltip)),
     )
+}
+
+/// A 1Click deposit address, which also identifies the swap on NEAR Intents' explorer.
+fn near_deposit_row(address: Address) -> gpui::Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(address_row(
+            "Deposit address",
+            address,
+            "Copy deposit address",
+        ))
+        .child(
+            app_muted_text("Search it on explorer.near-intents.org to follow the swap on NEAR.")
+                .whitespace_normal(),
+        )
 }
 
 /// A deposit address in full, so it can be read out or checked character by character. It

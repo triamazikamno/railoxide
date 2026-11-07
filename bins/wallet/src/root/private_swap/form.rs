@@ -1298,7 +1298,7 @@ pub(super) struct SwapForm {
     /// network, or the non-EVM network of `non_evm`. Receive to keeps it, so it may be one the
     /// delivery kind can't take.
     network: Option<u64>,
-    /// A Bitcoin, Solana or Tron destination, which NEAR Intents alone delivers to. `network`
+    /// A built-in non-EVM destination, which NEAR Intents alone delivers to. `network`
     /// is `None` while it is set, and `buy` too: the Buy asset is `non_evm_token`.
     non_evm: Option<NonEvmNetwork>,
     /// The non-EVM Buy asset by its 1Click mint or contract, `Some(None)` for the native asset.
@@ -14449,7 +14449,7 @@ fn non_evm_contract_row(delivery: &NonEvmDelivery) -> Option<SpendAuthorizationS
 const fn contract_label(network: NonEvmNetwork) -> &'static str {
     match network {
         NonEvmNetwork::Solana => "Mint",
-        NonEvmNetwork::Bitcoin | NonEvmNetwork::Tron => "Contract",
+        NonEvmNetwork::Bitcoin | NonEvmNetwork::Tron | NonEvmNetwork::Zcash => "Contract",
     }
 }
 
@@ -14493,6 +14493,7 @@ const fn receiver_placeholder(network: Option<NonEvmNetwork>) -> &'static str {
         Some(NonEvmNetwork::Bitcoin) => "Bitcoin address: bc1…, 1… or 3…",
         Some(NonEvmNetwork::Solana) => "Solana address",
         Some(NonEvmNetwork::Tron) => "Tron address: T…",
+        Some(NonEvmNetwork::Zcash) => "Zcash address: u1…, t1… or tex1…",
     }
 }
 
@@ -14514,7 +14515,15 @@ fn non_evm_receiver_message(network: NonEvmNetwork, error: NonEvmReceiverError) 
             NonEvmNetwork::Tron => {
                 "This isn't a valid Tron address. Check it, including its checksum.".to_owned()
             }
+            NonEvmNetwork::Zcash => {
+                "This isn't a valid Zcash address. Check it, including its checksum.".to_owned()
+            }
         },
+        NonEvmReceiverError::Sapling => {
+            "The bridge can't pay a Sapling-only address. Enter a t1… address, or a unified \
+             address (u1…) with an Orchard or transparent receiver."
+                .to_owned()
+        }
     }
 }
 

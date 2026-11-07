@@ -68,6 +68,9 @@ trezor-client = { workspace = true, optional = true }
 tracing = { workspace = true }
 url = { workspace = true }
 x25519-dalek = { workspace = true }
+# Decodes Zcash receivers. No release uses bech32 0.12, so this adds bech32 0.11.
+zcash_address = { version = "0.14.0", default-features = false }
+zcash_protocol = { version = "0.11.0", default-features = false }
 zeroize = { workspace = true }
 
 broadcaster-core = { workspace = true }

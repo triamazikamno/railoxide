@@ -12,6 +12,10 @@ const RAILGUN_ADDRESS: &str = "0zk1qy4v02p5zkq0zfpaxhz79j5tslrv8c44d80d8jr2fuecr
 const PUBLIC_ADDRESS: &str = "0x1111111111111111111111111111111111111111";
 const SOLANA_ADDRESS: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const BITCOIN_ADDRESS: &str = "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq";
+/// A unified address with Orchard and P2PKH receivers.
+const ZCASH_UNIFIED_ADDRESS: &str = "u17lpmx8t5cyk0uaaw0tzmsa8zs23w4wj6uteg4qhlqutpgeqeumtwjaa06l2x8af8gqkkw05fylg622czjahnwl6vtyqasrtzxawwtf0a2zak64zk7f52v2gsh7rqj6ln63sjz38v09h";
+const ZCASH_SAPLING_ADDRESS: &str =
+    "zs1z7rejlpsa98s2rrrfkwmaxu53e4ue0ulcrw0h4x5g8jl04tak0d3mm47vdtahatqrlkngh9slya";
 
 #[test]
 fn address_book_type_detection_uses_recipient_prefixes() {
@@ -46,7 +50,14 @@ fn address_book_validation_rejects_invalid_and_type_switched_values() {
     assert_eq!(
         address_book_entry_validation_message(None, "Bob", "not-an-address"),
         Some(
-            "Enter a 0zk private recipient, 0x public EVM address, or Bitcoin, Solana or Tron address"
+            "Enter a 0zk private recipient, 0x public EVM address, or Bitcoin, Solana, Tron or Zcash address"
+        )
+    );
+    assert_eq!(
+        address_book_entry_validation_message(None, "Shielded", ZCASH_SAPLING_ADDRESS),
+        Some(
+            "Sapling-only addresses aren't supported. Enter a t1… address, or a u1… address with \
+             an Orchard or transparent receiver"
         )
     );
     assert_eq!(
@@ -81,7 +92,7 @@ fn address_book_validation_rejects_invalid_and_type_switched_values() {
 }
 
 #[gpui::test]
-fn address_book_adds_a_solana_address_from_the_single_flow(cx: &mut gpui::TestAppContext) {
+fn address_book_adds_non_evm_addresses_from_the_single_flow(cx: &mut gpui::TestAppContext) {
     let path = temp_wallet_db_root("address-book-non-evm");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -111,6 +122,24 @@ fn address_book_adds_a_solana_address_from_the_single_flow(cx: &mut gpui::TestAp
         assert_eq!(
             (entry.label.as_str(), entry.network, entry.address.as_str()),
             ("Phantom", NonEvmNetwork::Solana, SOLANA_ADDRESS)
+        );
+
+        root.address_book
+            .add_label_input
+            .update(cx, |input, cx| input.set_value("Zashi", window, cx));
+        root.address_book.add_address_input.update(cx, |input, cx| {
+            input.set_value(ZCASH_UNIFIED_ADDRESS, window, cx);
+        });
+        assert!(root.add_address_book_entry_from_dialog(window, cx));
+        assert_eq!(
+            root.non_evm_address_book
+                .iter()
+                .map(|entry| (entry.label.as_str(), entry.network, entry.address.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("Phantom", NonEvmNetwork::Solana, SOLANA_ADDRESS),
+                ("Zashi", NonEvmNetwork::Zcash, ZCASH_UNIFIED_ADDRESS),
+            ]
         );
     });
 

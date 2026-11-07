@@ -64,6 +64,9 @@ impl AddressBookEntryKind {
             Self::NonEvm(NonEvmNetwork::Tron) => {
                 "Tron address-book entries must use a Tron address"
             }
+            Self::NonEvm(NonEvmNetwork::Zcash) => {
+                "Zcash address-book entries must use a Zcash address"
+            }
         }
     }
 
@@ -74,6 +77,7 @@ impl AddressBookEntryKind {
             Self::NonEvm(NonEvmNetwork::Bitcoin) => "Enter a valid mainnet Bitcoin address",
             Self::NonEvm(NonEvmNetwork::Solana) => "Enter a valid Solana address",
             Self::NonEvm(NonEvmNetwork::Tron) => "Enter a valid Tron address",
+            Self::NonEvm(NonEvmNetwork::Zcash) => "Enter a valid mainnet Zcash address",
         }
     }
 }
@@ -94,6 +98,7 @@ impl AddressBookDetectedType {
             Self::NonEvm(NonEvmNetwork::Bitcoin) => "Bitcoin recipient",
             Self::NonEvm(NonEvmNetwork::Solana) => "Solana recipient",
             Self::NonEvm(NonEvmNetwork::Tron) => "Tron recipient",
+            Self::NonEvm(NonEvmNetwork::Zcash) => "Zcash recipient",
             Self::Unknown => "Unknown type",
         }
     }
@@ -228,7 +233,13 @@ pub(in crate::root) fn address_book_entry_validation_message(
             // Detection only finds a network whose receiver format parses.
             AddressBookDetectedType::NonEvm(_) => None,
             AddressBookDetectedType::Unknown => Some(
-                "Enter a 0zk private recipient, 0x public EVM address, or Bitcoin, Solana or Tron address",
+                NonEvmNetwork::Zcash
+                    .parse_receiver(address)
+                    .err()
+                    .and_then(zcash_receiver_message)
+                    .unwrap_or(
+                        "Enter a 0zk private recipient, 0x public EVM address, or Bitcoin, Solana, Tron or Zcash address",
+                    ),
             ),
         },
     }
@@ -241,6 +252,7 @@ fn validate_address_for_kind(kind: AddressBookEntryKind, address: &str) -> Optio
             Err(NonEvmReceiverError::OtherNetwork(_)) => {
                 return Some(kind.type_validation_message());
             }
+            Err(error @ NonEvmReceiverError::Sapling) => return zcash_receiver_message(error),
             Err(NonEvmReceiverError::Testnet | NonEvmReceiverError::Invalid) => false,
         },
         _ if address_book_detected_type(address) != AddressBookDetectedType::from(kind) => {
@@ -250,6 +262,19 @@ fn validate_address_for_kind(kind: AddressBookEntryKind, address: &str) -> Optio
         AddressBookEntryKind::Public => address.parse::<Address>().is_ok(),
     };
     (!valid).then_some(kind.invalid_address_message())
+}
+
+/// Why a Zcash address that decodes can't be saved, when it is one of Zcash's own rules.
+const fn zcash_receiver_message(error: NonEvmReceiverError) -> Option<&'static str> {
+    match error {
+        NonEvmReceiverError::Sapling => Some(
+            "Sapling-only addresses aren't supported. Enter a t1… address, or a u1… address \
+             with an Orchard or transparent receiver",
+        ),
+        NonEvmReceiverError::Testnet
+        | NonEvmReceiverError::OtherNetwork(_)
+        | NonEvmReceiverError::Invalid => None,
+    }
 }
 
 fn filtered_private_address_book_entries<'a>(
@@ -1051,9 +1076,9 @@ fn address_book_error_message(error: &VaultError) -> String {
                 .type_validation_message()
                 .to_owned()
         }
-        VaultError::InvalidNonEvmAddressBookAddress(_) => {
-            "Enter a valid Bitcoin, Solana or Tron address".to_owned()
-        }
+        VaultError::InvalidNonEvmAddressBookAddress(error) => zcash_receiver_message(*error)
+            .unwrap_or("Enter a valid Bitcoin, Solana, Tron or Zcash address")
+            .to_owned(),
         VaultError::DuplicateNonEvmAddressBookAddress => {
             "This recipient is already saved for its network".to_owned()
         }

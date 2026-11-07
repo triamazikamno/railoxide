@@ -1355,7 +1355,7 @@ impl WalletRoot {
             add_address_input: new_text_input(
                 window,
                 cx,
-                "0zk, 0x, Bitcoin, Solana or Tron recipient",
+                "0zk, 0x, Bitcoin, Solana, Tron or Zcash recipient",
             ),
             edit_label_input: new_text_input(window, cx, "recipient label"),
             edit_address_input: new_text_input(window, cx, "recipient address"),
