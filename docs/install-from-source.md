@@ -40,7 +40,7 @@ powershell -ExecutionPolicy Bypass -File .\install-wallet.ps1
 - Uses the latest published GitHub release by default, including pre-releases.
 - Clones or updates `https://github.com/triamazikamno/railoxide.git`.
 - Stores the managed checkout at `~/.local/src/railoxide` on macOS/Linux and `%LOCALAPPDATA%\RailOxide\src\railoxide` on Windows by default.
-- Installs Rust `1.97.1` through `rustup` if needed.
+- Installs Rust `1.99.1` through `rustup` if needed.
 - Builds the wallet with hardware-wallet support enabled by default.
 - Builds and embeds the browser extension before compiling the wallet, and verifies the embedded ZIP.
 - Adds the WASM target to the selected Rust toolchain and prepares Python 3 and exactly the wasm-bindgen version pinned by the selected source's `scripts/browser-extension-tools.json`. A matching helper on `PATH` is reused; otherwise the installer downloads a checksum-pinned upstream binary into the checkout's `target/browser-extension-tools` directory.
