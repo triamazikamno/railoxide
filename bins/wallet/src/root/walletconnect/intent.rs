@@ -194,7 +194,7 @@ pub(super) struct WalletConnectTypedDataSummary {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct WalletConnectEip2612Permit {
+struct WalletConnectTokenPermit {
     token: Address,
     spender: Address,
     value: U256,
@@ -443,7 +443,7 @@ pub(super) fn build_walletconnect_intent<'a>(
         | WalletConnectParsedRequest::EthSignTypedDataV4 { typed_data, .. } => {
             let summary = typed_data_summary(typed_data);
             hero_summary = WalletConnectHeroSummary::TypedData(summary);
-            if let Some(permit) = parse_eip2612_permit(typed_data, selected_account) {
+            if let Some(permit) = parse_token_permit(typed_data, selected_account) {
                 action = WalletConnectIntentAction::Approve;
                 let (resolved_amount, resolved_icon) =
                     resolve_token_amount(context, Some(permit.token), permit.value, true);
@@ -1252,36 +1252,48 @@ fn typed_data_summary(value: &Value) -> WalletConnectTypedDataSummary {
     }
 }
 
-/// Reads the permit from the values Alloy signs, so JSON the signer ignores cannot hide it.
-fn parse_eip2612_permit(
+/// Reads an EIP-2612 or DAI-style permit from the values Alloy signs, so JSON the signer ignores
+/// cannot hide it.
+fn parse_token_permit(
     value: &Value,
     selected_account: Address,
-) -> Option<WalletConnectEip2612Permit> {
+) -> Option<WalletConnectTokenPermit> {
     let typed_data: TypedData = serde_json::from_value(value.clone()).ok()?;
-    if typed_data.encode_type().ok()?
-        != "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
-    {
-        return None;
-    }
+    let encode_type = typed_data.encode_type().ok()?;
     let token = typed_data.domain.verifying_contract?;
     let message = typed_data.coerce().ok()?;
-    let (
-        _,
-        _,
-        [
-            DynSolValue::Address(owner),
-            DynSolValue::Address(spender),
-            DynSolValue::Uint(value, 256),
-            ..,
-        ],
-    ) = message.as_custom_struct()?
-    else {
-        return None;
+    let (_, _, fields) = message.as_custom_struct()?;
+    let (owner, spender, value) = match (encode_type.as_str(), fields) {
+        (
+            "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)",
+            [
+                DynSolValue::Address(owner),
+                DynSolValue::Address(spender),
+                DynSolValue::Uint(value, 256),
+                ..,
+            ],
+        ) => (*owner, *spender, *value),
+        // DAI sets the allowance to `uint(-1)` when `allowed` is true and to zero otherwise.
+        (
+            "Permit(address holder,address spender,uint256 nonce,uint256 expiry,bool allowed)",
+            [
+                DynSolValue::Address(holder),
+                DynSolValue::Address(spender),
+                _,
+                _,
+                DynSolValue::Bool(allowed),
+            ],
+        ) => (
+            *holder,
+            *spender,
+            if *allowed { U256::MAX } else { U256::ZERO },
+        ),
+        _ => return None,
     };
-    (*owner == selected_account).then_some(WalletConnectEip2612Permit {
+    (owner == selected_account).then_some(WalletConnectTokenPermit {
         token,
-        spender: *spender,
-        value: *value,
+        spender,
+        value,
     })
 }
 
@@ -2155,6 +2167,47 @@ mod tests {
             permit_typed_data(token, account, spender, &json!(U256::MAX.to_string()));
         typed_data["message"]["memo"] = json!("x");
         typed_data["types"]["Permit"][0]["note"] = json!("x");
+        let request = request_with(
+            WalletConnectParsedRequest::EthSignTypedDataV4 {
+                account,
+                typed_data,
+                domain_chain_id: Some(U256::from(1)),
+            },
+            None,
+        );
+        let intent =
+            build_walletconnect_intent(&request, context(&chain, &registry, &rates, &[], &[]));
+
+        assert_eq!(intent.action, WalletConnectIntentAction::Approve);
+        assert_eq!(
+            intent.risks,
+            [WalletConnectRisk::UnlimitedAllowance { spender }]
+        );
+    }
+
+    #[test]
+    fn dai_style_permit_with_allowed_true_is_an_unlimited_approval() {
+        let account = Address::from([0x11; 20]);
+        let token = Address::from([0x22; 20]);
+        let spender = Address::from([0x33; 20]);
+        let chain = chain(None);
+        let registry = registry(token);
+        let rates = TokenAnchorRateCache::new();
+        let mut typed_data = permit_typed_data(token, account, spender, &json!("0"));
+        typed_data["types"]["Permit"] = json!([
+            {"name": "holder", "type": "address"},
+            {"name": "spender", "type": "address"},
+            {"name": "nonce", "type": "uint256"},
+            {"name": "expiry", "type": "uint256"},
+            {"name": "allowed", "type": "bool"}
+        ]);
+        typed_data["message"] = json!({
+            "holder": account.to_string(),
+            "spender": spender.to_string(),
+            "nonce": 0,
+            "expiry": 0,
+            "allowed": true
+        });
         let request = request_with(
             WalletConnectParsedRequest::EthSignTypedDataV4 {
                 account,
