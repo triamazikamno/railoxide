@@ -280,6 +280,10 @@ impl CowOrderbookClient {
     }
 
     /// `POST /api/v1/quote` for a sell order, with hook-free app data.
+    ///
+    /// A quote that doesn't echo the requested tokens and amount is
+    /// [`CowApiError::InvalidResponse`]: the signed order sells the requested amount at the
+    /// quote's price, so a quote for less would set the limit for a fraction of it.
     pub async fn quote_sell(&self, request: &CowSellQuoteRequest) -> Result<CowQuote, CowApiError> {
         let body = QuoteRequestBody {
             from: request.from,
@@ -293,12 +297,27 @@ impl CowOrderbookClient {
             app_data_hash: keccak256(QUOTE_APP_DATA.as_bytes()),
             signing_scheme: SIGNING_SCHEME_EIP712,
         };
-        let request = self
+        let http_request = self
             .http
             .client()
             .post(self.endpoint(&["api", "v1", "quote"]))
             .json(&body);
-        self.execute("quote", request, COW_QUOTE_TIMEOUT).await
+        let quote: CowQuote = self
+            .execute("quote", http_request, COW_QUOTE_TIMEOUT)
+            .await?;
+        let quoted = &quote.quote;
+        if quoted.sell_token != request.sell_token
+            || quoted.buy_token != request.buy_token
+            || quoted.sell_amount.checked_add(quoted.fee_amount)
+                != Some(request.sell_amount_before_fee)
+        {
+            tracing::debug!(
+                chain_id = self.chain_id,
+                "CoW quote doesn't match the requested tokens and amount"
+            );
+            return Err(CowApiError::InvalidResponse);
+        }
+        Ok(quote)
     }
 
     /// `POST /api/v1/orders`. This is the only request that carries signed hooks.

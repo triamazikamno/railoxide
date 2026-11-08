@@ -138,8 +138,8 @@ fn test_client(base_url: Url) -> CowOrderbookClient {
 
 fn quote_request() -> CowSellQuoteRequest {
     CowSellQuoteRequest {
-        sell_token: Address::repeat_byte(0xa0),
-        buy_token: Address::repeat_byte(0xc0),
+        sell_token: address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+        buy_token: address!("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"),
         from: Address::repeat_byte(0x11),
         receiver: Address::repeat_byte(0x11),
         sell_amount_before_fee: U256::from(1_000_000_000_u64),
@@ -276,6 +276,35 @@ async fn quote_request_carries_no_hooks_or_signed_payloads() {
     assert!(!serialized.contains("hooks"));
     assert!(!serialized.contains("signature"));
     assert!(!serialized.contains("callData"));
+}
+
+/// The signed order sells the requested amount, so a quote for a scaled-down amount at a fair
+/// price, or for another token, would set its limit and must be rejected.
+#[tokio::test]
+async fn quote_that_does_not_echo_the_request_is_rejected() {
+    for response in [
+        QUOTE_RESPONSE
+            .replace("\"998765432\"", "\"9987654\"")
+            .replace("\"1234568\"", "\"12346\"")
+            .replace("\"401234567890123456\"", "\"4012345678901234\""),
+        QUOTE_RESPONSE.replace("\"1234568\"", "\"1234567\""),
+        QUOTE_RESPONSE.replace(
+            "\"buyToken\": \"0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2\"",
+            "\"buyToken\": \"0xdac17f958d2ee523a2206206994597c13d831ec7\"",
+        ),
+        QUOTE_RESPONSE.replace(
+            "\"sellToken\": \"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48\"",
+            "\"sellToken\": \"0xdac17f958d2ee523a2206206994597c13d831ec7\"",
+        ),
+    ] {
+        assert_ne!(response, QUOTE_RESPONSE);
+        let (base_url, _) = spawn_orderbook_mock(200, &response).await;
+        let error = test_client(base_url)
+            .quote_sell(&quote_request())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CowApiError::InvalidResponse), "{error}");
+    }
 }
 
 #[test]
