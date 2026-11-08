@@ -672,51 +672,20 @@ impl WalletRoot {
                     self.walletconnect.error = None;
                 }
                 for (request, route) in result.pending_requests {
-                    if self
-                        .walletconnect
-                        .pending_requests
-                        .get(&request.key)
-                        .is_some_and(|existing| {
-                            existing.review_token != request.review_token
-                                || existing.item.raw_details != request.item.raw_details
-                        })
-                    {
-                        let request_key = request.key.clone();
-                        self.walletconnect
-                            .request_routes
-                            .insert(request_key.clone(), route);
-                        self.walletconnect
-                            .pending_requests
-                            .insert(request_key.clone(), request);
-                        self.walletconnect
-                            .request_disclosure_states
-                            .remove(&request_key);
-                        if self.walletconnect.request_dialog_key.as_deref()
-                            == Some(request_key.as_str())
-                        {
-                            self.discard_walletconnect_fee_for_request_replacement();
-                        }
-                        continue;
-                    }
+                    // The first delivery of a key is what the user reviews; a resend never replaces it.
                     if !walletconnect_request_should_queue(
                         &self.walletconnect.pending_requests,
                         &self.walletconnect.handled_request_keys,
                         &request.key,
                     ) {
-                        if self
-                            .walletconnect
-                            .handled_request_keys
-                            .contains(&request.key)
-                        {
-                            tracing::info!(
-                                target: "wallet::root::walletconnect",
-                                request_key = %walletconnect_request_key_log_label(&request.key),
-                                method = request.item.method.as_str(),
-                                chain_id = request.item.chain_id.as_str(),
-                                dapp = request.item.dapp_name.as_str(),
-                                "ignored replayed walletconnect request"
-                            );
-                        }
+                        tracing::info!(
+                            target: "wallet::root::walletconnect",
+                            request_key = %walletconnect_request_key_log_label(&request.key),
+                            method = request.item.method.as_str(),
+                            chain_id = request.item.chain_id.as_str(),
+                            dapp = request.item.dapp_name.as_str(),
+                            "ignored replayed walletconnect request"
+                        );
                         continue;
                     }
                     self.walletconnect

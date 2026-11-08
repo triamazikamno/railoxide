@@ -1,3 +1,4 @@
+use alloy::dyn_abi::{DynSolValue, TypedData};
 use alloy::primitives::{Address, U256};
 use gpui::{Pixels, px};
 use railgun_ui::{format_usd_micro_value, native_currency_icon_asset_path};
@@ -1251,74 +1252,37 @@ fn typed_data_summary(value: &Value) -> WalletConnectTypedDataSummary {
     }
 }
 
+/// Reads the permit from the values Alloy signs, so JSON the signer ignores cannot hide it.
 fn parse_eip2612_permit(
     value: &Value,
     selected_account: Address,
 ) -> Option<WalletConnectEip2612Permit> {
-    if value.get("primaryType")?.as_str()? != "Permit" {
-        return None;
-    }
-    let fields = value.get("types")?.get("Permit")?.as_array()?;
-    let expected_fields = [
-        ("owner", "address"),
-        ("spender", "address"),
-        ("value", "uint256"),
-        ("nonce", "uint256"),
-        ("deadline", "uint256"),
-    ];
-    if fields.len() != expected_fields.len()
-        || !fields.iter().zip(expected_fields).all(|(field, expected)| {
-            let Some(field) = field.as_object() else {
-                return false;
-            };
-            field.len() == 2
-                && field.get("name").and_then(Value::as_str) == Some(expected.0)
-                && field.get("type").and_then(Value::as_str) == Some(expected.1)
-        })
+    let typed_data: TypedData = serde_json::from_value(value.clone()).ok()?;
+    if typed_data.encode_type().ok()?
+        != "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
     {
         return None;
     }
-
-    let domain = value.get("domain")?.as_object()?;
-    let token = domain
-        .get("verifyingContract")
-        .and_then(Value::as_str)
-        .and_then(|value| value.parse::<Address>().ok())?;
-    let message = value.get("message")?.as_object()?;
-    if message.len() != expected_fields.len() {
+    let token = typed_data.domain.verifying_contract?;
+    let message = typed_data.coerce().ok()?;
+    let (
+        _,
+        _,
+        [
+            DynSolValue::Address(owner),
+            DynSolValue::Address(spender),
+            DynSolValue::Uint(value, 256),
+            ..,
+        ],
+    ) = message.as_custom_struct()?
+    else {
         return None;
-    }
-    let owner = message
-        .get("owner")
-        .and_then(Value::as_str)
-        .and_then(|value| value.parse::<Address>().ok())?;
-    if owner != selected_account {
-        return None;
-    }
-    let spender = message
-        .get("spender")
-        .and_then(Value::as_str)
-        .and_then(|value| value.parse::<Address>().ok())?;
-    let value = parse_permit_u256(message.get("value")?)?;
-    parse_permit_u256(message.get("nonce")?)?;
-    parse_permit_u256(message.get("deadline")?)?;
-    Some(WalletConnectEip2612Permit {
+    };
+    (*owner == selected_account).then_some(WalletConnectEip2612Permit {
         token,
-        spender,
-        value,
+        spender: *spender,
+        value: *value,
     })
-}
-
-fn parse_permit_u256(value: &Value) -> Option<U256> {
-    if let Some(value) = value.as_u64() {
-        return Some(U256::from(value));
-    }
-    let value = value.as_str()?;
-    if let Some(value) = value.strip_prefix("0x") {
-        U256::from_str_radix(value, 16).ok()
-    } else {
-        U256::from_str_radix(value, 10).ok()
-    }
 }
 
 fn selector_label(selector: Option<[u8; 4]>) -> Option<String> {
@@ -2176,6 +2140,36 @@ mod tests {
             summary
                 .rows_for_test()
                 .contains(&("Typed data".to_owned(), "USD Coin / Permit".to_owned()))
+        );
+    }
+
+    #[test]
+    fn keys_the_signer_ignores_do_not_hide_an_unlimited_permit() {
+        let account = Address::from([0x11; 20]);
+        let token = Address::from([0x22; 20]);
+        let spender = Address::from([0x33; 20]);
+        let chain = chain(None);
+        let registry = registry(token);
+        let rates = TokenAnchorRateCache::new();
+        let mut typed_data =
+            permit_typed_data(token, account, spender, &json!(U256::MAX.to_string()));
+        typed_data["message"]["memo"] = json!("x");
+        typed_data["types"]["Permit"][0]["note"] = json!("x");
+        let request = request_with(
+            WalletConnectParsedRequest::EthSignTypedDataV4 {
+                account,
+                typed_data,
+                domain_chain_id: Some(U256::from(1)),
+            },
+            None,
+        );
+        let intent =
+            build_walletconnect_intent(&request, context(&chain, &registry, &rates, &[], &[]));
+
+        assert_eq!(intent.action, WalletConnectIntentAction::Approve);
+        assert_eq!(
+            intent.risks,
+            [WalletConnectRisk::UnlimitedAllowance { spender }]
         );
     }
 
