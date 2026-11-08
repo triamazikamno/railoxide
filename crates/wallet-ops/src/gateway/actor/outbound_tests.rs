@@ -1,7 +1,10 @@
 use super::*;
 use crate::gateway::{
     GatewayProviderOutcome, GatewayWalletState,
-    provider::tests::{authorize, fixture, invalidate_authority},
+    provider::{
+        MAX_SESSION_DOCUMENTS,
+        tests::{authorize, fixture, invalidate_authority},
+    },
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -479,6 +482,59 @@ async fn unsealed_state_accounts_and_approval_labels_are_discarded_on_lock() {
         drop(view);
         std::fs::remove_dir_all(path).unwrap();
     }
+}
+
+#[tokio::test]
+async fn full_session_wallet_refresh_fits_the_outbound_queue() {
+    let (path, mut provider, view) = fixture();
+    let peer = PeerId::from_bytes([8; 16]);
+    for index in 0..=MAX_SESSION_DOCUMENTS {
+        provider
+            .register(1, peer, format!("doc-{index}"), "https://example.invalid/")
+            .unwrap();
+    }
+    let rejected = provider
+        .drain()
+        .into_iter()
+        .map(|(_, delivery)| serde_json::to_value(delivery.message).unwrap())
+        .find(|message| message["document"] == format!("doc-{MAX_SESSION_DOCUMENTS}"))
+        .unwrap();
+    assert_eq!(rejected["error"]["code"], -32005);
+    // An unchanged same-generation refresh repeats no document state.
+    let wallet = provider.authority().borrow().clone();
+    provider.update_wallet(wallet.clone(), 1);
+    assert!(!provider.drain().iter().any(|(_, delivery)| matches!(
+        delivery.message,
+        GatewayServerMessage::ProviderState { .. }
+    )));
+    // A new generation re-sends every document's state without overflowing the session queue.
+    provider.update_wallet(wallet, 2);
+    let (mut writer, mut client, mut protocol) = session().await;
+    enqueue(&mut writer, &mut provider, 1);
+    let reader = async {
+        let mut states = 0;
+        while let Some(Ok(Message::Binary(bytes))) = client.next().await {
+            if let Some(bytes) = protocol.receive_frame(&bytes, 0).unwrap() {
+                let message = serde_json::from_slice::<Value>(&bytes).unwrap();
+                if message["type"] == "provider_state" {
+                    assert_eq!(message["generation"], 2);
+                    states += 1;
+                }
+            }
+        }
+        states
+    };
+    let ((), states) = tokio::join!(
+        async {
+            flush_output(&mut writer, 1, &mut provider).await;
+            drop(writer);
+        },
+        reader
+    );
+    assert_eq!(states, MAX_SESSION_DOCUMENTS);
+    drop(provider);
+    drop(view);
+    std::fs::remove_dir_all(path).unwrap();
 }
 
 #[tokio::test]

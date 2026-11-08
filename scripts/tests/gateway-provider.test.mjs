@@ -380,6 +380,7 @@ test('connectivity transitions commit before callbacks and preserve bridge pendi
 
 test('registration capacity rejection releases pending quota without retiring accepted documents', async () => {
   const h = bridgeHarness();
+  // Stands in for the desktop's global document cap; the per-session cap exceeds the bridge's port cap.
   const accepted = Array.from({ length: 128 }, () => h.port());
   const rejected = Array.from({ length: 8 }, () => h.port());
   await flush();

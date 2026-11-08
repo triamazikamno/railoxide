@@ -44,7 +44,8 @@ const ACTIVITY_FLUSH_INTERVAL: Duration = Duration::from_mins(5);
 type Socket = WebSocketStream<TcpStream>;
 // Logical queued payloads are capped at 40 MiB per peer session (2.5 GiB at 64 sessions).
 // One additional sealed copy is bounded by the protocol message limit.
-const MAX_OUTBOUND_MESSAGES: usize = 64;
+// One state per document of a full session (provider MAX_SESSION_DOCUMENTS) plus control traffic.
+const MAX_OUTBOUND_MESSAGES: usize = 320;
 const MAX_OUTBOUND_BYTES: usize = 40 * 1024 * 1024;
 // Includes queue residence and stays below the browser's ten-second assembly window.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -949,6 +950,13 @@ impl Actor {
                 .await
                 .ok()?;
             if head.as_deref().is_some_and(install::is_websocket_upgrade) {
+                if !head
+                    .as_deref()
+                    .is_some_and(install::is_allowed_upgrade_origin)
+                {
+                    tracing::debug!("gateway refused a browser-page websocket upgrade");
+                    return None;
+                }
                 let config = WebSocketConfig::default()
                     .read_buffer_size(4096)
                     .write_buffer_size(4096)

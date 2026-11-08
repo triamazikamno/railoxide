@@ -50,7 +50,8 @@ pub use wallet_switch::{GatewayWalletSwitchRequest, GatewayWalletSwitchTransitio
 const APPROVAL_WINDOW: Duration = Duration::from_mins(5);
 const MAX_APPROVALS: usize = 16;
 const MAX_DOCUMENTS: usize = 1024;
-const MAX_SESSION_DOCUMENTS: usize = 128;
+// Must stay >= the 256-port cap in extensions/railoxide/gateway-page-bridge.js.
+pub(super) const MAX_SESSION_DOCUMENTS: usize = 256;
 const MAX_ID_LEN: usize = 256;
 
 /// Ephemeral desktop identity for requests admitted before a usable view is installed.
@@ -562,10 +563,12 @@ impl DappProvider {
             authority.send_replace(wallet.clone());
         }
         self.wallet = wallet;
-        self.generation = generation;
+        let previous = std::mem::replace(&mut self.generation, generation);
         self.reload_permissions();
         self.refresh_wallet_switches(Instant::now());
-        self.refresh_documents(true);
+        // Changed disclosures are pushed anyway; an unchanged same-generation state is redundant,
+        // except while locked: the bridge resets documents on every locked State and needs it.
+        self.refresh_documents(generation != previous || self.wallet.view.is_none());
         self.refresh_approvals(Instant::now());
         self.invalidate_reads(Instant::now());
         self.push_pending_ui();

@@ -125,6 +125,30 @@ fn prompt(messages: &[(u64, Value)]) -> &Value {
 }
 
 #[test]
+fn locked_same_generation_refresh_restores_document_state() {
+    let (path, mut provider, view) = fixture();
+    provider.update_wallet(GatewayWalletState::default(), 2);
+    provider
+        .register(
+            1,
+            PeerId::from_bytes([1; 16]),
+            "a".to_owned(),
+            "https://example.invalid/",
+        )
+        .unwrap();
+    messages(&mut provider);
+    provider.update_wallet(GatewayWalletState::default(), 2);
+    assert!(
+        messages(&mut provider)
+            .iter()
+            .any(|(_, message)| message["type"] == "provider_state" && message["document"] == "a")
+    );
+    drop(provider);
+    drop(view);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
 fn connect_is_owned_by_session_and_web_origin_and_revocation_is_origin_local() {
     let (path, mut provider, view) = fixture();
     let peer = PeerId::from_bytes([1; 16]);

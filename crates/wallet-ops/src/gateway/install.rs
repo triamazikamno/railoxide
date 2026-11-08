@@ -108,6 +108,20 @@ pub(super) fn is_websocket_upgrade(head: &[u8]) -> bool {
     })
 }
 
+/// Whether an upgrade may proceed: web pages always send `Origin`, so only the extension's
+/// `chrome-extension://` origin or a non-browser client without one is let through.
+pub(super) fn is_allowed_upgrade_origin(head: &[u8]) -> bool {
+    const EXTENSION: &[u8] = b"chrome-extension://";
+    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    complete_request(head, &mut headers).is_some_and(|request| {
+        header(&request, "origin").is_none_or(|value| {
+            value
+                .get(..EXTENSION.len())
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case(EXTENSION))
+        })
+    })
+}
+
 /// Builds the response for a non-upgrade request. An empty head answers a malformed request.
 ///
 /// `local` is the accepted socket's own address, which decides what the page tells the reader.
@@ -327,6 +341,19 @@ mod tests {
         assert!(!is_websocket_upgrade(b"Upgrade: websocket\r\n\r\n"));
         assert!(!is_websocket_upgrade(
             b"GET / HTTP/1.1\r\nUpgrade: h2c\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn upgrade_origin_admits_only_the_extension_or_no_origin() {
+        assert!(!is_allowed_upgrade_origin(
+            b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nOrigin: https://example.com\r\n\r\n"
+        ));
+        assert!(is_allowed_upgrade_origin(
+            b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nOrigin: chrome-extension://abcdef\r\n\r\n"
+        ));
+        assert!(is_allowed_upgrade_origin(
+            b"GET / HTTP/1.1\r\nUpgrade: websocket\r\n\r\n"
         ));
     }
 
