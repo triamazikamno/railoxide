@@ -47,11 +47,9 @@ impl ExecutorDelivery {
                 let target = candidate
                     .relay_adapt_7702
                     .and_then(|advertised| profile.interchangeable(advertised))
-                    .filter(|_| {
-                        candidate.chain_id == profile.chain_id()
-                            && candidate.available_wallets != 0
-                            && candidate.fee_expiration > std::time::SystemTime::now()
-                    })
+                    // Fee expiry and wallet count are informational: the broadcaster simulates
+                    // and settles any profitable request.
+                    .filter(|_| candidate.chain_id == profile.chain_id())
                     .ok_or_else(|| {
                         eyre!("selected broadcaster does not support this executor operation")
                     })?;

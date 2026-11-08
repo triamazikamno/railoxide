@@ -389,10 +389,6 @@ impl WalletRoot {
             }
             form.asset = updated;
             if form.delivery_mode == DeliveryMode::PublicBroadcaster && !form.generating {
-                form.cost_estimate = None;
-                form.estimate_id = 0;
-                form.cost_estimate_pending = false;
-                form.estimating_cost = false;
                 reschedule_estimates.push((DeliveryFormKind::Send, *key));
             }
         }
@@ -415,18 +411,15 @@ impl WalletRoot {
             }
             form.asset = updated;
             if form.delivery_mode == DeliveryMode::PublicBroadcaster && !form.generating {
-                form.cost_estimate = None;
-                form.estimate_id = 0;
-                form.cost_estimate_pending = false;
-                form.estimating_cost = false;
                 reschedule_estimates.push((DeliveryFormKind::Unshield, *key));
             }
         }
         for key in refresh_native_top_up {
             self.refresh_unshield_native_top_up_state(key, cx);
         }
+        // A sync snapshot is background work: keep the shown estimate while it is re-checked.
         for (kind, key) in reschedule_estimates {
-            self.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+            self.revalidate_public_broadcaster_cost_estimate(kind, key, cx);
         }
         for (kind, key) in reschedule_sponsored_estimates {
             self.revalidate_sponsored_funding_estimate(kind, key, cx);

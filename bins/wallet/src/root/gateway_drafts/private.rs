@@ -280,6 +280,7 @@ impl WalletRoot {
                     railgun_address: id.clone(),
                 },
             },
+            shown_broadcaster: None,
             allow_out_of_range: delivery.allow_out_of_range,
             favorites_only: delivery.favorites_only,
         })
@@ -1276,6 +1277,10 @@ impl WalletRoot {
                     .send_forms
                     .get_mut(&key)
                     .expect("private submission state");
+                if form.broadcaster_choice == BroadcasterChoice::Random {
+                    form.shown_broadcaster =
+                        Some(prepared.estimate.broadcaster.railgun_address.clone());
+                }
                 form.cost_estimate = Some(prepared.estimate);
                 form.gateway_estimated_at = estimated_at;
                 form.cost_estimate_pending = false;
@@ -1288,6 +1293,10 @@ impl WalletRoot {
                     .unshield_forms
                     .get_mut(&key)
                     .expect("private submission state");
+                if form.broadcaster_choice == BroadcasterChoice::Random {
+                    form.shown_broadcaster =
+                        Some(prepared.estimate.broadcaster.railgun_address.clone());
+                }
                 form.cost_estimate = Some(prepared.estimate);
                 form.gateway_estimated_at = estimated_at;
                 form.cost_estimate_pending = false;

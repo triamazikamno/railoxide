@@ -142,7 +142,7 @@ impl WalletRoot {
                                     }
                                 };
                                 if can_refresh {
-                                    root.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+                                    root.reroll_public_broadcaster_cost_estimate(kind, key, cx);
                                 }
                             });
                         })
@@ -434,6 +434,7 @@ impl WalletRoot {
                 cost_estimate_pending: false,
                 estimating_cost: false,
                 cost_estimate: None,
+                shown_broadcaster: None,
                 estimate_id: 0,
                 generation_id: 0,
                 generating: false,
@@ -892,6 +893,8 @@ impl WalletRoot {
             return;
         }
         form.broadcaster_choice = choice;
+        // A new choice, including going back to Random, starts a fresh pick.
+        form.shown_broadcaster = None;
         form.custom_fee_amount = None;
         form.error = None;
         form.result = None;
@@ -1850,6 +1853,7 @@ impl WalletRoot {
                 cost_estimate_pending: false,
                 estimating_cost: false,
                 cost_estimate: None,
+                shown_broadcaster: None,
                 estimate_id: 0,
                 generation_id: 0,
                 generating: false,
@@ -2038,6 +2042,8 @@ impl WalletRoot {
             return;
         }
         form.broadcaster_choice = choice;
+        // A new choice, including going back to Random, starts a fresh pick.
+        form.shown_broadcaster = None;
         form.custom_fee_amount = None;
         form.error = None;
         form.result = None;

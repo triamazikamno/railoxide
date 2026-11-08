@@ -17,16 +17,21 @@ use wallet_ops::{
     public_broadcaster_service_gas_price, settings::EffectiveTokenRegistry,
 };
 
-use super::broadcaster_picker::{BroadcasterPickerFeeEstimateContext, broadcaster_candidate_label};
+use super::broadcaster_picker::{
+    BroadcasterChoice, BroadcasterPickerFeeEstimateContext, broadcaster_candidate_label,
+};
 use super::private_action::{PrivateEstimateInput, PrivateEstimateOutput, delivery_element_id};
 use super::private_broadcaster::PrivateBroadcasterProgressState;
 use super::public_action::public_action_protocol_fee_label;
-use super::spend_authorization::spend_authorization_recipient_display;
+use super::spend_authorization::{
+    automatic_private_fee_bounds, spend_authorization_recipient_display,
+};
 use super::utxo::short_hash;
 use super::{
     COST_ESTIMATE_DEBOUNCE, DeliveryFormKind, DeliveryMode, UnshieldAsset, UnshieldAssetKey,
     WalletRoot, broadcaster_candidate_anchor_rate, format_native_token_amount_for_display,
-    format_native_top_up_recipient_suffix, format_report_chain, format_token_amount_for_display,
+    format_native_top_up_recipient_suffix, format_report_chain,
+    format_token_amount_ceiling_for_display, format_token_amount_for_display,
     format_value_with_usd_label, should_show_distinct_amount, token_display_metadata,
 };
 
@@ -409,10 +414,53 @@ impl PublicBroadcasterFeeDisplay<'_> {
 }
 
 impl WalletRoot {
+    /// The user's explicit refresh: Random may pick a different broadcaster than the shown one.
+    pub(super) fn reroll_public_broadcaster_cost_estimate(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let shown = match kind {
+            DeliveryFormKind::Send => self
+                .send_forms
+                .get_mut(&key)
+                .map(|form| &mut form.shown_broadcaster),
+            DeliveryFormKind::Unshield => self
+                .unshield_forms
+                .get_mut(&key)
+                .map(|form| &mut form.shown_broadcaster),
+        };
+        if let Some(shown) = shown {
+            *shown = None;
+        }
+        self.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+    }
+
     pub(super) fn schedule_public_broadcaster_cost_estimate(
         &mut self,
         kind: DeliveryFormKind,
         key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.start_public_broadcaster_cost_estimate(kind, key, false, cx);
+    }
+
+    /// A background refresh keeps the shown estimate, and its submission, until the new one lands.
+    pub(super) fn revalidate_public_broadcaster_cost_estimate(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.start_public_broadcaster_cost_estimate(kind, key, true, cx);
+    }
+
+    fn start_public_broadcaster_cost_estimate(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        retain_shown: bool,
         cx: &mut Context<'_, Self>,
     ) {
         if !self.can_schedule_public_broadcaster_cost_estimate(kind, key) {
@@ -425,7 +473,9 @@ impl WalletRoot {
             DeliveryFormKind::Send => {
                 if let Some(form) = self.send_forms.get_mut(&key) {
                     form.estimate_id = estimate_id;
-                    form.cost_estimate = None;
+                    if !retain_shown {
+                        form.cost_estimate = None;
+                    }
                     form.cost_estimate_pending = false;
                     form.estimating_cost = false;
                     form.error = None;
@@ -434,7 +484,9 @@ impl WalletRoot {
             DeliveryFormKind::Unshield => {
                 if let Some(form) = self.unshield_forms.get_mut(&key) {
                     form.estimate_id = estimate_id;
-                    form.cost_estimate = None;
+                    if !retain_shown {
+                        form.cost_estimate = None;
+                    }
                     form.cost_estimate_pending = false;
                     form.estimating_cost = false;
                     form.error = None;
@@ -448,6 +500,27 @@ impl WalletRoot {
             DeliveryFormKind::Unshield => {
                 self.estimate_unshield_public_broadcaster_cost_from_form(key, cx);
             }
+        }
+        if !retain_shown {
+            return;
+        }
+        // A retained estimate whose refresh could not start, e.g. mid-sync, is no longer current.
+        let unrefreshed = match kind {
+            DeliveryFormKind::Send => self
+                .send_forms
+                .get_mut(&key)
+                .filter(|form| !form.estimating_cost)
+                .map(|form| &mut form.cost_estimate),
+            DeliveryFormKind::Unshield => self
+                .unshield_forms
+                .get_mut(&key)
+                .filter(|form| !form.estimating_cost)
+                .map(|form| &mut form.cost_estimate),
+        };
+        if let Some(estimate) = unrefreshed
+            && estimate.take().is_some()
+        {
+            cx.notify();
         }
     }
 
@@ -620,6 +693,7 @@ impl WalletRoot {
             recipient: form.recipient_input.read(cx).value().to_string(),
             amount: form.amount_input.read(cx).value().to_string(),
             broadcaster: form.broadcaster_choice.clone(),
+            shown_broadcaster: form.shown_broadcaster.clone(),
             fee_token: form.selected_fee_token,
             fee_mode: form.fee_mode,
             allow_out_of_range: form.allow_suspicious_broadcasters,
@@ -678,6 +752,10 @@ impl WalletRoot {
                     Ok(estimate) => {
                         let context = BroadcasterPickerFeeEstimateContext::from(&estimate);
                         form.error = None;
+                        if form.broadcaster_choice == BroadcasterChoice::Random {
+                            form.shown_broadcaster =
+                                Some(estimate.broadcaster.railgun_address.clone());
+                        }
                         form.cost_estimate = Some(estimate);
                         form.gateway_estimated_at = form
                             .gateway_execution
@@ -727,6 +805,7 @@ impl WalletRoot {
             recipient: form.recipient_input.read(cx).value().to_string(),
             amount: form.amount_input.read(cx).value().to_string(),
             broadcaster: form.broadcaster_choice.clone(),
+            shown_broadcaster: form.shown_broadcaster.clone(),
             fee_token: form.selected_fee_token,
             fee_mode: form.fee_mode,
             allow_out_of_range: form.allow_suspicious_broadcasters,
@@ -795,6 +874,10 @@ impl WalletRoot {
                     Ok(estimate) => {
                         let context = BroadcasterPickerFeeEstimateContext::from(&estimate);
                         form.error = None;
+                        if form.broadcaster_choice == BroadcasterChoice::Random {
+                            form.shown_broadcaster =
+                                Some(estimate.broadcaster.railgun_address.clone());
+                        }
                         form.cost_estimate = Some(estimate);
                         form.gateway_estimated_at = form
                             .gateway_execution
@@ -839,11 +922,29 @@ fn render_transaction_fee_breakdown(
     anchor_cache: &TokenAnchorRateCache,
     open: bool,
     custom_fee: bool,
+    automatic_maximum_fee: Option<U256>,
     edit_action: Option<AnyElement>,
 ) -> impl IntoElement {
     let mut total = display.fee_amount_with_usd(anchor_cache);
     if custom_fee {
         total.push_str(" · Custom");
+    } else if let Some(maximum) = automatic_maximum_fee {
+        let fees = display.fee_display();
+        // Round up so the shown maximum is never below the enforced one.
+        let value = format_token_amount_ceiling_for_display(
+            fees.chain_id,
+            fees.fee_token,
+            maximum,
+            fees.registry,
+        );
+        total.push_str(" · Max ");
+        total.push_str(&fees.token_amount_value_with_usd(
+            value,
+            anchor_cache,
+            fees.fee_token,
+            maximum,
+            false,
+        ));
     }
     ui::private_action::transaction_fee_breakdown(
         delivery_element_id(key, kind, "transaction-fee-breakdown"),
@@ -911,6 +1012,9 @@ pub(super) fn render_public_broadcaster_cost_estimate(
             anchor_cache,
             transaction_fee_breakdown_open,
             custom_fee_amount.is_some(),
+            automatic_private_fee_bounds(estimate)
+                .ok()
+                .map(wallet_ops::PublicBroadcasterApprovalBounds::maximum_fee),
             fee_editable.then(|| {
                 super::private_action::fee_editor::fee_edit_button(root.clone(), kind, key)
                     .into_any_element()
@@ -921,7 +1025,7 @@ pub(super) fn render_public_broadcaster_cost_estimate(
         refreshing,
         move |_, cx| {
             root.update(cx, |root, cx| {
-                root.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+                root.reroll_public_broadcaster_cost_estimate(kind, key, cx);
             });
         },
     )

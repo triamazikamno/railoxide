@@ -7,7 +7,9 @@ use super::{
     send_public_broadcaster_estimate_input_error, unshield_public_broadcaster_estimate_input_error,
 };
 use wallet_ops::{
-    DesktopSendPublicBroadcasterEstimateRequest, DesktopUnshieldPublicBroadcasterEstimateRequest,
+    BroadcasterFeePolicy, DesktopSendPublicBroadcasterEstimateRequest,
+    DesktopUnshieldPublicBroadcasterEstimateRequest, PublicBroadcasterCandidate,
+    PublicBroadcasterSelection, PublicBroadcasterTrustFilter,
     estimate_desktop_send_public_broadcaster_cost,
     estimate_desktop_unshield_public_broadcaster_cost,
 };
@@ -28,6 +30,7 @@ pub(in crate::root) struct PrivateEstimateInput {
     pub(in crate::root) recipient: String,
     pub(in crate::root) amount: String,
     pub(in crate::root) broadcaster: BroadcasterChoice,
+    pub(in crate::root) shown_broadcaster: Option<String>,
     pub(in crate::root) fee_token: Address,
     pub(in crate::root) fee_mode: FeeHandlingMode,
     pub(in crate::root) allow_out_of_range: bool,
@@ -40,6 +43,7 @@ impl PrivateEstimateInput {
         self.recipient = recipient;
         // Comparison estimates must work even if the form's chosen broadcaster is unavailable.
         self.broadcaster = BroadcasterChoice::Random;
+        self.shown_broadcaster = None;
         if self.amount.trim().is_empty() {
             // Blank forms still need a representative amount for this display estimate.
             self.amount = format_send_amount_input(self.asset.max_batched, self.asset.decimals);
@@ -141,8 +145,14 @@ impl WalletRoot {
             input.favorites_only,
             fee_policy,
         );
-        let selection = Self::public_broadcaster_selection(&input.broadcaster);
         let trust_filter = self.public_broadcaster_trust_filter(input.favorites_only);
+        let selection = estimate_broadcaster_selection(
+            &input.broadcaster,
+            input.shown_broadcaster.as_deref(),
+            &candidates,
+            fee_policy,
+            &trust_filter,
+        );
         if select_public_broadcaster_with_policy_and_trust(
             &candidates,
             &selection,
@@ -207,6 +217,33 @@ impl WalletRoot {
     }
 }
 
+/// Random keeps the broadcaster the estimate card showed while it stays eligible, so only the
+/// user's re-roll picks a new one.
+fn estimate_broadcaster_selection(
+    choice: &BroadcasterChoice,
+    shown: Option<&str>,
+    candidates: &[PublicBroadcasterCandidate],
+    policy: BroadcasterFeePolicy,
+    trust_filter: &PublicBroadcasterTrustFilter,
+) -> PublicBroadcasterSelection {
+    if let (BroadcasterChoice::Random, Some(shown)) = (choice, shown) {
+        let selection = PublicBroadcasterSelection::Specific {
+            railgun_address: shown.to_owned(),
+        };
+        if select_public_broadcaster_with_policy_and_trust(
+            candidates,
+            &selection,
+            policy,
+            trust_filter,
+        )
+        .is_ok()
+        {
+            return selection;
+        }
+    }
+    WalletRoot::public_broadcaster_selection(choice)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +281,7 @@ mod tests {
                 broadcaster: BroadcasterChoice::Specific {
                     railgun_address: "unavailable broadcaster".into(),
                 },
+                shown_broadcaster: None,
                 fee_token: Address::ZERO,
                 fee_mode: FeeHandlingMode::DeductFromAmount,
                 allow_out_of_range: false,
@@ -292,5 +330,39 @@ mod tests {
             let picker = input.for_picker(String::new());
             assert!(validate("", &picker.amount, &picker.asset).is_some());
         }
+    }
+
+    #[test]
+    fn random_estimates_keep_the_shown_broadcaster_while_it_is_eligible() {
+        let policy = wallet_ops::BroadcasterFeePolicy::default();
+        let candidates = wallet_ops::public_broadcaster_candidates_for_asset(
+            &[crate::root::tests::fee_row(1, Address::ZERO, "shown")],
+            1,
+            Address::ZERO,
+            policy,
+            None,
+        )
+        .unwrap();
+        let shown = candidates[0].railgun_address.as_str();
+        let trust = wallet_ops::PublicBroadcasterTrustFilter::default();
+        let select = |choice: &BroadcasterChoice, shown: Option<&str>| {
+            estimate_broadcaster_selection(choice, shown, &candidates, policy, &trust)
+        };
+        let specific = |railgun_address: &str| PublicBroadcasterSelection::Specific {
+            railgun_address: railgun_address.into(),
+        };
+        assert_eq!(
+            select(&BroadcasterChoice::Random, Some(shown)),
+            specific(shown)
+        );
+        // An ineligible shown broadcaster falls back to a fresh random pick.
+        assert_eq!(
+            select(&BroadcasterChoice::Random, Some("gone")),
+            PublicBroadcasterSelection::Random
+        );
+        let chosen = BroadcasterChoice::Specific {
+            railgun_address: "chosen".into(),
+        };
+        assert_eq!(select(&chosen, Some(shown)), specific("chosen"));
     }
 }

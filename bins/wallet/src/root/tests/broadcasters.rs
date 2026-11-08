@@ -699,3 +699,90 @@ fn amount_adjustment_clamps_or_raises_only_at_mode_max() {
         None
     );
 }
+
+#[test]
+fn private_spend_review_accepts_quotes_within_the_reviewed_maximum() {
+    use crate::root::spend_authorization::{PrivateFeeReview, private_fee_review_change};
+    let token = Address::repeat_byte(1);
+    let candidate = wallet_ops::public_broadcaster_candidates(
+        &[fee_row(1, token, "quote")],
+        1,
+        token,
+        SystemTime::now(),
+        wallet_ops::BroadcasterFeePolicy::default(),
+        None,
+    )
+    .pop()
+    .unwrap();
+    let mut reviewed = public_broadcaster_cost_estimate(candidate);
+    reviewed.fee_amount = U256::from(100);
+    let review = PrivateFeeReview::new(reviewed.clone(), None).unwrap();
+    let maximum = review.bounds.maximum_fee();
+    let change = |estimate: Option<&wallet_ops::PublicBroadcasterCostEstimate>| {
+        private_fee_review_change(None, None, Some(&review), estimate, |_, amount: U256| {
+            amount.to_string()
+        })
+    };
+    assert_eq!(change(Some(&reviewed)), None);
+    let mut quote = reviewed.clone();
+    quote.fee_amount += U256::from(1);
+    // A re-estimate within the approved maximum keeps the review.
+    assert_eq!(change(Some(&quote)), None);
+    let mut quote = reviewed.clone();
+    quote.broadcaster.fees_id = "refreshed".into();
+    assert_eq!(change(Some(&quote)), None);
+    let mut quote = reviewed.clone();
+    quote.fee_amount = maximum + U256::from(1);
+    let message = change(Some(&quote)).unwrap();
+    for amount in [reviewed.fee_amount, quote.fee_amount, maximum] {
+        assert!(message.contains(&amount.to_string()), "{message}");
+    }
+    assert!(change(None).is_some());
+    let mut quote = reviewed.clone();
+    quote.broadcaster.railgun_address = "0zkother".into();
+    assert!(change(Some(&quote)).is_some());
+    // A custom fee pins the reviewed broadcaster as well.
+    let custom = Some((reviewed.fee_token, reviewed.fee_amount));
+    let custom_review = PrivateFeeReview::new(reviewed.clone(), Some(reviewed.fee_amount)).unwrap();
+    let custom_change = |estimate: &wallet_ops::PublicBroadcasterCostEstimate| {
+        private_fee_review_change(
+            custom,
+            custom,
+            Some(&custom_review),
+            Some(estimate),
+            |_, amount: U256| amount.to_string(),
+        )
+    };
+    assert_eq!(custom_change(&reviewed), None);
+    assert!(custom_change(&quote).is_some());
+}
+
+#[test]
+fn broadcaster_submission_accepts_a_shown_estimate_during_background_refresh() {
+    use crate::root::private_action::broadcaster_estimate_allows_submission;
+    let token = Address::repeat_byte(1);
+    let candidate = wallet_ops::public_broadcaster_candidates(
+        &[fee_row(1, token, "quote")],
+        1,
+        token,
+        SystemTime::now(),
+        wallet_ops::BroadcasterFeePolicy::default(),
+        None,
+    )
+    .pop()
+    .unwrap();
+    let estimate = public_broadcaster_cost_estimate(candidate);
+
+    assert!(!broadcaster_estimate_allows_submission(None, false));
+    assert!(broadcaster_estimate_allows_submission(
+        Some(&estimate),
+        false
+    ));
+    // A retained background refresh keeps the shown estimate.
+    assert!(broadcaster_estimate_allows_submission(
+        Some(&estimate),
+        true
+    ));
+    // An invalidating refresh has already cleared it.
+    assert!(!broadcaster_estimate_allows_submission(None, true));
+}

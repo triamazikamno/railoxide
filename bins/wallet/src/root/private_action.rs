@@ -92,8 +92,8 @@ use super::public_broadcaster_cost::{
     render_public_broadcaster_cost_status, should_render_public_broadcaster_cost_preview,
 };
 use super::spend_authorization::{
-    SpendAuthorizationIntent, SpendAuthorizationSummary, SpendAuthorizationSummaryRow,
-    is_spend_authorization_failure_error,
+    PrivateFeeReview, SpendAuthorizationIntent, SpendAuthorizationSummary,
+    SpendAuthorizationSummaryRow, is_spend_authorization_failure_error,
 };
 use super::utxo::short_hash;
 use super::{
@@ -131,7 +131,9 @@ mod types;
 
 pub(super) use delivery::*;
 #[cfg(test)]
-pub(super) use generation::sponsored_authorization_display;
+pub(super) use generation::{
+    broadcaster_estimate_allows_submission, sponsored_authorization_display,
+};
 pub(super) use helpers::*;
 pub(super) use recipient_picker::*;
 pub(super) use render_helpers::*;

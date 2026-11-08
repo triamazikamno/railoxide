@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::DeliveryMode;
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
 use gpui::{
     Anchor, AnyElement, App, AppContext, ClickEvent, Context, Entity, Focusable, FontWeight,
     InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString,
@@ -47,7 +47,9 @@ use wallet_ops::vault::{
     PublicAccountSource, SoftwareSeedSessionBinding, VaultError, WalletSoftwareContextKind,
 };
 use wallet_ops::{
-    BlockedShieldRescueUtxoId, DesktopPrivateSpendAuthorization, SponsoredAuthorizationLimit,
+    BlockedShieldRescueUtxoId, DesktopPrivateSpendAuthorization, PublicBroadcasterApprovalBounds,
+    PublicBroadcasterCostEstimate, SponsoredAuthorizationLimit,
+    default_public_broadcaster_fee_limit,
 };
 use zeroize::Zeroizing;
 
@@ -235,6 +237,7 @@ pub(super) enum SpendAuthorizationIntent {
         Option<SponsoredAuthorizationLimit>,
         Option<wallet_ops::gateway::GatewayDraftExecution>,
         Option<(alloy::primitives::Address, alloy::primitives::U256)>,
+        Option<Arc<PrivateFeeReview>>,
     ),
     PrivateSendSelfBroadcastGasPassword(
         UnshieldAssetKey,
@@ -246,6 +249,7 @@ pub(super) enum SpendAuthorizationIntent {
         Option<SponsoredAuthorizationLimit>,
         Option<wallet_ops::gateway::GatewayDraftExecution>,
         Option<(alloy::primitives::Address, alloy::primitives::U256)>,
+        Option<Arc<PrivateFeeReview>>,
     ),
     PrivateUnshieldSelfBroadcastGasPassword(
         UnshieldAssetKey,
@@ -348,10 +352,10 @@ impl SpendAuthorizationIntent {
     fn gateway_execution(&self) -> Option<&wallet_ops::gateway::GatewayDraftExecution> {
         match self {
             Self::ExecutorGasPassword { intent, .. } => intent.gateway_execution(),
-            Self::PrivateSend(_, _, execution, _)
+            Self::PrivateSend(_, _, execution, _, _)
             | Self::PrepareExecutorUnshield(_, _, execution)
             | Self::ExecutorUnshield(_, _, execution)
-            | Self::PrivateUnshield(_, _, execution, _)
+            | Self::PrivateUnshield(_, _, execution, _, _)
             | Self::PrivateSendSelfBroadcastGasPassword(_, _, execution)
             | Self::PrivateUnshieldSelfBroadcastGasPassword(_, _, execution) => execution.as_ref(),
             Self::PublicSend(draft) => draft.gateway_execution.as_ref(),
@@ -378,24 +382,7 @@ impl SpendAuthorizationIntent {
         if let Self::ExecutorGasPassword { intent, .. } = self {
             return intent.private_review_current(root);
         }
-        let custom_fee_matches = match self {
-            Self::PrivateSend(key, _, _, expected) => {
-                root.send_forms.get(key).is_some_and(|form| {
-                    form.custom_fee_amount
-                        .map(|amount| (form.selected_fee_token, amount))
-                        == *expected
-                })
-            }
-            Self::PrivateUnshield(key, _, _, expected) => {
-                root.unshield_forms.get(key).is_some_and(|form| {
-                    form.custom_fee_amount
-                        .map(|amount| (form.selected_fee_token, amount))
-                        == *expected
-                })
-            }
-            _ => true,
-        };
-        if !custom_fee_matches {
+        if self.private_fee_change(root).is_some() {
             return false;
         }
         if let Self::StealthAccounts(_, command) = self {
@@ -417,12 +404,12 @@ impl SpendAuthorizationIntent {
             return false;
         }
         let current = match self {
-            Self::PrivateSend(key, _, _, _)
+            Self::PrivateSend(key, _, _, _, _)
             | Self::PrivateSendSelfBroadcastGasPassword(key, _, _) => root
                 .send_forms
                 .get(key)
                 .map(|form| form.gateway_execution.as_ref()),
-            Self::PrivateUnshield(key, _, _, _)
+            Self::PrivateUnshield(key, _, _, _, _)
             | Self::PrepareExecutorUnshield(key, _, _)
             | Self::ExecutorUnshield(key, _, _)
             | Self::PrivateUnshieldSelfBroadcastGasPassword(key, _, _) => root
@@ -436,6 +423,55 @@ impl SpendAuthorizationIntent {
             (Some(expected), Some(Some(current))) => expected.same_execution(current),
             _ => false,
         }
+    }
+
+    /// Why the private fee shown in the review no longer matches its form, if it does not.
+    fn private_fee_change(&self, root: &WalletRoot) -> Option<String> {
+        let (key, reviewed_custom, reviewed_quote, current) = match self {
+            Self::ExecutorGasPassword { intent, .. } => return intent.private_fee_change(root),
+            Self::PrivateSend(key, _, _, custom, quote) => (
+                key,
+                custom,
+                quote,
+                root.send_forms.get(key).map(|form| {
+                    (
+                        form.custom_fee_amount
+                            .map(|amount| (form.selected_fee_token, amount)),
+                        form.cost_estimate.as_ref(),
+                    )
+                }),
+            ),
+            Self::PrivateUnshield(key, _, _, custom, quote) => (
+                key,
+                custom,
+                quote,
+                root.unshield_forms.get(key).map(|form| {
+                    (
+                        form.custom_fee_amount
+                            .map(|amount| (form.selected_fee_token, amount)),
+                        form.cost_estimate.as_ref(),
+                    )
+                }),
+            ),
+            _ => return None,
+        };
+        let Some((current_custom, current_quote)) = current else {
+            return Some("The action is no longer available.".into());
+        };
+        private_fee_review_change(
+            *reviewed_custom,
+            current_custom,
+            reviewed_quote.as_deref(),
+            current_quote,
+            |token, amount| {
+                super::private_action::fee_editor::custom_fee_label(
+                    key.chain_id,
+                    token,
+                    amount,
+                    &root.effective_token_registry,
+                )
+            },
+        )
     }
 
     pub(super) fn approve_gateway_review(&self, root: &WalletRoot) -> bool {
@@ -458,6 +494,82 @@ impl SpendAuthorizationIntent {
                 | Self::BlockedShieldRefund(_)
         )
     }
+}
+
+/// The broadcaster quote a review approved, with the limits submission enforces.
+pub(super) struct PrivateFeeReview {
+    pub(super) quote: PublicBroadcasterCostEstimate,
+    pub(super) bounds: PublicBroadcasterApprovalBounds,
+}
+
+impl PrivateFeeReview {
+    /// A custom fee is its own maximum; an automatic fee gets the default allowance.
+    pub(super) fn new(
+        quote: PublicBroadcasterCostEstimate,
+        custom_fee: Option<U256>,
+    ) -> eyre::Result<Self> {
+        let bounds = match custom_fee {
+            Some(fee) => quote.approval_bounds(fee)?,
+            None => automatic_private_fee_bounds(&quote)?,
+        };
+        Ok(Self { quote, bounds })
+    }
+}
+
+/// The limits submission enforces for an automatic fee; the estimate card shows their maximum.
+pub(super) fn automatic_private_fee_bounds(
+    quote: &PublicBroadcasterCostEstimate,
+) -> eyre::Result<PublicBroadcasterApprovalBounds> {
+    quote.approval_bounds(default_public_broadcaster_fee_limit(quote.fee_amount))
+}
+
+/// Submission enforces the reviewed limits, so a changed custom fee, a cleared estimate, or a
+/// quote outside the approved bounds needs a new review. Returns why, or `None` while it is current.
+/// A background refresh keeps the shown estimate, which is compared like any other quote.
+pub(super) fn private_fee_review_change(
+    reviewed_custom: Option<(Address, U256)>,
+    current_custom: Option<(Address, U256)>,
+    review: Option<&PrivateFeeReview>,
+    current_quote: Option<&PublicBroadcasterCostEstimate>,
+    fee_label: impl Fn(Address, U256) -> String,
+) -> Option<String> {
+    if reviewed_custom != current_custom {
+        return Some("The custom transaction fee changed. Review it again.".into());
+    }
+    let PrivateFeeReview {
+        quote: reviewed,
+        bounds,
+    } = review?;
+    let Some(current) = current_quote else {
+        return Some(
+            "The transaction fee estimate is refreshing. Review it again once it is ready.".into(),
+        );
+    };
+    // A refreshed offer from the same broadcaster is fine; the bounds decide the amounts.
+    if current.broadcaster.railgun_address != reviewed.broadcaster.railgun_address
+        || current.action_token != reviewed.action_token
+        || current.fee_token != reviewed.fee_token
+        || current.fee_mode != reviewed.fee_mode
+        || current.entered_amount != reviewed.entered_amount
+        || current.native_top_up != reviewed.native_top_up
+    {
+        return Some("The broadcaster quote changed. Review it again.".into());
+    }
+    if bounds.covers(current) {
+        return None;
+    }
+    let reviewed_fee = fee_label(reviewed.fee_token, reviewed.fee_amount);
+    let current_fee = fee_label(current.fee_token, current.fee_amount);
+    Some(if current.fee_amount > bounds.maximum_fee() {
+        format!(
+            "The transaction fee rose from {reviewed_fee} to {current_fee}, above the approved maximum of {}. Review it again.",
+            fee_label(reviewed.fee_token, bounds.maximum_fee()),
+        )
+    } else {
+        format!(
+            "The transaction fee changed from {reviewed_fee} to {current_fee}. Review it again."
+        )
+    })
 }
 
 #[derive(Clone)]
@@ -504,6 +616,7 @@ impl HardwareSpendAuthorizationCompletion {
                 *authorization_limit,
                 execution.clone(),
                 None,
+                None,
             )),
             Self::PrivateUnshieldSelfBroadcast {
                 key,
@@ -514,6 +627,7 @@ impl HardwareSpendAuthorizationCompletion {
                 *key,
                 *authorization_limit,
                 execution.clone(),
+                None,
                 None,
             )),
             Self::BlockedShieldRefund { .. } => None,
@@ -734,6 +848,21 @@ impl SpendAuthorizationSummary {
             amount,
         ));
         self.requires_explicit_review = true;
+        self
+    }
+
+    pub(super) fn with_broadcaster_fee(
+        mut self,
+        estimated: String,
+        maximum_label: &'static str,
+        maximum: String,
+    ) -> Self {
+        self.rows.push(SpendAuthorizationSummaryRow::new(
+            "Estimated transaction fee",
+            estimated,
+        ));
+        self.rows
+            .push(SpendAuthorizationSummaryRow::new(maximum_label, maximum));
         self
     }
 
@@ -1762,7 +1891,12 @@ impl HardwareSpendAuthorizationDialogContent {
                                         cx.notify();
                                         return;
                                     }
-                                    if completion.private_intent().is_some_and(|intent| !intent.approve_gateway_review(root.read(cx))) {
+                                    if let Some(intent) = completion.private_intent()
+                                        && !intent.approve_gateway_review(root.read(cx))
+                                    {
+                                        let message = root.update(cx, |root, cx| root.report_stale_private_fee_review(&intent, cx));
+                                        dialog.error = Some(message.map_or_else(|| "The action changed while awaiting the device. Review it again.".into(), Into::into));
+                                        cx.notify();
                                         return;
                                     }
                                     dialog.completed = true;
@@ -1793,6 +1927,7 @@ impl HardwareSpendAuthorizationDialogContent {
                                                      authorization,
                                                      Some(vault_password),
                                                      authorization_limit,
+                                                     None,
                                                      window,
                                                     cx,
                                                 );
@@ -1811,6 +1946,7 @@ impl HardwareSpendAuthorizationDialogContent {
                                                      authorization,
                                                      Some(vault_password),
                                                      authorization_limit,
+                                                     None,
                                                      window,
                                                     cx,
                                                 );
@@ -1944,6 +2080,7 @@ impl SpendAuthorizationDialogContent {
                 if root.current_spend_authorization_scope() != scope
                     || !intent.approve_gateway_review(root)
                 {
+                    root.report_stale_private_fee_review(&intent, cx);
                     window.close_dialog(cx);
                     return;
                 }
@@ -4178,6 +4315,34 @@ impl WalletRoot {
         }
     }
 
+    /// Explains on the form why a private review with a changed fee was not submitted.
+    fn report_stale_private_fee_review(
+        &mut self,
+        intent: &SpendAuthorizationIntent,
+        cx: &mut Context<'_, Self>,
+    ) -> Option<String> {
+        let message = intent.private_fee_change(self)?;
+        let intent = match intent {
+            SpendAuthorizationIntent::ExecutorGasPassword { intent, .. } => intent.as_ref(),
+            intent => intent,
+        };
+        // Set the error directly: the form setters would also discard the current or refreshing estimate.
+        let error = match intent {
+            SpendAuthorizationIntent::PrivateSend(key, ..) => {
+                self.send_forms.get_mut(key).map(|form| &mut form.error)
+            }
+            SpendAuthorizationIntent::PrivateUnshield(key, ..) => {
+                self.unshield_forms.get_mut(key).map(|form| &mut form.error)
+            }
+            _ => None,
+        };
+        if let Some(error) = error {
+            *error = Some(message.as_str().into());
+            cx.notify();
+        }
+        Some(message)
+    }
+
     pub(super) fn finish_spend_authorization(
         &mut self,
         intent: SpendAuthorizationIntent,
@@ -4195,6 +4360,7 @@ impl WalletRoot {
             ) {
                 self.cancel_spend_authorization(&intent, cx);
             }
+            self.report_stale_private_fee_review(&intent, cx);
             window.close_dialog(cx);
             return Ok(());
         }
@@ -4488,6 +4654,7 @@ impl WalletRoot {
                         key,
                         authorization,
                         None,
+                        None,
                         window,
                         cx,
                     );
@@ -4502,11 +4669,18 @@ impl WalletRoot {
                     self.reject_gateway_private_authorization(&execution, cx);
                 }
             }
-            SpendAuthorizationIntent::PrivateSend(key, authorization_limit, execution, _) => {
+            SpendAuthorizationIntent::PrivateSend(
+                key,
+                authorization_limit,
+                execution,
+                _,
+                fee_review,
+            ) => {
                 self.generate_send_calldata_authorized(
                     key,
                     authorization,
                     authorization_limit,
+                    fee_review.as_deref(),
                     window,
                     cx,
                 );
@@ -4536,11 +4710,18 @@ impl WalletRoot {
                     cx,
                 );
             }
-            SpendAuthorizationIntent::PrivateUnshield(key, authorization_limit, execution, _) => {
+            SpendAuthorizationIntent::PrivateUnshield(
+                key,
+                authorization_limit,
+                execution,
+                _,
+                fee_review,
+            ) => {
                 self.generate_unshield_calldata_authorized(
                     key,
                     authorization,
                     authorization_limit,
+                    fee_review.as_deref(),
                     window,
                     cx,
                 );

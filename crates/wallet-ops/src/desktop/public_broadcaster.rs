@@ -147,7 +147,8 @@ pub struct DesktopUnshieldPublicBroadcasterRequest {
     /// Exact total payment in fee-token base units; `None` uses automatic estimation.
     pub custom_fee_amount: Option<U256>,
     pub executor: Option<Arc<PreparedExecutorOperation>>,
-    pub executor_maximum_private_fee: Option<U256>,
+    /// The fee ceiling the user approved; required for automatic fees and for executor operations.
+    pub maximum_private_fee: Option<U256>,
     pub chain_id: u64,
     pub effective_chain: settings::EffectiveChainConfig,
     pub view_session: Arc<vault::DesktopViewSession>,
@@ -163,8 +164,8 @@ pub struct DesktopUnshieldPublicBroadcasterRequest {
     /// The origin of the gateway draft this submits, which its journal entry is tagged with.
     pub gateway_origin: Option<String>,
     pub verify_proof: bool,
-    pub fee_rows: Vec<FeeRow>,
-    pub selection: PublicBroadcasterSelection,
+    /// The current fee estimate within the approved bounds; submission pays its broadcaster's quoted rate.
+    pub quote: PublicBroadcasterCostEstimate,
     pub fee_mode: FeeHandlingMode,
     pub fee_policy: BroadcasterFeePolicy,
     pub trust_filter: PublicBroadcasterTrustFilter,
@@ -179,6 +180,8 @@ pub struct DesktopUnshieldPublicBroadcasterRequest {
 pub struct DesktopSendPublicBroadcasterRequest {
     /// Exact total payment in fee-token base units; `None` uses automatic estimation.
     pub custom_fee_amount: Option<U256>,
+    /// The fee ceiling the user approved; required for automatic fees.
+    pub maximum_private_fee: Option<U256>,
     pub chain_id: u64,
     pub effective_chain: settings::EffectiveChainConfig,
     pub view_session: Arc<vault::DesktopViewSession>,
@@ -192,8 +195,8 @@ pub struct DesktopSendPublicBroadcasterRequest {
     /// The origin of the gateway draft this submits, which its journal entry is tagged with.
     pub gateway_origin: Option<String>,
     pub verify_proof: bool,
-    pub fee_rows: Vec<FeeRow>,
-    pub selection: PublicBroadcasterSelection,
+    /// The current fee estimate within the approved bounds; submission pays its broadcaster's quoted rate.
+    pub quote: PublicBroadcasterCostEstimate,
     pub fee_mode: FeeHandlingMode,
     pub fee_policy: BroadcasterFeePolicy,
     pub trust_filter: PublicBroadcasterTrustFilter,
@@ -733,7 +736,7 @@ pub(crate) fn bounded_public_broadcaster_fee(
 ) -> Result<U256> {
     if maximum.is_some_and(|maximum| required_fee > maximum) {
         return Err(eyre!(
-            "executor broadcaster fee exceeds the reviewed maximum; refresh and approve the quote"
+            "broadcaster fee exceeds the reviewed maximum; refresh and approve the quote"
         ));
     }
     let buffered = buffered_public_broadcaster_fee(required_fee);
@@ -1030,8 +1033,8 @@ pub(crate) fn public_broadcaster_anchor_rate_for_policy(
         .or_else(|| fixed_token_anchor_rate(chain_id, token))
 }
 
-/// Executor requests keep the quote selected before approval until it expires.
-/// Refreshed advertisements are candidates for a new preparation, not this one.
+/// Submissions keep the reviewed quote, or the executor-reserved one.
+/// Refreshed advertisements need a new review, not this submission.
 pub(crate) fn public_broadcaster_for_request(
     fee_rows: &[FeeRow],
     chain_id: u64,
@@ -1041,6 +1044,7 @@ pub(crate) fn public_broadcaster_for_request(
     trust_filter: &PublicBroadcasterTrustFilter,
     anchor_rate: Option<U256>,
     executor_delivery: Option<&ExecutorDelivery>,
+    reviewed: Option<&PublicBroadcasterCandidate>,
 ) -> Result<PublicBroadcasterCandidate> {
     let candidates = if let Some(delivery) = executor_delivery {
         let ExecutorDelivery::PublicBroadcaster(candidate) = delivery else {
@@ -1055,6 +1059,14 @@ pub(crate) fn public_broadcaster_for_request(
             .ok_or_else(|| eyre!("broadcaster executor profile is unavailable"))?;
         delivery.admit(profile)?;
         let mut candidate = candidate.as_ref().clone();
+        candidate.fee_policy_status = policy.classify_fee(candidate.fee, anchor_rate);
+        vec![candidate]
+    } else if let Some(reviewed) = reviewed {
+        if reviewed.chain_id != chain_id || reviewed.token != token {
+            return Err(eyre!("reviewed broadcaster chain or fee token changed"));
+        }
+        // Expiry is informational: the broadcaster simulates and settles any profitable request.
+        let mut candidate = reviewed.clone();
         candidate.fee_policy_status = policy.classify_fee(candidate.fee, anchor_rate);
         vec![candidate]
     } else {
@@ -1075,8 +1087,7 @@ pub(super) async fn public_broadcaster_setup(
     chain_id: u64,
     effective_chain: &settings::EffectiveChainConfig,
     token: Address,
-    fee_rows: &[FeeRow],
-    selection: &PublicBroadcasterSelection,
+    quote: &PublicBroadcasterCandidate,
     executor_delivery: Option<&ExecutorDelivery>,
     policy: BroadcasterFeePolicy,
     trust_filter: &PublicBroadcasterTrustFilter,
@@ -1087,14 +1098,17 @@ pub(super) async fn public_broadcaster_setup(
     let chain = effective_desktop_chain_config(chain_id, effective_chain)?;
     let anchor_rate = public_broadcaster_anchor_rate_for_policy(anchor_cache, chain_id, token);
     let broadcaster = public_broadcaster_for_request(
-        fee_rows,
+        &[],
         chain_id,
         token,
-        selection,
+        &PublicBroadcasterSelection::Specific {
+            railgun_address: quote.railgun_address.clone(),
+        },
         policy,
         trust_filter,
         anchor_rate,
         executor_delivery,
+        Some(quote),
     )?;
     let route = chain
         .rpc_route

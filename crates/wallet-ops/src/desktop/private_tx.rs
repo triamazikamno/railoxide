@@ -2425,6 +2425,7 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
                 .executor
                 .as_ref()
                 .map(|prepared| prepared.delivery()),
+            None,
         )?
     };
     if let Some(executor) = &request.executor {

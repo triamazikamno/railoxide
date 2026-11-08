@@ -23,6 +23,15 @@ fn gateway_private_estimate_is_ready(
     })
 }
 
+/// Invalidating re-estimates clear the shown estimate, so one still shown during a refresh is
+/// the retained background kind and stays submittable; the review bounds any newer quote.
+pub(in crate::root) const fn broadcaster_estimate_allows_submission(
+    estimate: Option<&PublicBroadcasterCostEstimate>,
+    _refreshing: bool,
+) -> bool {
+    estimate.is_some()
+}
+
 pub(in crate::root) fn sponsored_authorization_display(
     chain_id: u64,
     limit: SponsoredAuthorizationLimit,
@@ -64,6 +73,44 @@ pub(in crate::root) fn sponsored_authorization_display(
     }
 }
 
+/// Shows the automatic broadcaster fee and the ceiling submission enforces for it.
+fn with_broadcaster_fee_rows(
+    summary: SpendAuthorizationSummary,
+    chain_id: u64,
+    review: &PrivateFeeReview,
+    fee_mode: FeeHandlingMode,
+    token_registry: &EffectiveTokenRegistry,
+) -> SpendAuthorizationSummary {
+    let label = |amount| {
+        super::fee_editor::custom_fee_label(
+            chain_id,
+            review.quote.fee_token,
+            amount,
+            token_registry,
+        )
+    };
+    summary.with_broadcaster_fee(
+        label(review.quote.fee_amount),
+        match fee_mode {
+            FeeHandlingMode::DeductFromAmount => "Maximum transaction fee (deducted from amount)",
+            FeeHandlingMode::AddToAmount => "Maximum transaction fee (added to amount)",
+        },
+        label(review.bounds.maximum_fee()),
+    )
+}
+
+/// The broadcaster fee review for a draft; it pins the shown broadcaster for custom fees too.
+fn broadcaster_fee_review(
+    delivery_mode: DeliveryMode,
+    custom_fee_amount: Option<U256>,
+    cost_estimate: Option<&PublicBroadcasterCostEstimate>,
+) -> eyre::Result<Option<Arc<PrivateFeeReview>>> {
+    cost_estimate
+        .filter(|_| delivery_mode == DeliveryMode::PublicBroadcaster)
+        .map(|estimate| PrivateFeeReview::new(estimate.clone(), custom_fee_amount).map(Arc::new))
+        .transpose()
+}
+
 impl WalletRoot {
     pub(in crate::root) fn generate_send_calldata_from_form(
         &mut self,
@@ -73,6 +120,17 @@ impl WalletRoot {
     ) {
         let Some(draft) = self.send_spend_draft(key, cx) else {
             return;
+        };
+        let fee_review = match broadcaster_fee_review(
+            draft.delivery_mode,
+            draft.custom_fee_amount,
+            draft.cost_estimate.as_ref(),
+        ) {
+            Ok(review) => review,
+            Err(error) => {
+                self.set_send_form_error(key, error.to_string(), cx);
+                return;
+            }
         };
         let requires_gas_payer_password = self.selected_wallet_source().is_hardware_derived()
             && self_broadcast_requires_software_gas_payer_password(
@@ -97,6 +155,7 @@ impl WalletRoot {
                 draft
                     .custom_fee_amount
                     .map(|amount| (draft.fee_token, amount)),
+                fee_review.clone(),
             )
         };
         let summary = if requires_gas_payer_password {
@@ -111,6 +170,14 @@ impl WalletRoot {
                 amount,
                 &self.effective_token_registry,
             ))
+        } else if let Some(review) = &fee_review {
+            with_broadcaster_fee_rows(
+                summary,
+                draft.asset.chain_id,
+                review,
+                draft.fee_mode,
+                &self.effective_token_registry,
+            )
         } else {
             summary
         };
@@ -141,9 +208,13 @@ impl WalletRoot {
                 )
             ) && self.gateway_self_broadcast_review_current(form.gateway_execution.as_ref(), cx)
         } else {
-            form.cost_estimate.is_some() && !form.cost_estimate_pending && !form.estimating_cost
+            broadcaster_estimate_allows_submission(
+                form.cost_estimate.as_ref(),
+                form.cost_estimate_pending || form.estimating_cost,
+            )
         };
-        if (form.custom_fee_amount.is_some() && !estimate_is_current)
+        if ((form.custom_fee_amount.is_some() || delivery_mode == DeliveryMode::PublicBroadcaster)
+            && !estimate_is_current)
             || !gateway_private_estimate_is_ready(
                 form.gateway_execution.as_ref(),
                 estimate_is_current,
@@ -162,7 +233,6 @@ impl WalletRoot {
         let asset = form.asset.clone();
         let recipient_input = form.recipient_input.clone();
         let amount_input = form.amount_input.clone();
-        let broadcaster_choice = form.broadcaster_choice.clone();
         let cost_estimate = form.cost_estimate.clone();
         let fee_token = form.selected_fee_token;
         let custom_fee_amount = form.custom_fee_amount;
@@ -374,42 +444,14 @@ impl WalletRoot {
             )
         });
 
-        let fee_rows = if delivery_mode == DeliveryMode::PublicBroadcaster {
-            let rows = self.monitor_fee_rows();
-            let policy = self.public_broadcaster_fee_policy(allow_suspicious_broadcasters);
-            let public_broadcaster_selection = Self::public_broadcaster_submission_selection(
-                &broadcaster_choice,
-                cost_estimate.as_ref(),
-            );
-            let candidates = self.current_public_broadcaster_candidates(
-                asset.chain_id,
-                fee_token,
-                false,
-                false,
-                favorites_only_broadcasters,
-                policy,
-            );
-            let trust_filter = self.public_broadcaster_trust_filter(favorites_only_broadcasters);
-            if let Err(error) = select_public_broadcaster_with_policy_and_trust(
-                &candidates,
-                &public_broadcaster_selection,
-                policy,
-                &trust_filter,
-            ) {
-                self.set_send_form_error(key, error.to_string(), cx);
-                return None;
-            }
-            rows
-        } else {
-            Vec::new()
-        };
+        // No live-advertisement check: delivery needs a current estimate, the review pins that
+        // quote, and wallet-ops re-applies the trust filter and fee policy to it before proving.
         let fee_policy = self.public_broadcaster_fee_policy(allow_suspicious_broadcasters);
 
         Some(SendSpendDraft {
             custom_fee_amount,
             asset,
             delivery_mode,
-            broadcaster_choice,
             cost_estimate,
             fee_token,
             self_broadcast_gas_fee,
@@ -427,7 +469,6 @@ impl WalletRoot {
             self_broadcast_public_account_uuid,
             self_broadcast_gas_payer_display,
             self_broadcast_gas_payer_source,
-            fee_rows,
             fee_policy,
             favorites_only_broadcasters,
         })
@@ -438,6 +479,7 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         spend_authorization: DesktopPrivateSpendAuthorization,
         authorization_limit: Option<SponsoredAuthorizationLimit>,
+        fee_review: Option<&PrivateFeeReview>,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -446,6 +488,7 @@ impl WalletRoot {
             spend_authorization,
             None,
             authorization_limit,
+            fee_review,
             window,
             cx,
         );
@@ -457,6 +500,7 @@ impl WalletRoot {
         spend_authorization: DesktopPrivateSpendAuthorization,
         gas_payer_password: Option<Zeroizing<String>>,
         authorization_limit: Option<SponsoredAuthorizationLimit>,
+        fee_review: Option<&PrivateFeeReview>,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -471,7 +515,6 @@ impl WalletRoot {
             custom_fee_amount,
             asset,
             delivery_mode,
-            broadcaster_choice,
             cost_estimate,
             fee_token,
             self_broadcast_gas_fee,
@@ -489,10 +532,29 @@ impl WalletRoot {
             self_broadcast_public_account_uuid,
             self_broadcast_gas_payer_display,
             self_broadcast_gas_payer_source,
-            fee_rows,
             fee_policy,
             favorites_only_broadcasters,
         } = draft;
+        // An automatic fee is submitted within the maximum the user reviewed.
+        let maximum_private_fee = fee_review
+            .filter(|_| custom_fee_amount.is_none())
+            .map(|review| review.bounds.maximum_fee());
+        let public_broadcaster_quote = if delivery_mode == DeliveryMode::PublicBroadcaster {
+            let Some(quote) = cost_estimate
+                .clone()
+                .filter(|_| custom_fee_amount.is_some() || maximum_private_fee.is_some())
+            else {
+                self.set_send_form_error(
+                    key,
+                    "Refresh the current fee estimate before submitting this review.",
+                    cx,
+                );
+                return;
+            };
+            Some(quote)
+        } else {
+            None
+        };
         let transaction_tracking = if delivery_mode == DeliveryMode::SelfBroadcast {
             let tracking = self_broadcast_public_account_uuid
                 .as_deref()
@@ -620,7 +682,7 @@ impl WalletRoot {
                     asset.label.clone(),
                     asset.icon_path.clone(),
                     recipient.clone(),
-                    cost_estimate.clone(),
+                    cost_estimate,
                     self.public_broadcaster_response_timeout,
                     cx,
                 ));
@@ -707,6 +769,7 @@ impl WalletRoot {
             DeliveryMode::PublicBroadcaster => {
                 let request = DesktopSendPublicBroadcasterRequest {
                     custom_fee_amount,
+                    maximum_private_fee,
                     chain_id,
                     effective_chain: resolved_chain,
                     view_session,
@@ -719,11 +782,8 @@ impl WalletRoot {
                     recipient,
                     gateway_origin,
                     verify_proof: true,
-                    fee_rows,
-                    selection: Self::public_broadcaster_submission_selection(
-                        &broadcaster_choice,
-                        cost_estimate.as_ref(),
-                    ),
+                    quote: public_broadcaster_quote
+                        .expect("public broadcaster quote was validated"),
                     fee_mode,
                     fee_policy,
                     trust_filter: self.public_broadcaster_trust_filter(favorites_only_broadcasters),
@@ -887,6 +947,8 @@ impl WalletRoot {
                             if let SendResult::Sponsored(result) = &result {
                                 sponsored_progress_outcome = Some(result.outcome.clone());
                             }
+                            // The next transaction gets a fresh random broadcaster, not this one.
+                            form.shown_broadcaster = None;
                             form.error = None;
                             form.result = Some(result);
                         }
@@ -1046,6 +1108,17 @@ impl WalletRoot {
             form.executor_review = None;
             form.executor_operation = None;
         }
+        let fee_review = match broadcaster_fee_review(
+            draft.delivery_mode,
+            draft.custom_fee_amount,
+            draft.cost_estimate.as_ref(),
+        ) {
+            Ok(review) => review,
+            Err(error) => {
+                self.set_unshield_form_error(key, error.to_string(), cx);
+                return;
+            }
+        };
         let requires_gas_payer_password = self.selected_wallet_source().is_hardware_derived()
             && self_broadcast_requires_software_gas_payer_password(
                 draft.delivery_mode,
@@ -1069,6 +1142,7 @@ impl WalletRoot {
                 draft
                     .custom_fee_amount
                     .map(|amount| (draft.fee_token, amount)),
+                fee_review.clone(),
             )
         };
         let summary = if requires_gas_payer_password {
@@ -1083,6 +1157,14 @@ impl WalletRoot {
                 amount,
                 &self.effective_token_registry,
             ))
+        } else if let Some(review) = &fee_review {
+            with_broadcaster_fee_rows(
+                summary,
+                draft.asset.chain_id,
+                review,
+                draft.fee_mode,
+                &self.effective_token_registry,
+            )
         } else {
             summary
         };
@@ -1131,10 +1213,17 @@ impl WalletRoot {
                 )
             ) && self.gateway_self_broadcast_review_current(form.gateway_execution.as_ref(), cx)
         } else {
-            form.cost_estimate.is_some() && !form.cost_estimate_pending && !form.estimating_cost
+            broadcaster_estimate_allows_submission(
+                form.cost_estimate.as_ref(),
+                form.cost_estimate_pending || form.estimating_cost,
+            )
         };
         if require_current_quote
-            && ((form.custom_fee_amount.is_some() && !estimate_is_current)
+            // A prepared executor review pays its own approved quote and bounds.
+            && (((form.custom_fee_amount.is_some()
+                || (delivery_mode == DeliveryMode::PublicBroadcaster
+                    && form.executor_review.is_none()))
+                && !estimate_is_current)
                 || !gateway_private_estimate_is_ready(
                     form.gateway_execution.as_ref(),
                     estimate_is_current,
@@ -1370,32 +1459,10 @@ impl WalletRoot {
             )
         });
 
+        // No live-advertisement check: delivery needs a current estimate, the review pins that
+        // quote, and wallet-ops re-applies the trust filter and fee policy to it before proving.
         let fee_rows = if delivery_mode == DeliveryMode::PublicBroadcaster {
-            let rows = self.monitor_fee_rows();
-            let policy = self.public_broadcaster_fee_policy(allow_suspicious_broadcasters);
-            let public_broadcaster_selection = Self::public_broadcaster_submission_selection(
-                &broadcaster_choice,
-                cost_estimate.as_ref(),
-            );
-            let candidates = self.current_public_broadcaster_candidates(
-                asset.chain_id,
-                fee_token,
-                unwrap,
-                native_top_up.is_some(),
-                favorites_only_broadcasters,
-                policy,
-            );
-            let trust_filter = self.public_broadcaster_trust_filter(favorites_only_broadcasters);
-            if let Err(error) = select_public_broadcaster_with_policy_and_trust(
-                &candidates,
-                &public_broadcaster_selection,
-                policy,
-                &trust_filter,
-            ) {
-                self.set_unshield_form_error(key, error.to_string(), cx);
-                return None;
-            }
-            rows
+            self.monitor_fee_rows()
         } else {
             Vec::new()
         };
@@ -1440,6 +1507,7 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         spend_authorization: DesktopPrivateSpendAuthorization,
         authorization_limit: Option<SponsoredAuthorizationLimit>,
+        fee_review: Option<&PrivateFeeReview>,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -1448,6 +1516,7 @@ impl WalletRoot {
             spend_authorization,
             None,
             authorization_limit,
+            fee_review,
             window,
             cx,
         );
@@ -1459,6 +1528,7 @@ impl WalletRoot {
         spend_authorization: DesktopPrivateSpendAuthorization,
         gas_payer_password: Option<Zeroizing<String>>,
         authorization_limit: Option<SponsoredAuthorizationLimit>,
+        fee_review: Option<&PrivateFeeReview>,
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
@@ -1489,7 +1559,7 @@ impl WalletRoot {
             asset,
             unwrap,
             delivery_mode,
-            broadcaster_choice,
+            broadcaster_choice: _,
             cost_estimate,
             fee_token,
             self_broadcast_gas_fee,
@@ -1508,10 +1578,40 @@ impl WalletRoot {
             self_broadcast_public_account_uuid,
             self_broadcast_gas_payer_display,
             self_broadcast_gas_payer_source,
-            fee_rows,
+            fee_rows: _,
             fee_policy,
             favorites_only_broadcasters,
         } = draft;
+        // Executor reviews carry their own approved maximum; automatic fees use the reviewed one.
+        let maximum_private_fee = executor_review
+            .as_ref()
+            .and_then(|review| review.maximum_private_fee())
+            .or_else(|| {
+                fee_review
+                    .filter(|_| custom_fee_amount.is_none())
+                    .map(|review| review.bounds.maximum_fee())
+            });
+        let public_broadcaster_quote = if delivery_mode == DeliveryMode::PublicBroadcaster {
+            let quote = match executor_review.as_ref().map(|review| &review.quote) {
+                Some(super::executor::ExecutorUnshieldQuote::Broadcaster(quote)) => {
+                    Some((**quote).clone())
+                }
+                _ => cost_estimate
+                    .clone()
+                    .filter(|_| custom_fee_amount.is_some() || maximum_private_fee.is_some()),
+            };
+            let Some(quote) = quote else {
+                self.set_unshield_form_error(
+                    key,
+                    "Refresh the current fee estimate before submitting this review.",
+                    cx,
+                );
+                return;
+            };
+            Some(quote)
+        } else {
+            None
+        };
         let transaction_tracking = if delivery_mode == DeliveryMode::SelfBroadcast {
             let tracking = self_broadcast_public_account_uuid
                 .as_deref()
@@ -1675,7 +1775,7 @@ impl WalletRoot {
                     asset.label.clone(),
                     asset.icon_path.clone(),
                     recipient.to_checksum(None),
-                    cost_estimate.clone(),
+                    cost_estimate,
                     self.public_broadcaster_response_timeout,
                     cx,
                 ));
@@ -1778,9 +1878,7 @@ impl WalletRoot {
                     executor: executor_review
                         .as_ref()
                         .map(|review| Arc::clone(&review.prepared)),
-                    executor_maximum_private_fee: executor_review
-                        .as_ref()
-                        .and_then(|review| review.maximum_private_fee()),
+                    maximum_private_fee,
                     chain_id,
                     effective_chain: resolved_chain,
                     view_session,
@@ -1795,11 +1893,8 @@ impl WalletRoot {
                     native_top_up: native_top_up_request,
                     gateway_origin,
                     verify_proof: true,
-                    fee_rows,
-                    selection: Self::public_broadcaster_submission_selection(
-                        &broadcaster_choice,
-                        cost_estimate.as_ref(),
-                    ),
+                    quote: public_broadcaster_quote
+                        .expect("public broadcaster quote was validated"),
                     fee_mode,
                     fee_policy,
                     trust_filter: self.public_broadcaster_trust_filter(favorites_only_broadcasters),
@@ -2009,6 +2104,8 @@ impl WalletRoot {
                             if let UnshieldResult::Sponsored(result) = &result {
                                 sponsored_progress_outcome = Some(result.outcome.clone());
                             }
+                            // The next transaction gets a fresh random broadcaster, not this one.
+                            form.shown_broadcaster = None;
                             form.error = None;
                             form.result = Some(result);
                         }

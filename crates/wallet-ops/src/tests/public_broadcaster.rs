@@ -34,7 +34,7 @@ fn public_broadcaster_candidates_filter_unsupported_rows_and_allow_valid_poi_req
 }
 
 #[test]
-fn executor_submission_keeps_the_reserved_quote_when_advertisements_refresh() {
+fn submission_keeps_the_reviewed_quote_when_advertisements_refresh() {
     let (mut reserved, _) = sample_public_broadcaster_candidate(11);
     let chain =
         crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
@@ -54,37 +54,50 @@ fn executor_submission_keeps_the_reserved_quote_when_advertisements_refresh() {
     let delivery = crate::ExecutorDelivery::PublicBroadcaster(Box::new(reserved.clone()));
     let policy = BroadcasterFeePolicy::default();
     let trust = PublicBroadcasterTrustFilter::default();
+    let select_reviewed =
+        |delivery,
+         selection: &PublicBroadcasterSelection,
+         anchor,
+         trust: &PublicBroadcasterTrustFilter,
+         reviewed: Option<&PublicBroadcasterCandidate>| {
+            crate::desktop::public_broadcaster_for_request(
+                &rows,
+                1,
+                reserved.token,
+                selection,
+                policy,
+                trust,
+                anchor,
+                delivery,
+                reviewed,
+            )
+        };
     let select = |delivery,
                   selection: &PublicBroadcasterSelection,
                   anchor,
                   trust: &PublicBroadcasterTrustFilter| {
-        crate::desktop::public_broadcaster_for_request(
-            &rows,
-            1,
-            reserved.token,
-            selection,
-            policy,
-            trust,
-            anchor,
-            delivery,
-        )
+        select_reviewed(delivery, selection, anchor, trust, None)
     };
     let random = PublicBroadcasterSelection::Random;
+    let specific = PublicBroadcasterSelection::Specific {
+        railgun_address: reserved.railgun_address.clone(),
+    };
     assert_eq!(
         select(None, &random, None, &trust).unwrap().fees_id,
         "refreshed-fees"
     );
-    for selection in [
-        random.clone(),
-        PublicBroadcasterSelection::Specific {
-            railgun_address: reserved.railgun_address.clone(),
-        },
-    ] {
+    for selection in [random.clone(), specific.clone()] {
         let selected = select(Some(&delivery), &selection, None, &trust).unwrap();
         assert_eq!(selected.fees_id, reserved.fees_id);
         assert_eq!(selected.fee, reserved.fee);
         assert_eq!(selected.fee_expiration, reserved.fee_expiration);
     }
+    // A reviewed quote outranks the same broadcaster's refreshed higher-fee row.
+    let reviewed = select_reviewed(None, &specific, None, &trust, Some(&reserved)).unwrap();
+    assert_eq!(
+        (reviewed.fees_id, reviewed.fee),
+        (reserved.fees_id.clone(), reserved.fee)
+    );
     assert!(select(Some(&delivery), &random, Some(U256::from(100)), &trust).is_err());
     let favorites_only = PublicBroadcasterTrustFilter {
         favorites_only: true,
@@ -93,6 +106,17 @@ fn executor_submission_keeps_the_reserved_quote_when_advertisements_refresh() {
     assert!(select(Some(&delivery), &random, None, &favorites_only).is_err());
     let mut expired = reserved.clone();
     expired.fee_expiration = SystemTime::now() - Duration::from_secs(1);
+    // Fee expiry is informational for reviewed and executor quotes alike.
+    assert!(
+        select_reviewed(
+            None,
+            &specific,
+            None,
+            &PublicBroadcasterTrustFilter::default(),
+            Some(&expired)
+        )
+        .is_ok()
+    );
     assert!(
         select(
             Some(&crate::ExecutorDelivery::PublicBroadcaster(Box::new(
@@ -102,7 +126,7 @@ fn executor_submission_keeps_the_reserved_quote_when_advertisements_refresh() {
             None,
             &PublicBroadcasterTrustFilter::default(),
         )
-        .is_err()
+        .is_ok()
     );
 }
 

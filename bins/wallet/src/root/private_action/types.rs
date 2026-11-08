@@ -252,7 +252,6 @@ pub(in crate::root) struct SendSpendDraft {
     pub(in crate::root) custom_fee_amount: Option<U256>,
     pub(in crate::root) asset: UnshieldAsset,
     pub(in crate::root) delivery_mode: DeliveryMode,
-    pub(in crate::root) broadcaster_choice: BroadcasterChoice,
     pub(in crate::root) cost_estimate: Option<PublicBroadcasterCostEstimate>,
     pub(in crate::root) fee_token: Address,
     pub(in crate::root) self_broadcast_gas_fee: SelfBroadcastGasFeeSelection,
@@ -270,7 +269,6 @@ pub(in crate::root) struct SendSpendDraft {
     pub(in crate::root) self_broadcast_public_account_uuid: Option<String>,
     pub(in crate::root) self_broadcast_gas_payer_display: Option<String>,
     pub(in crate::root) self_broadcast_gas_payer_source: Option<PublicAccountSource>,
-    pub(in crate::root) fee_rows: Vec<FeeRow>,
     pub(in crate::root) fee_policy: BroadcasterFeePolicy,
     pub(in crate::root) favorites_only_broadcasters: bool,
 }
@@ -599,6 +597,8 @@ pub(in crate::root) struct UnshieldFormState {
     pub(in crate::root) cost_estimate_pending: bool,
     pub(in crate::root) estimating_cost: bool,
     pub(in crate::root) cost_estimate: Option<PublicBroadcasterCostEstimate>,
+    /// The Random broadcaster the estimate card showed; re-estimates keep it until a re-roll.
+    pub(in crate::root) shown_broadcaster: Option<String>,
     pub(in crate::root) estimate_id: u64,
     pub(in crate::root) generation_id: u64,
     pub(in crate::root) generating: bool,
@@ -644,6 +644,8 @@ pub(in crate::root) struct SendFormState {
     pub(in crate::root) cost_estimate_pending: bool,
     pub(in crate::root) estimating_cost: bool,
     pub(in crate::root) cost_estimate: Option<PublicBroadcasterCostEstimate>,
+    /// The Random broadcaster the estimate card showed; re-estimates keep it until a re-roll.
+    pub(in crate::root) shown_broadcaster: Option<String>,
     pub(in crate::root) estimate_id: u64,
     pub(in crate::root) generation_id: u64,
     pub(in crate::root) generating: bool,

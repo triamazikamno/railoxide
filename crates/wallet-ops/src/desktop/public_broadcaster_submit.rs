@@ -31,9 +31,14 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
     let chain = effective_desktop_chain_config(request.chain_id, &request.effective_chain)?;
     let executor =
         validate_desktop_executor_preparation(&request.session, request.executor.as_deref())?;
-    if executor.is_some() && request.executor_maximum_private_fee.is_none() {
+    if executor.is_some() && request.maximum_private_fee.is_none() {
         return Err(eyre!(
             "review the executor fee limit before proving this operation"
+        ));
+    }
+    if request.custom_fee_amount.is_none() && request.maximum_private_fee.is_none() {
+        return Err(eyre!(
+            "review the broadcaster fee limit before proving this operation"
         ));
     }
     if request.unwrap && !is_effective_wrapped_native_token(request.chain_id, request.token, &chain)
@@ -56,8 +61,7 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         request.chain_id,
         &request.effective_chain,
         request.fee_token,
-        &request.fee_rows,
-        &request.selection,
+        &request.quote.broadcaster,
         request
             .executor
             .as_ref()
@@ -234,7 +238,8 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         railgun_contract: chain.railgun_contract,
     };
 
-    let maximum_fee = executor.and(request.executor_maximum_private_fee);
+    // A custom fee is an exact approved amount; automatic fees stay within the reviewed limit.
+    let maximum_fee = request.maximum_private_fee;
     // The fresh estimate includes a buffer. Do not reject an approved fee merely
     // because that buffer grew; the RPC estimate below must still fit the limit.
     let mut fee_amount = match request.custom_fee_amount {
@@ -554,6 +559,11 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
             request.chain_id
         ));
     }
+    if request.custom_fee_amount.is_none() && request.maximum_private_fee.is_none() {
+        return Err(eyre!(
+            "review the broadcaster fee limit before proving this operation"
+        ));
+    }
 
     let recipient = parse_railgun_recipient(&request.recipient)?;
     let PublicBroadcasterSetup {
@@ -569,8 +579,7 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         request.chain_id,
         &request.effective_chain,
         request.fee_token,
-        &request.fee_rows,
-        &request.selection,
+        &request.quote.broadcaster,
         None,
         request.fee_policy,
         &request.trust_filter,
@@ -688,11 +697,13 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         railgun_contract: chain.railgun_contract,
     };
 
-    let mut fee_amount = request
-        .custom_fee_amount
-        .map_or(Ok(initial_fee_amount), |amount| {
-            validate_custom_public_broadcaster_fee(amount, U256::ZERO, None)
-        })?;
+    let maximum_fee = request.maximum_private_fee;
+    let mut fee_amount = match request.custom_fee_amount {
+        Some(amount) => validate_custom_public_broadcaster_fee(amount, U256::ZERO, maximum_fee)?,
+        None => maximum_fee.map_or(initial_fee_amount, |maximum| {
+            initial_fee_amount.min(maximum)
+        }),
+    };
     for attempt in 1..=PUBLIC_BROADCASTER_FEE_ATTEMPTS {
         let split = public_broadcaster_amount_split_for_tokens(
             request.amount,
@@ -870,8 +881,8 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
             });
         }
         let next_fee = request.custom_fee_amount.map_or_else(
-            || Ok(buffered_public_broadcaster_fee(computed_fee)),
-            |amount| validate_custom_public_broadcaster_fee(amount, computed_fee, None),
+            || bounded_public_broadcaster_fee(computed_fee, maximum_fee),
+            |amount| validate_custom_public_broadcaster_fee(amount, computed_fee, maximum_fee),
         )?;
         log_public_broadcaster_fee_prediction_failure(
             "send",
@@ -1033,13 +1044,8 @@ pub(crate) fn public_broadcaster_transact_params(
     let uses_executor = data.starts_with(&RelayAdapt7702::executeCall::SELECTOR);
     if uses_executor {
         let call = RelayAdapt7702::executeCall::abi_decode(&data)?;
-        if call._transactions.is_empty()
-            || broadcaster.available_wallets == 0
-            || broadcaster.fee_expiration <= SystemTime::now()
-        {
-            return Err(eyre!(
-                "executor broadcaster fee selection is no longer available"
-            ));
+        if call._transactions.is_empty() {
+            return Err(eyre!("executor broadcaster call has no transactions"));
         }
         let profile = broadcaster
             .relay_adapt_7702

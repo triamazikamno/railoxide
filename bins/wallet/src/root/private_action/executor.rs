@@ -1,11 +1,12 @@
 use super::*;
+use crate::root::spend_authorization::automatic_private_fee_bounds;
 use std::time::Instant;
 use wallet_ops::settings::ExecutorProfile;
 use wallet_ops::{
     DesktopUnshieldPublicBroadcasterEstimateRequest, ExecutorAsset, ExecutorDelivery,
     ExecutorRouteUnavailable, PreparedExecutorOperation, PublicBroadcasterApprovalBounds,
-    PublicBroadcasterSelection, default_public_broadcaster_fee_limit,
-    estimate_desktop_unshield_public_broadcaster_cost, vault::ExecutorOperationId,
+    PublicBroadcasterSelection, estimate_desktop_unshield_public_broadcaster_cost,
+    vault::ExecutorOperationId,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -92,11 +93,12 @@ impl ExecutorUnshieldQuote {
         custom_fee: Option<U256>,
     ) -> eyre::Result<Option<PublicBroadcasterApprovalBounds>> {
         match self {
-            Self::Broadcaster(quote) => {
-                let maximum = custom_fee
-                    .unwrap_or_else(|| default_public_broadcaster_fee_limit(quote.fee_amount));
-                quote.approval_bounds(maximum).map(Some)
-            }
+            Self::Broadcaster(quote) => custom_fee
+                .map_or_else(
+                    || automatic_private_fee_bounds(quote),
+                    |fee| quote.approval_bounds(fee),
+                )
+                .map(Some),
             Self::SelfBroadcast { .. } => Ok(None),
         }
     }

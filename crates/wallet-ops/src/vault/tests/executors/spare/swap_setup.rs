@@ -982,9 +982,9 @@ async fn private_bridge_setup_claims_both_accounts_first_and_each_setup_stands_a
             (source.is_retired(), account.is_retired()),
         )
     };
-    let mut unavailable = broadcaster(profile.delegate());
-    unavailable.available_wallets = 0;
-    let request = preparation(unavailable, private_bridge_approval());
+    // The swap's own setup fails at admission: its broadcaster lists no accepted delegate.
+    let unsupported = broadcaster(Address::repeat_byte(0x99));
+    let request = preparation(unsupported, private_bridge_approval());
     rpc.hold.send_replace(Some(multicall()));
     {
         let preparing = prepare_swap_pair(&origin, Some(&destination), request);
