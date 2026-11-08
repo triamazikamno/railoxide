@@ -599,6 +599,8 @@ pub(in crate::root) struct UnshieldFormState {
     pub(in crate::root) cost_estimate: Option<PublicBroadcasterCostEstimate>,
     /// The Random broadcaster the estimate card showed; re-estimates keep it until a re-roll.
     pub(in crate::root) shown_broadcaster: Option<String>,
+    /// Broadcasters that refused this form's submission; Random estimates skip them.
+    pub(in crate::root) refused_broadcasters: Vec<String>,
     pub(in crate::root) estimate_id: u64,
     pub(in crate::root) generation_id: u64,
     pub(in crate::root) generating: bool,
@@ -646,6 +648,8 @@ pub(in crate::root) struct SendFormState {
     pub(in crate::root) cost_estimate: Option<PublicBroadcasterCostEstimate>,
     /// The Random broadcaster the estimate card showed; re-estimates keep it until a re-roll.
     pub(in crate::root) shown_broadcaster: Option<String>,
+    /// Broadcasters that refused this form's submission; Random estimates skip them.
+    pub(in crate::root) refused_broadcasters: Vec<String>,
     pub(in crate::root) estimate_id: u64,
     pub(in crate::root) generation_id: u64,
     pub(in crate::root) generating: bool,

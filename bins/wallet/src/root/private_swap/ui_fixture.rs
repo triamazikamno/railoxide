@@ -315,10 +315,13 @@
 //!   mode's start, and the footer offers Stop waiting. `reconnecting` waits while the route
 //!   reconnects, with 1 reconnect used and 3 publishes. `timeout` is that wait ended without
 //!   an answer, after both reconnects: the step shows the timed-out message and the chip
-//!   reads Route closed. `direct` is `ready` in direct network mode, where the chip reads Not
-//!   isolated, whatever the wallet's network mode is. The route's chip and its hover card show
-//!   the synthesized route, which never changes. Stop waiting marks the wait stopped, and
-//!   Close closes the dialog. No job runs, nothing is proved or sent, and no record is written.
+//!   reads Route closed. `refused` is that wait ended with the broadcaster's refusal ("Gas
+//!   cost is too high…") over the `ready` route: the step offers Retry with custom fee… and
+//!   Try another broadcaster, which a stand-in Send form backs. `direct` is `ready` in direct
+//!   network mode, where the chip reads Not isolated, whatever the wallet's network mode is.
+//!   The route's chip and its hover card show the synthesized route, which never changes.
+//!   Stop waiting marks the wait stopped, and Close closes the dialog. No job runs, nothing is
+//!   proved or sent, and no record is written.
 //! - `hardware-derive` shows the Derive from private dialog, from Public's Add account, as a
 //!   hardware wallet's: its authorize state with Show addresses, its preview and the progress
 //!   of an add. Whatever wallet is selected, the dialog treats it as Ledger-derived and asks a
@@ -534,6 +537,8 @@ enum BroadcasterProgress {
     Reconnecting,
     /// The wait ended without an answer.
     Timeout,
+    /// The broadcaster refused the request.
+    Refused,
     /// Waiting in direct network mode, with no route of its own.
     Direct,
 }
@@ -748,6 +753,7 @@ fn parse(value: &str) -> Option<Mode> {
             "ready" => BroadcasterProgress::Ready,
             "reconnecting" => BroadcasterProgress::Reconnecting,
             "timeout" => BroadcasterProgress::Timeout,
+            "refused" => BroadcasterProgress::Refused,
             "direct" => BroadcasterProgress::Direct,
             _ => return None,
         }));
@@ -3190,9 +3196,17 @@ impl WalletRoot {
             .as_ref()
             .and_then(|session| session.receive_address().ok())
             .unwrap_or_default();
+        let key = crate::root::UnshieldAssetKey::from_asset(asset);
+        if state == BroadcasterProgress::Refused {
+            // A Send form backs the refusal's actions; it clears progress, so it comes first.
+            self.initialize_send_form(asset.clone(), window, cx);
+            if let Some(form) = self.send_forms.get_mut(&key) {
+                form.generation_id = u64::MAX;
+            }
+        }
         let route = self.start_private_broadcaster_progress(
             crate::root::DeliveryFormKind::Send,
-            crate::root::UnshieldAssetKey::from_asset(asset),
+            key,
             u64::MAX,
             asset.label.clone(),
             asset.icon_path.clone(),
@@ -3202,7 +3216,9 @@ impl WalletRoot {
             cx,
         );
         route.send_replace(match state {
-            BroadcasterProgress::Ready | BroadcasterProgress::Direct => SubmissionRouteProgress {
+            BroadcasterProgress::Ready
+            | BroadcasterProgress::Refused
+            | BroadcasterProgress::Direct => SubmissionRouteProgress {
                 state: Ready,
                 peers: 3,
                 recoveries_used: 0,
@@ -3239,6 +3255,46 @@ impl WalletRoot {
                     WaitingForBroadcasterResponse,
                     &PublicBroadcasterResultKind::TimedOut,
                 );
+            }
+            if state == BroadcasterProgress::Refused {
+                let entered_amount = U256::from(10).pow(U256::from(asset.decimals.unwrap_or(18)));
+                let fee_amount = entered_amount / U256::from(100);
+                let result = wallet_ops::PublicBroadcasterSubmissionResult {
+                    broadcaster: wallet_ops::PublicBroadcasterCandidate {
+                        token: asset.token,
+                        fee: U256::from(1_000_000_000_u64),
+                        fee_expiration: std::time::SystemTime::now() + Duration::from_mins(1),
+                        ..super::setup_progress::stand_in_setup_broadcaster(asset.chain_id, None)
+                    },
+                    action_token: asset.token,
+                    fee_token: asset.token,
+                    entered_amount,
+                    receiver_amount: entered_amount - fee_amount,
+                    recipient_amount: entered_amount - fee_amount,
+                    total_private_spend: entered_amount,
+                    fee_amount,
+                    protocol_fee_amount: U256::ZERO,
+                    protocol_fee_bps: U256::ZERO,
+                    fee_mode: wallet_ops::FeeHandlingMode::DeductFromAmount,
+                    gas_limit: 1_175_614,
+                    min_gas_price: 58_798_000,
+                    transaction_count: 1,
+                    input_count: 1,
+                    private_output_count: 1,
+                    public_output_count: 0,
+                    relay_call_count: 0,
+                    uses_relay_adapt: false,
+                    result: PublicBroadcasterResultKind::Failed {
+                        error: "Gas cost is too high, please refresh and try again".to_owned(),
+                    },
+                    native_top_up: None,
+                };
+                finish_private_broadcaster_progress_steps_at_stage(
+                    &mut progress.steps,
+                    WaitingForBroadcasterResponse,
+                    &result.result,
+                );
+                progress.result = Some(result);
             }
         }
         self.show_private_broadcaster_progress_dialog(window, cx);

@@ -280,6 +280,8 @@ pub(super) fn private_progress_state(
         self_broadcast_attempts: Vec::new(),
         self_broadcast_current_gas_fee: None,
         self_broadcast_action_error: None,
+        refusal_retry_pending: false,
+        refusal_retry_error: None,
         public_broadcaster_response_timeout: Some(Duration::from_mins(2)),
         public_broadcaster_wait_started_at: None,
         route: None,

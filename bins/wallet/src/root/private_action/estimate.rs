@@ -11,7 +11,7 @@ use wallet_ops::{
     DesktopUnshieldPublicBroadcasterEstimateRequest, PublicBroadcasterCandidate,
     PublicBroadcasterSelection, PublicBroadcasterTrustFilter,
     estimate_desktop_send_public_broadcaster_cost,
-    estimate_desktop_unshield_public_broadcaster_cost,
+    estimate_desktop_unshield_public_broadcaster_cost, vault::BroadcasterPreferenceEntry,
 };
 
 #[derive(Clone)]
@@ -31,6 +31,7 @@ pub(in crate::root) struct PrivateEstimateInput {
     pub(in crate::root) amount: String,
     pub(in crate::root) broadcaster: BroadcasterChoice,
     pub(in crate::root) shown_broadcaster: Option<String>,
+    pub(in crate::root) refused_broadcasters: Vec<String>,
     pub(in crate::root) fee_token: Address,
     pub(in crate::root) fee_mode: FeeHandlingMode,
     pub(in crate::root) allow_out_of_range: bool,
@@ -44,6 +45,7 @@ impl PrivateEstimateInput {
         // Comparison estimates must work even if the form's chosen broadcaster is unavailable.
         self.broadcaster = BroadcasterChoice::Random;
         self.shown_broadcaster = None;
+        self.refused_broadcasters.clear();
         if self.amount.trim().is_empty() {
             // Blank forms still need a representative amount for this display estimate.
             self.amount = format_send_amount_input(self.asset.max_batched, self.asset.decimals);
@@ -145,7 +147,15 @@ impl WalletRoot {
             input.favorites_only,
             fee_policy,
         );
-        let trust_filter = self.public_broadcaster_trust_filter(input.favorites_only);
+        let mut trust_filter = self.public_broadcaster_trust_filter(input.favorites_only);
+        if input.broadcaster == BroadcasterChoice::Random {
+            trust_filter = exclude_refused_broadcasters(
+                trust_filter,
+                &input.refused_broadcasters,
+                &candidates,
+                fee_policy,
+            );
+        }
         let selection = estimate_broadcaster_selection(
             &input.broadcaster,
             input.shown_broadcaster.as_deref(),
@@ -244,6 +254,37 @@ fn estimate_broadcaster_selection(
     WalletRoot::public_broadcaster_selection(choice)
 }
 
+/// Random skips broadcasters that refused this form, unless no other candidate remains.
+fn exclude_refused_broadcasters(
+    trust_filter: PublicBroadcasterTrustFilter,
+    refused: &[String],
+    candidates: &[PublicBroadcasterCandidate],
+    policy: BroadcasterFeePolicy,
+) -> PublicBroadcasterTrustFilter {
+    if refused.is_empty() {
+        return trust_filter;
+    }
+    let mut excluding = trust_filter.clone();
+    excluding
+        .preferences
+        .banned
+        .extend(refused.iter().map(|address| BroadcasterPreferenceEntry {
+            address: address.clone(),
+        }));
+    if select_public_broadcaster_with_policy_and_trust(
+        candidates,
+        &PublicBroadcasterSelection::Random,
+        policy,
+        &excluding,
+    )
+    .is_ok()
+    {
+        excluding
+    } else {
+        trust_filter
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +323,7 @@ mod tests {
                     railgun_address: "unavailable broadcaster".into(),
                 },
                 shown_broadcaster: None,
+                refused_broadcasters: Vec::new(),
                 fee_token: Address::ZERO,
                 fee_mode: FeeHandlingMode::DeductFromAmount,
                 allow_out_of_range: false,
@@ -364,5 +406,46 @@ mod tests {
             railgun_address: "chosen".into(),
         };
         assert_eq!(select(&chosen, Some(shown)), specific("chosen"));
+    }
+
+    #[test]
+    fn random_estimates_skip_refused_broadcasters_unless_none_remain() {
+        const OTHER: &str = "0zk1qykzjxctynyz4z43pukckpv43jyzhyvy0ehrd5wuc54l5enqf9qfrrv7j6fe3z53la7enqphqvxys9aqyp9xx0km95ehqslx8apmu8l7anc7emau4tvsultrkvd";
+        let policy = wallet_ops::BroadcasterFeePolicy::default();
+        let refused_row = crate::root::tests::fee_row(1, Address::ZERO, "refused");
+        let refused = refused_row.railgun_address.to_string();
+        let mut other_row = crate::root::tests::fee_row(1, Address::ZERO, "other");
+        other_row.railgun_address = Arc::from(OTHER);
+        let candidates = wallet_ops::public_broadcaster_candidates_for_asset(
+            &[refused_row, other_row],
+            1,
+            Address::ZERO,
+            policy,
+            None,
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 2);
+        let trust = PublicBroadcasterTrustFilter::default();
+        let filter = exclude_refused_broadcasters(
+            trust.clone(),
+            std::slice::from_ref(&refused),
+            &candidates,
+            policy,
+        );
+        let picked = select_public_broadcaster_with_policy_and_trust(
+            &candidates,
+            &PublicBroadcasterSelection::Random,
+            policy,
+            &filter,
+        )
+        .unwrap();
+        assert_eq!(picked.railgun_address, OTHER);
+        // Once every candidate has refused, the plain filter keeps an estimate possible.
+        let filter =
+            exclude_refused_broadcasters(trust, &[refused, OTHER.into()], &candidates, policy);
+        assert_eq!(
+            filter.preferences,
+            wallet_ops::vault::BroadcasterPreferences::default()
+        );
     }
 }

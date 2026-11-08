@@ -90,6 +90,9 @@ pub(in crate::root) struct PrivateBroadcasterProgressState {
     pub(in crate::root) self_broadcast_attempts: Vec<SelfBroadcastAttemptInfo>,
     pub(in crate::root) self_broadcast_current_gas_fee: Option<(u128, u128)>,
     pub(in crate::root) self_broadcast_action_error: Option<Arc<str>>,
+    /// A refused broadcaster submission's retry is fetching its new estimate.
+    pub(in crate::root) refusal_retry_pending: bool,
+    pub(in crate::root) refusal_retry_error: Option<Arc<str>>,
     pub(in crate::root) public_broadcaster_response_timeout: Option<Duration>,
     pub(in crate::root) public_broadcaster_wait_started_at: Option<Instant>,
     /// The public broadcaster submission's route, as its delivery reports it. A self-broadcast

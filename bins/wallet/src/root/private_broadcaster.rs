@@ -23,8 +23,11 @@ use wallet_ops::{
     self_broadcast_replacement_bumped_fee,
 };
 
+use super::broadcaster_picker::BroadcasterChoice;
 use super::gas_fee::{GasRetryInputs, format_gwei};
-use super::private_action::{delivery_element_id, private_action_title_row};
+use super::private_action::{
+    delivery_element_id, fee_editor::BroadcasterFeeRetry, private_action_title_row,
+};
 use super::public_action::{
     ProgressDialogCloseBehavior, ProgressFooterAction, PublicActionStepStatus,
     progress_footer_action,
@@ -41,7 +44,8 @@ use super::utxo::short_hash;
 use super::{
     DeliveryFormKind, PRIVATE_BROADCASTER_PROGRESS_DIALOG_WIDTH, UnshieldAssetKey, WalletRoot,
     app_panel, app_status_tag, dialog_max_height, format_native_token_amount_for_display,
-    format_recipient_amount_with_native_top_up, secondary_dialog_content_width,
+    format_recipient_amount_with_native_top_up, format_report_chain,
+    secondary_dialog_content_width,
 };
 
 const SPONSORED_SHUTDOWN_ABORT_GRACE: Duration = Duration::from_secs(20);
@@ -323,6 +327,8 @@ impl WalletRoot {
             self_broadcast_attempts: Vec::new(),
             self_broadcast_current_gas_fee: None,
             self_broadcast_action_error: None,
+            refusal_retry_pending: false,
+            refusal_retry_error: None,
             public_broadcaster_response_timeout: Some(response_timeout),
             public_broadcaster_wait_started_at: None,
             route: Some(route_rx),
@@ -390,6 +396,8 @@ impl WalletRoot {
             self_broadcast_attempts: Vec::new(),
             self_broadcast_current_gas_fee: current_gas_fee,
             self_broadcast_action_error: None,
+            refusal_retry_pending: false,
+            refusal_retry_error: None,
             public_broadcaster_response_timeout: None,
             public_broadcaster_wait_started_at: None,
             route: None,
@@ -621,6 +629,276 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         self.apply_private_broadcaster_progress_dialog_close(window, cx, true);
+        cx.notify();
+    }
+
+    /// The broadcaster's refusal and the form's choice, while that form can still retry it.
+    fn refused_public_broadcaster_retry(
+        &self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+    ) -> Option<(&PublicBroadcasterSubmissionResult, &BroadcasterChoice)> {
+        let progress = self.private_broadcaster_progress.as_ref()?;
+        if progress.kind != kind
+            || progress.key != key
+            || progress.generation_id != generation_id
+            || progress.flow != PrivateSubmissionProgressFlow::PublicBroadcaster
+            || progress.gateway_execution.is_some()
+            // Closing the dialog abandons a retry, so a late estimate never opens authorization.
+            || !progress.dialog_open
+        {
+            return None;
+        }
+        let result = progress
+            .result
+            .as_ref()
+            .filter(|result| matches!(result.result, PublicBroadcasterResultKind::Failed { .. }))?;
+        let (generating, gateway, form_generation_id, choice) = match kind {
+            DeliveryFormKind::Send => {
+                let form = self.send_forms.get(&key)?;
+                (
+                    form.generating,
+                    form.gateway_execution.is_some(),
+                    form.generation_id,
+                    &form.broadcaster_choice,
+                )
+            }
+            DeliveryFormKind::Unshield => {
+                let form = self.unshield_forms.get(&key)?;
+                (
+                    form.generating,
+                    form.gateway_execution.is_some(),
+                    form.generation_id,
+                    &form.broadcaster_choice,
+                )
+            }
+        };
+        (!generating && !gateway && form_generation_id == generation_id).then_some((result, choice))
+    }
+
+    fn try_another_public_broadcaster(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((result, BroadcasterChoice::Random)) =
+            self.refused_public_broadcaster_retry(kind, key, generation_id)
+        else {
+            return;
+        };
+        let address = result.broadcaster.railgun_address.clone();
+        match kind {
+            DeliveryFormKind::Send => {
+                let form = self.send_forms.get_mut(&key).expect("validated form");
+                if !form.refused_broadcasters.contains(&address) {
+                    form.refused_broadcasters.push(address);
+                }
+                form.shown_broadcaster = None;
+                form.cost_estimate = None;
+                form.result = None;
+                form.error = None;
+            }
+            DeliveryFormKind::Unshield => {
+                let form = self.unshield_forms.get_mut(&key).expect("validated form");
+                if !form.refused_broadcasters.contains(&address) {
+                    form.refused_broadcasters.push(address);
+                }
+                form.shown_broadcaster = None;
+                form.cost_estimate = None;
+                form.result = None;
+                form.error = None;
+            }
+        }
+        self.start_refused_broadcaster_retry(kind, key, generation_id, None, window, cx);
+    }
+
+    fn retry_public_broadcaster_with_custom_fee(
+        &self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((result, _)) = self.refused_public_broadcaster_retry(kind, key, generation_id)
+        else {
+            return;
+        };
+        let retry = BroadcasterFeeRetry {
+            generation_id,
+            fee_amount: result.fee_amount,
+            broadcaster: result.broadcaster.clone(),
+        };
+        // The editor opens over the progress dialog, which stays until authorization opens.
+        self.open_broadcaster_fee_editor(kind, key, Some(retry), window, cx);
+    }
+
+    /// Fetches a refused submission's new estimate, then opens spend authorization for it.
+    /// `expected_broadcaster` fails the retry if the estimate lands on a different broadcaster.
+    pub(in crate::root) fn start_refused_broadcaster_retry(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        expected_broadcaster: Option<String>,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self
+            .refused_public_broadcaster_retry(kind, key, generation_id)
+            .is_none()
+        {
+            return;
+        }
+        let input = self.broadcaster_retry_estimate_input(kind, key, cx);
+        let request = match input.map_or(Ok(None), |input| {
+            self.prepare_private_broadcaster_estimate(&input)
+        }) {
+            Ok(Some(request)) => request,
+            Ok(None) => {
+                self.fail_refused_broadcaster_retry(
+                    "No broadcaster can take this retry right now.".into(),
+                    cx,
+                );
+                return;
+            }
+            Err(error) => {
+                self.fail_refused_broadcaster_retry(error.to_string(), cx);
+                return;
+            }
+        };
+        if let Some(progress) = self.private_broadcaster_progress.as_mut() {
+            progress.refusal_retry_pending = true;
+            progress.refusal_retry_error = None;
+        }
+        // Claiming the form's estimate id makes a background estimate that lands meanwhile stale.
+        self.cost_estimate_seq = self.cost_estimate_seq.wrapping_add(1);
+        let estimate_id = self.cost_estimate_seq;
+        if let Some((id, estimating)) = self.public_broadcaster_estimate_claim(kind, key) {
+            *id = estimate_id;
+            *estimating = true;
+        }
+        cx.notify();
+
+        let http = self.http.clone();
+        let join = self
+            .runtime
+            .spawn(async move { request.estimate(&http).await });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = match join.await {
+                Ok(result) => result,
+                Err(error) => Err(eyre::eyre!("retry cost estimate task failed: {error}")),
+            };
+            let result = result.and_then(|estimate| match &expected_broadcaster {
+                Some(expected) if estimate.broadcaster.railgun_address != *expected => {
+                    Err(eyre::eyre!(
+                        "The broadcaster that refused is no longer available. Try another broadcaster."
+                    ))
+                }
+                _ => Ok(estimate),
+            });
+            let _ = this.update_in(cx, |root, window, cx| {
+                let retryable = root
+                    .refused_public_broadcaster_retry(kind, key, generation_id)
+                    .is_some();
+                let estimate = match result {
+                    Ok(estimate) if retryable => estimate,
+                    result => {
+                        let released = root
+                            .public_broadcaster_estimate_claim(kind, key)
+                            .filter(|(id, _)| **id == estimate_id)
+                            .map(|(id, estimating)| {
+                                *id = 0;
+                                *estimating = false;
+                            })
+                            .is_some();
+                        if let Err(error) = result
+                            && retryable
+                        {
+                            root.fail_refused_broadcaster_retry(format_report_chain(&error), cx);
+                        } else {
+                            // The dialog closed or moved on; nothing is submitted. A newer
+                            // submission's progress keeps its own pending state.
+                            if let Some(progress) = root.private_broadcaster_progress.as_mut()
+                                && progress.accepts_update(kind, key, generation_id)
+                            {
+                                progress.refusal_retry_pending = false;
+                            }
+                            cx.notify();
+                        }
+                        // The form keeps a current estimate, unless a newer estimate already
+                        // claimed it.
+                        if released {
+                            root.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+                        }
+                        return;
+                    }
+                };
+                match kind {
+                    DeliveryFormKind::Send => {
+                        let form = root.send_forms.get_mut(&key).expect("validated form");
+                        if form.broadcaster_choice == BroadcasterChoice::Random {
+                            form.shown_broadcaster =
+                                Some(estimate.broadcaster.railgun_address.clone());
+                        }
+                        form.cost_estimate = Some(estimate);
+                        form.cost_estimate_pending = false;
+                        form.estimating_cost = false;
+                        form.estimate_id = 0;
+                    }
+                    DeliveryFormKind::Unshield => {
+                        let form = root.unshield_forms.get_mut(&key).expect("validated form");
+                        if form.broadcaster_choice == BroadcasterChoice::Random {
+                            form.shown_broadcaster =
+                                Some(estimate.broadcaster.railgun_address.clone());
+                        }
+                        form.cost_estimate = Some(estimate);
+                        form.cost_estimate_pending = false;
+                        form.estimating_cost = false;
+                        form.estimate_id = 0;
+                    }
+                }
+                root.close_private_broadcaster_progress_dialog(window, cx);
+                match kind {
+                    DeliveryFormKind::Send => {
+                        root.generate_send_calldata_from_form(key, window, cx);
+                    }
+                    DeliveryFormKind::Unshield => {
+                        root.generate_unshield_calldata_from_form(key, window, cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The form's estimate id and in-flight flag.
+    fn public_broadcaster_estimate_claim(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+    ) -> Option<(&mut u64, &mut bool)> {
+        match kind {
+            DeliveryFormKind::Send => self
+                .send_forms
+                .get_mut(&key)
+                .map(|form| (&mut form.estimate_id, &mut form.estimating_cost)),
+            DeliveryFormKind::Unshield => self
+                .unshield_forms
+                .get_mut(&key)
+                .map(|form| (&mut form.estimate_id, &mut form.estimating_cost)),
+        }
+    }
+
+    fn fail_refused_broadcaster_retry(&mut self, error: String, cx: &mut Context<'_, Self>) {
+        if let Some(progress) = self.private_broadcaster_progress.as_mut() {
+            progress.refusal_retry_pending = false;
+            progress.refusal_retry_error = Some(Arc::from(error));
+        }
         cx.notify();
     }
 
@@ -1067,12 +1345,12 @@ impl WalletRoot {
                 .w(content_width)
                 .child(app_muted_text("No active private submission."));
         };
-        let mut content = div()
-            .w(content_width)
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(render_private_broadcaster_progress_stepper(root, progress));
+        let refusal_actions = self
+            .refused_public_broadcaster_retry(progress.kind, progress.key, progress.generation_id)
+            .map(|(_, choice)| *choice == BroadcasterChoice::Random);
+        let mut content = div().w(content_width).flex().flex_col().gap_3().child(
+            render_private_broadcaster_progress_stepper(root, progress, refusal_actions),
+        );
 
         match progress.flow {
             PrivateSubmissionProgressFlow::PublicBroadcaster => {
@@ -1626,9 +1904,11 @@ fn render_private_broadcaster_progress_footer(
         }))
 }
 
+/// `refusal_actions` is `Some(offer_another_broadcaster)` when a broadcaster refusal can be retried.
 pub(super) fn render_private_broadcaster_progress_stepper(
     root: &Entity<WalletRoot>,
     progress: &PrivateBroadcasterProgressState,
+    refusal_actions: Option<bool>,
 ) -> gpui::Div {
     render_submission_progress_stepper(progress.steps.iter().map(|step| {
         let detail = if step.status == PublicActionStepStatus::Error {
@@ -1649,9 +1929,85 @@ pub(super) fn render_private_broadcaster_progress_stepper(
                 private_broadcaster_stage_id(step.stage)
             )
             .into(),
-            action: render_self_broadcast_step_action(root.clone(), progress, step),
+            action: match refusal_actions {
+                Some(another) if step.status == PublicActionStepStatus::Error => Some(
+                    render_refused_broadcaster_step_action(root.clone(), progress, another),
+                ),
+                _ => render_self_broadcast_step_action(root.clone(), progress, step),
+            },
         }
     }))
+}
+
+fn render_refused_broadcaster_step_action(
+    root: Entity<WalletRoot>,
+    progress: &PrivateBroadcasterProgressState,
+    another_broadcaster: bool,
+) -> gpui::AnyElement {
+    let key = progress.key;
+    let kind = progress.kind;
+    let generation_id = progress.generation_id;
+    let pending = progress.refusal_retry_pending;
+    let custom_fee_root = root.clone();
+    let buttons = div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_2()
+        .child(
+            app_button(
+                delivery_element_id(key, kind, "progress-retry-custom-fee"),
+                "Retry with custom fee…",
+            )
+            .small()
+            .outline()
+            .disabled(pending)
+            .on_click(move |_event, window, cx| {
+                custom_fee_root.update(cx, |root, cx| {
+                    root.retry_public_broadcaster_with_custom_fee(
+                        kind,
+                        key,
+                        generation_id,
+                        window,
+                        cx,
+                    );
+                });
+            }),
+        )
+        .when(another_broadcaster, |this| {
+            this.child(
+                app_button(
+                    delivery_element_id(key, kind, "progress-try-another-broadcaster"),
+                    "Try another broadcaster",
+                )
+                .small()
+                .outline()
+                .disabled(pending)
+                .on_click(move |_event, window, cx| {
+                    root.update(cx, |root, cx| {
+                        root.try_another_public_broadcaster(kind, key, generation_id, window, cx);
+                    });
+                }),
+            )
+        });
+    div()
+        .pt(px(4.0))
+        .flex()
+        .flex_col()
+        .items_start()
+        .gap_1()
+        .child(buttons)
+        .when(pending, |this| {
+            this.child(app_muted_text("Getting a new fee estimate…").whitespace_normal())
+        })
+        .when_some(progress.refusal_retry_error.as_deref(), |this, error| {
+            this.child(
+                app_muted_text(format!("Retry failed: {error}"))
+                    .text_color(rgb(theme::DANGER))
+                    .whitespace_normal(),
+            )
+        })
+        .into_any_element()
 }
 
 fn render_self_broadcast_step_action(
