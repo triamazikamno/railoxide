@@ -27,7 +27,7 @@ use tracing_subscriber::field::MakeExt as _;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, filter::filter_fn, fmt};
-use ui::logs::{DEFAULT_LOG_CAPACITY, LogStore, UiLogLayer, compact_log_value};
+use ui::logs::{DEFAULT_LOG_CAPACITY, LogStore, UiLogLayer, compact_log_value, redact_log_urls};
 
 use crate::assets::WalletAssets;
 use crate::cli::Options;
@@ -263,18 +263,8 @@ fn install_tracing(logs: LogStore) -> Result<()> {
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
-    let console_fields = fmt::format::debug_fn(|writer, field, value| {
-        let value = format!("{value:?}");
-        let value = compact_log_value(&value);
-        if field.name() == "message" {
-            write!(writer, "{value}")
-        } else {
-            write!(writer, "{field}={value}")
-        }
-    })
-    .delimited(" ");
     let console_layer = fmt::layer()
-        .fmt_fields(console_fields)
+        .fmt_fields(console_fields())
         .with_target(true)
         .with_level(true)
         .with_writer(std::io::stderr);
@@ -289,6 +279,20 @@ fn install_tracing(logs: LogStore) -> Result<()> {
         .map_err(|error| eyre::eyre!("install tracing subscriber: {error}"))?;
 
     Ok(())
+}
+
+/// Stderr field formatter. Redacts URLs like the UI log, since stderr often lands in the journal.
+fn console_fields() -> impl for<'writer> fmt::FormatFields<'writer> + Send + Sync + 'static {
+    fmt::format::debug_fn(|writer, field, value| {
+        let value = format!("{value:?}");
+        let value = redact_log_urls(&compact_log_value(&value));
+        if field.name() == "message" {
+            write!(writer, "{value}")
+        } else {
+            write!(writer, "{field}={value}")
+        }
+    })
+    .delimited(" ")
 }
 
 /// Caps `trezor-client` at INFO whatever `RUST_LOG` asks for: its DEBUG and TRACE events carry
@@ -335,5 +339,38 @@ mod tests {
             assert!(!event_enabled!(target: "trezor_client::client", Level::TRACE));
             assert!(event_enabled!(target: "wallet_ops::hardware", Level::TRACE));
         });
+    }
+
+    #[test]
+    fn console_fields_redact_urls() {
+        #[derive(Clone, Default)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .fmt_fields(console_fields())
+                .with_writer(move || writer.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            let error =
+                "error sending request for url (https://user:pw@rpc.example/v2/KEY?k=SECRET)";
+            tracing::warn!(%error, "rpc failed");
+        });
+
+        let output = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("https://rpc.example/"), "{output}");
+        for secret in ["pw", "KEY", "SECRET"] {
+            assert!(!output.contains(secret), "{secret} leaked: {output}");
+        }
     }
 }

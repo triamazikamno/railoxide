@@ -437,7 +437,8 @@ fn split_url_start(value: &str, cut: usize) -> Option<usize> {
     (start + url_candidate_end(&value[start..]) > cut).then_some(start)
 }
 
-fn redact_log_urls(value: &str) -> String {
+#[must_use]
+pub fn redact_log_urls(value: &str) -> String {
     let Some(mut offset) = next_url_start(value) else {
         return value.to_string();
     };
