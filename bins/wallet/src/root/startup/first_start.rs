@@ -36,8 +36,9 @@ use crate::root::private_action::render_private_action_info_icon_with_body;
 use crate::root::private_swap::ui_fixture_first_start_old_notice;
 use crate::root::rgb_with_alpha;
 use crate::root::settings::{
-    CHAINS_PAGE_INDEX, SyncedStringFieldState, WalletSettingsEditor, format_auto_lock_timeout,
-    non_empty_setting, settings_dialog_dimensions, settings_text_input,
+    CHAINS_PAGE_INDEX, PROXY_SOCKS5_DNS_WARNING, SyncedStringFieldState, WalletSettingsEditor,
+    format_auto_lock_timeout, non_empty_setting, proxy_url_resolves_dns_locally,
+    settings_dialog_dimensions, settings_text_input, settings_warning_banner,
 };
 use crate::root::shell::render_wallet_hero_screen;
 
@@ -540,6 +541,12 @@ impl WalletStartupRoot {
                         section.when_some(setup.proxy.as_ref(), |section, proxy| {
                             section.child(settings_text_input(&proxy.input))
                         })
+                    })
+                    .when(proxy_url_resolves_dns_locally(draft), |section| {
+                        section.child(settings_warning_banner(
+                            "first-start-proxy-dns-warning",
+                            PROXY_SOCKS5_DNS_WARNING,
+                        ))
                     })
                     .child(app_muted_text(note).whitespace_normal())
                     .when_some(editor.validation_error.clone(), |section, error| {

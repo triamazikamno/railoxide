@@ -618,16 +618,33 @@ impl Render for WalletSettingsEditor {
                     .layout(Axis::Vertical),
             );
         }
-        network_group = network_group.item(
+        if should_show_proxy_waku_disclaimer(self.draft.network.mode) {
+            let dns_warning = proxy_url_resolves_dns_locally(&self.draft);
+            network_group = network_group.footer(move |_window, _cx| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(settings_warning_banner(
+                        "wallet-settings-proxy-waku-warning",
+                        PROXY_WAKU_DISCLAIMER,
+                    ))
+                    .when(dns_warning, |footer| {
+                        footer.child(settings_warning_banner(
+                            "wallet-settings-proxy-dns-warning",
+                            PROXY_SOCKS5_DNS_WARNING,
+                        ))
+                    })
+            });
+        }
+        let walletconnect_group = settings_group().title("WalletConnect").item(
             SettingItem::new("WalletConnect project ID", walletconnect_project_id)
                 .keywords(["wallet connect", "reown", "dapp", "pairing"])
                 .layout(Axis::Vertical),
         );
-        if should_show_proxy_waku_disclaimer(self.draft.network.mode) {
-            network_group =
-                network_group.footer(|_window, _cx| settings_warning_banner(PROXY_WAKU_DISCLAIMER));
-        }
-        let network_page = SettingPage::new("Network").group(network_group);
+        let network_page = SettingPage::new("Network")
+            .group(network_group)
+            .group(walletconnect_group);
 
         let broadcasters_page = SettingPage::new("Broadcasters")
             .group(

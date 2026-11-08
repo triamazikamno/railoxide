@@ -62,10 +62,13 @@ pub(in crate::root) fn settings_info_banner(message: impl Into<SharedString>) ->
         .child(Alert::info("wallet-settings-info-banner", message.into().to_string()).small())
 }
 
-pub(in crate::root) fn settings_warning_banner(message: impl Into<SharedString>) -> gpui::Div {
+pub(in crate::root) fn settings_warning_banner(
+    id: impl Into<ElementId>,
+    message: impl Into<SharedString>,
+) -> gpui::Div {
     div()
         .w_full()
-        .child(Alert::warning("wallet-settings-warning-banner", message.into().to_string()).small())
+        .child(Alert::warning(id, message.into().to_string()).small())
 }
 
 pub(in crate::root) fn settings_text_input(input: &Entity<InputState>) -> Input {
@@ -94,6 +97,7 @@ pub(in crate::root) fn render_token_dialog_content(
         .gap_3()
         .when(!readonly_identity, |this| {
             this.child(settings_warning_banner(
+                "wallet-settings-token-risk-warning",
                 "Tokens that rebase, charge transfer fees, or restrict transfers may fail in Railgun \
                  or cause loss of funds. Adding a token makes it available for swaps on supported \
                  chains and means you accept these risks.",

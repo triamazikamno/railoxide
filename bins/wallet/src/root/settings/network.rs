@@ -278,6 +278,17 @@ pub(in crate::root) const fn should_show_proxy_waku_disclaimer(mode: NetworkMode
     matches!(mode, NetworkModeSetting::Proxy)
 }
 
+/// reqwest resolves hostnames locally for `socks5://`, unlike `socks5h://`.
+pub(in crate::root) fn proxy_url_resolves_dns_locally(settings: &WalletSettings) -> bool {
+    settings.network.mode == NetworkModeSetting::Proxy
+        && settings
+            .network
+            .proxy_url
+            .as_deref()
+            .and_then(|url| reqwest::Url::parse(url).ok())
+            .is_some_and(|url| url.scheme() == "socks5")
+}
+
 pub(in crate::root) const fn poi_source_value(source: PoiReadSourceSetting) -> &'static str {
     match source {
         PoiReadSourceSetting::IndexedArtifacts => "indexed-artifacts",

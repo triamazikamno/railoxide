@@ -539,6 +539,21 @@ fn proxy_url_setting_only_shows_for_proxy_mode() {
 }
 
 #[test]
+fn only_socks5_proxy_url_warns_about_local_dns() {
+    let mut settings = WalletSettings::default();
+    settings.network.mode = NetworkModeSetting::Proxy;
+    for (url, warns) in [
+        ("socks5://127.0.0.1:9050", true),
+        ("SOCKS5://127.0.0.1:9050", true),
+        ("socks5h://127.0.0.1:9050", false),
+        ("http://127.0.0.1:8080", false),
+    ] {
+        settings.network.proxy_url = Some(url.to_string());
+        assert_eq!(proxy_url_resolves_dns_locally(&settings), warns, "{url}");
+    }
+}
+
+#[test]
 fn proxy_waku_disclaimer_only_shows_for_proxy_mode() {
     assert!(!should_show_proxy_waku_disclaimer(NetworkModeSetting::Tor));
     assert!(should_show_proxy_waku_disclaimer(NetworkModeSetting::Proxy));

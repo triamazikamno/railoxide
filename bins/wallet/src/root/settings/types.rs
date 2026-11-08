@@ -146,6 +146,7 @@ pub(in crate::root) const ANCHOR_BPS_SLIDER_MAX: f32 = 100_000.0;
 pub(in crate::root) const ANCHOR_BPS_SLIDER_STEP: f32 = 10.0;
 pub(in crate::root) const ANCHOR_BPS_SLIDER_MAX_BPS: u64 = 100_000;
 pub(in crate::root) const PROXY_WAKU_DISCLAIMER: &str = "Broadcasters are disabled in proxy mode because their connections may bypass the proxy and expose your IP address.";
+pub(in crate::root) const PROXY_SOCKS5_DNS_WARNING: &str = "With socks5://, your DNS provider can see the server names the wallet looks up. Replace socks5:// with socks5h:// to send these lookups through the proxy.";
 
 #[derive(Clone)]
 pub(in crate::root) enum SettingsUrlListKind {

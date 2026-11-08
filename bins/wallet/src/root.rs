@@ -283,11 +283,12 @@ use settings::{
     display_waku_doh_fallback_endpoints, format_anchor_bps_exact_range, format_anchor_bps_percent,
     format_anchor_bps_percent_range, format_anchor_premium_range,
     price_anchor_dialog_values_from_entry, price_anchor_override_from_dialog_values,
-    price_anchor_token_primary_label, remove_poi_gateway_url, remove_waku_dns_enr_tree,
-    remove_waku_doh_fallback_endpoint, set_poi_gateway_url, set_price_anchor_override,
-    set_waku_dns_enr_tree, set_waku_doh_fallback_endpoint, settings_draft_after_discard,
-    settings_restart_action_enabled, settings_restart_reuses_active_network,
-    settings_save_action_enabled, should_show_proxy_url_setting, should_show_proxy_waku_disclaimer,
+    price_anchor_token_primary_label, proxy_url_resolves_dns_locally, remove_poi_gateway_url,
+    remove_waku_dns_enr_tree, remove_waku_doh_fallback_endpoint, set_poi_gateway_url,
+    set_price_anchor_override, set_waku_dns_enr_tree, set_waku_doh_fallback_endpoint,
+    settings_draft_after_discard, settings_restart_action_enabled,
+    settings_restart_reuses_active_network, settings_save_action_enabled,
+    should_show_proxy_url_setting, should_show_proxy_waku_disclaimer,
     startup_settings_action_state,
 };
 #[cfg(test)]
