@@ -11,6 +11,7 @@ use crate::http::{OperationHttpClient, redact_url_for_display};
 
 const SPONSORED_BUNDLE_REQUEST_ID: u64 = 1;
 const SPONSORED_BUNDLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SponsoredBundleRelayFailureKind {
@@ -159,7 +160,7 @@ async fn submit_sponsored_bundle_to_relay(
             txs: [signed_raw_transaction],
         }],
     };
-    let response = client
+    let mut response = client
         .client()
         .post(request_url)
         .timeout(SPONSORED_BUNDLE_REQUEST_TIMEOUT)
@@ -170,9 +171,18 @@ async fn submit_sponsored_bundle_to_relay(
     if !response.status().is_success() {
         return Err(RelayAttemptError::HttpStatus(response.status().as_u16()));
     }
-    let response = response
-        .json::<SponsoredBundleResponse>()
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
+        .map_err(|_| RelayAttemptError::InvalidResponse)?
+    {
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(RelayAttemptError::InvalidResponse);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let response = serde_json::from_slice::<SponsoredBundleResponse>(&body)
         .map_err(|_| RelayAttemptError::InvalidResponse)?;
     if response.jsonrpc != "2.0" || response.id != SPONSORED_BUNDLE_REQUEST_ID {
         return Err(RelayAttemptError::InvalidResponse);
@@ -453,6 +463,25 @@ mod tests {
         assert!(error.failures.iter().any(|failure| {
             failure.kind == SponsoredBundleRelayFailureKind::JsonRpc { code: -32000 }
         }));
+    }
+
+    #[tokio::test]
+    async fn oversized_valid_response_is_rejected() {
+        let response = format!("{}{}", success_response(), " ".repeat(MAX_RESPONSE_BYTES));
+        let (url, _, task) = spawn_relay(200, &response, None);
+        let relays = [SensitiveUrl::from(url)];
+
+        let client = operation_client(reqwest::Client::new());
+        let error = submit_sponsored_bundle(&client, &relays, "0xsigned")
+            .await
+            .expect_err("oversized response is rejected");
+        // The client may close before the relay finishes writing.
+        let _ = task.join();
+
+        assert_eq!(
+            error.failures[0].kind,
+            SponsoredBundleRelayFailureKind::InvalidResponse
+        );
     }
 
     #[tokio::test]
