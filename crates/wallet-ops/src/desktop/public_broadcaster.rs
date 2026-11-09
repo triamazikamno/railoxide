@@ -635,7 +635,11 @@ pub fn broadcaster_fee_amount(
     gas_price: u128,
 ) -> U256 {
     const FEE_SCALE: U256 = uint!(1_000_000_000_000_000_000_U256);
-    token_fee_per_unit_gas * U256::from(gas_limit) * U256::from(gas_price) / FEE_SCALE
+    // The rate comes from an untrusted fee row; wrapping would turn a huge rate into a tiny fee.
+    token_fee_per_unit_gas
+        .saturating_mul(U256::from(gas_limit))
+        .saturating_mul(U256::from(gas_price))
+        / FEE_SCALE
 }
 
 #[must_use]

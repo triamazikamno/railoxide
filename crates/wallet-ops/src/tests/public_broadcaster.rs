@@ -745,6 +745,20 @@ fn broadcaster_fee_amount_uses_same_token_fee_rate() {
 }
 
 #[test]
+fn broadcaster_fee_amount_saturates_instead_of_wrapping_on_huge_rate() {
+    // Each row wraps to zero with plain multiplication: once at gas_limit, once at gas_price.
+    for (rate, gas_limit, gas_price) in [
+        (U256::from(1) << 255, 2, 1),
+        (U256::from(1) << 192, 1, 1_u128 << 64),
+    ] {
+        assert_eq!(
+            broadcaster_fee_amount(rate, gas_limit, gas_price),
+            U256::MAX / uint!(1_000_000_000_000_000_000_U256)
+        );
+    }
+}
+
+#[test]
 fn railgun_protocol_fee_uses_hardcoded_unshield_bps() {
     let amount = uint!(1_000_000_U256);
 
