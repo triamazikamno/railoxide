@@ -20,6 +20,8 @@ use tokio::{
     time::Instant,
 };
 
+const MAX_APPROVAL_PARAMS_LEN: usize = 1024 * 1024;
+
 pub struct GatewayApprovalRequest {
     pub id: String,
     pub deadline: Instant,
@@ -128,9 +130,13 @@ impl DappProvider {
             self.respond(session, &document, &request_id, Err(4100));
             return Ok(());
         }
+        // Locked admission cannot check grants and chain additions need none, so origins are
+        // free to mint; the global count and size cap bound retained params.
         if self.pending.iter().filter(|p| p.origin == origin).count()
             + self.approvals.iter().filter(|p| p.origin == origin).count()
             >= MAX_APPROVALS
+            || self.approvals.len() >= MAX_APPROVALS
+            || serde_json::to_vec(&params).is_ok_and(|bytes| bytes.len() > MAX_APPROVAL_PARAMS_LEN)
         {
             self.respond(session, &document, &request_id, Err(-32005));
             return Ok(());

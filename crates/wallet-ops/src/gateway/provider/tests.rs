@@ -2360,6 +2360,52 @@ async fn locked_connect_and_sign_share_capacity_and_original_expiry() {
 }
 
 #[tokio::test]
+async fn locked_approvals_bound_params_size_and_total_across_origins() {
+    let (path, mut provider, view) = fixture();
+    provider.update_wallet(GatewayWalletState::default(), 2);
+    for index in 0..=MAX_APPROVALS {
+        provider
+            .register(
+                1,
+                PeerId::from_bytes([1; 16]),
+                format!("doc-{index}"),
+                &format!("https://site-{index}.invalid/"),
+            )
+            .unwrap();
+    }
+    messages(&mut provider);
+    let now = Instant::now();
+    let sign = |provider: &mut DappProvider, index: usize, message: String| {
+        provider
+            .request(
+                1,
+                format!("doc-{index}"),
+                "sign".into(),
+                "personal_sign",
+                json!([message, "0x0000000000000000000000000000000000000001"]),
+                now,
+            )
+            .unwrap();
+        messages(provider)
+    };
+    let oversized = sign(&mut provider, 0, format!("0x{}", "00".repeat(1024 * 1024)));
+    assert_eq!(result(&oversized)["error"]["code"], -32005);
+    for index in 0..MAX_APPROVALS {
+        let admitted = sign(&mut provider, index, "0x1234".into());
+        assert!(
+            admitted
+                .iter()
+                .all(|(_, m)| m["type"] != "provider_response")
+        );
+    }
+    let overflow = sign(&mut provider, MAX_APPROVALS, "0x1234".into());
+    assert_eq!(result(&overflow)["error"]["code"], -32005);
+    drop(provider);
+    drop(view);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[tokio::test]
 async fn waiting_approvals_reject_retired_cohorts_and_stale_admission() {
     for coalesced in [false, true] {
         let (path, mut provider, view) = fixture();
