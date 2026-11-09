@@ -406,6 +406,7 @@ impl WalletRoot {
         match generate_seed_material() {
             Ok(seed) => {
                 self.generated_seed = Some(seed);
+                self.generated_seed_revealed = false;
                 self.vault_error = None;
                 self.wallet_setup_mode = WalletSetupMode::GeneratedReview;
                 cx.notify();

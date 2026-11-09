@@ -9,13 +9,14 @@ use gpui_component::alert::Alert;
 use gpui_component::checkbox::Checkbox;
 use gpui_component::progress::Progress as UiProgress;
 use gpui_component::spinner::Spinner;
-use gpui_component::{Disableable, IconName, WindowExt, button::ButtonVariants, tooltip::Tooltip};
+use gpui_component::{
+    Disableable, IconName, WindowExt,
+    button::{Button, ButtonVariants},
+    tooltip::Tooltip,
+};
 use gpui_component::{Icon, Sizable};
 #[cfg(feature = "hardware")]
-use gpui_component::{
-    Selectable,
-    button::{Button, ButtonGroup},
-};
+use gpui_component::{Selectable, button::ButtonGroup};
 use ui::clipboard::secret_clipboard_with_toast;
 use ui::controls::{
     app_button, app_button_base, app_button_label, app_input, app_masked_input,
@@ -509,12 +510,22 @@ impl WalletRoot {
     fn render_generated_wallet_review(&self, root: Entity<Self>) -> gpui::AnyElement {
         let confirm_root = root.clone();
         let password_root = root.clone();
+        let reveal_root = root.clone();
         let back_root = root;
-        let phrase = self
+        let phrase_for_clipboard = self
             .generated_seed
             .as_ref()
             .map_or_else(String::new, |seed| seed.mnemonic.to_string());
-        let phrase_for_clipboard = phrase.clone();
+        let revealed = self.generated_seed_revealed;
+        let phrase = if revealed {
+            phrase_for_clipboard.clone()
+        } else {
+            phrase_for_clipboard
+                .split_whitespace()
+                .map(|_| "••••")
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         let mut body = vault_dialog_body(
             "Write this phrase down before continuing. It is shown once and then encrypted into the vault.",
         );
@@ -548,7 +559,31 @@ impl WalletRoot {
                         .child(SharedString::from(phrase)),
                 )
                 .when(!phrase_for_clipboard.is_empty(), |this| {
+                    let visibility_label = if revealed {
+                        "Hide recovery phrase"
+                    } else {
+                        "Show recovery phrase"
+                    };
                     this.child(
+                        Button::new("generated-wallet-recovery-phrase-visibility")
+                            .icon(if revealed {
+                                IconName::EyeOff
+                            } else {
+                                IconName::Eye
+                            })
+                            .ghost()
+                            .xsmall()
+                            .flex_none()
+                            .accessibility_label(visibility_label)
+                            .tooltip(visibility_label)
+                            .on_click(move |_event, _window, cx| {
+                                reveal_root.update(cx, |root, cx| {
+                                    root.generated_seed_revealed = !root.generated_seed_revealed;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
                         div()
                             .id("generated-wallet-recovery-phrase-copy-action")
                             .flex_none()
