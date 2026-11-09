@@ -206,15 +206,20 @@ impl WalletRoot {
             // Builder ownership also invalidates programmatically closed dialogs.
             let identity = Rc::downgrade(&lease);
             let content_root = root.clone();
+            let close_root = root.clone();
             dialog
                 .w(dialog_width)
                 .on_ok(|_, _, _| false)
                 .max_h(dialog_max_height)
                 .title(app_strong_text("Add wallet"))
-                .on_close(move |_, _, _| {
+                .on_close(move |_, window, cx| {
                     if let Some(lease) = identity.upgrade() {
                         lease.set(false);
                     }
+                    close_root.update(cx, |root, cx| {
+                        root.import_mnemonic_input
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                    });
                 })
                 .child(
                     content_root
@@ -225,6 +230,8 @@ impl WalletRoot {
         cx.defer_in(window, move |root, window, cx| {
             root.set_wallet_name_input(&label, window, cx);
             root.clear_add_wallet_password(window, cx);
+            root.import_mnemonic_input
+                .update(cx, |input, cx| input.set_value("", window, cx));
         });
     }
 
@@ -1282,10 +1289,12 @@ impl WalletRoot {
         self.broadcaster_picker = None;
         self.active_wallet_tab = self.default_wallet_tab();
         self.setup_password = None;
-        self.add_wallet_device_auth_password = None;
+        self.clear_add_wallet_password(window, cx);
         self.vault_view_unlock = None;
         self.auto_lock.disarm();
         self.generated_seed = None;
+        self.import_mnemonic_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
         self.clear_key_export_dialog_state(window, cx);
         #[cfg(feature = "hardware")]
         {
