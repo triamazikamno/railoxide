@@ -20,7 +20,6 @@ $Branch = "main"
 $RustVersion = "1.99.1"
 $Target = "x86_64-pc-windows-msvc"
 $Toolchain = "$RustVersion-$Target"
-$SqliteVersion = "3530200"
 $SourceMode = "release"
 $SourceRef = ""
 $ExplicitSource = $false
@@ -39,7 +38,7 @@ Usage:
   irm https://raw.githubusercontent.com/triamazikamno/railoxide/main/scripts/install-wallet.ps1 | iex
 
 Options:
-  -InstallDir PATH       Install wallet.exe and sqlite3.dll under PATH
+  -InstallDir PATH       Install wallet.exe under PATH
   -SourceDir PATH        Use PATH for the managed source checkout
   -Main                  Build the latest main branch without prompting
   -Ref REF               Build a specific tag, branch, or commit without prompting
@@ -477,43 +476,6 @@ function Get-SourceCommit {
     return $commit.Trim()
 }
 
-function Ensure-SqliteForLinking {
-    $sqliteRoot = Join-Path $SourceDir ".deps\sqlite-x64"
-    $dllZip = Join-Path $sqliteRoot "sqlite-dll-win-x64-$SqliteVersion.zip"
-    $amalgamationZip = Join-Path $sqliteRoot "sqlite-amalgamation-$SqliteVersion.zip"
-    $dllUrl = "https://www.sqlite.org/2026/sqlite-dll-win-x64-$SqliteVersion.zip"
-    $amalgamationUrl = "https://www.sqlite.org/2026/sqlite-amalgamation-$SqliteVersion.zip"
-    $sqliteLib = Join-Path $sqliteRoot "sqlite3.lib"
-    $sqliteDef = Join-Path $sqliteRoot "sqlite3.def"
-
-    Write-Step "preparing SQLite $SqliteVersion for Windows linking"
-    if ($DryRun) {
-        Write-Host "+ New-Item -ItemType Directory -Force $sqliteRoot"
-        Write-Host "+ Invoke-WebRequest $dllUrl -OutFile $dllZip"
-        Write-Host "+ Invoke-WebRequest $amalgamationUrl -OutFile $amalgamationZip"
-        Write-Host "+ Expand-Archive $dllZip -DestinationPath $sqliteRoot -Force"
-        Write-Host "+ Expand-Archive $amalgamationZip -DestinationPath $sqliteRoot -Force"
-    } else {
-        New-Item -ItemType Directory -Path $sqliteRoot -Force | Out-Null
-        Invoke-WebRequest -Uri $dllUrl -OutFile $dllZip
-        Invoke-WebRequest -Uri $amalgamationUrl -OutFile $amalgamationZip
-        Expand-Archive -LiteralPath $dllZip -DestinationPath $sqliteRoot -Force
-        Expand-Archive -LiteralPath $amalgamationZip -DestinationPath $sqliteRoot -Force
-    }
-
-    $vsDevCmd = Get-VsDevCmdPath
-    if (-not $vsDevCmd) {
-        Stop-Install "Visual Studio Build Tools are required to generate sqlite3.lib"
-    }
-
-    $hostArch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
-    $command = '"{0}" -arch=x64 -host_arch={1} && lib /MACHINE:X64 /DEF:"{2}" /OUT:"{3}"' -f $vsDevCmd, $hostArch, $sqliteDef, $sqliteLib
-    Invoke-Cmd $command
-
-    $env:SQLITE3_LIB_DIR = $sqliteRoot
-    $env:SQLITE3_INCLUDE_DIR = Join-Path $sqliteRoot "sqlite-amalgamation-$SqliteVersion"
-}
-
 function Find-Python {
     foreach ($name in @("py", "python", "python3")) {
         if (-not (Test-Command $name)) { continue }
@@ -600,7 +562,7 @@ function Build-Wallet {
     }
 
     $manifestPath = Join-Path $SourceDir "Cargo.toml"
-    $cargoArgs = @("+$Toolchain", "build", "--release", "--manifest-path", $manifestPath, "-p", "wallet")
+    $cargoArgs = @("+$Toolchain", "build", "--release", "--locked", "--manifest-path", $manifestPath, "-p", "wallet")
     if (-not [string]::IsNullOrWhiteSpace($features)) {
         $cargoArgs += @("--features", $features)
     }
@@ -632,21 +594,17 @@ function Build-Wallet {
 }
 
 function Install-WalletFiles {
-    $sqliteRoot = Join-Path $SourceDir ".deps\sqlite-x64"
     $walletExe = Join-Path $SourceDir "target\$Target\release\wallet.exe"
-    $sqliteDll = Join-Path $sqliteRoot "sqlite3.dll"
     $iconSrc = Join-Path $SourceDir "bins\wallet\packaging\icons\windows\RailOxide.ico"
 
     Write-Step "installing RailOxide to $InstallDir"
     if ($DryRun) {
         Write-Host "+ New-Item -ItemType Directory -Force $InstallDir"
         Write-Host "+ Copy-Item $walletExe $InstallDir\wallet.exe"
-        Write-Host "+ Copy-Item $sqliteDll $InstallDir\sqlite3.dll"
         Write-Host "+ Copy-Item $iconSrc $InstallDir\RailOxide.ico"
     } else {
         New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
         Copy-Item -LiteralPath $walletExe -Destination (Join-Path $InstallDir "wallet.exe") -Force
-        Copy-Item -LiteralPath $sqliteDll -Destination (Join-Path $InstallDir "sqlite3.dll") -Force
         if (Test-Path -LiteralPath $iconSrc) {
             Copy-Item -LiteralPath $iconSrc -Destination (Join-Path $InstallDir "RailOxide.ico") -Force
         }
@@ -752,7 +710,6 @@ function Main {
     Ensure-RustToolchain
     Ensure-SourceCheckout
     Write-Step "building source commit $(Get-SourceCommit)"
-    Ensure-SqliteForLinking
     Ensure-ExtensionDependencies
     Build-Wallet
     Install-WalletFiles

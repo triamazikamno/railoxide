@@ -588,9 +588,9 @@ build_linux() (
   fi
   log 'building RailOxide wallet release binary'
   if [[ -n "$features" ]]; then
-    run cargo "+$toolchain" build --release -p wallet --features "$features"
+    run cargo "+$toolchain" build --release --locked -p wallet --features "$features"
   else
-    run cargo "+$toolchain" build --release -p wallet
+    run cargo "+$toolchain" build --release --locked -p wallet
   fi
   if [[ -f "$source_dir/scripts/build-browser-extension" ]]; then
     run python3 "$source_dir/scripts/verify-browser-extension.py" "$source_dir/target/release/wallet" "$RAILOXIDE_EXTENSION_BUNDLE"

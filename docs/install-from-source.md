@@ -100,13 +100,10 @@ It builds the x64 MSVC target:
 x86_64-pc-windows-msvc
 ```
 
-It also downloads the official SQLite DLL package, generates `sqlite3.lib` with Visual Studio's `lib` tool, and copies `sqlite3.dll` next to the wallet executable.
-
-The installed files are written to:
+The wallet is installed to:
 
 ```text
 %LOCALAPPDATA%\RailOxide\bin\wallet.exe
-%LOCALAPPDATA%\RailOxide\bin\sqlite3.dll
 ```
 
 The installer creates a Start Menu shortcut unless `-NoShortcut` is passed.
@@ -133,7 +130,7 @@ macOS/Linux options:
 Windows PowerShell options:
 
 ```text
--InstallDir PATH       Install wallet.exe and sqlite3.dll under PATH
+-InstallDir PATH       Install wallet.exe under PATH
 -SourceDir PATH        Use PATH for the managed source checkout
 -Main                  Build the latest main branch without prompting
 -Ref REF               Build a specific tag, branch, or commit without prompting
