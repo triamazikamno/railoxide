@@ -9,7 +9,7 @@ use gpui::{
     Render, SharedString, Styled, Window, div, prelude::FluentBuilder, px, rgb,
 };
 use gpui_component::{Sizable, WindowExt, alert::Alert, button::ButtonVariants, input::InputEvent};
-use ui::clipboard::clipboard_with_toast;
+use ui::clipboard::secret_clipboard_with_toast;
 use ui::controls::{app_button, app_muted_text, app_strong_text};
 use ui::dialog::WalletDialogExt as _;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
@@ -649,7 +649,7 @@ fn render_key_export_value_field(
                 .whitespace_normal()
                 .child(SharedString::from(value.clone())),
         )
-        .children(revealed.then(|| clipboard_with_toast(copy_button_id, value)))
+        .children(revealed.then(|| secret_clipboard_with_toast(copy_button_id, value)))
 }
 
 pub(in crate::root) const fn key_export_mnemonic_available(source: WalletSource) -> bool {

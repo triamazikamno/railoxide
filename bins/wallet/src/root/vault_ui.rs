@@ -16,7 +16,7 @@ use gpui_component::{
     Selectable,
     button::{Button, ButtonGroup},
 };
-use ui::clipboard::clipboard_with_toast;
+use ui::clipboard::secret_clipboard_with_toast;
 use ui::controls::{
     app_button, app_button_base, app_button_label, app_input, app_masked_input,
     app_muted_shimmer_text, app_muted_text, app_strong_text,
@@ -555,7 +555,7 @@ impl WalletRoot {
                             .tooltip(|window, cx| {
                                 Tooltip::new("Copy recovery phrase").build(window, cx)
                             })
-                            .child(clipboard_with_toast(
+                            .child(secret_clipboard_with_toast(
                                 "generated-wallet-recovery-phrase-copy",
                                 phrase_for_clipboard,
                             )),

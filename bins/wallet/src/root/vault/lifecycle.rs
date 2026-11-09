@@ -1244,6 +1244,7 @@ impl WalletRoot {
         window.close_all_dialogs(cx);
         self.set_network_status_popover_open(false, cx);
         self.clear_protected_software_seed_session(cx);
+        ui::clipboard::clear_copied_secret(cx);
         self.view_session = None;
         self.pending_software_profile_open = None;
         self.pending_software_profile_base_profile_uuid = None;
