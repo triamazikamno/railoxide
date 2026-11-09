@@ -1,9 +1,10 @@
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::DeliveryMode;
+use super::auto_lock::AutoLockTimestamp;
 use alloy::primitives::{Address, U256};
 use gpui::{
     Anchor, AnyElement, App, AppContext, ClickEvent, Context, Entity, Focusable, FontWeight,
@@ -155,7 +156,9 @@ impl SpendAuthorizationScope {
 pub(super) struct SpendAuthorizationCache {
     password: Zeroizing<String>,
     scope: SpendAuthorizationScope,
-    expires_at: Option<Instant>,
+    // Dual-clock so suspend time counts toward the lifetime.
+    granted_at: AutoLockTimestamp,
+    lifetime: Option<Duration>,
 }
 
 fn clear_protected_software_seed_session_state(
@@ -173,28 +176,26 @@ impl SpendAuthorizationCache {
         password: Zeroizing<String>,
         lifetime: SpendAuthorizationLifetime,
         scope: SpendAuthorizationScope,
-        now: Instant,
+        now: AutoLockTimestamp,
     ) -> Option<Self> {
         match lifetime {
             SpendAuthorizationLifetime::Once => None,
-            SpendAuthorizationLifetime::UntilVaultLock => Some(Self {
+            SpendAuthorizationLifetime::UntilVaultLock
+            | SpendAuthorizationLifetime::FiveMinutes
+            | SpendAuthorizationLifetime::FifteenMinutes => Some(Self {
                 password,
                 scope,
-                expires_at: None,
+                granted_at: now,
+                lifetime: lifetime.duration(),
             }),
-            SpendAuthorizationLifetime::FiveMinutes
-            | SpendAuthorizationLifetime::FifteenMinutes => {
-                lifetime.duration().map(|duration| Self {
-                    password,
-                    scope,
-                    expires_at: Some(now + duration),
-                })
-            }
         }
     }
 
-    fn is_valid_at(&self, scope: &SpendAuthorizationScope, now: Instant) -> bool {
-        self.scope == *scope && self.expires_at.is_none_or(|expires_at| now < expires_at)
+    fn is_valid_at(&self, scope: &SpendAuthorizationScope, now: AutoLockTimestamp) -> bool {
+        self.scope == *scope
+            && self
+                .lifetime
+                .is_none_or(|lifetime| now.elapsed_since(self.granted_at) < lifetime)
     }
 }
 
@@ -4253,7 +4254,7 @@ impl WalletRoot {
         &mut self,
         cx: &mut Context<'_, Self>,
     ) -> Option<Zeroizing<String>> {
-        let now = Instant::now();
+        let now = AutoLockTimestamp::now();
         let scope = self.current_spend_authorization_scope();
         if self
             .spend_authorization_cache
@@ -4369,7 +4370,7 @@ impl WalletRoot {
             password,
             lifetime,
             self.current_spend_authorization_scope(),
-            Instant::now(),
+            AutoLockTimestamp::now(),
         );
         window.close_dialog(cx);
         self.continue_authorized_spend(intent, authorization, window, cx);
@@ -5018,7 +5019,7 @@ pub(super) fn remembered_spend_authorization_valid_for_test(
     lifetime: SpendAuthorizationLifetime,
     elapsed: Duration,
 ) -> bool {
-    let now = Instant::now();
+    let now = AutoLockTimestamp::now();
     let scope = SpendAuthorizationScope::new("base", "wallet", None);
     let Some(cache) = SpendAuthorizationCache::new(
         Zeroizing::new("password".to_string()),
@@ -5034,6 +5035,7 @@ pub(super) fn remembered_spend_authorization_valid_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
     #[cfg(not(feature = "hardware"))]
     use ui::controls::app_masked_input;
 
@@ -5676,8 +5678,29 @@ mod tests {
     }
 
     #[test]
+    fn timed_authorization_expires_when_only_wall_clock_advances() {
+        let scope = SpendAuthorizationScope::new("base", "wallet", None);
+        let granted = AutoLockTimestamp::now();
+        for lifetime in [
+            SpendAuthorizationLifetime::FiveMinutes,
+            SpendAuthorizationLifetime::FifteenMinutes,
+        ] {
+            let cache = SpendAuthorizationCache::new(
+                Zeroizing::new("password".to_owned()),
+                lifetime,
+                scope.clone(),
+                granted,
+            )
+            .expect("timed cache");
+            let resumed = granted.with_wall_advanced(lifetime.duration().expect("timed"));
+
+            assert!(!cache.is_valid_at(&scope, resumed));
+        }
+    }
+
+    #[test]
     fn remembered_authorization_is_bound_to_exact_wallet_scope() {
-        let now = Instant::now();
+        let now = AutoLockTimestamp::now();
         let first_scope = SpendAuthorizationScope::new("base-a", "wallet-a", None);
         let second_scope = SpendAuthorizationScope::new("base-a", "wallet-b", None);
         let session_scope = SpendAuthorizationScope::new(
@@ -5724,7 +5747,7 @@ mod tests {
             Zeroizing::new("test-vault-password".to_owned()),
             SpendAuthorizationLifetime::UntilVaultLock,
             scope,
-            Instant::now(),
+            AutoLockTimestamp::now(),
         );
 
         assert!(clear_protected_software_seed_session_state(

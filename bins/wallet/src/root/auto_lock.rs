@@ -31,7 +31,7 @@ impl AutoLockTimestamp {
         }
     }
 
-    fn elapsed_since(self, earlier: Self) -> Duration {
+    pub(super) fn elapsed_since(self, earlier: Self) -> Duration {
         let monotonic = self.monotonic.saturating_duration_since(earlier.monotonic);
         let wall = self.wall.duration_since(earlier.wall).unwrap_or_default();
         monotonic.max(wall)
@@ -474,6 +474,17 @@ impl std::ops::Add<Duration> for AutoLockTimestamp {
     fn add(self, duration: Duration) -> Self::Output {
         Self {
             monotonic: self.monotonic + duration,
+            wall: self.wall + duration,
+        }
+    }
+}
+
+#[cfg(test)]
+impl AutoLockTimestamp {
+    /// Models a suspend, during which only wall time advances.
+    pub(super) fn with_wall_advanced(self, duration: Duration) -> Self {
+        Self {
+            monotonic: self.monotonic,
             wall: self.wall + duration,
         }
     }
