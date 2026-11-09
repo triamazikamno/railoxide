@@ -130,6 +130,21 @@ impl ConfirmationDialogProps {
             confirm_variant: ButtonVariant::Danger,
         }
     }
+
+    pub(super) const fn primary(
+        title: &'static str,
+        body: &'static str,
+        detail: Option<&'static str>,
+        confirm_text: &'static str,
+    ) -> Self {
+        Self {
+            title,
+            body,
+            detail,
+            confirm_text,
+            confirm_variant: ButtonVariant::Primary,
+        }
+    }
 }
 
 pub(super) fn dialog_footer(ok_text: impl Into<SharedString>, show_cancel: bool) -> DialogFooter {

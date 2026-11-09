@@ -199,11 +199,8 @@ impl WalletRoot {
         };
         let prepared = editor.update(cx, WalletSettingsEditor::prepare_prover_cache_build);
         let params = match prepared {
-            Ok(prepared) => {
-                let mut params = prepared.params;
-                if prepared.reuse_active_network {
-                    params.reusable_http = Some(self.reusable_network_context());
-                }
+            Ok(mut params) => {
+                params.reusable_http = Some(self.reusable_network_context());
                 params
             }
             Err(message) => {

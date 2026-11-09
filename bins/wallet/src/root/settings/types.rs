@@ -83,11 +83,6 @@ pub(in crate::root) struct ProverCacheBuildParams {
     pub(in crate::root) reusable_http: Option<HttpContext>,
 }
 
-pub(in crate::root) struct PreparedProverCacheBuild {
-    pub(in crate::root) params: ProverCacheBuildParams,
-    pub(in crate::root) reuse_active_network: bool,
-}
-
 pub(in crate::root) struct WalletSettingsEditor {
     pub(in crate::root) chain_editor: Entity<ui::chain_editor::ChainEditor>,
     /// The chain editor owned the Settings body last frame.

@@ -634,9 +634,9 @@ impl WalletSettingsEditor {
                 app_button("wallet-settings-build-cache", label)
                     // The build opens its own network context.
                     .disabled(building || invalid || pre_start)
-                    .on_click(move |_event, _window, cx| {
+                    .on_click(move |_event, window, cx| {
                         build_editor.update(cx, |editor, cx| {
-                            editor.build_prover_cache(cx);
+                            editor.request_prover_cache_build(window, cx);
                         });
                     }),
             )
@@ -771,7 +771,7 @@ impl WalletSettingsEditor {
     pub(in crate::root) fn prepare_prover_cache_build(
         &mut self,
         cx: &mut Context<'_, Self>,
-    ) -> Result<PreparedProverCacheBuild, Arc<str>> {
+    ) -> Result<ProverCacheBuildParams, Arc<str>> {
         if self.cache_building || self.cache_build_progress.is_some() {
             return Err(Arc::from("Prover cache build is already running"));
         }
@@ -781,8 +781,9 @@ impl WalletSettingsEditor {
                 "Fix validation errors before building prover cache",
             ));
         }
+        // Saved network settings match the active root; unsaved network changes apply only after restart.
         let proxy = self
-            .draft
+            .saved
             .network
             .proxy_url
             .as_deref()
@@ -791,24 +792,65 @@ impl WalletSettingsEditor {
             .map_err(|error| Arc::from(format!("Invalid proxy URL: {error}")))?;
         let db = self.vault_store.db();
         let db_path = db.root_dir().to_path_buf();
-        let network_mode = self.draft.wallet_network_mode();
-        let reuse_active_network = settings_restart_reuses_active_network(&self.saved, &self.draft);
+        let network_mode = self.saved.wallet_network_mode();
         cx.notify();
-        Ok(PreparedProverCacheBuild {
-            params: ProverCacheBuildParams {
-                db,
-                db_path,
-                network_mode,
-                proxy,
-                reusable_http: None,
-            },
-            reuse_active_network,
+        Ok(ProverCacheBuildParams {
+            db,
+            db_path,
+            network_mode,
+            proxy,
+            reusable_http: None,
         })
     }
 
+    pub(in crate::root) fn request_prover_cache_build(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self.draft.network == self.saved.network {
+            self.build_prover_cache(cx);
+            return;
+        }
+        let body = match self.saved.network.mode {
+            NetworkModeSetting::Tor => {
+                "Your network changes are not saved. The prover cache download will use your saved setting, Tor."
+            }
+            NetworkModeSetting::Proxy => {
+                "Your network changes are not saved. The prover cache download will use your saved proxy."
+            }
+            NetworkModeSetting::Direct => {
+                "Your network changes are not saved. The prover cache download will use your saved setting, Direct, which connects without Tor or a proxy."
+            }
+        };
+        let editor = cx.entity();
+        let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
+        let dialog_max_height = dialog_max_height(window);
+        window.open_wallet_alert_dialog(cx, move |dialog, _window, _cx| {
+            let confirm_editor = editor.clone();
+            confirmation_dialog(
+                dialog,
+                ConfirmationDialogProps::primary(
+                    "Unsaved network changes",
+                    body,
+                    Some("Apply your network changes first to download with the new setting."),
+                    "Build with saved setting",
+                ),
+                dialog_width,
+                dialog_max_height,
+            )
+            .on_ok(move |_event, _window, cx| {
+                confirm_editor.update(cx, |editor, cx| {
+                    editor.build_prover_cache(cx);
+                });
+                true
+            })
+        });
+    }
+
     pub(in crate::root) fn build_prover_cache(&mut self, cx: &mut Context<'_, Self>) {
-        let prepared = match self.prepare_prover_cache_build(cx) {
-            Ok(prepared) => prepared,
+        let params = match self.prepare_prover_cache_build(cx) {
+            Ok(params) => params,
             Err(message) => {
                 self.status = Some(message);
                 cx.notify();
@@ -818,16 +860,10 @@ impl WalletSettingsEditor {
         let initial_progress = ProverCacheBuildProgress::preparing();
         if let Some(root) = self.active_root.as_ref() {
             let editor = cx.entity();
-            let params = prepared.params.clone();
-            let reuse_active_network = prepared.reuse_active_network;
+            let root_params = params.clone();
             let start = root.update(cx, |root, cx| {
-                let mut params = params;
-                let reusable_http = if reuse_active_network {
-                    Some(root.reusable_network_context())
-                } else {
-                    None
-                };
-                params.reusable_http = reusable_http;
+                let mut params = root_params;
+                params.reusable_http = Some(root.reusable_network_context());
                 root.start_prover_cache_build_from_settings(editor, params, cx)
             });
             match start {
@@ -846,7 +882,7 @@ impl WalletSettingsEditor {
             }
         }
 
-        self.start_local_prover_cache_build(prepared.params, initial_progress, cx);
+        self.start_local_prover_cache_build(params, initial_progress, cx);
     }
 
     pub(in crate::root) fn mark_cache_build_started(

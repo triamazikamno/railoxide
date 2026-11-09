@@ -2126,6 +2126,12 @@ fn pre_start_editor_saves_network_changes_that_save_otherwise_refuses(
     editor.update(cx, |editor, cx| {
         editor.set_draft_network_mode(NetworkModeSetting::Direct, cx);
         assert!(!editor.save_draft(cx), "a running wallet must Apply this");
+        let params = editor.prepare_prover_cache_build(cx).unwrap();
+        assert_eq!(
+            params.network_mode,
+            wallet_ops::WalletNetworkMode::Tor,
+            "an unsaved Direct draft must not reach the prover cache download"
+        );
     });
     assert_eq!(stored_mode(), NetworkModeSetting::Tor);
     editor.update(cx, |editor, cx| {
