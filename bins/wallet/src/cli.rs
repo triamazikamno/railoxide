@@ -9,6 +9,7 @@ const APP_DATA_DIR: &str = "RailOxide";
 #[derive(Clone, StructOpt)]
 #[structopt(name = "wallet", about = "Railgun wallet desktop GUI.")]
 pub(crate) struct Options {
+    /// Dedicated profile directory. On Unix it (or a symlink's target) is made private (0700).
     #[structopt(long, parse(from_os_str))]
     pub(crate) db_path: Option<PathBuf>,
 }

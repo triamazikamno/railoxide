@@ -77,3 +77,23 @@ fn desktop_vault_first_run_unlock_wallet_setup_and_spend_prompt_flow() {
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
+
+#[cfg(unix)]
+#[test]
+fn desktop_vault_open_makes_existing_profile_private() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root_dir = temp_db_root();
+    fs::create_dir_all(&root_dir).expect("create profile dir");
+    fs::set_permissions(&root_dir, fs::Permissions::from_mode(0o755)).expect("loosen profile");
+
+    let store = DesktopVaultStore::open(root_dir.clone()).expect("open vault store");
+    let mode = fs::metadata(&root_dir)
+        .expect("stat profile")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700);
+
+    drop(store);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}

@@ -8,6 +8,16 @@ const DESKTOP_DB_CACHE_SIZE_BYTES: usize = 128 * 1024 * 1024;
 
 impl DesktopVaultStore {
     pub fn open(db_path: PathBuf) -> Result<Self, VaultError> {
+        // The profile holds plaintext settings and the vault: keep other local users out.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&db_path)?;
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o700))?;
+        }
         let db = DbStore::open_with_cache_size_bytes(
             DbConfig { root_dir: db_path },
             DESKTOP_DB_CACHE_SIZE_BYTES,
