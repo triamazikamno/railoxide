@@ -44,6 +44,14 @@ fn address_book_validation_rejects_invalid_and_type_switched_values() {
         None
     );
     assert_eq!(
+        address_book_entry_validation_message(
+            None,
+            "Bob",
+            "0xd8DA6BF26964aF9D7eEd9e03E53415D37aA96045"
+        ),
+        Some("Enter a valid public EVM address")
+    );
+    assert_eq!(
         address_book_entry_validation_message(None, "  ", PUBLIC_ADDRESS),
         Some("Enter a label")
     );

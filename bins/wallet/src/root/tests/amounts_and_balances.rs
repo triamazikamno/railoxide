@@ -84,6 +84,26 @@ fn native_wrapped_output_labels_are_chain_specific() {
 }
 
 #[test]
+fn parse_address_enforces_checksum_only_on_mixed_case() {
+    let address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045";
+    let expected = address.parse::<Address>().ok();
+    for accepted in [
+        address,
+        "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+        "0xD8DA6BF26964AF9D7EED9E03E53415D37AA96045",
+        "0Xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+        "0Xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+    ] {
+        assert_eq!(parse_address(accepted), expected, "{accepted}");
+    }
+    // One letter's case flipped: still mixed case, checksum no longer matches.
+    assert_eq!(
+        parse_address("0xd8DA6BF26964aF9D7eEd9e03E53415D37aA96045"),
+        None
+    );
+}
+
+#[test]
 fn native_gas_cost_display_uses_base_token_label() {
     assert_eq!(native_token_display_label(1), "ETH");
     assert_eq!(native_token_display_label(999_999), "base token");

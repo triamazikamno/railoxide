@@ -210,8 +210,15 @@ pub(super) const fn native_wrapped_output_labels(
     }
 }
 
+/// Policy: mixed-case input must match its EIP-55 checksum; single-case input is unchecked.
 pub(super) fn parse_address(raw: &str) -> Option<Address> {
-    raw.parse().ok()
+    let address: Address = raw.parse().ok()?;
+    let hex = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .unwrap_or(raw);
+    let single_case = hex == hex.to_ascii_lowercase() || hex == hex.to_ascii_uppercase();
+    (single_case || hex == &address.to_checksum(None)[2..]).then_some(address)
 }
 
 pub(super) fn is_effective_wrapped_native_token(

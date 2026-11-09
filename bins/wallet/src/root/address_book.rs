@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use alloy::primitives::Address;
 use gpui::{
     App, Context, ElementId, Entity, Focusable, InteractiveElement, IntoElement, MouseButton,
     ParentElement, Pixels, SharedString, Styled, Window, div, img, px, rgb,
@@ -28,7 +27,7 @@ use crate::root::ui_helpers::dialog_footer;
 use super::utxo::short_hash;
 use super::{
     ConfirmationDialogProps, WalletRoot, app_status_tag, confirmation_dialog, dialog_max_height,
-    secondary_dialog_content_width, vault_error_kind,
+    parse_address, secondary_dialog_content_width, vault_error_kind,
 };
 
 const ADDRESS_BOOK_CONTENT_WIDTH: Pixels = px(980.0);
@@ -259,7 +258,7 @@ fn validate_address_for_kind(kind: AddressBookEntryKind, address: &str) -> Optio
             return Some(kind.type_validation_message());
         }
         AddressBookEntryKind::Private => parse_railgun_recipient(address).is_ok(),
-        AddressBookEntryKind::Public => address.parse::<Address>().is_ok(),
+        AddressBookEntryKind::Public => parse_address(address).is_some(),
     };
     (!valid).then_some(kind.invalid_address_message())
 }
