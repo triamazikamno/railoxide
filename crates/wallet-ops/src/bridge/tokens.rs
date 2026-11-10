@@ -22,7 +22,8 @@ pub struct BridgeDestination {
     pub intermediate: Address,
     /// The configured token's symbol, or the provider's for a native asset.
     pub symbol: String,
-    /// Whether the intermediate is the destination token's own asset. Always true for Across.
+    /// Whether the intermediate is the destination token's own asset. For Across, whether both
+    /// tokens' configured symbols name one asset.
     pub same_asset: bool,
     /// 1Click's assets for a NEAR Intents destination, `None` for Across.
     pub near: Option<NearAssets>,
@@ -55,7 +56,8 @@ pub struct NearAssets {
     pub destination_decimals: u8,
 }
 
-/// Destinations of Across `routes` from the swap's chain to `destination_chain` whose
+/// Destinations of Across `routes` from `origin_chain`, the swap's chain, to
+/// `destination_chain` whose origin token is configured on the swap's chain and whose
 /// destination token is configured there. A route that starts from `sell_token` is skipped.
 /// When several routes reach one destination token, the one whose origin symbol matches the
 /// destination symbol is kept, otherwise the first in the provider's order.
@@ -64,6 +66,7 @@ pub fn across_destination_tokens(
     routes: &[AcrossRoute],
     sell_token: Address,
     registry: &EffectiveTokenRegistry,
+    origin_chain: u64,
     destination_chain: u64,
 ) -> Vec<BridgeDestination> {
     let mut destinations: Vec<(BridgeDestination, bool)> = Vec::new();
@@ -71,19 +74,14 @@ pub fn across_destination_tokens(
         if route.origin_token == sell_token || route.origin_token == Address::ZERO {
             continue;
         }
-        let Some(configured) = registry.get(destination_chain, &route.destination_token) else {
+        let Some(destination) =
+            across_destination(route, registry, origin_chain, destination_chain, true)
+        else {
             continue;
         };
         let matched = route
             .origin_symbol
             .eq_ignore_ascii_case(&route.destination_symbol);
-        let destination = BridgeDestination {
-            destination_token: route.destination_token,
-            intermediate: route.origin_token,
-            symbol: configured.symbol.clone(),
-            same_asset: true,
-            near: None,
-        };
         match destinations
             .iter_mut()
             .find(|(known, _)| known.destination_token == route.destination_token)
@@ -126,19 +124,46 @@ pub enum PublicSellAsset {
     },
 }
 
-/// Destinations of Across `routes` from a Public account's chain to `destination_chain` whose
-/// destination token is configured there. A route that starts from the sell token, or from
-/// the wrapped token of a native sell asset, is a direct deposit. Any other route takes an
-/// order, offered only when the chain can swap (`can_swap`) and the sell asset is an ERC-20: a
-/// native asset is never the sell side of an order. When several routes reach one destination
-/// token, a deposit is kept over an order, then an order whose origin symbol matches the
-/// destination symbol, otherwise the first in the provider's order.
+/// The destination of an Across `route` whose destination token is configured on
+/// `destination_chain`. An `order` buys the origin token, so it must be configured on
+/// `origin_chain`; a direct deposit's origin is the account's own sell token. The API pairs the
+/// tokens, so only their configured symbols say whether they are one asset.
+fn across_destination(
+    route: &AcrossRoute,
+    registry: &EffectiveTokenRegistry,
+    origin_chain: u64,
+    destination_chain: u64,
+    order: bool,
+) -> Option<BridgeDestination> {
+    let origin = registry.get(origin_chain, &route.origin_token);
+    if order && origin.is_none() {
+        return None;
+    }
+    let configured = registry.get(destination_chain, &route.destination_token)?;
+    Some(BridgeDestination {
+        destination_token: route.destination_token,
+        intermediate: route.origin_token,
+        symbol: configured.symbol.clone(),
+        same_asset: origin.is_some_and(|origin| same_asset(&origin.symbol, &configured.symbol)),
+        near: None,
+    })
+}
+
+/// Destinations of Across `routes` from `origin_chain`, a Public account's chain, to
+/// `destination_chain` whose destination token is configured there, and whose origin token,
+/// when an order buys it, is configured on the account's chain. A route that starts from the
+/// sell token, or from the wrapped token of a native sell asset, is a direct deposit. Any other
+/// route takes an order, offered only when the chain can swap (`can_swap`) and the sell asset
+/// is an ERC-20: a native asset is never the sell side of an order. When several routes reach
+/// one destination token, a deposit is kept over an order, then an order whose origin symbol
+/// matches the destination symbol, otherwise the first in the provider's order.
 #[must_use]
 pub fn public_across_destination_tokens(
     routes: &[AcrossRoute],
     sell: PublicSellAsset,
     can_swap: bool,
     registry: &EffectiveTokenRegistry,
+    origin_chain: u64,
     destination_chain: u64,
 ) -> Vec<PublicBridgeDestination> {
     let (source, orders) = match sell {
@@ -163,19 +188,13 @@ pub fn public_across_destination_tokens(
         } else {
             (PublicBridgePath::Order, 0)
         };
-        let Some(configured) = registry.get(destination_chain, &route.destination_token) else {
+        let order = path == PublicBridgePath::Order;
+        let Some(destination) =
+            across_destination(route, registry, origin_chain, destination_chain, order)
+        else {
             continue;
         };
-        let destination = PublicBridgeDestination {
-            destination: BridgeDestination {
-                destination_token: route.destination_token,
-                intermediate: route.origin_token,
-                symbol: configured.symbol.clone(),
-                same_asset: true,
-                near: None,
-            },
-            path,
-        };
+        let destination = PublicBridgeDestination { destination, path };
         match destinations
             .iter_mut()
             .find(|(known, _)| known.destination.destination_token == route.destination_token)
@@ -360,9 +379,9 @@ fn near_intermediate<'a>(
         })
 }
 
-/// Equal 1Click symbols, with a native symbol `X` the same asset as `WX`: ETH and WETH, BNB and
-/// WBNB, POL and WPOL.
-fn same_asset(a: &str, b: &str) -> bool {
+/// Equal 1Click or configured symbols, with a native symbol `X` the same asset as `WX`: ETH and
+/// WETH, BNB and WBNB, POL and WPOL.
+pub(crate) fn same_asset(a: &str, b: &str) -> bool {
     let wraps = |wrapped: &str, native: &str| {
         wrapped
             .strip_prefix(['W', 'w'])
@@ -424,6 +443,8 @@ mod tests {
         let registry = build_effective_token_registry(&WalletSettings::default()).unwrap();
         // Arbitrum One to Polygon, as in `fixtures/across_routes_arb_pol.json`.
         let routes = [
+            // An origin not in Arbitrum's configured list, whatever symbol the provider gives it.
+            route(Address::repeat_byte(9), "USDC", POL_USDC, "USDC"),
             // Another origin for a destination that a later route reaches from its own asset.
             route(ARB_USDC_E, "USDC.e", POL_USDC, "USDC"),
             route(ARB_USDC, "USDC", POL_USDC, "USDC"),
@@ -439,7 +460,7 @@ mod tests {
         // WETH to WETH would bridge the sell token itself.
         assert_eq!(
             destination_tokens(&across_destination_tokens(
-                &routes, ARB_WETH, &registry, 137
+                &routes, ARB_WETH, &registry, 42161, 137
             )),
             [
                 (POL_USDC, ARB_USDC),
@@ -447,17 +468,37 @@ mod tests {
                 (POL_USDT, ARB_USDT)
             ]
         );
-        // Selling USDC.e keeps USDC's routes, including the one to USDC.e.
+        // Selling USDC.e keeps USDC's routes, including the one to USDC.e, which is another
+        // asset by its configured symbols.
+        let from_usdc_e = across_destination_tokens(&routes, ARB_USDC_E, &registry, 42161, 137);
         assert_eq!(
-            destination_tokens(&across_destination_tokens(
-                &routes, ARB_USDC_E, &registry, 137
-            )),
+            destination_tokens(&from_usdc_e),
             [
                 (POL_USDC, ARB_USDC),
                 (POL_USDC_E, ARB_USDC),
                 (POL_USDT, ARB_USDT),
                 (POL_WETH, ARB_WETH)
             ]
+        );
+        assert_eq!(
+            from_usdc_e
+                .iter()
+                .map(|destination| destination.same_asset)
+                .collect::<Vec<_>>(),
+            [true, false, true, true]
+        );
+        // The provider can pair any configured origin with a destination: WETH to USDC is
+        // offered, but not as the same asset.
+        let paired = across_destination_tokens(
+            &[route(ARB_WETH, "USDC", POL_USDC, "USDC")],
+            ARB_USDC,
+            &registry,
+            42161,
+            137,
+        );
+        assert_eq!(
+            (destination_tokens(&paired), paired[0].same_asset),
+            (vec![(POL_USDC, ARB_WETH)], false)
         );
     }
 
@@ -466,6 +507,8 @@ mod tests {
         use PublicBridgePath::{Deposit, Order};
         let registry = build_effective_token_registry(&WalletSettings::default()).unwrap();
         let routes = [
+            // An origin not in Arbitrum's configured list is never bought by an order.
+            route(Address::repeat_byte(9), "USDT", POL_USDT, "USDT"),
             // Another origin for a destination the sell token reaches itself.
             route(ARB_USDC_E, "USDC.e", POL_USDC, "USDC"),
             route(ARB_USDC, "USDC", POL_USDC, "USDC"),
@@ -473,8 +516,11 @@ mod tests {
             route(ARB_USDT, "USDT", POL_USDT, "USDT"),
             route(ARB_WETH, "WETH", POL_WETH, "WETH"),
         ];
+        let offers = |sell, can_swap| {
+            public_across_destination_tokens(&routes, sell, can_swap, &registry, 42161, 137)
+        };
         let offered = |sell, can_swap| {
-            public_across_destination_tokens(&routes, sell, can_swap, &registry, 137)
+            offers(sell, can_swap)
                 .into_iter()
                 .map(|offer| {
                     (
@@ -514,6 +560,14 @@ mod tests {
                 (POL_USDT, ARB_USDT, Order),
                 (POL_WETH, ARB_WETH, Deposit)
             ]
+        );
+        // USDC to USDC.e stays offered as another asset.
+        assert_eq!(
+            offers(PublicSellAsset::Erc20(ARB_WETH), true)
+                .iter()
+                .map(|offer| offer.destination.same_asset)
+                .collect::<Vec<_>>(),
+            [true, false, true, true]
         );
         // The native asset is deposited as WETH and is never the sell side of an order.
         assert_eq!(
@@ -580,7 +634,7 @@ mod tests {
         // Across has no native BNB route, so only NEAR Intents offers it.
         let across = [route(ARB_USDC, "USDC", BSC_USDC, "USDC")];
         assert!(
-            across_destination_tokens(&across, ARB_WETH, &registry, 56)
+            across_destination_tokens(&across, ARB_WETH, &registry, 42161, 56)
                 .iter()
                 .all(|destination| destination.destination_token != Address::ZERO)
         );

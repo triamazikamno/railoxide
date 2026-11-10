@@ -17342,6 +17342,7 @@ fn public_review_fixture(
         PublicSellAsset::Erc20(sell),
         true,
         &registry,
+        1,
         137,
     )
     .remove(0);
@@ -17360,6 +17361,7 @@ fn public_review_fixture(
                 across: &across,
                 anchor_cache: None,
                 token_registry: &registry,
+                anchor_deviation_bps: 300,
                 max_fee_per_gas: 1,
                 max_priority_fee_per_gas: 1,
                 client: orderbook.http(),
@@ -19649,6 +19651,7 @@ fn public_buy_picker_keeps_same_asset_routes_and_refuses_own_chain_and_unfunded_
                         PublicSellAsset::Erc20(sell),
                         false,
                         &root.read(cx).effective_token_registry,
+                        1,
                         137,
                     );
                     assert_eq!(routes[0].path, PublicBridgePath::Deposit);

@@ -440,7 +440,7 @@ const TOKENS: &[TokenRow] = &[
     (1, address!("0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9"), "AAVE", 18, &[feed(ETH_AAVE_ETH_FEED, 18, 18, true)], TokenIcon::None),
     // BSC (56)
     (56, address!("0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"), "WBNB", 18, WRAPPED_NATIVE_ANCHOR, TokenIcon::Own),
-    (56, address!("0x55d398326f99059ff775485246999027b3197955"), "BSC-USD", 18, BNB_USD_18_ANCHOR, TokenIcon::Own),
+    (56, address!("0x55d398326f99059ff775485246999027b3197955"), "USDT", 18, BNB_USD_18_ANCHOR, TokenIcon::Own),
     (56, address!("0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"), "USDC", 18, BNB_USD_18_ANCHOR, TokenIcon::Own),
     (56, address!("0xe9e7cea3dedca5984780bafc599bd69add087d56"), "BUSD", 18, BNB_USD_18_ANCHOR, TokenIcon::Own),
     (56, address!("0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3"), "DAI", 18, BNB_USD_18_ANCHOR, TokenIcon::Own),

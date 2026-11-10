@@ -34,8 +34,8 @@ use railgun_wallet::tx::GasEstimateMode;
 use serde_json::{Value, json};
 
 use super::bridge::{
-    AcrossOrigin, BridgeLegPrice, SwapBridgeQuote, across_bridge_quote, across_quote_covers,
-    quote_across_preview,
+    AcrossOrigin, BridgeLegPrice, SwapBridgeQuote, across_bridge_quote, across_leg_pricing,
+    across_quote_covers, quote_across_preview,
 };
 use super::gas::hook_data_cost_from_candidates;
 use super::order::{
@@ -115,6 +115,9 @@ pub struct PublicSwapReviewRequest<'a> {
     pub across: &'a AcrossClient,
     pub anchor_cache: Option<&'a TokenAnchorRateCache>,
     pub token_registry: &'a EffectiveTokenRegistry,
+    /// How far the bridge leg's output may be below its cached anchor, in basis points. The
+    /// review keeps it for its later quotes.
+    pub anchor_deviation_bps: u32,
     /// The fee the Public account pays for its own transactions.
     pub max_fee_per_gas: u128,
     pub max_priority_fee_per_gas: u128,
@@ -139,6 +142,8 @@ pub struct PublicSwapReview {
     /// The previewed delivery. Its receiver is a placeholder.
     delivery: BridgeDelivery,
     bridge: SwapBridgeQuote,
+    /// The bridge leg's anchor deviation limit, which every quote of this review is priced at.
+    anchor_deviation_bps: u32,
     /// How the Public account lets the swap take what it sells, as read for this review.
     approval_plan: PublicSwapApprovalPlan,
     gas_plan: PublicSwapGasPlan,
@@ -189,10 +194,16 @@ impl PublicSwapReview {
     pub const fn bridge(&self) -> &SwapBridgeQuote {
         &self.bridge
     }
-    /// Replace this review's preview with the actual delivery costs that stopped signing.
-    /// The route and input must still be the ones reviewed. This changes no saved approval;
-    /// the resulting terms need explicit approval before signing can resume.
-    fn with_delivery_quote(&self, quote: &PublicSwapDeliveryQuote) -> Result<Self> {
+    /// Replace this review's preview with the actual delivery costs that stopped signing,
+    /// priced again from the quote's output like the preview. The route and input must still be
+    /// the ones reviewed. This changes no saved approval; the resulting terms need explicit
+    /// approval before signing can resume.
+    fn with_delivery_quote(
+        &self,
+        quote: &PublicSwapDeliveryQuote,
+        anchor_cache: Option<&TokenAnchorRateCache>,
+        token_registry: &EffectiveTokenRegistry,
+    ) -> Result<Self> {
         let request = quote.request;
         if request.origin_chain != self.origin_chain
             || request.destination_chain != self.delivery.destination_chain
@@ -206,16 +217,31 @@ impl PublicSwapReview {
             .bridge
             .private
             .ok_or_else(|| eyre!("the reviewed swap has no private delivery"))?;
+        let pricing = across_leg_pricing(
+            (self.origin_chain, self.bridged_token),
+            (
+                self.delivery.destination_chain,
+                self.delivery.destination_token,
+            ),
+            anchor_cache,
+            token_registry,
+            self.anchor_deviation_bps,
+        );
         // The real message already priced the shield's gas; adding the preview allowance
         // again would charge it twice. Across's real minimum deposit needs no extrapolation.
-        let mut bridge = across_bridge_quote(&quote.fees, self.spoke_pool, Some(U256::ZERO))?;
+        let mut bridge = across_bridge_quote(
+            &quote.fees,
+            self.spoke_pool,
+            Some(U256::ZERO),
+            request.amount,
+            pricing,
+        )?;
         if let Some(private) = &mut bridge.private {
             private.destination_shield_fee_bps = original.destination_shield_fee_bps;
             private.deposit_floor = (!quote.fees.min_deposit.is_zero()
                 && quote.fees.min_deposit != U256::MAX)
                 .then_some(quote.fees.min_deposit);
         }
-        bridge.leg = self.bridge.leg;
         Ok(Self {
             bridge,
             ..self.clone()
@@ -335,6 +361,7 @@ impl PublicSwapReview {
                 private: Some(BridgePrivateDelivery { on_shield_failure }),
             },
             bridge,
+            anchor_deviation_bps: 300,
             approval_plan: PublicSwapApprovalPlan::None,
             gas_plan: PublicSwapGasPlan {
                 approval_gas_limits: Vec::new(),
@@ -393,7 +420,7 @@ impl PublicSwapReview {
     }
     /// An order's `CoW` quote checked against the pair's cached anchors on the chain the
     /// account pays on. A direct deposit has no such quote: its price is the bridge leg's
-    /// cached cross-chain rate, when there is one, and isn't compared with anything.
+    /// cached cross-chain rate, when there is one, which the bridge leg is checked against.
     /// [`Self::price_verified`] says whether approval needs an acknowledgement.
     #[must_use]
     pub const fn price(&self) -> &SwapPrice {
@@ -938,6 +965,7 @@ impl ExecutorOwner {
             across,
             anchor_cache,
             token_registry,
+            anchor_deviation_bps,
             max_fee_per_gas,
             max_priority_fee_per_gas,
             client,
@@ -1163,6 +1191,7 @@ impl ExecutorOwner {
             bridged_amount,
             anchor_cache,
             token_registry,
+            anchor_deviation_bps,
         )
         .await?;
         // A permit and a covered allowance take no transaction, and so no gas from the account.
@@ -1184,6 +1213,7 @@ impl ExecutorOwner {
             spoke_pool,
             delivery,
             bridge,
+            anchor_deviation_bps,
             approval_plan,
             gas_plan,
             price,
@@ -1267,7 +1297,9 @@ impl ExecutorOwner {
     /// Review the actual delivery costs that stopped signing, with the approval plan read
     /// again and only the Public account's remaining transactions priced at its originally
     /// reviewed fee rates. Approval already paid on-chain must not be charged again, and a
-    /// permit still costs the account no gas. No bridge preview or order quote is requested.
+    /// permit still costs the account no gas. No bridge preview or order quote is requested:
+    /// the bridge leg is priced from `anchor_cache` alone, at the review's deviation limit.
+    #[allow(clippy::too_many_arguments)]
     pub async fn requote_public_swap_delivery(
         &self,
         review: &PublicSwapReview,
@@ -1275,6 +1307,8 @@ impl ExecutorOwner {
         origin: &EffectiveChainConfig,
         source: Address,
         client: &OperationHttpClient,
+        anchor_cache: Option<&TokenAnchorRateCache>,
+        token_registry: &EffectiveTokenRegistry,
     ) -> Result<PublicSwapReview> {
         self.while_active(Box::pin(async {
             if origin.chain_id != review.origin_chain
@@ -1282,7 +1316,7 @@ impl ExecutorOwner {
             {
                 return Err(eyre!("the reviewed swap belongs to another network"));
             }
-            let mut corrected = review.with_delivery_quote(quote)?;
+            let mut corrected = review.with_delivery_quote(quote, anchor_cache, token_registry)?;
             (corrected.approval_plan, corrected.gas_plan) = self
                 .requote_public_swap_plan(review, origin, source, client)
                 .await?;
@@ -1321,6 +1355,7 @@ impl ExecutorOwner {
                 order.limit.buy_amount,
                 anchor_cache,
                 token_registry,
+                review.anchor_deviation_bps,
             )
             .await?;
             Ok(PublicSwapReview {

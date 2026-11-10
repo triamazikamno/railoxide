@@ -379,6 +379,7 @@ async fn delivery_review(
             across,
             anchor_cache: None,
             token_registry: &registry,
+            anchor_deviation_bps: 300,
             max_fee_per_gas: 1,
             max_priority_fee_per_gas: 1,
             client: crate::OperationHttpClient::direct_for_tests(),
@@ -610,6 +611,10 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
         .lock()
         .unwrap()
         .insert(USDC, Some(input_amount));
+    let registry = crate::settings::build_effective_token_registry(
+        &crate::settings::WalletSettings::default(),
+    )
+    .unwrap();
     let corrected = owner
         .requote_public_swap_delivery(
             &review,
@@ -617,6 +622,8 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
             &origin_chain,
             Address::repeat_byte(0x50),
             crate::OperationHttpClient::direct_for_tests(),
+            None,
+            &registry,
         )
         .await
         .unwrap();
@@ -632,6 +639,11 @@ async fn a_short_signing_time_quote_returns_the_public_swap_to_review() {
             .max_gas_cost
     );
     assert_eq!(corrected.bridge().destination_minimum, U256::from(999));
+    // The fee is priced again from the real output, not taken from Across's relay fee of 10.
+    assert_eq!(
+        (corrected.bridge().fee, corrected.bridge().leg),
+        (Some(U256::from(11)), crate::BridgeLegPrice::SameAsset)
+    );
     assert_eq!(
         corrected.bridge().private.unwrap().delivery_allowance,
         U256::ZERO
@@ -950,6 +962,7 @@ async fn a_public_orders_short_signing_time_quote_within_the_cushion_raises_its_
             across: &preview,
             anchor_cache: None,
             token_registry: &registry,
+            anchor_deviation_bps: 300,
             max_fee_per_gas: 1,
             max_priority_fee_per_gas: 1,
             client: crate::OperationHttpClient::direct_for_tests(),
@@ -971,6 +984,8 @@ async fn a_public_orders_short_signing_time_quote_within_the_cushion_raises_its_
             &origin_chain,
             Address::repeat_byte(0x50),
             crate::OperationHttpClient::direct_for_tests(),
+            None,
+            &registry,
         )
         .await
         .unwrap();
@@ -1008,7 +1023,9 @@ async fn a_public_orders_short_signing_time_quote_within_the_cushion_raises_its_
                 &quote,
                 &origin_chain,
                 Address::repeat_byte(0x50),
-                crate::OperationHttpClient::direct_for_tests()
+                crate::OperationHttpClient::direct_for_tests(),
+                None,
+                &registry,
             )
             .await
             .is_err()
@@ -3556,6 +3573,7 @@ async fn an_order_is_refused_until_the_math_contract_is_deployed_on_its_chain() 
                 across: &across,
                 anchor_cache: None,
                 token_registry: &registry,
+                anchor_deviation_bps: 300,
                 max_fee_per_gas: 100,
                 max_priority_fee_per_gas: 1,
                 client: crate::OperationHttpClient::direct_for_tests(),
@@ -5852,6 +5870,7 @@ async fn a_permit_review_corrected_to_a_covered_allowance_binds_no_permit_hook()
             across: &across,
             anchor_cache: None,
             token_registry: &registry,
+            anchor_deviation_bps: 300,
             max_fee_per_gas: 100,
             max_priority_fee_per_gas: 1,
             client: crate::OperationHttpClient::direct_for_tests(),

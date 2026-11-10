@@ -312,6 +312,9 @@ enum PublicSwapCommand {
         approval: PublicSwapApproval,
         clients: PublicSwapClients,
         waku: Option<PublicBroadcasterWaku>,
+        /// What prices the bridge leg again when signing returns the swap to review.
+        anchors: Arc<TokenAnchorRateCache>,
+        registry: EffectiveTokenRegistry,
     },
     Withdraw {
         review: PublicSwapWithdrawalReview,
@@ -512,7 +515,14 @@ impl PrivateSwapsView {
         for (key, (sell, routes)) in &public.across_routes {
             public.routes.insert(
                 *key,
-                public_across_destination_tokens(routes, *sell, can_swap, registry, key.1),
+                public_across_destination_tokens(
+                    routes,
+                    *sell,
+                    can_swap,
+                    registry,
+                    origin.chain_id,
+                    key.1,
+                ),
             );
         }
     }
@@ -814,6 +824,11 @@ impl PrivateSwapsView {
                         across: &clients.across,
                         anchor_cache: Some(&anchors),
                         token_registry: &registry,
+                        // A deposit-only network has no profile: 300 is every built-in
+                        // profile's limit, as the form's own fallback assumes.
+                        anchor_deviation_bps: origin
+                            .public_swap_profile()
+                            .map_or(300, |profile| profile.anchor_deviation_bps()),
                         max_fee_per_gas: fee.suggested_max_fee_per_gas,
                         max_priority_fee_per_gas: fee.suggested_max_priority_fee_per_gas,
                         client: &clients.http,
@@ -1490,6 +1505,14 @@ impl PrivateSwapsView {
             })
             .or(fixture_setup);
         let summary = self.public_review_summary(form, &review, &approval, setup.as_ref(), cx);
+        let (anchors, registry) = {
+            let root = self.root.upgrade().ok_or("The wallet closed.")?;
+            let root = root.read(cx);
+            (
+                root.public_broadcaster_anchor_cache.clone(),
+                root.effective_token_registry.clone(),
+            )
+        };
         Ok(PublicSwapAuthorization {
             source: public.account.clone(),
             origin,
@@ -1507,6 +1530,8 @@ impl PrivateSwapsView {
                 approval,
                 clients,
                 waku,
+                anchors,
+                registry,
             },
             summary,
             revision: form.quote_revision,
@@ -5047,18 +5072,28 @@ async fn changed_public_delivery(
     quote: Option<&wallet_ops::PublicSwapDeliveryQuote>,
 ) -> eyre::Result<PublicExecutionResult> {
     let review = match quote {
-        Some(quote) => Some(Arc::new(
-            command
-                .owner
-                .requote_public_swap_delivery(
-                    review,
-                    quote,
-                    &command.origin,
-                    command.source.address,
-                    &command.client,
-                )
-                .await?,
-        )),
+        Some(quote) => {
+            let PublicSwapCommand::Swap {
+                anchors, registry, ..
+            } = &command.action
+            else {
+                return Err(eyre::eyre!("This action has no destination delivery."));
+            };
+            Some(Arc::new(
+                command
+                    .owner
+                    .requote_public_swap_delivery(
+                        review,
+                        quote,
+                        &command.origin,
+                        command.source.address,
+                        &command.client,
+                        Some(anchors),
+                        registry,
+                    )
+                    .await?,
+            ))
+        }
         None => None,
     };
     Ok(PublicExecutionResult::Changed { change, review })

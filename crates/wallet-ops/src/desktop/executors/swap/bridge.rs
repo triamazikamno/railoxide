@@ -23,7 +23,7 @@ use super::{SwapInputPlan, SwapReview, SwapReviewChange};
 use crate::bridge::{
     AcrossClient, AcrossFeeQuote, AcrossFeeRequest, AcrossMessageFeeRequest, BridgeApi,
     BridgeApiError, BridgeDestination, NearAssets, NearIntentsClient, NonEvmBridgeDestination,
-    NonEvmNetwork, OneClickDryQuote, OneClickQuoteParams, OneClickRecipient,
+    NonEvmNetwork, OneClickDryQuote, OneClickQuoteParams, OneClickRecipient, same_asset,
 };
 use crate::cow::{
     CowOrderbookClient, DeliveryAllowanceParams, DeliveryAllowanceRate, OrderLimitError,
@@ -145,6 +145,79 @@ pub enum BridgeLegPrice {
     Unverified,
 }
 
+/// What prices a bridge leg's output against its input, the one policy for both providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BridgeLegPricing {
+    /// The leg's cached cross-chain anchor rate, which takes precedence.
+    pub(super) anchor: Option<PairAnchorRate>,
+    /// The input and output tokens' decimals when both are the same asset.
+    pub(super) same_asset_decimals: Option<(u8, u8)>,
+    pub(super) deviation_bps: u32,
+}
+
+impl BridgeLegPricing {
+    /// The fee and price check of a leg that delivers `output` for `input`. With an anchor,
+    /// `output` must be within the deviation of it, and the fee is `input` less the output's
+    /// value in the input token. Without one, a same-asset leg's fee is `input` less the output
+    /// in the input's decimals, and a leg between different assets has no known fee.
+    pub(super) fn price(self, input: U256, output: U256) -> Result<(Option<U256>, BridgeLegPrice)> {
+        Ok(match (self.anchor, self.same_asset_decimals) {
+            (Some(rate), _) => {
+                check_quote_against_anchor(input, output, rate, self.deviation_bps)?;
+                let value =
+                    U512::from(output) * U512::from(rate.sell_rate) / U512::from(rate.buy_rate);
+                (
+                    Some(input.saturating_sub(U256::saturating_from(value))),
+                    BridgeLegPrice::Verified(rate),
+                )
+            }
+            (None, Some((input_decimals, output_decimals))) => (
+                Some(input.saturating_sub(rescale(output, output_decimals, input_decimals))),
+                BridgeLegPrice::SameAsset,
+            ),
+            (None, None) => (None, BridgeLegPrice::Unverified),
+        })
+    }
+}
+
+/// How an Across leg from `origin`'s token to `destination`'s is priced: by the pair's anchor
+/// rate, which only the cache is asked for, else as the same asset when both tokens' configured
+/// symbols name one, with their configured decimals. A token that isn't configured leaves the
+/// leg unverified.
+pub(super) fn across_leg_pricing(
+    origin: (u64, Address),
+    destination: (u64, Address),
+    anchor_cache: Option<&TokenAnchorRateCache>,
+    token_registry: &EffectiveTokenRegistry,
+    deviation_bps: u32,
+) -> BridgeLegPricing {
+    let (origin_chain, origin_token) = origin;
+    let destination_chain = destination.0;
+    let destination_token = anchor_token(destination_chain, destination.1);
+    let anchor = anchor_cache.and_then(|cache| {
+        cache
+            .cached_bridge_leg_rate(
+                origin_chain,
+                origin_token,
+                destination_chain,
+                destination_token,
+                token_registry,
+            )
+            .ok()
+            .flatten()
+    });
+    let same_asset_decimals = token_registry
+        .get(origin_chain, &origin_token)
+        .zip(token_registry.get(destination_chain, &destination_token))
+        .filter(|(input, output)| same_asset(&input.symbol, &output.symbol))
+        .map(|(input, output)| (input.decimals, output.decimals));
+    BridgeLegPricing {
+        anchor,
+        same_asset_decimals,
+        deviation_bps,
+    }
+}
+
 /// The bridge leg of a Bridge review, quoted for the order's buy amount.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SwapBridgeQuote {
@@ -253,6 +326,7 @@ impl ExecutorOwner {
                         buy_amount,
                         anchor_cache,
                         token_registry,
+                        profile.anchor_deviation_bps(),
                     )
                     .await?
                 }
@@ -584,8 +658,9 @@ pub(super) struct AcrossOrigin {
 }
 
 /// Across's preview quote for depositing `amount` of `origin`'s token for `delivery`. The
-/// request names only tokens, chains and the amount. A private delivery's output is then
-/// reduced by its delivery allowance, read on `destination_chain`.
+/// request names only tokens, chains and the amount. Its output is priced against `amount` by
+/// [`across_leg_pricing`], within `deviation_bps` of a cached anchor. A private delivery's
+/// output is then reduced by its delivery allowance, read on `destination_chain`.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn quote_across_preview(
     http: &HttpContext,
@@ -596,6 +671,7 @@ pub(super) async fn quote_across_preview(
     amount: U256,
     anchor_cache: Option<&TokenAnchorRateCache>,
     token_registry: &EffectiveTokenRegistry,
+    deviation_bps: u32,
 ) -> Result<SwapBridgeQuote> {
     let fees = across
         .suggested_fees(&AcrossFeeRequest {
@@ -606,6 +682,13 @@ pub(super) async fn quote_across_preview(
             amount,
         })
         .await?;
+    let pricing = across_leg_pricing(
+        (origin.chain_id, origin.token),
+        (delivery.destination_chain, delivery.destination_token),
+        anchor_cache,
+        token_registry,
+        deviation_bps,
+    );
     let allowance = if delivery.is_private() {
         Some(
             private_delivery_allowance(
@@ -621,7 +704,7 @@ pub(super) async fn quote_across_preview(
     } else {
         None
     };
-    across_bridge_quote(&fees, origin.spoke_pool, allowance)
+    across_bridge_quote(&fees, origin.spoke_pool, allowance, amount, pricing)
 }
 
 /// The delivery allowance of a private `delivery` for the Across quote `fees`, in
@@ -770,20 +853,24 @@ pub(super) fn delivery_allowance_rate(
     })
 }
 
-/// An Across fee quote for the order's buy amount. Its output is the destination minimum and
-/// its relay fee, which includes the LP fee, the bridge fee. The quote must name the swap
-/// chain's `SpokePool`: the wallet never takes the deposit contract from the API. A private
-/// delivery's preview passes its delivery `allowance`: the destination minimum is then the
-/// output less the allowance, the amount the deposit signs for the destination stealth
-/// account, and the allowance is reported beside the fee.
+/// An Across fee quote for `input`, the order's buy amount. Its output is the destination
+/// minimum, and `pricing` prices that output against `input` for the bridge fee: the API's own
+/// relay fee is never the fee. The quote must name the swap chain's `SpokePool`: the wallet
+/// never takes the deposit contract from the API. A private delivery's preview passes its
+/// delivery `allowance`: the destination minimum is then the output less the allowance, the
+/// amount the deposit signs for the destination stealth account, and the allowance is reported
+/// beside the fee, which is priced before it.
 pub(super) fn across_bridge_quote(
     fees: &AcrossFeeQuote,
     spoke_pool: Address,
     allowance: Option<U256>,
+    input: U256,
+    pricing: BridgeLegPricing,
 ) -> Result<SwapBridgeQuote> {
     if fees.spoke_pool != spoke_pool {
         return Err(eyre!("Across quoted a deposit into an unknown SpokePool"));
     }
+    let (fee, leg) = pricing.price(input, fees.output_amount)?;
     let (output, private) = match allowance {
         Some(allowance) => (
             destination_minimum_after_allowance(fees.output_amount, allowance)?,
@@ -801,8 +888,8 @@ pub(super) fn across_bridge_quote(
         destination_minimum: output,
         expected_output: output,
         expected_output_usd: None,
-        fee: Some(fees.total_relay_fee_total),
-        leg: BridgeLegPrice::SameAsset,
+        fee,
+        leg,
         fill_time_sec: Some(fees.estimated_fill_time_sec),
         private,
     })
@@ -849,7 +936,13 @@ pub(super) fn across_order_terms(
     valid_to: u32,
     handler_message: Option<(Address, B256)>,
 ) -> Result<BridgeSigning> {
-    let quote = across_bridge_quote(fees, spoke_pool, None)?;
+    // Only the destination minimum is used: signing doesn't price the leg again.
+    let unpriced = BridgeLegPricing {
+        anchor: None,
+        same_asset_decimals: None,
+        deviation_bps: 0,
+    };
+    let quote = across_bridge_quote(fees, spoke_pool, None, buy_amount, unpriced)?;
     // The only use of the destination pool the provider names: it can only refuse a swap. A
     // private delivery's receiver is the wallet's own account, and its deposit pays the handler.
     if !delivery.is_private() && delivery.receiver == fees.destination_spoke_pool {
@@ -935,26 +1028,13 @@ pub(super) fn near_bridge_quote(
     deviation_bps: u32,
 ) -> Result<SwapBridgeQuote> {
     let minimum = quote.min_amount_out;
-    let (fee, leg) = match anchor {
-        Some(rate) => {
-            check_quote_against_anchor(buy_amount, minimum, rate, deviation_bps)?;
-            let value =
-                U512::from(minimum) * U512::from(rate.sell_rate) / U512::from(rate.buy_rate);
-            (
-                Some(buy_amount.saturating_sub(U256::saturating_from(value))),
-                BridgeLegPrice::Verified(rate),
-            )
-        }
-        None if same_asset => (
-            Some(buy_amount.saturating_sub(rescale(
-                minimum,
-                assets.destination_decimals,
-                assets.origin_decimals,
-            ))),
-            BridgeLegPrice::SameAsset,
-        ),
-        None => (None, BridgeLegPrice::Unverified),
-    };
+    let (fee, leg) = BridgeLegPricing {
+        anchor,
+        same_asset_decimals: same_asset
+            .then_some((assets.origin_decimals, assets.destination_decimals)),
+        deviation_bps,
+    }
+    .price(buy_amount, minimum)?;
     Ok(SwapBridgeQuote {
         provider: BridgeProvider::NearIntents,
         destination_minimum: minimum,

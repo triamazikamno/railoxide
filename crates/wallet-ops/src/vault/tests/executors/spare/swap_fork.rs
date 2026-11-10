@@ -7050,6 +7050,7 @@ async fn public_permit_order_scenario(route: PermitOrigin) {
             across: &across_client(preview_url),
             anchor_cache: None,
             token_registry: &registry,
+            anchor_deviation_bps: 300,
             max_fee_per_gas: PUBLIC_MAX_FEE_PER_GAS,
             max_priority_fee_per_gas: PUBLIC_MAX_PRIORITY_FEE_PER_GAS,
             client: crate::OperationHttpClient::direct_for_tests(),

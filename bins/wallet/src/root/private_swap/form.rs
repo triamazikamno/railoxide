@@ -2200,19 +2200,20 @@ async fn fetch_bridge_routes(
     };
     // Across failing here means NEAR Intents is offered, so the network isn't unserved.
     let served = near_offered || !routes.is_empty();
-    let across = across_destination_tokens(&routes, sell, tokens, chain);
+    let across = across_destination_tokens(&routes, sell, tokens, origin.chain_id(), chain);
     let near = near_destination_tokens(&listed, &origin, &destination, sell, tokens);
     // Without a sell token to leave out, the lists also hold the sell token's own asset.
     let mut same_asset: Vec<BridgeDestination> = Vec::new();
-    for candidate in across_destination_tokens(&routes, Address::ZERO, tokens, chain)
-        .into_iter()
-        .chain(near_destination_tokens(
-            &listed,
-            &origin,
-            &destination,
-            Address::ZERO,
-            tokens,
-        ))
+    for candidate in
+        across_destination_tokens(&routes, Address::ZERO, tokens, origin.chain_id(), chain)
+            .into_iter()
+            .chain(near_destination_tokens(
+                &listed,
+                &origin,
+                &destination,
+                Address::ZERO,
+                tokens,
+            ))
     {
         let token = candidate.destination_token;
         if destination_for(&across, token).is_none()

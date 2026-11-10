@@ -5,8 +5,8 @@ use railgun_wallet::tx::GasEstimateMode;
 use railgun_wallet::{Note, UtxoCommitmentKind, UtxoSource};
 
 use super::super::bridge::{
-    BridgeSigning, SwapPrivateBridgeQuote, across_bridge_quote, across_order_terms,
-    delivery_allowance_rate, near_bridge_quote,
+    BridgeLegPricing, BridgeSigning, SwapPrivateBridgeQuote, across_bridge_quote,
+    across_leg_pricing, across_order_terms, delivery_allowance_rate, near_bridge_quote,
 };
 use super::super::public_order::{
     PublicSwapBatchTerms, PublicSwapReview, execute_hooks_typed_data, order_typed_data,
@@ -418,11 +418,18 @@ const USDC_TO_BNB: PairAnchorRate = PairAnchorRate {
     buy_rate: uint!(3_000_000_000_000_000_000_000_000_000_U256),
 };
 
-// Across's output for the buy amount is the destination minimum, and its whole relay fee,
-// which includes the LP fee, is the bridge fee the high-cost check counts: 15% here. The
-// deposit contract comes from the profile, never from the API. A private delivery's minimum is
-// that output less the delivery allowance, and what reaches the private balance also pays the
-// destination chain's shield fee.
+/// Pricing of a leg between one asset in 6 decimals on both chains, without an anchor.
+const SAME_ASSET_6: BridgeLegPricing = BridgeLegPricing {
+    anchor: None,
+    same_asset_decimals: Some((6, 6)),
+    deviation_bps: 300,
+};
+
+// Across's output for the buy amount is the destination minimum, and its shortfall from the
+// buy amount is the bridge fee the high-cost check counts: 15% here. The deposit contract
+// comes from the profile, never from the API. A private delivery's minimum is that output less
+// the delivery allowance, and what reaches the private balance also pays the destination
+// chain's shield fee.
 #[test]
 fn across_quote_prices_the_relay_fee_and_requires_the_profiles_spoke_pool() {
     let spoke_pool = Address::repeat_byte(0x5b);
@@ -445,7 +452,7 @@ fn across_quote_prices_the_relay_fee_and_requires_the_profiles_spoke_pool() {
         max_deposit: U256::MAX,
         estimated_fill_time_sec: 12,
     };
-    let quote = across_bridge_quote(&fees, spoke_pool, None).unwrap();
+    let quote = across_bridge_quote(&fees, spoke_pool, None, BRIDGED, SAME_ASSET_6).unwrap();
     assert_eq!(
         (quote.destination_minimum, quote.fee, quote.leg),
         (
@@ -458,12 +465,22 @@ fn across_quote_prices_the_relay_fee_and_requires_the_profiles_spoke_pool() {
         (quote.private, quote.received_minimum()),
         (None, quote.destination_minimum)
     );
-    assert!(across_bridge_quote(&fees, Address::repeat_byte(0x5d), None).is_err());
+    assert!(
+        across_bridge_quote(
+            &fees,
+            Address::repeat_byte(0x5d),
+            None,
+            BRIDGED,
+            SAME_ASSET_6
+        )
+        .is_err()
+    );
 
     // An allowance of 50 leaves 800 for the destination account, whose shield takes 25 bp, 2.
-    // The relay fee stays the bridge fee.
+    // The fee is priced from the output before the allowance, which the review counts apart.
     let allowance = U256::from(50_000_000);
-    let private = across_bridge_quote(&fees, spoke_pool, Some(allowance)).unwrap();
+    let private =
+        across_bridge_quote(&fees, spoke_pool, Some(allowance), BRIDGED, SAME_ASSET_6).unwrap();
     assert_eq!(
         (
             private.destination_minimum,
@@ -487,9 +504,15 @@ fn across_quote_prices_the_relay_fee_and_requires_the_profiles_spoke_pool() {
     );
     assert_eq!(private.received_minimum(), U256::from(798_000_000));
     assert_eq!(
-        across_bridge_quote(&fees, spoke_pool, Some(fees.output_amount))
-            .unwrap_err()
-            .downcast_ref::<OrderLimitError>(),
+        across_bridge_quote(
+            &fees,
+            spoke_pool,
+            Some(fees.output_amount),
+            BRIDGED,
+            SAME_ASSET_6
+        )
+        .unwrap_err()
+        .downcast_ref::<OrderLimitError>(),
         Some(&OrderLimitError::DeliveryAllowanceExceedsOutput {
             allowance: fees.output_amount,
             output: fees.output_amount,
@@ -529,6 +552,67 @@ fn across_quote_prices_the_relay_fee_and_requires_the_profiles_spoke_pool() {
     assert!(delivery_allowance_rate(delivery, Some(WETH), None, &unusable).is_err());
 }
 
+// The API reports its own relay fee and pairs its own tokens, so neither prices the leg. Half
+// the input delivered as BNB Chain's 18-decimal USDC costs half, whatever the relay fee says.
+// Another asset without an anchor has no known fee, and with the leg's anchor the loss fails
+// like a CoW quote beyond the deviation.
+#[test]
+fn across_fee_is_the_priced_shortfall_not_the_reported_relay_fee() {
+    const ARB_USDC: Address = address!("af88d065e77c8cc2239327c5edb3a432268e5831");
+    const ARB_WETH: Address = address!("82af49447d8a07e3bd95bd0d56f35241523fbab1");
+    const BSC_USDC: Address = address!("8ac76a51cc950d9822d68b83fe1ad97b32cd580d");
+    let registry = crate::settings::build_effective_token_registry(
+        &crate::settings::WalletSettings::default(),
+    )
+    .unwrap();
+    let spoke_pool = Address::repeat_byte(0x5b);
+    let fees = AcrossFeeQuote {
+        output_amount: uint!(500_000_000_000_000_000_000_U256),
+        total_relay_fee_total: U256::ONE,
+        total_relay_fee_pct: U256::ZERO,
+        relayer_gas_fee_total: U256::ZERO,
+        relayer_gas_fee_pct: U256::ZERO,
+        lp_fee_total: U256::ZERO,
+        timestamp: 1,
+        fill_deadline: 2,
+        exclusive_relayer: Address::ZERO,
+        exclusivity_deadline: 0,
+        spoke_pool,
+        destination_spoke_pool: Address::repeat_byte(0x5c),
+        is_amount_too_low: false,
+        min_deposit: U256::ONE,
+        max_deposit: U256::MAX,
+        estimated_fill_time_sec: 12,
+    };
+    let leg = |pricing| {
+        across_bridge_quote(&fees, spoke_pool, None, BRIDGED, pricing)
+            .map(|quote| (quote.fee, quote.leg))
+    };
+
+    let usdc = across_leg_pricing((42161, ARB_USDC), (56, BSC_USDC), None, &registry, 300);
+    assert_eq!(
+        leg(usdc).unwrap(),
+        (Some(U256::from(500_000_000)), BridgeLegPrice::SameAsset)
+    );
+    let weth = across_leg_pricing((42161, ARB_WETH), (56, BSC_USDC), None, &registry, 300);
+    assert_eq!(leg(weth).unwrap(), (None, BridgeLegPrice::Unverified));
+    // USDC at par across the decimals.
+    let par = PairAnchorRate {
+        sell_rate: U256::ONE,
+        buy_rate: uint!(1_000_000_000_000_U256),
+    };
+    let anchored = BridgeLegPricing {
+        anchor: Some(par),
+        ..usdc
+    };
+    assert_eq!(
+        leg(anchored)
+            .unwrap_err()
+            .downcast_ref::<QuoteDeviationError>(),
+        Some(&QuoteDeviationError::ExceedsThreshold)
+    );
+}
+
 // Across's least deposit grows with the fill's gas, and the handler message adds the shield's:
 // a preview with a gas fee of 20,000 and a least deposit of 1 USDC gives 6 USDC for an allowance
 // of 100,000. A deposit below that can't be approved, and one that reaches it can. A quote
@@ -556,7 +640,8 @@ fn a_private_deposit_below_the_least_across_would_take_with_its_message_cant_be_
         estimated_fill_time_sec: 12,
     };
     let allowance = Some(U256::from(100_000));
-    let bridge = across_bridge_quote(&fees, spoke_pool, allowance).unwrap();
+    let input = U256::from(4_000_000);
+    let bridge = across_bridge_quote(&fees, spoke_pool, allowance, input, SAME_ASSET_6).unwrap();
     let floor = U256::from(6_000_000);
     assert_eq!(bridge.private.unwrap().deposit_floor, Some(floor));
     let account = crate::vault::SwapApprovedAccount {
@@ -581,7 +666,8 @@ fn a_private_deposit_below_the_least_across_would_take_with_its_message_cant_be_
             ..fees
         },
     ] {
-        let bridge = across_bridge_quote(&unusable, spoke_pool, allowance).unwrap();
+        let bridge =
+            across_bridge_quote(&unusable, spoke_pool, allowance, input, SAME_ASSET_6).unwrap();
         assert_eq!(bridge.private.unwrap().deposit_floor, None);
         let review = PublicSwapReview::for_tests(USDC, U256::ONE, 100, bridge, None);
         assert!(review.approval(account, None, false).is_ok());

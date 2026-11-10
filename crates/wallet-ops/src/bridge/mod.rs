@@ -44,6 +44,7 @@ pub use near_intents::{
 #[cfg(feature = "test-support")]
 pub use near_intents::{sign_quote_response_with_stand_in, stand_in_quote_key};
 pub use non_evm::{NonEvmNetwork, NonEvmReceiverError};
+pub(crate) use tokens::same_asset;
 pub use tokens::{
     BridgeDestination, NearAssets, NonEvmBridgeDestination, PublicBridgeDestination,
     PublicBridgePath, PublicSellAsset, across_destination_tokens, near_destination_tokens,
