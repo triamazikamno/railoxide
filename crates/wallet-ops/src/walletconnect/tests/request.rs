@@ -226,6 +226,22 @@ fn rejects_malformed_personal_sign_hex_before_approval() {
     ));
 }
 
+#[test]
+fn rejects_personal_sign_of_shield_key_message_before_approval() {
+    let account = address!("1111111111111111111111111111111111111111");
+    for message in [
+        "RAILGUN_SHIELD",
+        "0x5241494c47554e5f534849454c44",
+        "0x5241494C47554E5F534849454C44",
+        "0x0x5241494c47554e5f534849454c44",
+    ] {
+        assert!(matches!(
+            parse_walletconnect_session_request(35, "personal_sign", &json!([message, account])),
+            Err(WalletConnectError::MalformedParams(message)) if message.contains("RAILGUN_SHIELD")
+        ));
+    }
+}
+
 #[cfg(not(feature = "hardware"))]
 #[test]
 fn default_build_hardware_session_request_rejects_signing_method() {

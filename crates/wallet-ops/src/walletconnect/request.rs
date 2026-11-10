@@ -752,11 +752,18 @@ fn parse_personal_sign(
     let message = message_value
         .and_then(Value::as_str)
         .ok_or_else(|| malformed_params("personal_sign message is required"))?;
-    if let Some(encoded) = message.strip_prefix("0x")
-        && (!encoded.len().is_multiple_of(2) || hex::decode(encoded).is_err())
-    {
+    let bytes = match message.strip_prefix("0x") {
+        Some(encoded) if encoded.len().is_multiple_of(2) => hex::decode(encoded).ok(),
+        Some(_) => None,
+        None => Some(message.as_bytes().to_vec()),
+    }
+    .ok_or_else(|| {
+        malformed_params("personal_sign message must be valid hex when prefixed with 0x")
+    })?;
+    // keccak256 of this message's signature is the account's RAILGUN shield private key.
+    if bytes == b"RAILGUN_SHIELD" {
         return Err(malformed_params(
-            "personal_sign message must be valid hex when prefixed with 0x",
+            "personal_sign message RAILGUN_SHIELD is reserved for shield key derivation",
         ));
     }
     let account = account.ok_or_else(|| malformed_params("personal_sign account is required"))?;
