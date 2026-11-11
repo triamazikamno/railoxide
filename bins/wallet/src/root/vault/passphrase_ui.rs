@@ -409,7 +409,12 @@ impl PassphraseOpenUi {
         })
         .detach();
 
-        cx.observe(&root, |_this, _root, cx| cx.notify()).detach();
+        // Sync outside render: this view is unmounted once the root leaves pending.
+        cx.observe_in(&root, window, |this, _root, window, cx| {
+            this.sync_root_state(window, cx);
+            cx.notify();
+        })
+        .detach();
 
         Self {
             root,
@@ -1177,6 +1182,27 @@ mod tests {
             root.vault_state,
             VaultState::PendingSoftwareProfileOpen
         )));
+        // The unmounted pending view must drop typed secrets when the root abandons pending.
+        let ui = root.read_with(cx, |root, _| root.passphrase_open_ui.clone());
+        let inputs = ui.read_with(cx, |ui, _| {
+            [
+                ui.passphrase_input.clone(),
+                ui.confirmation_input.clone(),
+                ui.label_input.clone(),
+            ]
+        });
+        cx.update(|window, cx| {
+            for input in &inputs {
+                input.update(cx, |input, cx| input.set_value("typed secret", window, cx));
+            }
+            root.update(cx, |root, cx| {
+                root.abandon_pending_software_profile_open(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        for input in &inputs {
+            assert!(input.read_with(cx, |input, _| input.value().is_empty()));
+        }
         cx.update(|window, cx| {
             assert!(!window.has_active_dialog(cx));
             window.remove_window();
