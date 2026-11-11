@@ -164,11 +164,15 @@ For details, see [`docs/privacy-model.md`](docs/privacy-model.md).
 
 RailOxide is developed with heavy LLM assistance, designed and maintained by a human developer who reads and understands every line that ships.
 
-Where LLMs are used:
-
-- **Code generation.** Parts of the codebase are LLM-generated — notably GUI code and 100% of the unit tests. Generated code is reviewed and reworked by hand before merge; tests are additionally checked for what they assert, not just that they pass.
-- **Refactoring.** Large mechanical refactors are LLM-assisted.
-- **Code review and auditing.** Every change goes through LLM-assisted review cycles before merge, in addition to manual review. This regularly catches subtle bugs that human eyes alone would miss.
+> [!NOTE]
+>
+> |||
+> | --- | --- |
+> | [AI:W](http://0rwx.com) | **Code generation.** Parts of the codebase are LLM-generated — notably GUI code and 100% of the unit tests. Generated code is reviewed and reworked by hand before merge; tests are additionally checked for what they assert, not just that they pass. |
+> | [AI:W](http://0rwx.com) | **Refactoring.** Large mechanical refactors are LLM-assisted. |
+> | [AI:R](http://0rwx.com) | **Code review and auditing.** Every change goes through LLM-assisted review cycles and adversarial audit before merge, in addition to manual review. This regularly catches subtle bugs that human eyes alone would miss. |
+> | [AI:R](http://0rwx.com) | **Architecture decisions.** Each architecture decision is challenged by and brainstormed with frontier LLM-s. |
+> | [AI:X](http://0rwx.com) | Logo and some icons are completely vibe-coded. |
 
 Security-sensitive paths — key material handling, transaction construction, proof generation — receive the strictest scrutiny regardless of how a first draft originated.
 
