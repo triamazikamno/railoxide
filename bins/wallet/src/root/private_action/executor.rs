@@ -29,15 +29,33 @@ struct ExecutorUnshieldBinding {
     fee_policy: BroadcasterFeePolicy,
 }
 
+/// Chain, token, recipient, amount, unwrap, native top-up and fee handling.
+pub(in crate::root) type ExecutorUnshieldAction<'a> = (
+    u64,
+    Address,
+    Address,
+    U256,
+    bool,
+    Option<&'a DesktopNativeTopUpPlan>,
+    FeeHandlingMode,
+);
+
 impl ExecutorUnshieldBinding {
     fn same_action(&self, other: &Self) -> bool {
-        self.chain_id == other.chain_id
-            && self.token == other.token
-            && self.recipient == other.recipient
-            && self.amount == other.amount
-            && self.unwrap == other.unwrap
-            && self.native_top_up == other.native_top_up
-            && self.fee_mode == other.fee_mode
+        self.action() == other.action()
+    }
+
+    /// What an operation is for; a submission of the same action reuses the operation.
+    const fn action(&self) -> ExecutorUnshieldAction<'_> {
+        (
+            self.chain_id,
+            self.token,
+            self.recipient,
+            self.amount,
+            self.unwrap,
+            self.native_top_up.as_ref(),
+            self.fee_mode,
+        )
     }
 
     fn from_draft(draft: &UnshieldSpendDraft) -> Self {
@@ -62,6 +80,7 @@ impl ExecutorUnshieldBinding {
     }
 }
 
+#[derive(Clone)]
 pub(in crate::root) struct ExecutorUnshieldOperation {
     id: ExecutorOperationId,
     binding: ExecutorUnshieldBinding,
@@ -76,6 +95,14 @@ impl ExecutorUnshieldOperation {
             .filter(|previous| previous.binding.same_action(&binding))
             .map_or_else(ExecutorOperationId::random, |previous| Ok(previous.id))?;
         Ok(Self { id, binding })
+    }
+
+    /// This operation, when a submission of `action` would reuse it.
+    pub(in crate::root) fn reused_for(
+        &self,
+        action: ExecutorUnshieldAction<'_>,
+    ) -> Option<ExecutorOperationId> {
+        (self.binding.action() == action).then_some(self.id)
     }
 }
 
@@ -284,6 +311,38 @@ impl WalletRoot {
             window,
             cx,
         );
+    }
+
+    /// Whether submitting `draft` leaves the form's executor operation behind while a payload
+    /// it signed can still execute, so both could pay. A same-action executor submission
+    /// reuses the operation and its nonce instead.
+    pub(in crate::root) fn unshield_submission_abandons_executor_operation(
+        &self,
+        key: UnshieldAssetKey,
+        draft: &UnshieldSpendDraft,
+    ) -> bool {
+        let Some(operation) = self
+            .unshield_forms
+            .get(&key)
+            .and_then(|form| form.executor_operation.as_ref())
+        else {
+            return false;
+        };
+        if Self::unshield_requires_executor(draft)
+            && operation
+                .binding
+                .same_action(&ExecutorUnshieldBinding::from_draft(draft))
+        {
+            return false;
+        }
+        draft.session.executor_owner().is_some_and(|owner| {
+            // Unreadable records count as unresolved.
+            owner.records().map_or(true, |records| {
+                records.iter().any(|record| {
+                    record.operation() == operation.id && record.has_unresolved_issued_work()
+                })
+            })
+        })
     }
 
     pub(in crate::root) const fn unshield_requires_executor(draft: &UnshieldSpendDraft) -> bool {
@@ -501,7 +560,9 @@ impl WalletRoot {
                         let quote = estimate_desktop_unshield_public_broadcaster_cost(
                             DesktopUnshieldPublicBroadcasterEstimateRequest {
                                 custom_fee_amount: draft.custom_fee_amount,
+                                input_pin: None,
                                 executor: Some(Arc::clone(&prepared)),
+                                reused_executor_operation: None,
                                 chain_id: key.chain_id,
                                 effective_chain: chain,
                                 session: Arc::clone(&draft.session),

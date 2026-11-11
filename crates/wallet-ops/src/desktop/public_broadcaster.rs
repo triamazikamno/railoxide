@@ -143,9 +143,35 @@ pub enum PublicBroadcasterSelection {
     Specific { railgun_address: String },
 }
 
+/// The notes of an earlier broadcaster proof for this payment, which may still execute. An
+/// attempt that spends one of them can't execute alongside it, so it can't pay twice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicBroadcasterInputPin {
+    pub inputs: Vec<SelectedInputIdentity>,
+    /// The user accepted that the earlier proof may still execute, so selection is free.
+    pub overridden: bool,
+}
+
+impl PublicBroadcasterInputPin {
+    /// The notes an attempt must share at least one of, unless the pin is overridden.
+    pub(crate) fn active(pin: Option<&Self>) -> Option<&[SelectedInputIdentity]> {
+        pin.filter(|pin| !pin.overridden)
+            .map(|pin| pin.inputs.as_slice())
+    }
+}
+
+/// A pinned attempt that isn't one payload transaction sharing a pinned note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "The notes of this payment's earlier proof can't cover this attempt. Submit again to choose whether to use other notes."
+)]
+pub struct PublicBroadcasterInputPinUnavailable;
+
 pub struct DesktopUnshieldPublicBroadcasterRequest {
     /// Exact total payment in fee-token base units; `None` uses automatic estimation.
     pub custom_fee_amount: Option<U256>,
+    /// Notes an earlier, possibly executable proof of this form spent.
+    pub input_pin: Option<PublicBroadcasterInputPin>,
     pub executor: Option<Arc<PreparedExecutorOperation>>,
     /// The fee ceiling the user approved; required for automatic fees and for executor operations.
     pub maximum_private_fee: Option<U256>,
@@ -175,11 +201,15 @@ pub struct DesktopUnshieldPublicBroadcasterRequest {
     pub republish_interval: Duration,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
     pub route_tx: Option<SubmissionRouteSender>,
+    /// Receives the final single-payload notes before publication starts.
+    pub payload_inputs_tx: Option<tokio::sync::oneshot::Sender<Vec<SelectedInputIdentity>>>,
 }
 
 pub struct DesktopSendPublicBroadcasterRequest {
     /// Exact total payment in fee-token base units; `None` uses automatic estimation.
     pub custom_fee_amount: Option<U256>,
+    /// Notes an earlier, possibly executable proof of this form spent.
+    pub input_pin: Option<PublicBroadcasterInputPin>,
     /// The fee ceiling the user approved; required for automatic fees.
     pub maximum_private_fee: Option<U256>,
     pub chain_id: u64,
@@ -206,11 +236,17 @@ pub struct DesktopSendPublicBroadcasterRequest {
     pub republish_interval: Duration,
     pub progress_tx: Option<TransactionGenerationProgressSender>,
     pub route_tx: Option<SubmissionRouteSender>,
+    /// Receives the final single-payload notes before publication starts.
+    pub payload_inputs_tx: Option<tokio::sync::oneshot::Sender<Vec<SelectedInputIdentity>>>,
 }
 
 pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {
     pub custom_fee_amount: Option<U256>,
+    pub input_pin: Option<PublicBroadcasterInputPin>,
     pub executor: Option<Arc<PreparedExecutorOperation>>,
+    /// Without `executor`, the operation a later submission reuses: its own reserved notes
+    /// stay admissible.
+    pub reused_executor_operation: Option<vault::ExecutorOperationId>,
     pub chain_id: u64,
     pub effective_chain: settings::EffectiveChainConfig,
     pub session: Arc<WalletSession>,
@@ -230,6 +266,7 @@ pub struct DesktopUnshieldPublicBroadcasterEstimateRequest {
 
 pub struct DesktopSendPublicBroadcasterEstimateRequest {
     pub custom_fee_amount: Option<U256>,
+    pub input_pin: Option<PublicBroadcasterInputPin>,
     pub chain_id: u64,
     pub effective_chain: settings::EffectiveChainConfig,
     pub session: Arc<WalletSession>,
@@ -361,6 +398,9 @@ pub struct PublicBroadcasterSubmissionResult {
     pub uses_relay_adapt: bool,
     pub result: PublicBroadcasterResultKind,
     pub native_top_up: Option<DesktopNativeTopUpPlan>,
+    /// The notes of the attempt's only payload transaction; `None` for a payload of several
+    /// transactions or an executor operation.
+    pub payload_inputs: Option<Vec<SelectedInputIdentity>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1015,6 +1055,56 @@ pub(crate) fn public_broadcaster_build_error(
         }
         other => Report::new(other),
     }
+}
+
+/// The input notes of the only transaction that spends `action_token`, or `None` when several
+/// do. A separate fee token's fee-only transaction is not a payload.
+pub(crate) fn single_payload_inputs<'a, C>(
+    chunk_inputs: impl IntoIterator<Item = C>,
+    action_token: Address,
+) -> Option<Vec<SelectedInputIdentity>>
+where
+    C: IntoIterator<Item = &'a Utxo>,
+{
+    let token = U256::from_be_slice(action_token.as_slice());
+    let mut payloads = chunk_inputs
+        .into_iter()
+        .map(|inputs| inputs.into_iter().collect::<Vec<_>>())
+        .filter(|inputs| inputs.iter().any(|utxo| utxo.note.token_hash == token));
+    let payload = payloads.next()?;
+    payloads.next().is_none().then(|| {
+        payload
+            .into_iter()
+            .map(SelectedInputIdentity::from_utxo)
+            .collect()
+    })
+}
+
+/// A pinned attempt is one payload transaction that spends at least one pinned note, so it
+/// can't execute alongside the earlier proof.
+pub(crate) fn require_pinned_payload(
+    pinned: Option<&[SelectedInputIdentity]>,
+    payload: Option<&[SelectedInputIdentity]>,
+) -> Result<()> {
+    let Some(pinned) = pinned else {
+        return Ok(());
+    };
+    match payload {
+        Some(inputs) if inputs.iter().any(|input| pinned.contains(input)) => Ok(()),
+        _ => Err(PublicBroadcasterInputPinUnavailable.into()),
+    }
+}
+
+/// A pinned estimate has one payload transaction besides any separate fee transaction.
+pub(crate) fn require_pinned_estimate(
+    pinned: bool,
+    estimate: &PublicBroadcasterCostEstimate,
+) -> Result<()> {
+    let fee_transactions = usize::from(estimate.fee_token != estimate.action_token);
+    if pinned && estimate.transaction_count.saturating_sub(fee_transactions) != 1 {
+        return Err(PublicBroadcasterInputPinUnavailable.into());
+    }
+    Ok(())
 }
 
 pub(super) struct PublicBroadcasterSetup {

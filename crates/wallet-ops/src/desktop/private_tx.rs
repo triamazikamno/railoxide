@@ -2438,8 +2438,15 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
     )
     .await?;
     let min_gas_price = buffered_gas_price_from_candidates(&fee_candidates, &chain.gas).await?;
+    let pinned = PublicBroadcasterInputPin::active(request.input_pin.as_ref());
+    // Executor retries are bound by their operation's nonce instead; a pin can't apply to them.
+    if pinned.is_some() && uses_executor {
+        return Err(PublicBroadcasterInputPinUnavailable.into());
+    }
     let utxos = if let Some(prepared) = request.executor.as_deref() {
         request.session.unspent_utxos_for_executor(prepared)?
+    } else if let Some(operation) = request.reused_executor_operation {
+        request.session.unspent_utxos_for_operation(operation)?
     } else {
         request.session.unspent_utxos()
     };
@@ -2551,6 +2558,7 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
             )
         },
     )?;
+    require_pinned_estimate(pinned.is_some(), &estimate)?;
     let reported_amounts = public_broadcaster_reported_amounts(
         request.token,
         request.fee_token,
@@ -2751,6 +2759,7 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
     )
     .await?;
     let min_gas_price = buffered_gas_price_from_candidates(&fee_candidates, &chain.gas).await?;
+    let pinned = PublicBroadcasterInputPin::active(request.input_pin.as_ref());
     let utxos = request.session.unspent_utxos();
     let same_token_fee = request.fee_token == request.token;
     let initial_fee_amount = initial_public_broadcaster_fee_amount(
@@ -2779,7 +2788,7 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
         },
     )?;
 
-    approximate_public_broadcaster_cost(
+    let estimate = approximate_public_broadcaster_cost(
         broadcaster,
         chain.gas.gas_limit_buffer,
         request.token,
@@ -2810,11 +2819,13 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
             })?;
             Ok(send_approximate_shape(&selection, selection.max_spendable))
         },
-    )
+    )?;
+    require_pinned_estimate(pinned.is_some(), &estimate)?;
+    Ok(estimate)
 }
 
 pub async fn submit_desktop_unshield_public_broadcaster(
-    request: DesktopUnshieldPublicBroadcasterRequest,
+    mut request: DesktopUnshieldPublicBroadcasterRequest,
     http: &HttpContext,
 ) -> Result<PublicBroadcasterSubmissionResult> {
     let waku = request.waku.clone();
@@ -2822,6 +2833,7 @@ pub async fn submit_desktop_unshield_public_broadcaster(
     let republish_interval = request.republish_interval;
     let progress_tx = request.progress_tx.clone();
     let route_tx = request.route_tx.clone();
+    let payload_inputs_tx = request.payload_inputs_tx.take();
     let session = Arc::clone(&request.session);
     let (vault_store, view_session) = (
         Arc::clone(&request.vault_store),
@@ -2836,6 +2848,15 @@ pub async fn submit_desktop_unshield_public_broadcaster(
     let gateway_origin = request.gateway_origin.clone();
     let prepared = Box::pin(prepare_desktop_unshield_public_broadcaster(request, http)).await?;
     let pending_spent_inputs = prepared.plan.input_utxos();
+    let payload_inputs = match &prepared.plan {
+        DesktopUnshieldPreparedPlan::Single(plan) => single_payload_inputs(
+            plan.chunks
+                .iter()
+                .map(|chunk| chunk.inputs.iter().map(|input| &input.utxo)),
+            token,
+        ),
+        DesktopUnshieldPreparedPlan::Composite(_) => None,
+    };
     let transaction = prepared.transaction.unwrap_or_else(|| {
         TransactionRequest::default()
             .to(prepared.plan.call_to())
@@ -2869,6 +2890,9 @@ pub async fn submit_desktop_unshield_public_broadcaster(
         }),
     )
     .with_gateway_origin(gateway_origin);
+    if let (Some(tx), Some(inputs)) = (payload_inputs_tx, &payload_inputs) {
+        let _ = tx.send(inputs.clone());
+    }
     activity.begin();
     let result = submit_public_broadcaster_plan(
         &waku,
@@ -2895,6 +2919,7 @@ pub async fn submit_desktop_unshield_public_broadcaster(
         prepared.relay_call_count,
         prepared.uses_relay_adapt,
         prepared.native_top_up,
+        payload_inputs,
         progress_tx,
         route_tx,
         timeout,
@@ -2915,7 +2940,7 @@ pub async fn submit_desktop_unshield_public_broadcaster(
 }
 
 pub async fn submit_desktop_send_public_broadcaster(
-    request: DesktopSendPublicBroadcasterRequest,
+    mut request: DesktopSendPublicBroadcasterRequest,
     http: &HttpContext,
 ) -> Result<PublicBroadcasterSubmissionResult> {
     let waku = request.waku.clone();
@@ -2923,6 +2948,7 @@ pub async fn submit_desktop_send_public_broadcaster(
     let republish_interval = request.republish_interval;
     let progress_tx = request.progress_tx.clone();
     let route_tx = request.route_tx.clone();
+    let payload_inputs_tx = request.payload_inputs_tx.take();
     let session = Arc::clone(&request.session);
     let (vault_store, view_session) = (
         Arc::clone(&request.vault_store),
@@ -2938,6 +2964,14 @@ pub async fn submit_desktop_send_public_broadcaster(
         .iter()
         .map(|input| input.utxo.clone())
         .collect::<Vec<_>>();
+    let payload_inputs = single_payload_inputs(
+        prepared
+            .plan
+            .chunks
+            .iter()
+            .map(|chunk| chunk.inputs.iter().map(|input| &input.utxo)),
+        token,
+    );
     let activity = ActivitySubmission::private(
         &vault_store,
         &view_session,
@@ -2957,6 +2991,9 @@ pub async fn submit_desktop_send_public_broadcaster(
         false,
     )
     .with_gateway_origin(gateway_origin);
+    if let (Some(tx), Some(inputs)) = (payload_inputs_tx, &payload_inputs) {
+        let _ = tx.send(inputs.clone());
+    }
     activity.begin();
     let result = submit_public_broadcaster_plan(
         &waku,
@@ -2987,6 +3024,7 @@ pub async fn submit_desktop_send_public_broadcaster(
         prepared.relay_call_count,
         prepared.uses_relay_adapt,
         prepared.native_top_up,
+        payload_inputs,
         progress_tx,
         route_tx,
         timeout,
@@ -4496,5 +4534,36 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("native top-up wrapped-native max spendable"));
         assert!(message.contains(&format!("required: {expected_required}")));
+    }
+
+    #[test]
+    fn pinned_broadcaster_payload_is_one_transaction_sharing_a_pinned_note() {
+        let token = Address::from([0x73; 20]);
+        let fee_token = Address::from([0x74; 20]);
+        let a = test_utxo_at(token, U256::from(60_u64), 0);
+        let b = test_utxo_at(token, U256::from(60_u64), 1);
+        let c = test_utxo_at(token, U256::from(60_u64), 2);
+        let fee = test_utxo_at(fee_token, U256::from(100_u64), 3);
+        let identity = SelectedInputIdentity::from_utxo;
+        let pin = [identity(&a)];
+        let rejected = |payload: Option<&[SelectedInputIdentity]>| {
+            require_pinned_payload(Some(&pin[..]), payload)
+                .unwrap_err()
+                .downcast_ref::<PublicBroadcasterInputPinUnavailable>()
+                .is_some()
+        };
+        // The separate fee transaction is not the payload; an extra unpinned note is allowed.
+        let shared = single_payload_inputs([vec![&fee], vec![&a, &c]], token)
+            .expect("one payload transaction");
+        assert_eq!(shared, vec![identity(&a), identity(&c)]);
+        assert!(require_pinned_payload(Some(&pin[..]), Some(shared.as_slice())).is_ok());
+        // A payload sharing no pinned note could execute alongside the earlier proof.
+        let disjoint = single_payload_inputs([vec![&b, &c]], token);
+        assert!(rejected(disjoint.as_deref()));
+        // A payload of several transactions is rejected while pinned, and installs no pin.
+        let multi_chunk = single_payload_inputs([vec![&a], vec![&b]], token);
+        assert_eq!(multi_chunk, None);
+        assert!(rejected(multi_chunk.as_deref()));
+        assert!(require_pinned_payload(None, None).is_ok());
     }
 }

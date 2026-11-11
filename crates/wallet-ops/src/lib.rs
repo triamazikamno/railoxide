@@ -35,6 +35,7 @@ use railgun_wallet::prover::build_prover_cache_with_progress;
 pub use railgun_wallet::prover::{
     ProverCacheBuildProgress, ProverCacheBuildReport, ProverCacheBuildStage,
 };
+pub use railgun_wallet::tx::SelectedInputIdentity;
 use railgun_wallet::tx::{
     BroadcasterFeeOutput, BuildError, CompositeAdapter, CompositePrivateOutputRole,
     CompositePrivateOutputRoleKind, CompositeRelayAction, CompositeRelayActionToken,
@@ -43,10 +44,10 @@ use railgun_wallet::tx::{
     MixedPrivateActionPlan, MixedPrivateActionRebuildConstraint, MixedPrivateActionRequest,
     MixedPrivateOutputRole, MixedPrivatePlannedOutput, MixedPrivateSend, MixedPrivateSendRole,
     MixedPublicPlannedOutput, PoiMerkleProofSource, PreTransactionPoiGenerationRequest,
-    PreTransactionPoiMap, SelectedInputIdentity, SendPlan, SendRequest as RailgunSendRequest,
-    TransactionPlanChunk, UnshieldPlan, UnshieldRequest as RailgunUnshieldRequest,
-    generate_pre_transaction_pois, max_broadcaster_fee_token_spendable, max_send_spendable,
-    max_unshield_spendable, send_selection_info, send_selection_info_with_broadcaster_fee_token,
+    PreTransactionPoiMap, SendPlan, SendRequest as RailgunSendRequest, TransactionPlanChunk,
+    UnshieldPlan, UnshieldRequest as RailgunUnshieldRequest, generate_pre_transaction_pois,
+    max_broadcaster_fee_token_spendable, max_send_spendable, max_unshield_spendable,
+    send_selection_info, send_selection_info_with_broadcaster_fee_token,
     send_selection_info_with_separate_broadcaster_fee_seed, unshield_selection_info,
     unshield_selection_info_with_broadcaster_fee_token,
     unshield_selection_info_with_separate_broadcaster_fee_seed,

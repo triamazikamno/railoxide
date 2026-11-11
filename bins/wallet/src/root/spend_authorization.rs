@@ -28,8 +28,8 @@ use ui::clipboard::clipboard_with_toast;
 #[cfg(feature = "hardware")]
 use ui::controls::app_masked_input;
 use ui::controls::{
-    app_amount_text, app_button, app_button_base, app_muted_shimmer_text, app_muted_text,
-    app_strong_text, app_text,
+    AppNoticeTone, app_amount_text, app_button, app_button_base, app_muted_shimmer_text,
+    app_muted_text, app_notice, app_strong_text, app_text,
 };
 use ui::dialog::WalletDialogExt as _;
 use ui::hint::hint_card;
@@ -675,6 +675,7 @@ pub(super) struct SpendAuthorizationSummary {
     detail: Arc<str>,
     confirm_label: Arc<str>,
     context: Option<Arc<str>>,
+    notice: Option<(AppNoticeTone, Arc<str>)>,
     cards: Option<[SpendAuthorizationCard; 2]>,
     rows: Vec<SpendAuthorizationSummaryRow>,
     compact_rows: bool,
@@ -699,6 +700,7 @@ impl SpendAuthorizationSummary {
             detail: detail.into(),
             confirm_label: "Authorize and continue".into(),
             context: None,
+            notice: None,
             cards: None,
             rows,
             compact_rows: false,
@@ -720,6 +722,11 @@ impl SpendAuthorizationSummary {
 
     pub(super) fn with_context(mut self, context: impl Into<Arc<str>>) -> Self {
         self.context = Some(context.into());
+        self
+    }
+
+    pub(super) fn with_notice(mut self, tone: AppNoticeTone, text: impl Into<Arc<str>>) -> Self {
+        self.notice = Some((tone, text.into()));
         self
     }
 
@@ -2370,6 +2377,9 @@ impl gpui::Render for SpendAuthorizationDialogContent {
             .when_some(self.summary.context.as_ref(), |this, context| {
                 this.child(app_muted_text(context.to_string()).whitespace_normal())
             })
+            .when_some(self.summary.notice.as_ref(), |this, (tone, text)| {
+                this.child(app_notice(*tone, text.to_string(), cx))
+            })
             .children(
                 self.summary
                     .warnings
@@ -2520,6 +2530,9 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
             ))
             .when_some(self.summary.context.as_ref(), |this, context| {
                 this.child(app_muted_text(context.to_string()).whitespace_normal())
+            })
+            .when_some(self.summary.notice.as_ref(), |this, (tone, text)| {
+                this.child(app_notice(*tone, text.to_string(), cx))
             })
             .children(self.summary.warnings.iter().enumerate().map(|(index, warning)| {
                 Alert::warning(

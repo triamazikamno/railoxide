@@ -93,6 +93,8 @@ pub(in crate::root) struct PrivateBroadcasterProgressState {
     /// A refused broadcaster submission's retry is fetching its new estimate.
     pub(in crate::root) refusal_retry_pending: bool,
     pub(in crate::root) refusal_retry_error: Option<Arc<str>>,
+    /// The submission stopped before sending because it shared no note with the form's pin.
+    pub(in crate::root) input_pin_conflict: bool,
     pub(in crate::root) public_broadcaster_response_timeout: Option<Duration>,
     pub(in crate::root) public_broadcaster_wait_started_at: Option<Instant>,
     /// The public broadcaster submission's route, as its delivery reports it. A self-broadcast
@@ -102,6 +104,10 @@ pub(in crate::root) struct PrivateBroadcasterProgressState {
     /// Direct.
     pub(in crate::root) route_isolated: bool,
     pub(in crate::root) task_abort_handle: Option<tokio::task::AbortHandle>,
+    /// The single payload's notes, sent before publication; an attempt abandoned while
+    /// running pins its form to them.
+    pub(in crate::root) payload_inputs_rx:
+        Option<tokio::sync::oneshot::Receiver<Vec<wallet_ops::SelectedInputIdentity>>>,
     pub(in crate::root) stop_available: bool,
     pub(in crate::root) stopped: bool,
     pub(in crate::root) error: Option<Arc<str>>,

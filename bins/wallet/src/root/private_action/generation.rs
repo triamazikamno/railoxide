@@ -1,6 +1,10 @@
 use super::*;
+use ui::controls::AppNoticeTone;
 use wallet_ops::gateway::GatewayDraftExecution;
 use zeroize::Zeroizing;
+
+/// A pinned form reached a path off its pinned notes without the user accepting the risk.
+const PINNED_FORM_LEFT_BROADCASTER: &str = "An earlier proof for this payment may still go through. Submit again to choose whether to continue.";
 
 const SOFTWARE_SELF_BROADCAST_GAS_PAYER_PASSWORD_REQUIRED: &str = concat!(
     "The selected gas payer is a software Public account, so self-broadcast requires the vault ",
@@ -99,6 +103,83 @@ fn with_broadcaster_fee_rows(
     )
 }
 
+const INPUT_PIN_CONFLICT_MESSAGE: &str =
+    "This retry would spend different notes than the earlier attempt, so nothing was sent.";
+
+/// A failed submission's message, and whether it stopped on the form's note pin.
+fn submission_error_message(error: &eyre::Report) -> (String, bool) {
+    if error
+        .downcast_ref::<wallet_ops::PublicBroadcasterInputPinUnavailable>()
+        .is_some()
+    {
+        (INPUT_PIN_CONFLICT_MESSAGE.to_owned(), true)
+    } else {
+        (format_report_chain(error), false)
+    }
+}
+
+/// The form's note pin after a published attempt.
+fn input_pin_after_attempt(
+    pin: Option<wallet_ops::PublicBroadcasterInputPin>,
+    result: &PublicBroadcasterSubmissionResult,
+) -> Option<wallet_ops::PublicBroadcasterInputPin> {
+    let may_still_execute = matches!(
+        result.result,
+        PublicBroadcasterResultKind::Failed { .. } | PublicBroadcasterResultKind::TimedOut
+    );
+    input_pin_transition(pin, may_still_execute, result.payload_inputs.as_deref())
+}
+
+/// A refused, unanswered or abandoned attempt with one payload transaction narrows the pin
+/// to the notes it shares with that transaction, so a later attempt conflicts with both
+/// proofs. Without shared notes, such as after an override, it pins that transaction's
+/// notes. An override covered only that attempt.
+fn input_pin_transition(
+    pin: Option<wallet_ops::PublicBroadcasterInputPin>,
+    may_still_execute: bool,
+    payload_inputs: Option<&[wallet_ops::SelectedInputIdentity]>,
+) -> Option<wallet_ops::PublicBroadcasterInputPin> {
+    match payload_inputs {
+        Some(inputs) if may_still_execute && !inputs.is_empty() => {
+            let shared = pin
+                .map(|pin| {
+                    pin.inputs
+                        .into_iter()
+                        .filter(|input| inputs.contains(input))
+                        .collect::<Vec<_>>()
+                })
+                .filter(|shared| !shared.is_empty());
+            Some(wallet_ops::PublicBroadcasterInputPin {
+                inputs: shared.unwrap_or_else(|| inputs.to_vec()),
+                overridden: false,
+            })
+        }
+        _ => pin.map(|pin| wallet_ops::PublicBroadcasterInputPin {
+            overridden: false,
+            ..pin
+        }),
+    }
+}
+
+/// Review text for a batch of several plain transactions, which a broadcaster can split.
+/// It informs only; the note pin never depends on this estimate.
+fn unbundling_disclosure(
+    estimate: &PublicBroadcasterCostEstimate,
+    action_symbol: &str,
+) -> Option<String> {
+    if estimate.transaction_count < 2 || estimate.uses_relay_adapt {
+        return None;
+    }
+    // Same-token fees ride in the first proof, so a payment that fits one proof is atomic.
+    Some(if estimate.fee_token == estimate.action_token {
+        "Your private balance is spread across many smaller amounts, so a malicious broadcaster could collect the fee without delivering part of this payment. Sending a smaller amount at a time avoids this; a trusted broadcaster reduces the risk.".to_owned()
+    } else {
+        format!(
+            "A malicious broadcaster could collect the fee without delivering some or all of this payment. Using a trusted broadcaster or paying the fee in {action_symbol} reduces this risk."
+        )
+    })
+}
+
 /// The broadcaster fee review for a draft; it pins the shown broadcaster for custom fees too.
 fn broadcaster_fee_review(
     delivery_mode: DeliveryMode,
@@ -112,12 +193,47 @@ fn broadcaster_fee_review(
 }
 
 impl WalletRoot {
+    /// Before the running public broadcaster attempt is abandoned, pins its form to the
+    /// payload it already sent, as an unanswered attempt would. Taking the receiver applies
+    /// it at most once.
+    pub(in crate::root) fn pin_abandoned_private_broadcaster_payload(&mut self) {
+        let Some(progress) = self.private_broadcaster_progress.as_mut() else {
+            return;
+        };
+        let Some(Ok(inputs)) = progress
+            .payload_inputs_rx
+            .take()
+            .map(|mut payload_inputs_rx| payload_inputs_rx.try_recv())
+        else {
+            return;
+        };
+        let (kind, key, generation_id) = (progress.kind, progress.key, progress.generation_id);
+        let pin = match kind {
+            DeliveryFormKind::Send => self
+                .send_forms
+                .get_mut(&key)
+                .filter(|form| form.generation_id == generation_id)
+                .map(|form| &mut form.input_pin),
+            DeliveryFormKind::Unshield => self
+                .unshield_forms
+                .get_mut(&key)
+                .filter(|form| form.generation_id == generation_id)
+                .map(|form| &mut form.input_pin),
+        };
+        if let Some(pin) = pin {
+            *pin = input_pin_transition(pin.take(), true, Some(inputs.as_slice()));
+        }
+    }
+
     pub(in crate::root) fn generate_send_calldata_from_form(
         &mut self,
         key: UnshieldAssetKey,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if self.confirm_private_input_pin_admission(DeliveryFormKind::Send, key, window, cx) {
+            return;
+        }
         let Some(draft) = self.send_spend_draft(key, cx) else {
             return;
         };
@@ -178,6 +294,16 @@ impl WalletRoot {
                 draft.fee_mode,
                 &self.effective_token_registry,
             )
+        } else {
+            summary
+        };
+        let summary = if let Some(disclosure) = draft
+            .cost_estimate
+            .as_ref()
+            .filter(|_| draft.delivery_mode == DeliveryMode::PublicBroadcaster)
+            .and_then(|estimate| unbundling_disclosure(estimate, &draft.asset.label))
+        {
+            summary.with_notice(AppNoticeTone::Warning, disclosure)
         } else {
             summary
         };
@@ -504,6 +630,15 @@ impl WalletRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
+        // Debug UI fixture: the `broadcaster-review` mode's quote is a stand-in, so approving
+        // its review must prove and send nothing.
+        #[cfg(debug_assertions)]
+        {
+            if crate::root::private_swap::ui_fixture_holds_send_review() {
+                self.set_send_form_error(key, "The UI fixture's review sends nothing.", cx);
+                return;
+            }
+        }
         let Ok(resolved_chain) = self.effective_chain_configs.railgun(key.chain_id).cloned() else {
             return;
         };
@@ -535,6 +670,14 @@ impl WalletRoot {
             fee_policy,
             favorites_only_broadcasters,
         } = draft;
+        let input_pin = self
+            .send_forms
+            .get(&key)
+            .and_then(|form| form.input_pin.clone());
+        if input_pin.is_some() && delivery_mode != DeliveryMode::PublicBroadcaster {
+            self.set_send_form_error(key, PINNED_FORM_LEFT_BROADCASTER, cx);
+            return;
+        }
         // An automatic fee is submitted within the maximum the user reviewed.
         let maximum_private_fee = fee_review
             .filter(|_| custom_fee_amount.is_none())
@@ -673,6 +816,7 @@ impl WalletRoot {
         let self_broadcast_requires_device_approval =
             self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived);
         let mut route_tx = None;
+        let mut payload_inputs_tx = None;
         match delivery_mode {
             DeliveryMode::PublicBroadcaster => {
                 route_tx = Some(self.start_private_broadcaster_progress(
@@ -686,6 +830,11 @@ impl WalletRoot {
                     self.public_broadcaster_response_timeout,
                     cx,
                 ));
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                payload_inputs_tx = Some(tx);
+                if let Some(progress) = self.private_broadcaster_progress.as_mut() {
+                    progress.payload_inputs_rx = Some(rx);
+                }
             }
             DeliveryMode::SelfBroadcast => {
                 let signer =
@@ -769,6 +918,7 @@ impl WalletRoot {
             DeliveryMode::PublicBroadcaster => {
                 let request = DesktopSendPublicBroadcasterRequest {
                     custom_fee_amount,
+                    input_pin,
                     maximum_private_fee,
                     chain_id,
                     effective_chain: resolved_chain,
@@ -793,6 +943,7 @@ impl WalletRoot {
                     republish_interval: self.public_broadcaster_republish_interval,
                     progress_tx: Some(progress_tx),
                     route_tx,
+                    payload_inputs_tx,
                 };
                 self.spawn_public_transaction_submission(chain_id, async move {
                     Box::pin(submit_desktop_send_public_broadcaster(request, &http))
@@ -938,6 +1089,8 @@ impl WalletRoot {
                         Ok(result) => {
                             if let SendResult::PublicBroadcaster(result) = &result {
                                 progress_result = Some((**result).clone());
+                                form.input_pin =
+                                    input_pin_after_attempt(form.input_pin.take(), result);
                             }
                             if let SendResult::SelfBroadcast(result) = &result {
                                 form.self_broadcast_estimated_native_gas_cost =
@@ -953,15 +1106,22 @@ impl WalletRoot {
                             form.result = Some(result);
                         }
                         Err(error) => {
-                            let message = format_report_chain(&error);
+                            let (message, pin_conflict) = submission_error_message(&error);
                             if is_spend_authorization_failure_error(&message) {
                                 clear_spend_authorization = true;
                             }
-                            progress_error = Some(message.clone());
-                            if form_error_clears_public_broadcaster_cost_estimate(
-                                DeliveryFormKind::Send,
-                                message.as_str(),
-                            ) {
+                            if pin_conflict {
+                                form.input_pin_conflict = true;
+                            }
+                            progress_error = Some((message.clone(), pin_conflict));
+                            // A pin conflict comes from note selection, not the fee, so
+                            // "Continue anyway…" can resubmit on the same estimate.
+                            if !pin_conflict
+                                && form_error_clears_public_broadcaster_cost_estimate(
+                                    DeliveryFormKind::Send,
+                                    message.as_str(),
+                                )
+                            {
                                 form.cost_estimate = None;
                             }
                             form.result = None;
@@ -1010,13 +1170,14 @@ impl WalletRoot {
                         cx,
                     );
                 }
-                if let Some(message) = progress_error {
+                if let Some((message, pin_conflict)) = progress_error {
                     root.fail_private_broadcaster_progress(
                         DeliveryFormKind::Send,
                         key,
                         generation_id,
                         final_stage,
                         message,
+                        pin_conflict,
                         cx,
                     );
                 }
@@ -1089,9 +1250,23 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        if self.confirm_private_input_pin_admission(DeliveryFormKind::Unshield, key, window, cx) {
+            return;
+        }
         let Some(draft) = self.unshield_spend_draft(key, cx) else {
             return;
         };
+        // Checked before the form's operation is replaced or cleared below.
+        if self.unshield_submission_abandons_executor_operation(key, &draft) {
+            Self::confirm_double_payment_risk(window, cx, move |root, window, cx| {
+                if let Some(form) = root.unshield_forms.get_mut(&key) {
+                    form.executor_operation = None;
+                    form.executor_review = None;
+                }
+                root.generate_unshield_calldata_from_form(key, window, cx);
+            });
+            return;
+        }
         if Self::unshield_requires_executor(&draft) {
             if draft.delivery_mode == DeliveryMode::ManualCalldata {
                 self.set_unshield_form_error(key, "External-wallet export is unavailable for this stealth-account action. Select a supported delivery method.", cx);
@@ -1165,6 +1340,16 @@ impl WalletRoot {
                 draft.fee_mode,
                 &self.effective_token_registry,
             )
+        } else {
+            summary
+        };
+        let summary = if let Some(disclosure) = draft
+            .cost_estimate
+            .as_ref()
+            .filter(|_| draft.delivery_mode == DeliveryMode::PublicBroadcaster)
+            .and_then(|estimate| unbundling_disclosure(estimate, &draft.asset.label))
+        {
+            summary.with_notice(AppNoticeTone::Warning, disclosure)
         } else {
             summary
         };
@@ -1582,6 +1767,16 @@ impl WalletRoot {
             fee_policy,
             favorites_only_broadcasters,
         } = draft;
+        let input_pin = self
+            .unshield_forms
+            .get(&key)
+            .and_then(|form| form.input_pin.clone());
+        if input_pin.is_some()
+            && (delivery_mode != DeliveryMode::PublicBroadcaster || executor_review.is_some())
+        {
+            self.set_unshield_form_error(key, PINNED_FORM_LEFT_BROADCASTER, cx);
+            return;
+        }
         // Executor reviews carry their own approved maximum; automatic fees use the reviewed one.
         let maximum_private_fee = executor_review
             .as_ref()
@@ -1766,6 +1961,7 @@ impl WalletRoot {
         let self_broadcast_requires_device_approval =
             self_broadcast_gas_payer_source == Some(PublicAccountSource::HardwareDerived);
         let mut route_tx = None;
+        let mut payload_inputs_tx = None;
         match delivery_mode {
             DeliveryMode::PublicBroadcaster => {
                 route_tx = Some(self.start_private_broadcaster_progress(
@@ -1779,6 +1975,11 @@ impl WalletRoot {
                     self.public_broadcaster_response_timeout,
                     cx,
                 ));
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                payload_inputs_tx = Some(tx);
+                if let Some(progress) = self.private_broadcaster_progress.as_mut() {
+                    progress.payload_inputs_rx = Some(rx);
+                }
             }
             DeliveryMode::SelfBroadcast => {
                 let signer =
@@ -1875,6 +2076,7 @@ impl WalletRoot {
             DeliveryMode::PublicBroadcaster => {
                 let request = DesktopUnshieldPublicBroadcasterRequest {
                     custom_fee_amount,
+                    input_pin,
                     executor: executor_review
                         .as_ref()
                         .map(|review| Arc::clone(&review.prepared)),
@@ -1904,6 +2106,7 @@ impl WalletRoot {
                     republish_interval: self.public_broadcaster_republish_interval,
                     progress_tx: Some(progress_tx),
                     route_tx,
+                    payload_inputs_tx,
                 };
                 self.spawn_public_transaction_submission(chain_id, async move {
                     Box::pin(submit_desktop_unshield_public_broadcaster(request, &http))
@@ -2095,6 +2298,8 @@ impl WalletRoot {
                             };
                             if let UnshieldResult::PublicBroadcaster(result) = &result {
                                 progress_result = Some((**result).clone());
+                                form.input_pin =
+                                    input_pin_after_attempt(form.input_pin.take(), result);
                             }
                             if let UnshieldResult::SelfBroadcast(result) = &result {
                                 form.self_broadcast_estimated_native_gas_cost =
@@ -2110,15 +2315,21 @@ impl WalletRoot {
                             form.result = Some(result);
                         }
                         Err(error) => {
-                            let message = format_report_chain(&error);
+                            let (message, pin_conflict) = submission_error_message(&error);
                             if is_spend_authorization_failure_error(&message) {
                                 clear_spend_authorization = true;
                             }
-                            progress_error = Some(message.clone());
-                            if form_error_clears_public_broadcaster_cost_estimate(
-                                DeliveryFormKind::Unshield,
-                                message.as_str(),
-                            ) {
+                            if pin_conflict {
+                                form.input_pin_conflict = true;
+                            }
+                            progress_error = Some((message.clone(), pin_conflict));
+                            // See the Send handler: the estimate stays valid for "Continue anyway…".
+                            if !pin_conflict
+                                && form_error_clears_public_broadcaster_cost_estimate(
+                                    DeliveryFormKind::Unshield,
+                                    message.as_str(),
+                                )
+                            {
                                 form.cost_estimate = None;
                             }
                             form.result = None;
@@ -2171,13 +2382,14 @@ impl WalletRoot {
                         cx,
                     );
                 }
-                if let Some(message) = progress_error {
+                if let Some((message, pin_conflict)) = progress_error {
                     root.fail_private_broadcaster_progress(
                         DeliveryFormKind::Unshield,
                         key,
                         generation_id,
                         final_stage,
                         message,
+                        pin_conflict,
                         cx,
                     );
                 }
@@ -2356,5 +2568,100 @@ mod tests {
             Some(expired_at),
             true,
         ));
+    }
+
+    #[test]
+    fn refused_or_unanswered_single_payload_attempts_narrow_the_note_pin() {
+        use wallet_ops::{PublicBroadcasterInputPin, SelectedInputIdentity};
+        let broadcaster = wallet_ops::public_broadcaster_candidates_for_asset(
+            &[crate::root::tests::fee_row(1, Address::ZERO, "pin")],
+            1,
+            Address::ZERO,
+            BroadcasterFeePolicy::default(),
+            None,
+        )
+        .unwrap()
+        .remove(0);
+        let attempt = |result, payload_inputs| PublicBroadcasterSubmissionResult {
+            broadcaster: broadcaster.clone(),
+            action_token: Address::ZERO,
+            fee_token: Address::ZERO,
+            entered_amount: U256::from(100),
+            receiver_amount: U256::from(99),
+            recipient_amount: U256::from(99),
+            total_private_spend: U256::from(100),
+            fee_amount: U256::ONE,
+            protocol_fee_amount: U256::ZERO,
+            protocol_fee_bps: U256::ZERO,
+            fee_mode: FeeHandlingMode::DeductFromAmount,
+            gas_limit: 1,
+            min_gas_price: 1,
+            transaction_count: 1,
+            input_count: 1,
+            private_output_count: 1,
+            public_output_count: 0,
+            relay_call_count: 0,
+            uses_relay_adapt: false,
+            result,
+            native_top_up: None,
+            payload_inputs,
+        };
+        let note = |position| SelectedInputIdentity { tree: 0, position };
+        let pin = |positions: &[u64], overridden| PublicBroadcasterInputPin {
+            inputs: positions.iter().copied().map(note).collect(),
+            overridden,
+        };
+        let refused = || PublicBroadcasterResultKind::Failed {
+            error: "refused".into(),
+        };
+        for outcome in [refused(), PublicBroadcasterResultKind::TimedOut] {
+            assert_eq!(
+                input_pin_after_attempt(None, &attempt(outcome, Some(vec![note(1), note(2)]))),
+                Some(pin(&[1, 2], false))
+            );
+        }
+        // A payload of several transactions can't be pinned and installs nothing.
+        assert_eq!(
+            input_pin_after_attempt(None, &attempt(refused(), None)),
+            None
+        );
+        // A pinned retry shares some of the pinned notes; only those conflict with both proofs.
+        assert_eq!(
+            input_pin_after_attempt(
+                Some(pin(&[1, 2], false)),
+                &attempt(PublicBroadcasterResultKind::TimedOut, Some(vec![note(1)])),
+            ),
+            Some(pin(&[1], false))
+        );
+        assert_eq!(
+            input_pin_after_attempt(
+                Some(pin(&[1, 2], false)),
+                &attempt(refused(), Some(vec![note(2), note(3)])),
+            ),
+            Some(pin(&[2], false))
+        );
+        // An overridden attempt that shared no note replaces the pin with its own notes.
+        assert_eq!(
+            input_pin_after_attempt(
+                Some(pin(&[1, 2], true)),
+                &attempt(refused(), Some(vec![note(3)])),
+            ),
+            Some(pin(&[3], false))
+        );
+        // Otherwise the pin stays, and an override covered only the attempt it was given for.
+        for (outcome, payload) in [
+            (refused(), None),
+            (
+                PublicBroadcasterResultKind::Submitted {
+                    tx_hash: "0xabc".into(),
+                },
+                Some(vec![note(3)]),
+            ),
+        ] {
+            assert_eq!(
+                input_pin_after_attempt(Some(pin(&[1, 2], true)), &attempt(outcome, payload)),
+                Some(pin(&[1, 2], false))
+            );
+        }
     }
 }

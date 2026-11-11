@@ -4,7 +4,7 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputGroup, InputState};
 use gpui_component::{
-    Disableable, Icon, IconName, IndexPath, Selectable, Sizable,
+    ActiveTheme as _, Disableable, Icon, IconName, IndexPath, Selectable, Sizable,
     button::{Button, ButtonGroup, ButtonVariants},
     select::{SearchableVec, SelectDelegate, SelectItem},
     shimmer::ShimmerText,
@@ -293,6 +293,27 @@ pub fn app_amount_text(label: impl Into<SharedString>) -> Div {
 #[must_use]
 pub fn app_muted_text(label: impl Into<SharedString>) -> Div {
     app_text(label).text_color(rgb(theme::TEXT_MUTED))
+}
+
+/// The colour of an [`app_notice`] rule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppNoticeTone {
+    Info,
+    Warning,
+}
+
+/// Body text behind a toned left rule, for something worth noticing but less urgent than an Alert.
+#[must_use]
+pub fn app_notice(tone: AppNoticeTone, label: impl Into<SharedString>, cx: &App) -> Div {
+    let color = match tone {
+        AppNoticeTone::Info => cx.theme().info,
+        AppNoticeTone::Warning => cx.theme().warning,
+    };
+    app_text(label)
+        .whitespace_normal()
+        .border_l_3()
+        .border_color(color)
+        .pl_3()
 }
 
 /// Loading shimmer with the app's highlight; inherits the parent's text style.

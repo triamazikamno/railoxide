@@ -1,8 +1,8 @@
 //! A debug-only fixture for looking at the Public account swap screens, at a private swap's
 //! retry review, failed quote, speed-up, split outcome, reported fill, setup progress,
 //! cancelled preparation and delivery to a non-EVM network, at the Stealth accounts inspector, at the refund dialog of a blocked
-//! Shield, at a private Send's broadcaster progress, at the rows of the UTXO table and at a
-//! hardware wallet's Derive from private dialog without a device: it opens
+//! Shield, at a private Send's broadcaster progress and review, at the rows of the UTXO table
+//! and at a hardware wallet's Derive from private dialog without a device: it opens
 //! them on a scratch wallet without private
 //! funds and holds a chosen state on screen. It is compiled only with `debug_assertions`, and
 //! does nothing unless `RAILOXIDE_UI_FIXTURE` is set.
@@ -322,6 +322,15 @@
 //!   The route's chip and its hover card show the synthesized route, which never changes.
 //!   Stop waiting marks the wait stopped, and Close closes the dialog. No job runs, nothing is
 //!   proved or sent, and no record is written.
+//! - `broadcaster-review` lets the Private tab's Send offer the same stand-in 1.0 as
+//!   `broadcaster-progress:`. The network's private session must be started and synced. Send
+//!   then opens the review of a private Send via broadcaster in place of the form: 0.5 of the
+//!   token to the wallet's own address, over a stand-in broadcaster's quote of two plain
+//!   transactions with a fee of 1.25 USDC (Ethereum's USDC where the network lists none). The
+//!   review is the wallet's own, so it shows the notice that a broadcaster could unbundle the
+//!   batch, with its sentence about paying the fee in the payment's token. The quote is never
+//!   estimated again. Approving the review takes the vault password and ends with nothing
+//!   proved or sent, and no record is written.
 //! - `hardware-derive` shows the Derive from private dialog, from Public's Add account, as a
 //!   hardware wallet's: its authorize state with Show addresses, its preview and the progress
 //!   of an add. Whatever wallet is selected, the dialog treats it as Ledger-derived and asks a
@@ -478,6 +487,7 @@ enum Mode {
     Reported(Reported),
     Cancelled(Cancelled),
     BroadcasterProgress(BroadcasterProgress),
+    BroadcasterReview,
     HardwareDerive,
     NonEvm(NonEvm, NonEvmNetwork),
     Tron(Tron),
@@ -731,6 +741,9 @@ fn parse(value: &str) -> Option<Mode> {
     }
     if value == "hardware-derive" {
         return Some(Mode::HardwareDerive);
+    }
+    if value == "broadcaster-review" {
+        return Some(Mode::BroadcasterReview);
     }
     if let Some(state) = value.strip_prefix("update-check:") {
         return Some(Mode::UpdateCheck(match state {
@@ -3177,8 +3190,8 @@ impl WalletRoot {
     }
 
     /// In a `broadcaster-progress:` mode, open the progress dialog of a synthesized Send via
-    /// broadcaster of `asset` in place of its form, held at the mode's state. `true` when the
-    /// dialog opened.
+    /// broadcaster of `asset` in place of its form, held at the mode's state; in the
+    /// `broadcaster-review` mode, open its review. `true` when the mode is one of them.
     pub(in crate::root) fn open_ui_fixture_broadcaster_progress(
         &mut self,
         asset: &crate::root::UnshieldAsset,
@@ -3187,6 +3200,10 @@ impl WalletRoot {
     ) -> bool {
         use TransactionGenerationStage::WaitingForBroadcasterResponse;
         use wallet_ops::SubmissionRouteState::{Ready, Reconnecting};
+        if holds_send_review() {
+            self.open_ui_fixture_broadcaster_review(asset, window, cx);
+            return true;
+        }
         let Some(Mode::BroadcasterProgress(state)) = mode() else {
             return false;
         };
@@ -3288,6 +3305,7 @@ impl WalletRoot {
                         error: "Gas cost is too high, please refresh and try again".to_owned(),
                     },
                     native_top_up: None,
+                    payload_inputs: None,
                 };
                 finish_private_broadcaster_progress_steps_at_stage(
                     &mut progress.steps,
@@ -3299,6 +3317,76 @@ impl WalletRoot {
         }
         self.show_private_broadcaster_progress_dialog(window, cx);
         true
+    }
+
+    /// Fill a Send form of `asset` with 0.5 to the wallet's own address and a stand-in quote of
+    /// two plain transactions whose fee is paid in USDC, then submit it, which opens the real
+    /// review. No estimate runs, so nothing replaces the quote.
+    fn open_ui_fixture_broadcaster_review(
+        &mut self,
+        asset: &crate::root::UnshieldAsset,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let recipient = self
+            .view_session
+            .as_ref()
+            .and_then(|session| session.receive_address().ok())
+            .unwrap_or_default();
+        let fee_token = [asset.chain_id, 1]
+            .into_iter()
+            .find_map(|chain| known_tokens_for_chain(chain).find(|token| token.symbol == "USDC"))
+            .map_or(Address::ZERO, |token| token.token);
+        let entered_amount =
+            U256::from(10).pow(U256::from(asset.decimals.unwrap_or(18))) / U256::from(2);
+        let gas_limit = 2_351_228;
+        let min_gas_price = 58_798_000;
+        let estimate = wallet_ops::PublicBroadcasterCostEstimate {
+            broadcaster: wallet_ops::PublicBroadcasterCandidate {
+                token: fee_token,
+                fee: U256::from(1_000_000_000_u64),
+                fee_expiration: std::time::SystemTime::now() + Duration::from_mins(1),
+                ..super::setup_progress::stand_in_setup_broadcaster(asset.chain_id, None)
+            },
+            action_token: asset.token,
+            fee_token,
+            entered_amount,
+            receiver_amount: entered_amount,
+            recipient_amount: entered_amount,
+            total_private_spend: entered_amount,
+            // 1.25 USDC.
+            fee_amount: U256::from(1_250_000_u64),
+            protocol_fee_amount: U256::ZERO,
+            protocol_fee_bps: U256::ZERO,
+            fee_mode: wallet_ops::FeeHandlingMode::AddToAmount,
+            max_receiver_amount: asset.max_batched,
+            max_entered_amount: asset.max_batched,
+            gas_limit,
+            min_gas_price,
+            native_gas_cost: U256::from(gas_limit) * U256::from(min_gas_price),
+            transaction_count: 2,
+            input_count: 2,
+            private_output_count: 2,
+            public_output_count: 0,
+            relay_call_count: 0,
+            uses_relay_adapt: false,
+            native_top_up: None,
+        };
+        let key = crate::root::UnshieldAssetKey::from_asset(asset);
+        self.initialize_send_form(asset.clone(), window, cx);
+        let Some(form) = self.send_forms.get_mut(&key) else {
+            return;
+        };
+        // `set_value` emits no change, so no estimate is scheduled to replace the quote.
+        form.recipient_input.update(cx, |input, cx| {
+            input.set_value(recipient.clone(), window, cx);
+        });
+        form.amount_input
+            .update(cx, |input, cx| input.set_value("0.5", window, cx));
+        form.recipient_value = recipient.into();
+        form.selected_fee_token = fee_token;
+        form.cost_estimate = Some(estimate);
+        self.generate_send_calldata_from_form(key, window, cx);
     }
 }
 
@@ -3355,19 +3443,28 @@ pub(in crate::root) fn unshield_asset(
     })
 }
 
-/// The stand-in asset Send offers in a `broadcaster-progress:` or `max:` mode, with its token's
-/// icon. `None` in every other mode.
+/// The stand-in asset Send offers in a `broadcaster-progress:`, `broadcaster-review` or `max:`
+/// mode, with its token's icon. `None` in every other mode.
 pub(in crate::root) fn send_asset(
     chain_id: u64,
     wrapped_native: Address,
 ) -> Option<crate::root::UnshieldAsset> {
     max_asset(chain_id, wrapped_native).or_else(|| {
-        matches!(mode(), Some(Mode::BroadcasterProgress(_))).then(|| crate::root::UnshieldAsset {
+        matches!(
+            mode(),
+            Some(Mode::BroadcasterProgress(_) | Mode::BroadcasterReview)
+        )
+        .then(|| crate::root::UnshieldAsset {
             icon_path: token_icon_asset_path(chain_id, &wrapped_native)
                 .map(WalletIconSource::embedded),
             ..stand_in_asset(chain_id, wrapped_native)
         })
     })
+}
+
+/// Whether the `broadcaster-review` mode is active, whose Send reviews prove and send nothing.
+pub(in crate::root) fn holds_send_review() -> bool {
+    matches!(mode(), Some(Mode::BroadcasterReview))
 }
 
 /// The token the Private tab's Swap offers in a `setup:`, `retry-review`, `native-buy` or `max:`

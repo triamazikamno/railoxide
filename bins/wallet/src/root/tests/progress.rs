@@ -1079,11 +1079,13 @@ fn closed_private_broadcaster_progress_exposes_active_stage() {
         self_broadcast_action_error: None,
         refusal_retry_pending: false,
         refusal_retry_error: None,
+        input_pin_conflict: false,
         public_broadcaster_response_timeout: Some(Duration::from_mins(2)),
         public_broadcaster_wait_started_at: None,
         route: None,
         route_isolated: true,
         task_abort_handle: None,
+        payload_inputs_rx: None,
         stop_available: true,
         stopped: false,
         error: None,
@@ -1406,4 +1408,74 @@ fn broadcaster_preference_control_follows_ban_then_submission() {
             "banned={banned} favorite={favorite} submitted={submitted} ban_offered={ban_offered}"
         );
     }
+}
+
+/// Stopping or resetting a running attempt skips its completion, so the payload it already
+/// sent must still pin the form that a retry reuses.
+#[gpui::test]
+fn abandoned_public_broadcaster_attempts_pin_their_payload_notes(cx: &mut gpui::TestAppContext) {
+    use wallet_ops::{PublicBroadcasterInputPin, SelectedInputIdentity};
+    let path = temp_wallet_db_root("abandoned-attempt-pin");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    let (root, cx) = wallet_view_root(&path, &runtime, cx);
+    let asset = UnshieldAsset {
+        chain_id: 1,
+        token: Address::from([0x31; 20]),
+        label: "WETH".to_string(),
+        decimals: Some(18),
+        total: U256::from(10),
+        poi_verified_total: U256::from(10),
+        max_batched: U256::from(10),
+        icon_path: None,
+    };
+    let key = UnshieldAssetKey::from_asset(&asset);
+    let note = |position| SelectedInputIdentity { tree: 0, position };
+    // A running attempt of the form's next generation whose payload already went out.
+    let start_attempt = |root: &mut WalletRoot, inputs: Vec<SelectedInputIdentity>| {
+        let form = root.send_forms.get_mut(&key).expect("send form");
+        form.generation_id += 1;
+        form.generating = true;
+        let mut progress =
+            private_progress_state(PrivateSubmissionProgressFlow::PublicBroadcaster, key);
+        progress.generation_id = form.generation_id;
+        let (payload_inputs_tx, payload_inputs_rx) = tokio::sync::oneshot::channel();
+        payload_inputs_tx.send(inputs).expect("payload inputs");
+        progress.payload_inputs_rx = Some(payload_inputs_rx);
+        root.private_broadcaster_progress = Some(progress);
+    };
+    cx.update(|window, cx| {
+        root.update(cx, |root, cx| {
+            root.initialize_send_form(asset, window, cx);
+            start_attempt(root, vec![note(1), note(2)]);
+            root.stop_private_broadcaster_progress(cx);
+            assert_eq!(
+                root.send_forms[&key].input_pin,
+                Some(PublicBroadcasterInputPin {
+                    inputs: vec![note(1), note(2)],
+                    overridden: false,
+                })
+            );
+
+            // A cache reset abandons the retry while keeping the form; the pin narrows to the
+            // note both proofs spend.
+            start_attempt(root, vec![note(2), note(3)]);
+            let _ = root.begin_public_sync_cache_reset(cx);
+            assert_eq!(
+                root.send_forms[&key].input_pin,
+                Some(PublicBroadcasterInputPin {
+                    inputs: vec![note(2)],
+                    overridden: false,
+                })
+            );
+        });
+    });
+
+    cx.update(|window, _| window.remove_window());
+    drop(root);
+    cx.run_until_parked();
+    std::fs::remove_dir_all(path).unwrap();
 }

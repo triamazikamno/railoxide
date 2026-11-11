@@ -329,11 +329,13 @@ impl WalletRoot {
             self_broadcast_action_error: None,
             refusal_retry_pending: false,
             refusal_retry_error: None,
+            input_pin_conflict: false,
             public_broadcaster_response_timeout: Some(response_timeout),
             public_broadcaster_wait_started_at: None,
             route: Some(route_rx),
             route_isolated: self.http.network_mode() != WalletNetworkMode::Direct,
             task_abort_handle: None,
+            payload_inputs_rx: None,
             stop_available: true,
             stopped: false,
             error: None,
@@ -398,11 +400,13 @@ impl WalletRoot {
             self_broadcast_action_error: None,
             refusal_retry_pending: false,
             refusal_retry_error: None,
+            input_pin_conflict: false,
             public_broadcaster_response_timeout: None,
             public_broadcaster_wait_started_at: None,
             route: None,
             route_isolated: false,
             task_abort_handle: None,
+            payload_inputs_rx: None,
             stop_available: true,
             stopped: false,
             error: None,
@@ -505,8 +509,15 @@ impl WalletRoot {
         });
     }
 
-    fn stop_private_broadcaster_progress(&mut self, cx: &mut Context<'_, Self>) {
-        let (kind, key, generation_id, sponsored_stopping, sponsored_watchdog_handle) = {
+    pub(super) fn stop_private_broadcaster_progress(&mut self, cx: &mut Context<'_, Self>) {
+        let (
+            kind,
+            key,
+            generation_id,
+            sponsored_stopping,
+            sponsored_watchdog_handle,
+            task_abort_handle,
+        ) = {
             let Some(progress) = self.private_broadcaster_progress.as_mut() else {
                 return;
             };
@@ -520,13 +531,12 @@ impl WalletRoot {
                 step.status == PublicActionStepStatus::Pending
                     && sponsored_stop_uses_session_command(step.stage)
             });
+            let mut task_abort_handle = None;
             let sponsored_stopping = if sponsored_session_active {
                 request_sponsored_session_cancel(progress)
             } else {
                 progress.sponsored_self_broadcast_command_tx.take();
-                if let Some(handle) = progress.task_abort_handle.take() {
-                    handle.abort();
-                }
+                task_abort_handle = progress.task_abort_handle.take();
                 false
             };
             progress.self_broadcast_command_tx = None;
@@ -546,8 +556,16 @@ impl WalletRoot {
                 generation_id,
                 sponsored_stopping,
                 sponsored_watchdog_handle,
+                task_abort_handle,
             )
         };
+        if !sponsored_stopping {
+            // The broadcaster may already hold the payload, so pin it before abandoning it.
+            self.pin_abandoned_private_broadcaster_payload();
+        }
+        if let Some(handle) = task_abort_handle {
+            handle.abort();
+        }
         self.clear_trezor_pin_matrix_prompt(cx);
 
         if sponsored_stopping {
@@ -714,6 +732,85 @@ impl WalletRoot {
             }
         }
         self.start_refused_broadcaster_retry(kind, key, generation_id, None, window, cx);
+    }
+
+    /// Whether a submission the form's note pin stopped can still continue without the pin.
+    fn input_pin_conflict_retryable(
+        &self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+    ) -> bool {
+        let Some(progress) = self.private_broadcaster_progress.as_ref() else {
+            return false;
+        };
+        if !progress.input_pin_conflict
+            || progress.kind != kind
+            || progress.key != key
+            || progress.generation_id != generation_id
+            || progress.gateway_execution.is_some()
+            || !progress.dialog_open
+        {
+            return false;
+        }
+        // Not the form's conflict flag: estimates rewrite it without seeing note overlap.
+        let (generating, form_generation_id) = match kind {
+            DeliveryFormKind::Send => {
+                let Some(form) = self.send_forms.get(&key) else {
+                    return false;
+                };
+                (form.generating, form.generation_id)
+            }
+            DeliveryFormKind::Unshield => {
+                let Some(form) = self.unshield_forms.get(&key) else {
+                    return false;
+                };
+                (form.generating, form.generation_id)
+            }
+        };
+        !generating && form_generation_id == generation_id
+    }
+
+    /// Once the user accepts the double-payment risk, overrides the pin for one attempt and
+    /// submits again from the form.
+    fn continue_despite_input_pin(
+        &self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        generation_id: u64,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.input_pin_conflict_retryable(kind, key, generation_id) {
+            return;
+        }
+        Self::confirm_double_payment_risk(window, cx, move |root, window, cx| {
+            if !root.input_pin_conflict_retryable(kind, key, generation_id) {
+                return;
+            }
+            let pin = match kind {
+                DeliveryFormKind::Send => root.send_forms.get_mut(&key).and_then(|form| {
+                    form.input_pin_conflict = false;
+                    form.input_pin.as_mut()
+                }),
+                DeliveryFormKind::Unshield => root.unshield_forms.get_mut(&key).and_then(|form| {
+                    form.input_pin_conflict = false;
+                    form.input_pin.as_mut()
+                }),
+            };
+            if let Some(pin) = pin {
+                pin.overridden = true;
+            }
+            root.close_private_broadcaster_progress_dialog(window, cx);
+            match kind {
+                DeliveryFormKind::Send => {
+                    root.generate_send_calldata_from_form(key, window, cx);
+                }
+                DeliveryFormKind::Unshield => {
+                    root.generate_unshield_calldata_from_form(key, window, cx);
+                }
+            }
+        });
     }
 
     fn retry_public_broadcaster_with_custom_fee(
@@ -1027,6 +1124,7 @@ impl WalletRoot {
             &result.result,
         );
         progress.task_abort_handle = None;
+        progress.payload_inputs_rx = None;
         progress.stop_available = false;
         progress.result = Some(result);
         progress.error = None;
@@ -1120,6 +1218,7 @@ impl WalletRoot {
         generation_id: u64,
         final_stage: TransactionGenerationStage,
         message: String,
+        input_pin_conflict: bool,
         cx: &mut Context<'_, Self>,
     ) {
         let Some(progress) = self.private_broadcaster_progress.as_mut() else {
@@ -1135,9 +1234,11 @@ impl WalletRoot {
             message.as_str(),
         );
         progress.self_broadcast_action_error = None;
+        progress.input_pin_conflict = input_pin_conflict;
         progress.error = Some(Arc::from(message));
         progress.self_broadcast_command_tx = None;
         progress.task_abort_handle = None;
+        progress.payload_inputs_rx = None;
         progress.stop_available = false;
         cx.notify();
     }
@@ -1348,8 +1449,15 @@ impl WalletRoot {
         let refusal_actions = self
             .refused_public_broadcaster_retry(progress.kind, progress.key, progress.generation_id)
             .map(|(_, choice)| *choice == BroadcasterChoice::Random);
+        let input_pin_override =
+            self.input_pin_conflict_retryable(progress.kind, progress.key, progress.generation_id);
         let mut content = div().w(content_width).flex().flex_col().gap_3().child(
-            render_private_broadcaster_progress_stepper(root, progress, refusal_actions),
+            render_private_broadcaster_progress_stepper(
+                root,
+                progress,
+                refusal_actions,
+                input_pin_override,
+            ),
         );
 
         match progress.flow {
@@ -1905,10 +2013,12 @@ fn render_private_broadcaster_progress_footer(
 }
 
 /// `refusal_actions` is `Some(offer_another_broadcaster)` when a broadcaster refusal can be retried.
+/// `input_pin_override` offers to continue a submission the form's note pin stopped.
 pub(super) fn render_private_broadcaster_progress_stepper(
     root: &Entity<WalletRoot>,
     progress: &PrivateBroadcasterProgressState,
     refusal_actions: Option<bool>,
+    input_pin_override: bool,
 ) -> gpui::Div {
     render_submission_progress_stepper(progress.steps.iter().map(|step| {
         let detail = if step.status == PublicActionStepStatus::Error {
@@ -1932,6 +2042,9 @@ pub(super) fn render_private_broadcaster_progress_stepper(
             action: match refusal_actions {
                 Some(another) if step.status == PublicActionStepStatus::Error => Some(
                     render_refused_broadcaster_step_action(root.clone(), progress, another),
+                ),
+                _ if input_pin_override && step.status == PublicActionStepStatus::Error => Some(
+                    render_input_pin_conflict_step_action(root.clone(), progress),
                 ),
                 _ => render_self_broadcast_step_action(root.clone(), progress, step),
             },
@@ -2007,6 +2120,31 @@ fn render_refused_broadcaster_step_action(
                     .whitespace_normal(),
             )
         })
+        .into_any_element()
+}
+
+fn render_input_pin_conflict_step_action(
+    root: Entity<WalletRoot>,
+    progress: &PrivateBroadcasterProgressState,
+) -> gpui::AnyElement {
+    let key = progress.key;
+    let kind = progress.kind;
+    let generation_id = progress.generation_id;
+    div()
+        .pt(px(4.0))
+        .child(
+            app_button(
+                delivery_element_id(key, kind, "progress-continue-despite-pin"),
+                "Continue anyway…",
+            )
+            .small()
+            .outline()
+            .on_click(move |_event, window, cx| {
+                root.update(cx, |root, cx| {
+                    root.continue_despite_input_pin(kind, key, generation_id, window, cx);
+                });
+            }),
+        )
         .into_any_element()
 }
 

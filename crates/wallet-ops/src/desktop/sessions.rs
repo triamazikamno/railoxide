@@ -129,6 +129,33 @@ impl WalletSession {
             .inputs_for_preparation(inputs, prepared)
     }
 
+    /// Spendable notes for a later preparation of `operation`, including its own durable
+    /// reservation, as [`Self::unspent_utxos_for_executor`] admits them once it is prepared.
+    pub fn unspent_utxos_for_operation(
+        &self,
+        operation: vault::ExecutorOperationId,
+    ) -> Result<Vec<Utxo>> {
+        let snapshot = self
+            .handle
+            .current_snapshot()
+            .ok_or_else(|| eyre!("private wallet snapshot is unavailable"))?;
+        let inputs =
+            poi_verified_unspent_utxos_from_records(&snapshot.utxos, &snapshot.pending_overlay);
+        let owner = self
+            .executor_owner
+            .as_ref()
+            .ok_or_else(|| eyre!("executor wallet ownership is unavailable"))?;
+        // An operation not yet recorded reserves nothing of its own.
+        match owner
+            .records()?
+            .into_iter()
+            .find(|record| record.operation() == operation)
+        {
+            Some(record) => owner.inputs_for_recovery(inputs, &record),
+            None => owner.available_inputs(inputs),
+        }
+    }
+
     pub(crate) async fn mark_pending_spent_utxos(
         &self,
         utxos: &[Utxo],

@@ -28,6 +28,11 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
         request.native_top_up.is_some(),
         request.executor.is_some(),
     )?;
+    let pinned = PublicBroadcasterInputPin::active(request.input_pin.as_ref());
+    // Executor retries are bound by their operation's nonce instead; a pin can't apply to them.
+    if pinned.is_some() && request.executor.is_some() {
+        return Err(PublicBroadcasterInputPinUnavailable.into());
+    }
     let chain = effective_desktop_chain_config(request.chain_id, &request.effective_chain)?;
     let executor =
         validate_desktop_executor_preparation(&request.session, request.executor.as_deref())?;
@@ -352,6 +357,16 @@ pub(super) async fn prepare_desktop_unshield_public_broadcaster(
                     .wrap_err("build public broadcaster unshield proof")?,
             )
         };
+        require_pinned_payload(
+            pinned,
+            single_payload_inputs(
+                plan.chunks()
+                    .iter()
+                    .map(|chunk| chunk.inputs.iter().map(|input| &input.utxo)),
+                request.token,
+            )
+            .as_deref(),
+        )?;
         tracing::info!(
             attempt,
             fee_amount = %fee_amount,
@@ -588,6 +603,7 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
         &http.operation_http_client().await?,
     )
     .await?;
+    let pinned = PublicBroadcasterInputPin::active(request.input_pin.as_ref());
     let bound_min_gas_price =
         public_broadcaster_bound_min_gas_price(request.chain_id, min_gas_price);
     let same_token_fee = request.fee_token == request.token;
@@ -749,6 +765,16 @@ pub(super) async fn prepare_desktop_send_public_broadcaster(
                 )
             })
             .wrap_err("build public broadcaster send proof")?;
+        require_pinned_payload(
+            pinned,
+            single_payload_inputs(
+                plan.chunks
+                    .iter()
+                    .map(|chunk| chunk.inputs.iter().map(|input| &input.utxo)),
+                request.token,
+            )
+            .as_deref(),
+        )?;
         let chunk_input_counts = plan
             .chunks
             .iter()
@@ -1183,6 +1209,7 @@ pub(super) async fn submit_public_broadcaster_plan(
     relay_call_count: usize,
     uses_relay_adapt: bool,
     native_top_up: Option<DesktopNativeTopUpPlan>,
+    payload_inputs: Option<Vec<SelectedInputIdentity>>,
     progress_tx: Option<TransactionGenerationProgressSender>,
     route_tx: Option<SubmissionRouteSender>,
     timeout: Duration,
@@ -1236,6 +1263,7 @@ pub(super) async fn submit_public_broadcaster_plan(
         uses_relay_adapt,
         result,
         native_top_up,
+        payload_inputs,
     })
 }
 

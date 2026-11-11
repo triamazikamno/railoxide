@@ -282,6 +282,8 @@ impl WalletRoot {
             },
             shown_broadcaster: None,
             refused_broadcasters: Vec::new(),
+            input_pin: None,
+            executor_operation: None,
             allow_out_of_range: delivery.allow_out_of_range,
             favorites_only: delivery.favorites_only,
         })

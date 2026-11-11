@@ -601,6 +601,12 @@ pub(in crate::root) struct UnshieldFormState {
     pub(in crate::root) shown_broadcaster: Option<String>,
     /// Broadcasters that refused this form's submission; Random estimates skip them.
     pub(in crate::root) refused_broadcasters: Vec<String>,
+    /// Notes of this form's last refused or unanswered broadcaster proof, which may still
+    /// execute. Later attempts spend within them until the form closes or the user accepts
+    /// a change that can't.
+    pub(in crate::root) input_pin: Option<wallet_ops::PublicBroadcasterInputPin>,
+    /// The last estimate found the pinned notes can't make this attempt.
+    pub(in crate::root) input_pin_conflict: bool,
     pub(in crate::root) estimate_id: u64,
     pub(in crate::root) generation_id: u64,
     pub(in crate::root) generating: bool,
@@ -650,6 +656,12 @@ pub(in crate::root) struct SendFormState {
     pub(in crate::root) shown_broadcaster: Option<String>,
     /// Broadcasters that refused this form's submission; Random estimates skip them.
     pub(in crate::root) refused_broadcasters: Vec<String>,
+    /// Notes of this form's last refused or unanswered broadcaster proof, which may still
+    /// execute. Later attempts spend within them until the form closes or the user accepts
+    /// a change that can't.
+    pub(in crate::root) input_pin: Option<wallet_ops::PublicBroadcasterInputPin>,
+    /// The last estimate found the pinned notes can't make this attempt.
+    pub(in crate::root) input_pin_conflict: bool,
     pub(in crate::root) estimate_id: u64,
     pub(in crate::root) generation_id: u64,
     pub(in crate::root) generating: bool,

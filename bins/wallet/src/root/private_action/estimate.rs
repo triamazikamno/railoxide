@@ -9,7 +9,7 @@ use super::{
 use wallet_ops::{
     BroadcasterFeePolicy, DesktopSendPublicBroadcasterEstimateRequest,
     DesktopUnshieldPublicBroadcasterEstimateRequest, PublicBroadcasterCandidate,
-    PublicBroadcasterSelection, PublicBroadcasterTrustFilter,
+    PublicBroadcasterInputPin, PublicBroadcasterSelection, PublicBroadcasterTrustFilter,
     estimate_desktop_send_public_broadcaster_cost,
     estimate_desktop_unshield_public_broadcaster_cost, vault::BroadcasterPreferenceEntry,
 };
@@ -32,6 +32,9 @@ pub(in crate::root) struct PrivateEstimateInput {
     pub(in crate::root) broadcaster: BroadcasterChoice,
     pub(in crate::root) shown_broadcaster: Option<String>,
     pub(in crate::root) refused_broadcasters: Vec<String>,
+    pub(in crate::root) input_pin: Option<PublicBroadcasterInputPin>,
+    /// The form's executor operation, which a same-action submission reuses with its notes.
+    pub(in crate::root) executor_operation: Option<super::executor::ExecutorUnshieldOperation>,
     pub(in crate::root) fee_token: Address,
     pub(in crate::root) fee_mode: FeeHandlingMode,
     pub(in crate::root) allow_out_of_range: bool,
@@ -46,6 +49,8 @@ impl PrivateEstimateInput {
         self.broadcaster = BroadcasterChoice::Random;
         self.shown_broadcaster = None;
         self.refused_broadcasters.clear();
+        // They compare broadcasters' rates; the form's own estimate keeps its note pin.
+        self.input_pin = None;
         if self.amount.trim().is_empty() {
             // Blank forms still need a representative amount for this display estimate.
             self.amount = format_send_amount_input(self.asset.max_batched, self.asset.decimals);
@@ -184,6 +189,7 @@ impl WalletRoot {
             DeliveryFormKind::Send => {
                 PrivateEstimateRequest::Send(DesktopSendPublicBroadcasterEstimateRequest {
                     custom_fee_amount: input.custom_fee_amount,
+                    input_pin: input.input_pin.clone(),
                     chain_id: asset.chain_id,
                     effective_chain,
                     session,
@@ -203,9 +209,28 @@ impl WalletRoot {
                 let Ok(recipient) = recipient.parse::<Address>() else {
                     return Ok(None);
                 };
+                let reused_executor_operation = match &input.output {
+                    PrivateEstimateOutput::Unshield {
+                        unwrap,
+                        native_top_up,
+                    } => input.executor_operation.as_ref().and_then(|operation| {
+                        operation.reused_for((
+                            asset.chain_id,
+                            asset.token,
+                            recipient,
+                            amount,
+                            *unwrap,
+                            native_top_up.as_ref(),
+                            fee_mode,
+                        ))
+                    }),
+                    PrivateEstimateOutput::Send => None,
+                };
                 PrivateEstimateRequest::Unshield(DesktopUnshieldPublicBroadcasterEstimateRequest {
                     custom_fee_amount: input.custom_fee_amount,
+                    input_pin: input.input_pin.clone(),
                     executor: None,
+                    reused_executor_operation,
                     chain_id: asset.chain_id,
                     effective_chain,
                     session,
@@ -324,6 +349,8 @@ mod tests {
                 },
                 shown_broadcaster: None,
                 refused_broadcasters: Vec::new(),
+                input_pin: None,
+                executor_operation: None,
                 fee_token: Address::ZERO,
                 fee_mode: FeeHandlingMode::DeductFromAmount,
                 allow_out_of_range: false,

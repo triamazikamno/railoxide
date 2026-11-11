@@ -1589,6 +1589,8 @@ impl WalletRoot {
         &mut self,
         cx: &mut Context<'_, Self>,
     ) -> WalletPublicSyncCacheResetContext {
+        // The forms outlive the aborted submission.
+        self.pin_abandoned_private_broadcaster_payload();
         self.begin_public_transaction_shutdown();
         self.clear_private_broadcaster_progress_state();
         self.public_sync_cache_resetting = true;
@@ -1612,6 +1614,8 @@ impl WalletRoot {
         &mut self,
         cx: &mut Context<'_, Self>,
     ) -> WalletPublicSyncCacheResetContext {
+        // The forms outlive the aborted submission.
+        self.pin_abandoned_private_broadcaster_payload();
         self.begin_public_transaction_shutdown();
         self.clear_private_broadcaster_progress_state();
         self.public_sync_cache_resetting = true;

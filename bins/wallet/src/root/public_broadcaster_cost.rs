@@ -695,6 +695,8 @@ impl WalletRoot {
             broadcaster: form.broadcaster_choice.clone(),
             shown_broadcaster: form.shown_broadcaster.clone(),
             refused_broadcasters: form.refused_broadcasters.clone(),
+            input_pin: form.input_pin.clone(),
+            executor_operation: None,
             fee_token: form.selected_fee_token,
             fee_mode: form.fee_mode,
             allow_out_of_range: form.allow_suspicious_broadcasters,
@@ -749,6 +751,7 @@ impl WalletRoot {
                 }
                 form.cost_estimate_pending = false;
                 form.estimating_cost = false;
+                form.input_pin_conflict = input_pin_conflict(&result);
                 let picker_context = match result {
                     Ok(estimate) => {
                         let context = BroadcasterPickerFeeEstimateContext::from(&estimate);
@@ -808,6 +811,8 @@ impl WalletRoot {
             broadcaster: form.broadcaster_choice.clone(),
             shown_broadcaster: form.shown_broadcaster.clone(),
             refused_broadcasters: form.refused_broadcasters.clone(),
+            input_pin: form.input_pin.clone(),
+            executor_operation: form.executor_operation.clone(),
             fee_token: form.selected_fee_token,
             fee_mode: form.fee_mode,
             allow_out_of_range: form.allow_suspicious_broadcasters,
@@ -872,6 +877,7 @@ impl WalletRoot {
                 }
                 form.cost_estimate_pending = false;
                 form.estimating_cost = false;
+                form.input_pin_conflict = input_pin_conflict(&result);
                 let picker_context = match result {
                     Ok(estimate) => {
                         let context = BroadcasterPickerFeeEstimateContext::from(&estimate);
@@ -907,6 +913,15 @@ impl WalletRoot {
         })
         .detach();
     }
+}
+
+/// Whether an estimate failed because the form's pinned notes can't make this attempt.
+fn input_pin_conflict(result: &eyre::Result<PublicBroadcasterCostEstimate>) -> bool {
+    result.as_ref().is_err_and(|error| {
+        error
+            .downcast_ref::<wallet_ops::PublicBroadcasterInputPinUnavailable>()
+            .is_some()
+    })
 }
 
 pub(super) const fn public_broadcaster_estimate_needs_ready_retry(

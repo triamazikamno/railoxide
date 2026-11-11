@@ -54,6 +54,8 @@ pub(super) use ui_fixture::activity as ui_fixture_activity;
 pub(super) use ui_fixture::fill_logs as ui_fixture_fill_logs;
 pub(super) use ui_fixture::first_start_old_notice as ui_fixture_first_start_old_notice;
 pub(super) use ui_fixture::hardware_derive as ui_fixture_hardware_derive;
+#[cfg(debug_assertions)]
+pub(super) use ui_fixture::holds_send_review as ui_fixture_holds_send_review;
 pub(super) use ui_fixture::refund_dialog_state as ui_fixture_refund_dialog_state;
 pub(super) use ui_fixture::send_asset as ui_fixture_send_asset;
 pub(super) use ui_fixture::setup_swap_token as ui_fixture_setup_swap_token;

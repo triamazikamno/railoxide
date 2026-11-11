@@ -343,6 +343,7 @@ fn native_top_up_plan_display_and_request_use_fixed_native_amount() {
             tx_hash: "0xabc".to_string(),
         },
         native_top_up: estimate.native_top_up.clone(),
+        payload_inputs: None,
     };
     let display = PublicBroadcasterCostDisplay::from_result(&result, None, None);
     assert_eq!(

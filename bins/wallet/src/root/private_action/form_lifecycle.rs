@@ -1,8 +1,168 @@
 use super::*;
 use crate::root::actions::{PRIVATE_ACTION_FORM_KEY_CONTEXT, RefreshBroadcasterEstimate};
+use crate::root::{ConfirmationDialogProps, confirmation_dialog};
+use std::rc::Rc;
 use ui::dialog::WalletDialogExt as _;
 
+const DOUBLE_PAYMENT_RISK: ConfirmationDialogProps = ConfirmationDialogProps::danger(
+    "Earlier proof may still go through",
+    "An earlier proof for this payment may still be executed by the broadcaster. Continuing may use different notes, so if that proof also goes through, the recipient could be paid twice.",
+    None,
+    "Continue anyway",
+);
+
 impl WalletRoot {
+    /// Runs `change` once the user accepts that an earlier proof of this payment may still
+    /// execute alongside the next one. Cancel leaves everything as it was.
+    pub(in crate::root) fn confirm_double_payment_risk(
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+        change: impl Fn(&mut Self, &mut Window, &mut Context<'_, Self>) + 'static,
+    ) {
+        let root = cx.entity();
+        let change = Rc::new(change);
+        let dialog_width = (window.viewport_size().width * 0.92).min(px(520.0));
+        let dialog_max_height = dialog_max_height(window);
+        window.open_wallet_alert_dialog(cx, move |dialog, _window, _cx| {
+            let root = root.clone();
+            let change = Rc::clone(&change);
+            confirmation_dialog(dialog, DOUBLE_PAYMENT_RISK, dialog_width, dialog_max_height).on_ok(
+                move |_event, window, cx| {
+                    // After this dialog closes, so a dialog `change` opens stays open.
+                    let (root, change) = (root.clone(), Rc::clone(&change));
+                    window.defer(cx, move |window, cx| {
+                        root.update(cx, |root, cx| change(root, window, cx));
+                    });
+                    true
+                },
+            )
+        });
+    }
+
+    /// A pinned form's change that takes the next attempt off its pinned notes runs only after
+    /// the user accepts the risk, which also clears the pin. Returns whether it asked.
+    pub(in crate::root) fn confirm_leaving_input_pin(
+        &self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+        change: impl Fn(&mut Self, &mut Window, &mut Context<'_, Self>) + 'static,
+    ) -> bool {
+        let pinned = match kind {
+            DeliveryFormKind::Send => self
+                .send_forms
+                .get(&key)
+                .is_some_and(|form| form.input_pin.is_some()),
+            DeliveryFormKind::Unshield => self
+                .unshield_forms
+                .get(&key)
+                .is_some_and(|form| form.input_pin.is_some()),
+        };
+        if !pinned {
+            return false;
+        }
+        Self::confirm_double_payment_risk(window, cx, move |root, window, cx| {
+            match kind {
+                DeliveryFormKind::Send => {
+                    if let Some(form) = root.send_forms.get_mut(&key) {
+                        form.input_pin = None;
+                        form.input_pin_conflict = false;
+                    }
+                }
+                DeliveryFormKind::Unshield => {
+                    if let Some(form) = root.unshield_forms.get_mut(&key) {
+                        form.input_pin = None;
+                        form.input_pin_conflict = false;
+                    }
+                }
+            }
+            change(root, window, cx);
+        });
+        true
+    }
+
+    /// Before a submission from a pinned form, asks about an attempt that can't stay on its
+    /// pinned notes: one off the broadcaster path, or one the estimate found the notes can't
+    /// make. Continuing the latter overrides the pin for one attempt and refreshes the
+    /// estimate. Returns whether it asked.
+    pub(in crate::root) fn confirm_private_input_pin_admission(
+        &self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        let (pin, conflict, leaves_pin) = match kind {
+            DeliveryFormKind::Send => {
+                let Some(form) = self.send_forms.get(&key).filter(|form| !form.generating) else {
+                    return false;
+                };
+                (
+                    form.input_pin.as_ref(),
+                    form.input_pin_conflict,
+                    form.delivery_mode != DeliveryMode::PublicBroadcaster,
+                )
+            }
+            DeliveryFormKind::Unshield => {
+                let Some(form) = self
+                    .unshield_forms
+                    .get(&key)
+                    .filter(|form| !form.generating)
+                else {
+                    return false;
+                };
+                (
+                    form.input_pin.as_ref(),
+                    form.input_pin_conflict,
+                    // Unwrap and gas top-up go through the executor, which a pin can't bind.
+                    form.delivery_mode != DeliveryMode::PublicBroadcaster
+                        || form.unwrap
+                        || (form.native_top_up_enabled && form.native_top_up.is_some()),
+                )
+            }
+        };
+        let Some(pin) = pin else {
+            return false;
+        };
+        if leaves_pin {
+            return self.confirm_leaving_input_pin(
+                kind,
+                key,
+                window,
+                cx,
+                move |root, window, cx| match kind {
+                    DeliveryFormKind::Send => {
+                        root.generate_send_calldata_from_form(key, window, cx);
+                    }
+                    DeliveryFormKind::Unshield => {
+                        root.generate_unshield_calldata_from_form(key, window, cx);
+                    }
+                },
+            );
+        }
+        if !conflict || pin.overridden {
+            return false;
+        }
+        Self::confirm_double_payment_risk(window, cx, move |root, _window, cx| {
+            let pin = match kind {
+                DeliveryFormKind::Send => root.send_forms.get_mut(&key).and_then(|form| {
+                    form.input_pin_conflict = false;
+                    form.input_pin.as_mut()
+                }),
+                DeliveryFormKind::Unshield => root.unshield_forms.get_mut(&key).and_then(|form| {
+                    form.input_pin_conflict = false;
+                    form.input_pin.as_mut()
+                }),
+            };
+            if let Some(pin) = pin {
+                pin.overridden = true;
+            }
+            root.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+        });
+        true
+    }
+
     pub(in crate::root) fn close_send_form(
         &mut self,
         key: UnshieldAssetKey,
@@ -207,7 +367,7 @@ impl WalletRoot {
     ) {
         window.close_all_dialogs(cx);
         // Debug UI fixture: a `broadcaster-progress:` mode opens its progress dialog in place of
-        // the form.
+        // the form, and `broadcaster-review` its review.
         #[cfg(debug_assertions)]
         {
             if self.open_ui_fixture_broadcaster_progress(&asset, window, cx) {
@@ -436,6 +596,8 @@ impl WalletRoot {
                 cost_estimate: None,
                 shown_broadcaster: None,
                 refused_broadcasters: Vec::new(),
+                input_pin: None,
+                input_pin_conflict: false,
                 estimate_id: 0,
                 generation_id: 0,
                 generating: false,
@@ -836,12 +998,24 @@ impl WalletRoot {
         } else {
             None
         };
-        let Some(form) = self.send_forms.get_mut(&key) else {
+        let Some(form) = self.send_forms.get(&key) else {
             return;
         };
         if form.generating || form.delivery_mode == mode || form.gateway_execution.is_some() {
             return;
         }
+        if self.confirm_leaving_input_pin(
+            DeliveryFormKind::Send,
+            key,
+            window,
+            cx,
+            move |root, window, cx| root.set_send_delivery_mode(key, mode, window, cx),
+        ) {
+            return;
+        }
+        let Some(form) = self.send_forms.get_mut(&key) else {
+            return;
+        };
         let old_max = send_form_max_entered_amount(form, form.delivery_mode, form.fee_mode);
         let new_max = send_form_max_entered_amount(form, mode, form.fee_mode);
         let adjusted =
@@ -1856,6 +2030,8 @@ impl WalletRoot {
                 cost_estimate: None,
                 shown_broadcaster: None,
                 refused_broadcasters: Vec::new(),
+                input_pin: None,
+                input_pin_conflict: false,
                 estimate_id: 0,
                 generation_id: 0,
                 generating: false,
@@ -1864,6 +2040,57 @@ impl WalletRoot {
                 result: None,
             },
         );
+    }
+
+    /// The user's unwrap toggle. It moves the unshield to the executor, off a pinned form's notes.
+    pub(in crate::root) fn request_unshield_unwrap(
+        &mut self,
+        key: UnshieldAssetKey,
+        unwrap: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self
+            .unshield_forms
+            .get(&key)
+            .is_some_and(|form| !form.generating && form.unwrap != unwrap)
+            && self.confirm_leaving_input_pin(
+                DeliveryFormKind::Unshield,
+                key,
+                window,
+                cx,
+                move |root, _window, cx| root.set_unshield_unwrap(key, unwrap, cx),
+            )
+        {
+            return;
+        }
+        self.set_unshield_unwrap(key, unwrap, cx);
+    }
+
+    /// The user's gas top-up toggle. It moves the unshield to the executor, off a pinned
+    /// form's notes.
+    pub(in crate::root) fn request_unshield_native_top_up_enabled(
+        &mut self,
+        key: UnshieldAssetKey,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if self
+            .unshield_forms
+            .get(&key)
+            .is_some_and(|form| !form.generating && form.native_top_up_enabled != enabled)
+            && self.confirm_leaving_input_pin(
+                DeliveryFormKind::Unshield,
+                key,
+                window,
+                cx,
+                move |root, _window, cx| root.set_unshield_native_top_up_enabled(key, enabled, cx),
+            )
+        {
+            return;
+        }
+        self.set_unshield_native_top_up_enabled(key, enabled, cx);
     }
 
     pub(in crate::root) fn set_unshield_unwrap(
@@ -1982,12 +2209,24 @@ impl WalletRoot {
         } else {
             None
         };
-        let Some(form) = self.unshield_forms.get_mut(&key) else {
+        let Some(form) = self.unshield_forms.get(&key) else {
             return;
         };
         if form.generating || form.delivery_mode == mode || form.gateway_execution.is_some() {
             return;
         }
+        if self.confirm_leaving_input_pin(
+            DeliveryFormKind::Unshield,
+            key,
+            window,
+            cx,
+            move |root, window, cx| root.set_unshield_delivery_mode(key, mode, window, cx),
+        ) {
+            return;
+        }
+        let Some(form) = self.unshield_forms.get_mut(&key) else {
+            return;
+        };
         let old_max = unshield_form_max_entered_amount(form, form.delivery_mode, form.fee_mode);
         let new_max = unshield_form_max_entered_amount(form, mode, form.fee_mode);
         let adjusted =
@@ -2306,5 +2545,96 @@ impl WalletRoot {
             form.error = Some(message);
             cx.notify();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[gpui::test]
+    fn pinned_form_keeps_its_pin_until_the_user_accepts_leaving_it(cx: &mut gpui::TestAppContext) {
+        let path = std::env::temp_dir().join(format!(
+            "pinned-private-form-{:032x}",
+            rand::random::<u128>()
+        ));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let entered = runtime.enter();
+        cx.update(gpui_component::init);
+        let mut root = None;
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let wallet =
+                crate::root::tests::public_accounts::fixture_root(&path, &runtime, window, cx);
+            root = Some(wallet.clone());
+            gpui_component::Root::new(wallet, window, cx)
+        });
+        let root = root.unwrap();
+        let asset = UnshieldAsset {
+            chain_id: 1,
+            token: Address::repeat_byte(0x55),
+            label: "TEST".into(),
+            decimals: Some(18),
+            total: U256::from(1_000),
+            poi_verified_total: U256::from(1_000),
+            max_batched: U256::from(1_000),
+            icon_path: None,
+        };
+        let key = UnshieldAssetKey::from_asset(&asset);
+        let pin = wallet_ops::PublicBroadcasterInputPin {
+            inputs: vec![wallet_ops::SelectedInputIdentity {
+                tree: 0,
+                position: 7,
+            }],
+            overridden: false,
+        };
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                root.initialize_send_form(asset, window, cx);
+                root.send_forms.get_mut(&key).unwrap().input_pin = Some(pin.clone());
+                let amount = root.send_forms[&key].amount_input.clone();
+                amount.update(cx, |input, cx| input.set_value("0.5", window, cx));
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            root.update(cx, |root, cx| {
+                assert_eq!(root.send_forms[&key].input_pin, Some(pin.clone()));
+                root.set_send_delivery_mode(key, DeliveryMode::ManualCalldata, window, cx);
+                assert!(window.has_active_dialog(cx), "leaving the pin asks first");
+                assert_eq!(
+                    root.send_forms[&key].delivery_mode,
+                    DeliveryMode::PublicBroadcaster
+                );
+            });
+            // Cancel leaves the form as it was.
+            window.close_all_dialogs(cx);
+            root.update(cx, |root, cx| {
+                assert_eq!(
+                    root.send_forms[&key].delivery_mode,
+                    DeliveryMode::PublicBroadcaster
+                );
+                assert_eq!(root.send_forms[&key].input_pin, Some(pin.clone()));
+                root.set_send_delivery_mode(key, DeliveryMode::ManualCalldata, window, cx);
+            });
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        cx.dispatch_action(gpui_component::dialog::Confirm { secondary: false });
+        cx.run_until_parked();
+        root.read_with(cx, |root, _| {
+            let form = &root.send_forms[&key];
+            assert_eq!(form.delivery_mode, DeliveryMode::ManualCalldata);
+            assert_eq!(form.input_pin, None, "accepting the risk clears the pin");
+        });
+        cx.update(|window, _| window.remove_window());
+        drop(host);
+        drop(root);
+        cx.run_until_parked();
+        drop(entered);
+        drop(runtime);
+        std::fs::remove_dir_all(path).unwrap();
     }
 }

@@ -346,9 +346,9 @@ pub(in crate::root) fn render_unshield_native_top_up_control(
             format!("Recipient receives {native_amount}; funded from private {source_amount}."),
             enabled,
             generating,
-            move |checked, _window, cx| {
+            move |checked, window, cx| {
                 root.update(cx, |root, cx| {
-                    root.set_unshield_native_top_up_enabled(key, *checked, cx);
+                    root.request_unshield_native_top_up_enabled(key, *checked, window, cx);
                 });
             },
         );

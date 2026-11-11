@@ -356,8 +356,10 @@ pub(in crate::root) fn render_unshield_output_toggle(
         wrapped_label,
         unwrap,
         generating,
-        move |unwrap, _, cx| {
-            root.update(cx, |root, cx| root.set_unshield_unwrap(key, unwrap, cx));
+        move |unwrap, window, cx| {
+            root.update(cx, |root, cx| {
+                root.request_unshield_unwrap(key, unwrap, window, cx);
+            });
         },
     )
 }
