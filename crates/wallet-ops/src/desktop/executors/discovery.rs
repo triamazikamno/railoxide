@@ -152,13 +152,9 @@ impl ExecutorOwner {
                 )?
             };
         // Stop and RPC failure must not discard already derived accounts.
-        let records = addresses
-            .iter()
-            .map(|(index, address)| {
-                self.store
-                    .restore_index(*index, *address, profile.delegate(), &[])
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let records = self
+            .store
+            .restore_indices(&addresses, profile.delegate(), &[])?;
         self.notify_change();
         Ok(addresses
             .into_iter()
