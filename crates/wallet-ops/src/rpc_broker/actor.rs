@@ -467,14 +467,14 @@ impl Actor {
         current_batch: &mut Vec<WorkItem>,
     ) {
         let latest_epoch = matches!(
-            read.reuse_block_id(),
+            read.cache_block_id(),
             Some(BlockId::Number(BlockNumberOrTag::Latest))
         )
         .then(|| self.cache.reconcile_latest_cache_epoch(route.chain_id()))
         .flatten();
         let is_dedupable = read.is_dedupable()
             && (!matches!(
-                read.reuse_block_id(),
+                read.cache_block_id(),
                 Some(BlockId::Number(BlockNumberOrTag::Latest))
             ) || latest_epoch.is_some());
         let key = WorkKey {
@@ -489,7 +489,7 @@ impl Actor {
             },
             latest_epoch,
         };
-        let expected_epoch = match read.reuse_block_id() {
+        let expected_epoch = match read.cache_block_id() {
             Some(BlockId::Number(BlockNumberOrTag::Latest)) => {
                 latest_epoch.map(|epoch| epoch.block_number)
             }
@@ -845,7 +845,7 @@ impl Actor {
                 let read = active.read;
                 if read.is_cacheable() && result.is_ok() {
                     let chain_id = key.identity.chain_id();
-                    let observed = match read.reuse_block_id() {
+                    let observed = match read.cache_block_id() {
                         Some(BlockId::Number(BlockNumberOrTag::Latest)) => self
                             .cache
                             .reconcile_latest_cache_epoch(chain_id)
@@ -857,7 +857,7 @@ impl Actor {
                     let latest_still_current =
                         self.cache.latest_is_current(chain_id, key.latest_epoch);
                     if !matches!(
-                        read.reuse_block_id(),
+                        read.cache_block_id(),
                         Some(BlockId::Number(BlockNumberOrTag::Latest))
                     ) || latest_still_current
                     {

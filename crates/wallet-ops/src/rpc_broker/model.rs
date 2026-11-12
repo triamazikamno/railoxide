@@ -282,6 +282,16 @@ impl RpcRead {
             _ => None,
         }
     }
+
+    /// The block a reusable result is scoped to. Unlike [`Self::reuse_block_id`], it never
+    /// drives Multicall grouping.
+    #[must_use]
+    pub(super) const fn cache_block_id(&self) -> Option<BlockId> {
+        match &self.operation {
+            RpcOperation::GasPrice => Some(BlockId::latest()),
+            _ => self.reuse_block_id(),
+        }
+    }
     /// Estimates gas for batching, using an explicit call limit when provided.
     #[must_use]
     pub(super) fn estimated_gas(&self) -> u64 {
@@ -439,13 +449,17 @@ impl RpcRead {
                 block: *block,
                 account: *account,
             },
+            RpcOperation::GasPrice => ReadIdentity::GasPrice {
+                chain_id: route.chain_id(),
+                isolation: route.chain_route().isolation_id(),
+            },
             _ => ReadIdentity::Individual {
                 chain_id: route.chain_id(),
             },
         }
     }
     pub(super) fn is_cacheable(&self) -> bool {
-        let Some(block) = self.reuse_block_id() else {
+        let Some(block) = self.cache_block_id() else {
             return false;
         };
         let block_cacheable = match block {
@@ -462,17 +476,19 @@ impl RpcRead {
     }
 
     pub(super) fn is_dedupable(&self) -> bool {
-        matches!(self.operation(), RpcOperation::GetBalance { .. })
-            || matches!(
-                self.operation(),
-                RpcOperation::EthCall {
-                    request,
-                    state_overrides,
-                    ..
-                } if request.value.unwrap_or_default() == U256::ZERO && state_overrides.is_none()
-                    && !request.has_eip4844_fields() && request.authorization_list.is_none()
-                    && request.other.is_empty()
-            )
+        matches!(
+            self.operation(),
+            RpcOperation::GetBalance { .. } | RpcOperation::GasPrice
+        ) || matches!(
+            self.operation(),
+            RpcOperation::EthCall {
+                request,
+                state_overrides,
+                ..
+            } if request.value.unwrap_or_default() == U256::ZERO && state_overrides.is_none()
+                && !request.has_eip4844_fields() && request.authorization_list.is_none()
+                && request.other.is_empty()
+        )
     }
 
     /// Assumes calls without a sender, and allowlisted selectors with a sender, tolerate
@@ -621,6 +637,10 @@ pub(super) enum ReadIdentity {
         block: BlockId,
         account: Address,
     },
+    GasPrice {
+        chain_id: u64,
+        isolation: Option<u64>,
+    },
 }
 
 impl Hash for ReadIdentity {
@@ -655,6 +675,14 @@ impl Hash for ReadIdentity {
                 BlockKey(*block).hash(state);
                 account.hash(state);
             }
+            Self::GasPrice {
+                chain_id,
+                isolation,
+            } => {
+                3_u8.hash(state);
+                chain_id.hash(state);
+                isolation.hash(state);
+            }
         }
     }
 }
@@ -684,12 +712,14 @@ impl ReadIdentity {
         match self {
             Self::EthCall { chain_id, .. }
             | Self::GetBalance { chain_id, .. }
+            | Self::GasPrice { chain_id, .. }
             | Self::Individual { chain_id } => *chain_id,
         }
     }
     pub(super) const fn block(&self) -> Option<BlockId> {
         match self {
             Self::EthCall { block, .. } | Self::GetBalance { block, .. } => Some(*block),
+            Self::GasPrice { .. } => Some(BlockId::latest()),
             Self::Individual { .. } => None,
         }
     }
@@ -701,6 +731,7 @@ pub enum WalletRpcOrigin {
     Anchors,
     Governance,
     GovernorRewards,
+    PrivateActions,
     PublicWallet,
     Staking,
     Swaps,

@@ -2431,13 +2431,12 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
     if let Some(executor) = &request.executor {
         executor.require_broadcaster(&broadcaster)?;
     }
-    let fee_candidates = acquire_fee_candidates(
+    let min_gas_price = buffered_gas_price_from_broker(
         http,
-        &chain.rpc_route.for_class(RpcTrafficClass::General)?,
-        None,
+        chain.rpc_route.for_class(RpcTrafficClass::General)?,
+        &chain.gas,
     )
     .await?;
-    let min_gas_price = buffered_gas_price_from_candidates(&fee_candidates, &chain.gas).await?;
     let pinned = PublicBroadcasterInputPin::active(request.input_pin.as_ref());
     // Executor retries are bound by their operation's nonce instead; a pin can't apply to them.
     if pinned.is_some() && uses_executor {
@@ -2752,13 +2751,12 @@ pub async fn estimate_desktop_send_public_broadcaster_cost(
         policy,
         &request.trust_filter,
     )?;
-    let fee_candidates = acquire_fee_candidates(
+    let min_gas_price = buffered_gas_price_from_broker(
         http,
-        &chain.rpc_route.for_class(RpcTrafficClass::General)?,
-        None,
+        chain.rpc_route.for_class(RpcTrafficClass::General)?,
+        &chain.gas,
     )
     .await?;
-    let min_gas_price = buffered_gas_price_from_candidates(&fee_candidates, &chain.gas).await?;
     let pinned = PublicBroadcasterInputPin::active(request.input_pin.as_ref());
     let utxos = request.session.unspent_utxos();
     let same_token_fee = request.fee_token == request.token;

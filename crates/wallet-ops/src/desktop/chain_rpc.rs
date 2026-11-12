@@ -81,6 +81,35 @@ pub(crate) async fn buffered_gas_price_from_candidates(
     .await
 }
 
+/// Reads gas price as a broker read, which reuses one result per observed head and route.
+/// Submission must not use this; it reads a fresh price through its candidates.
+pub(crate) async fn buffered_gas_price_from_broker(
+    http: &HttpContext,
+    route: crate::ClassRoute,
+    gas: &settings::EffectiveChainGasSettings,
+) -> Result<u128> {
+    let result = http
+        .rpc_broker()
+        .submit(RpcSubmission::new(
+            RpcRoute::from(route),
+            vec![RpcRead::gas_price()],
+            WalletRpcOrigin::PrivateActions.into(),
+        ))
+        .await
+        .map_err(|error| eyre!("gas price RPC request failed: {error}"))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre!("gas price result is missing"))?
+        .map_err(|error| eyre!("gas price RPC request failed: {error}"))?;
+    let gas_price: alloy::primitives::U128 = serde_json::from_value(result.into_value())
+        .map_err(|error| eyre!("gas price was invalid: {error}"))?;
+    buffer_gas_price(
+        gas_price.to(),
+        u128::from(gas.gas_price_buffer_numerator),
+        u128::from(gas.gas_price_buffer_denominator),
+    )
+}
+
 pub(crate) async fn gas_price_from_candidates_with_policy(
     candidates: &RpcCandidates,
     numerator: u128,

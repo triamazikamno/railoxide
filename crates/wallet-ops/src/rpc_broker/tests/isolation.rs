@@ -136,6 +136,83 @@ async fn each_route_caches_only_its_own_reads_and_shares_no_requests() {
 }
 
 #[tokio::test]
+async fn gas_price_is_reused_per_head_and_route_and_never_aggregated() {
+    let responder: RpcResponder = Arc::new(|request| match aggregated_calls(&request) {
+        Some(calls) => aggregate_response(
+            &request,
+            calls
+                .into_iter()
+                .map(|call| (true, call.callData))
+                .collect(),
+        ),
+        None => rpc_result(&request, &json!("0x10")),
+    });
+    let (endpoint, recorded, server) = spawn_recording_rpc_mock(responder).await;
+    let shared = RpcRoute::new(RpcChainRoute::new(1, vec![endpoint]).with_multicall(MULTICALL));
+    let first = RpcRoute::new(shared.chain_route().isolated(tagged_client("first")));
+    let second = RpcRoute::new(shared.chain_route().isolated(tagged_client("second")));
+    let broker = test_broker(Duration::from_millis(20), 4);
+    broker.notify_block(1, 10);
+    time::sleep(Duration::from_millis(5)).await;
+    let latest_call =
+        |target| RpcRead::eth_call(Address::repeat_byte(target), Bytes::from(vec![target]));
+    let submit = |route: &RpcRoute, reads| {
+        broker.submit(RpcSubmission::new(route.clone(), reads, test_origin()))
+    };
+    let gas_price_requests = || {
+        recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, body)| body["method"] == "eth_gasPrice")
+            .map(|(tag, _)| tag.clone())
+            .collect::<Vec<_>>()
+    };
+    let price = Ok(RpcResult::new(json!("0x10")));
+
+    // Collected with Multicall-eligible calls, the gas price still goes out on its own.
+    let results = submit(
+        &shared,
+        vec![latest_call(1), RpcRead::gas_price(), latest_call(2)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(results[1], price);
+    let aggregates = recorded
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(_, body)| aggregated_calls(body).map(|calls| calls.len()))
+        .collect::<Vec<_>>();
+    assert_eq!(aggregates, vec![2]);
+    assert_eq!(gas_price_requests(), vec![None]);
+
+    // A repeat within the head is served from the cache, and isolated routes neither use the
+    // shared result nor each other's.
+    for route in [&shared, &first, &second, &first, &second] {
+        assert_eq!(
+            submit(route, vec![RpcRead::gas_price()]).await.unwrap()[0],
+            price
+        );
+    }
+    assert_eq!(
+        gas_price_requests(),
+        vec![None, Some("first".to_owned()), Some("second".to_owned())]
+    );
+
+    // A newer head forces a new request.
+    broker.notify_block(1, 11);
+    time::sleep(Duration::from_millis(5)).await;
+    assert_eq!(
+        submit(&shared, vec![RpcRead::gas_price()]).await.unwrap()[0],
+        price
+    );
+    assert_eq!(gas_price_requests().len(), 4);
+    drop(broker);
+    server.abort();
+}
+
+#[tokio::test]
 async fn failover_sends_each_endpoint_over_its_own_transport() {
     let failing: RpcResponder = Arc::new(|request| rpc_error(&request, -32000));
     let (direct_down, direct_down_requests, direct_down_server) =

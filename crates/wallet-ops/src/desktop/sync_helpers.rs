@@ -699,12 +699,20 @@ pub(super) async fn buffered_gas_price_with_policy(
     numerator: u128,
     denominator: u128,
 ) -> Result<u128> {
+    let gas_price = provider.get_gas_price().await.wrap_err("fetch gas price")?;
+    buffer_gas_price(gas_price, numerator, denominator)
+}
+
+pub(super) fn buffer_gas_price(
+    gas_price: u128,
+    numerator: u128,
+    denominator: u128,
+) -> Result<u128> {
     if denominator == 0 {
         return Err(eyre!(
             "gas price buffer denominator must be greater than zero"
         ));
     }
-    let gas_price = provider.get_gas_price().await.wrap_err("fetch gas price")?;
     let buffered_gas_price = gas_price * numerator / denominator;
     tracing::debug!(
         target: "gas_price",
