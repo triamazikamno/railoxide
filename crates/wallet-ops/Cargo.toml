@@ -11,6 +11,7 @@ hardware = [
     "dep:hidapi-rusb",
     "dep:libusb1-sys",
     "dep:protobuf",
+    "dep:rusb",
     "dep:trezor-client",
 ]
 # Seams for the desktop wallet's UI tests. Only its dev-dependencies enable this.
@@ -51,6 +52,8 @@ rand = { workspace = true }
 reqwest = { workspace = true }
 reqwest-websocket = { workspace = true }
 rmp-serde = { workspace = true }
+# Same version trezor-client uses, to match its typed USB errors.
+rusb = { version = "0.9", optional = true }
 # No defaults: they add `prefer-post-quantum`, which would change every client's ClientHello.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-platform-verifier = "0.7"

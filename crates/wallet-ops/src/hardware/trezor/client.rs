@@ -9,7 +9,6 @@ use super::super::{
     HardwarePublicAccountDescriptor, HardwareTypedDataSigningMode, hardware_profile_fingerprint,
     hardware_public_account_key_path,
 };
-use super::bridge::BridgeTransport;
 use super::passphrase::{
     TrezorPassphraseState, TrezorPinMatrixProvider, handle_trezor_interaction,
 };
@@ -38,67 +37,46 @@ pub struct TrezorDeviceInfo {
     pub bootloader_mode: bool,
 }
 
+// Only WebUSB: loopback transports (Bridge HTTP, UDP emulator) are unauthenticated and could
+// impersonate the device.
+fn connect_webusb() -> Result<trezor_client::Trezor, HardwareDerivationError> {
+    // trezor-client panics if libusb can't start or list devices, so check both first.
+    let usb_error = |error: rusb::Error| trezor_client::Error::TransportConnect(error.into());
+    drop(rusb::Context::new().map_err(usb_error)?);
+    drop(rusb::devices().map_err(usb_error)?);
+    let mut devices = trezor_client::transport::webusb::WebUsbTransport::find_devices(false)
+        .map_err(trezor_client::Error::TransportConnect)?;
+    if devices.len() > 1 {
+        return Err(trezor_client::Error::DeviceNotUnique.into());
+    }
+    let device = devices.pop().ok_or(trezor_client::Error::NoDeviceFound)?;
+    match device.connect() {
+        Err(trezor_client::Error::TransportConnect(
+            trezor_client::transport::error::Error::Usb(
+                cause @ (rusb::Error::Busy | rusb::Error::Access),
+            ),
+        )) => Err(HardwareDerivationError::TrezorUsbUnavailable(
+            cause.to_string(),
+        )),
+        result => result.map_err(Into::into),
+    }
+}
+
 impl TrezorHardwareDerivationClient {
     pub fn connect() -> Result<Self, HardwareDerivationError> {
-        match BridgeTransport::connect_unique() {
-            Ok(transport) => {
-                let mut client = trezor_client::client::trezor_with_transport(
-                    trezor_client::Model::Trezor,
-                    Box::new(transport),
-                );
-                client.init_device(None)?;
-                Ok(Self {
-                    client,
-                    passphrase: TrezorPassphraseState::default(),
-                    pin_matrix_provider: None,
-                })
-            }
-            Err(error) if error.should_fallback() => {
-                tracing::debug!(%error, "Trezor Bridge unavailable; falling back to direct WebUSB transport");
-                Self::connect_direct()
-            }
-            Err(error) => Err(error.into_hardware_error()),
-        }
-    }
-
-    fn connect_direct() -> Result<Self, HardwareDerivationError> {
-        let mut client = trezor_client::unique(false)?;
-        client.init_device(None)?;
-        Ok(Self {
-            client,
-            passphrase: TrezorPassphraseState::default(),
-            pin_matrix_provider: None,
-        })
+        Self::connect_with_session(None)
     }
 
     pub fn connect_with_session(
         session_id: Option<Vec<u8>>,
     ) -> Result<Self, HardwareDerivationError> {
-        match BridgeTransport::connect_unique() {
-            Ok(transport) => {
-                let mut client = trezor_client::client::trezor_with_transport(
-                    trezor_client::Model::Trezor,
-                    Box::new(transport),
-                );
-                client.init_device(session_id)?;
-                Ok(Self {
-                    client,
-                    passphrase: TrezorPassphraseState::default(),
-                    pin_matrix_provider: None,
-                })
-            }
-            Err(error) if error.should_fallback() => {
-                tracing::debug!(%error, "Trezor Bridge unavailable; falling back to direct WebUSB transport");
-                let mut client = trezor_client::unique(false)?;
-                client.init_device(session_id)?;
-                Ok(Self {
-                    client,
-                    passphrase: TrezorPassphraseState::default(),
-                    pin_matrix_provider: None,
-                })
-            }
-            Err(error) => Err(error.into_hardware_error()),
-        }
+        let mut client = connect_webusb()?;
+        client.init_device(session_id)?;
+        Ok(Self {
+            client,
+            passphrase: TrezorPassphraseState::default(),
+            pin_matrix_provider: None,
+        })
     }
 
     pub fn set_passphrase_mode(&mut self, mode: TrezorPassphraseMode) {

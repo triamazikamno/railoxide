@@ -15,7 +15,7 @@ pub use derivation::{
     SyntheticRailgunEntropy, hardware_profile_fingerprint,
     hardware_view_access_key_from_hardware_output, synthetic_entropy_from_hardware_output,
 };
-pub use error::HardwareDerivationError;
+pub use error::{HardwareDerivationError, TREZOR_USB_UNAVAILABLE_GUIDANCE};
 pub use path::{
     DEFAULT_HARDWARE_DERIVATION_PATH, HARDENED_BIP32_INDEX, format_bip32_path, parse_bip32_path,
 };
@@ -173,7 +173,7 @@ mod tests {
         assert!(HardwareDerivationError::TrezorPinEntryCancelled.is_user_rejected());
         assert!(!HardwareDerivationError::TrezorLocked.is_user_rejected());
         assert!(
-            !HardwareDerivationError::TrezorBridge("cancelled/rejected".to_owned())
+            !HardwareDerivationError::TrezorUsbUnavailable("cancelled/rejected".to_owned())
                 .is_user_rejected()
         );
     }
@@ -223,61 +223,5 @@ mod tests {
             .await
             .expect("derive entropy");
         assert_ne!(entropy.expose_secret(), &[0u8; 32]);
-    }
-
-    #[cfg(feature = "hardware")]
-    #[test]
-    fn trezor_bridge_message_framing_roundtrip() {
-        let encoded = trezor::encode_bridge_message(trezor_client::transport::ProtoMessage::new(
-            trezor_client::protos::MessageType::MessageType_Initialize,
-            vec![1, 2, 3],
-        ));
-        assert_eq!(encoded, "000000000003010203");
-
-        let bytes = alloy::hex::decode(encoded).expect("hex bridge frame");
-        let decoded = trezor::decode_bridge_message(&bytes).expect("decode bridge frame");
-        assert_eq!(
-            decoded.message_type(),
-            trezor_client::protos::MessageType::MessageType_Initialize,
-        );
-        assert_eq!(decoded.payload(), &[1, 2, 3]);
-    }
-
-    #[cfg(feature = "hardware")]
-    #[test]
-    fn trezor_bridge_selection_rejects_busy_or_ambiguous_devices() {
-        let free = trezor::BridgeDevice {
-            path: "device-1".to_owned(),
-            session: None,
-        };
-        let busy = trezor::BridgeDevice {
-            path: "device-1".to_owned(),
-            session: Some("session".to_owned()),
-        };
-
-        assert!(matches!(
-            trezor::select_bridge_device(&[]),
-            Err(trezor::BridgeConnectError::NoDevice)
-        ));
-        assert!(matches!(
-            trezor::select_bridge_device(std::slice::from_ref(&busy)),
-            Err(trezor::BridgeConnectError::DeviceBusy)
-        ));
-        assert!(matches!(
-            trezor::select_bridge_device(&[free.clone(), busy]),
-            Err(trezor::BridgeConnectError::DeviceNotUnique(2))
-        ));
-        let selected = trezor::select_bridge_device(&[free]).expect("select one free device");
-        assert_eq!(selected.path, "device-1");
-    }
-
-    #[cfg(feature = "hardware")]
-    #[test]
-    fn trezor_bridge_busy_message_points_to_competing_apps() {
-        let message = trezor::trezor_bridge_busy_message();
-
-        assert!(message.contains("Trezor Suite"));
-        assert!(message.contains("browser wallet tabs"));
-        assert!(message.contains("other Trezor applications"));
     }
 }

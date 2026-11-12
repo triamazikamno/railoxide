@@ -1192,9 +1192,7 @@ fn hardware_setup_password_preservation_policy_keeps_early_device_errors() {
         }
     ));
     assert!(crate::root::vault::hardware_setup_error_preserves_password(
-        &HardwareDerivationError::TrezorBridge(
-            "Trezor Bridge did not report a connected device".to_owned()
-        )
+        &HardwareDerivationError::TrezorUsbUnavailable("busy".to_owned())
     ));
     assert!(crate::root::vault::hardware_setup_error_preserves_password(
         &HardwareDerivationError::TrezorLocked

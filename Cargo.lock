@@ -16461,6 +16461,7 @@ dependencies = [
  "reqwest",
  "reqwest-websocket",
  "rmp-serde",
+ "rusb",
  "rustls",
  "rustls-platform-verifier",
  "security-framework",

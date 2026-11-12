@@ -2,6 +2,9 @@ use thiserror::Error;
 
 use super::types::HardwareAppVersion;
 
+pub const TREZOR_USB_UNAVAILABLE_GUIDANCE: &str =
+    "Close Trezor Suite or other apps using the Trezor, and check USB permissions, then try again.";
+
 #[derive(Debug, Error)]
 pub enum HardwareDerivationError {
     #[error(transparent)]
@@ -42,8 +45,11 @@ pub enum HardwareDerivationError {
     #[error(transparent)]
     Trezor(#[from] trezor_client::Error),
     #[cfg(feature = "hardware")]
-    #[error("Trezor Bridge transport failed: {0}")]
-    TrezorBridge(String),
+    #[error(
+        "Trezor is in use or not accessible. {guidance} ({0})",
+        guidance = TREZOR_USB_UNAVAILABLE_GUIDANCE
+    )]
+    TrezorUsbUnavailable(String),
     #[cfg(feature = "hardware")]
     #[error("Trezor requested an app-entered passphrase but none was provided")]
     MissingTrezorAppPassphrase,
@@ -87,7 +93,7 @@ impl HardwareDerivationError {
     pub const fn is_early_device_readiness_error(&self) -> bool {
         match self {
             #[cfg(feature = "hardware")]
-            Self::LedgerUnavailable(_) | Self::TrezorBridge(_) => true,
+            Self::LedgerUnavailable(_) | Self::TrezorUsbUnavailable(_) => true,
             #[cfg(feature = "hardware")]
             Self::TrezorLocked | Self::UnsupportedTrezorPinMatrix => true,
             #[cfg(feature = "hardware")]

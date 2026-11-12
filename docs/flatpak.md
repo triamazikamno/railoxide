@@ -66,7 +66,7 @@ Network access is required for Tor bootstrap, RPC calls, Waku, artifacts, and Wa
 
 The default build additionally receives `--device=usb`. This exposes raw USB devices for direct Ledger and Trezor access. Host udev rules must still allow the desktop user to open those devices. Use the current [Ledger Linux guidance](https://support.ledger.com/article/115005165269-zd) and [Trezor udev rules](https://trezor.io/learn/a/udev-rules) rather than granting world-writable access to HID devices.
 
-The no-hardware build does not include hardware-wallet integration. Hardware-wallet controls, direct USB access, and Trezor Bridge support are absent from its UI and binary.
+The no-hardware build does not include hardware-wallet integration. Hardware-wallet controls and direct USB access are absent from its UI and binary.
 
 Direct X11 access weakens desktop isolation because X11 clients share a trusted display server. Wayland provides the stronger desktop boundary and is preferred when available.
 

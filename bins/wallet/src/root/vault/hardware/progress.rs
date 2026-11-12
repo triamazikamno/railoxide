@@ -5,6 +5,8 @@ use super::{
     HardwareProfileStepStatus, TrezorPinMatrixProvider, TrezorPinMatrixRequestKind, Zeroizing,
     hardware_device_label, mpsc,
 };
+#[cfg(feature = "hardware")]
+use wallet_ops::hardware::TREZOR_USB_UNAVAILABLE_GUIDANCE;
 
 #[cfg(feature = "hardware")]
 pub(super) const HARDWARE_PROFILE_READINESS_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -33,6 +35,9 @@ pub(in crate::root) fn hardware_profile_hardware_error_message(
     if error.is_ledger_busy_error() {
         return "Ledger connection is busy. Make sure no other wallet app is using it, keep the Ethereum app open, then try again. If this keeps happening, unplug and reconnect your Ledger."
             .into();
+    }
+    if matches!(error, HardwareDerivationError::TrezorUsbUnavailable(_)) {
+        return TREZOR_USB_UNAVAILABLE_GUIDANCE.into();
     }
     if awaiting_approval {
         match error {
@@ -67,7 +72,7 @@ pub(in crate::root) fn hardware_profile_hardware_error_message(
                 return "Trezor locked before the request was approved. Enter your PIN, then try again."
                     .into();
             }
-            HardwareDerivationError::TrezorBridge(_) | HardwareDerivationError::Trezor(_) => {
+            HardwareDerivationError::Trezor(_) => {
                 return "Trezor locked or disconnected before the request was approved. Plug it in and enter your PIN, then try again."
                     .into();
             }
@@ -84,7 +89,7 @@ pub(in crate::root) fn hardware_profile_hardware_error_message(
             "Ledger communication failed. Keep the Ethereum app open, then try again. If this keeps happening, unplug and reconnect your Ledger."
                 .into()
         }
-        HardwareDerivationError::TrezorBridge(_) | HardwareDerivationError::Trezor(_) => {
+        HardwareDerivationError::Trezor(_) => {
             "Plug it in and enter your PIN, then try again.".into()
         }
         HardwareDerivationError::TrezorLocked
@@ -134,7 +139,9 @@ pub(in crate::root) const fn hardware_profile_detection_should_suppress_initial_
 ) -> bool {
     matches!(
         error,
-        HardwareDerivationError::TrezorLocked | HardwareDerivationError::UnsupportedTrezorPinMatrix
+        HardwareDerivationError::TrezorLocked
+            | HardwareDerivationError::UnsupportedTrezorPinMatrix
+            | HardwareDerivationError::TrezorUsbUnavailable(_)
     )
 }
 
@@ -372,14 +379,11 @@ pub(super) fn send_hardware_profile_readiness_progress(
             }
         },
         HardwareDeviceKind::Trezor => {
-            let unlock_message = if matches!(
-                error,
+            let unlock_message = match error {
                 HardwareDerivationError::TrezorLocked
-                    | HardwareDerivationError::UnsupportedTrezorPinMatrix
-            ) {
-                "Enter your PIN."
-            } else {
-                "Plug it in and enter your PIN."
+                | HardwareDerivationError::UnsupportedTrezorPinMatrix => "Enter your PIN.",
+                HardwareDerivationError::TrezorUsbUnavailable(_) => TREZOR_USB_UNAVAILABLE_GUIDANCE,
+                _ => "Plug it in and enter your PIN.",
             };
             send_hardware_profile_progress(
                 progress_tx,
@@ -550,5 +554,27 @@ mod hardware_profile_detection_tests {
         assert_eq!(approval.status, HardwareProfileStepStatus::NotStarted);
         assert_eq!(approval.message, None);
         assert!(progress_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn trezor_usb_unavailable_keeps_guidance_across_retries() {
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+        let error = HardwareDerivationError::TrezorUsbUnavailable("busy".to_owned());
+
+        assert!(hardware_profile_detection_should_retry(&error));
+        assert!(hardware_profile_detection_should_suppress_initial_trezor_progress(&error));
+        assert!(send_hardware_profile_readiness_progress(
+            HardwareDeviceKind::Trezor,
+            &error,
+            &progress_tx,
+        ));
+
+        let unlock = progress_rx.try_recv().expect("unlock pending update");
+        assert_eq!(unlock.step, HardwareProfileStep::UnlockDevice);
+        assert_eq!(unlock.status, HardwareProfileStepStatus::Pending);
+        assert_eq!(
+            unlock.message.as_deref(),
+            Some(TREZOR_USB_UNAVAILABLE_GUIDANCE)
+        );
     }
 }
