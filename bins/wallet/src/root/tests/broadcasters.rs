@@ -759,7 +759,9 @@ fn private_spend_review_accepts_quotes_within_the_reviewed_maximum() {
 
 #[test]
 fn broadcaster_submission_accepts_a_shown_estimate_during_background_refresh() {
-    use crate::root::private_action::broadcaster_estimate_allows_submission;
+    use crate::root::private_action::{
+        broadcaster_estimate_allows_submission, broadcaster_input_pin_conflict_awaits_choice,
+    };
     let token = Address::repeat_byte(1);
     let candidate = wallet_ops::public_broadcaster_candidates(
         &[fee_row(1, token, "quote")],
@@ -785,4 +787,33 @@ fn broadcaster_submission_accepts_a_shown_estimate_during_background_refresh() {
     ));
     // An invalidating refresh has already cleared it.
     assert!(!broadcaster_estimate_allows_submission(None, true));
+
+    // An unresolved pin conflict keeps Submit reachable so the user can choose to override.
+    let pin = |overridden| wallet_ops::PublicBroadcasterInputPin {
+        inputs: Vec::new(),
+        overridden,
+    };
+    assert!(broadcaster_input_pin_conflict_awaits_choice(
+        Some(&pin(false)),
+        true,
+        false
+    ));
+    assert!(!broadcaster_input_pin_conflict_awaits_choice(
+        Some(&pin(false)),
+        true,
+        true
+    ));
+    assert!(!broadcaster_input_pin_conflict_awaits_choice(
+        Some(&pin(true)),
+        true,
+        false
+    ));
+    assert!(!broadcaster_input_pin_conflict_awaits_choice(
+        None, true, false
+    ));
+    assert!(!broadcaster_input_pin_conflict_awaits_choice(
+        Some(&pin(false)),
+        false,
+        false
+    ));
 }

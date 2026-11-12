@@ -132,7 +132,8 @@ mod types;
 pub(super) use delivery::*;
 #[cfg(test)]
 pub(super) use generation::{
-    broadcaster_estimate_allows_submission, sponsored_authorization_display,
+    broadcaster_estimate_allows_submission, broadcaster_input_pin_conflict_awaits_choice,
+    sponsored_authorization_display,
 };
 pub(super) use helpers::*;
 pub(super) use recipient_picker::*;

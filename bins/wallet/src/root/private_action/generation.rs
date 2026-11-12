@@ -36,6 +36,15 @@ pub(in crate::root) const fn broadcaster_estimate_allows_submission(
     estimate.is_some()
 }
 
+/// Submitting is how the user reaches the pin override confirmation after a pin conflict.
+pub(in crate::root) fn broadcaster_input_pin_conflict_awaits_choice(
+    input_pin: Option<&wallet_ops::PublicBroadcasterInputPin>,
+    conflict: bool,
+    refreshing: bool,
+) -> bool {
+    conflict && !refreshing && input_pin.is_some_and(|pin| !pin.overridden)
+}
+
 pub(in crate::root) fn sponsored_authorization_display(
     chain_id: u64,
     limit: SponsoredAuthorizationLimit,

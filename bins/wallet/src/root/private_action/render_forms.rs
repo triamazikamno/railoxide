@@ -1,3 +1,6 @@
+use super::generation::{
+    broadcaster_estimate_allows_submission, broadcaster_input_pin_conflict_awaits_choice,
+};
 use super::{
     Alert, ButtonVariants, DeliveryFormKind, DeliveryMode, Disableable, Entity, ParentElement,
     Pixels, PublicBroadcasterResultKind, SendResult, Sizable, SponsoredSelfBroadcastSessionOutcome,
@@ -43,6 +46,7 @@ impl WalletRoot {
         let chooser_root = root.clone();
         let estimate_root = root.clone();
         let progress_root = root.clone();
+        let retry_root = root.clone();
         let recipient_root = root.clone();
         let delivery_submit_root = root.clone();
         let amount_submit_root = root.clone();
@@ -58,6 +62,11 @@ impl WalletRoot {
             sponsorship_unavailable_reason,
         );
         let mut public_broadcaster_submit_disabled = false;
+        let pin_conflict_awaits_choice = broadcaster_input_pin_conflict_awaits_choice(
+            form.input_pin.as_ref(),
+            form.input_pin_conflict,
+            form.cost_estimate_pending || form.estimating_cost,
+        );
         let mut self_broadcast_submit_disabled = false;
         let mut sponsored_funding_estimate = None;
         let generation_ready = self.private_action_generation_ready(asset.chain_id);
@@ -118,7 +127,10 @@ impl WalletRoot {
                 public_broadcaster_submit_disabled_for_fee_token_options(
                     &fee_token_options,
                     form.selected_fee_token,
-                );
+                ) || (!broadcaster_estimate_allows_submission(
+                    form.cost_estimate.as_ref(),
+                    form.cost_estimate_pending || form.estimating_cost,
+                ) && !pin_conflict_awaits_choice);
             let candidates = self.current_public_broadcaster_candidates(
                 asset.chain_id,
                 form.selected_fee_token,
@@ -389,17 +401,46 @@ impl WalletRoot {
         }
 
         if let Some(error) = form.error.as_ref() {
+            let alert = Alert::error(
+                send_element_id(key, "form-error"),
+                format_form_error_for_asset(
+                    error,
+                    asset,
+                    form.selected_fee_token,
+                    Some(&self.effective_token_registry),
+                ),
+            )
+            .small();
+            // Nothing else restarts a failed or abandoned estimate until an input changes.
+            let estimate_retry = (form.delivery_mode == DeliveryMode::PublicBroadcaster
+                && form.cost_estimate.is_none()
+                && !form.cost_estimate_pending
+                && !form.estimating_cost
+                && !form.generating
+                && form.result.is_none()
+                && !pin_conflict_awaits_choice)
+                .then(|| {
+                    app_button(send_element_id(key, "estimate-retry"), "Retry")
+                        .outline()
+                        .small()
+                        .flex_none()
+                        .on_click(move |_event, _window, cx| {
+                            retry_root.update(cx, |root, cx| {
+                                root.schedule_public_broadcaster_cost_estimate(
+                                    DeliveryFormKind::Send,
+                                    key,
+                                    cx,
+                                );
+                            });
+                        })
+                });
             card = card.child(
-                Alert::error(
-                    send_element_id(key, "form-error"),
-                    format_form_error_for_asset(
-                        error,
-                        asset,
-                        form.selected_fee_token,
-                        Some(&self.effective_token_registry),
-                    ),
-                )
-                .small(),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w(px(0.0)).child(alert))
+                    .children(estimate_retry),
             );
         }
 
@@ -468,6 +509,7 @@ impl WalletRoot {
         let output_root = root.clone();
         let estimate_root = root.clone();
         let progress_root = root.clone();
+        let retry_root = root.clone();
         let recipient_root = root.clone();
         let top_up_root = root.clone();
         let delivery_submit_root = root.clone();
@@ -484,6 +526,11 @@ impl WalletRoot {
             sponsorship_unavailable_reason,
         );
         let mut public_broadcaster_submit_disabled = false;
+        let pin_conflict_awaits_choice = broadcaster_input_pin_conflict_awaits_choice(
+            form.input_pin.as_ref(),
+            form.input_pin_conflict,
+            form.cost_estimate_pending || form.estimating_cost,
+        );
         let mut self_broadcast_submit_disabled = false;
         let mut sponsored_funding_estimate = None;
         let generation_ready = self.private_action_generation_ready(asset.chain_id);
@@ -552,7 +599,10 @@ impl WalletRoot {
                 public_broadcaster_submit_disabled_for_fee_token_options(
                     &fee_token_options,
                     form.selected_fee_token,
-                );
+                ) || (!broadcaster_estimate_allows_submission(
+                    form.cost_estimate.as_ref(),
+                    form.cost_estimate_pending || form.estimating_cost,
+                ) && !pin_conflict_awaits_choice);
             let candidates = self.current_public_broadcaster_candidates(
                 asset.chain_id,
                 form.selected_fee_token,
@@ -856,17 +906,46 @@ impl WalletRoot {
         }
 
         if let Some(error) = form.error.as_ref() {
+            let alert = Alert::error(
+                unshield_element_id(key, "form-error"),
+                format_form_error_for_asset(
+                    error,
+                    asset,
+                    form.selected_fee_token,
+                    Some(&self.effective_token_registry),
+                ),
+            )
+            .small();
+            // Nothing else restarts a failed or abandoned estimate until an input changes.
+            let estimate_retry = (form.delivery_mode == DeliveryMode::PublicBroadcaster
+                && form.cost_estimate.is_none()
+                && !form.cost_estimate_pending
+                && !form.estimating_cost
+                && !form.generating
+                && form.result.is_none()
+                && !pin_conflict_awaits_choice)
+                .then(|| {
+                    app_button(unshield_element_id(key, "estimate-retry"), "Retry")
+                        .outline()
+                        .small()
+                        .flex_none()
+                        .on_click(move |_event, _window, cx| {
+                            retry_root.update(cx, |root, cx| {
+                                root.schedule_public_broadcaster_cost_estimate(
+                                    DeliveryFormKind::Unshield,
+                                    key,
+                                    cx,
+                                );
+                            });
+                        })
+                });
             card = card.child(
-                Alert::error(
-                    unshield_element_id(key, "form-error"),
-                    format_form_error_for_asset(
-                        error,
-                        asset,
-                        form.selected_fee_token,
-                        Some(&self.effective_token_registry),
-                    ),
-                )
-                .small(),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w(px(0.0)).child(alert))
+                    .children(estimate_retry),
             );
         }
 
