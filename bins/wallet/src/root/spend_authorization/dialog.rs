@@ -3,11 +3,9 @@ use std::rc::Weak;
 use std::sync::Arc;
 
 use alloy::primitives::U256;
-#[cfg(not(feature = "hardware"))]
-use gpui::AnyElement;
 use gpui::{
-    Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement, SharedString,
-    Styled, Window, div, prelude::FluentBuilder as _, rgb,
+    AnyElement, App, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement,
+    SharedString, Styled, Window, div, prelude::FluentBuilder as _, rgb,
 };
 use gpui_component::{
     Disableable, Sizable, WindowExt,
@@ -684,56 +682,9 @@ impl gpui::Render for SpendAuthorizationDialogContent {
                 payload_dialog.update(cx, Self::toggle_payload);
             })
         });
-        let row_group = self.summary.row_group.as_ref().map(|group| {
-            render_spend_authorization_details(
-                SPEND_AUTHORIZATION_ROW_GROUP_TOGGLE,
-                group,
-                self.row_group_open,
-                move |_, _, cx| {
-                    row_group_dialog.update(cx, Self::toggle_row_group);
-                },
-                cx,
-            )
-            .into_any_element()
-        });
-        let details = self.summary.details.as_ref().map(|details| {
-            render_spend_authorization_details(
-                SPEND_AUTHORIZATION_DETAILS_TOGGLE,
-                details,
-                self.details_open,
-                move |_, _, cx| {
-                    dialog.update(cx, Self::toggle_details);
-                },
-                cx,
-            )
-            .into_any_element()
-        });
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .children(
-                self.summary
-                    .steps
-                    .as_ref()
-                    .map(render_spend_authorization_steps),
-            )
-            .when(!self.summary.detail.is_empty(), |this| {
-                this.child(app_muted_text(self.summary.detail.to_string()).whitespace_normal())
-            })
-            .child(render_spend_authorization_summary(
-                &self.summary,
-                row_group,
-                details,
-                cx,
-            ))
-            .when_some(self.summary.context.as_ref(), |this, context| {
-                this.child(app_muted_text(context.to_string()).whitespace_normal())
-            })
-            .when_some(self.summary.notice.as_ref(), |this, (tone, text)| {
-                this.child(app_notice(*tone, text.to_string(), cx))
-            })
+        let row_group = self.render_row_group(row_group_dialog, cx);
+        let details = self.render_details(dialog, cx);
+        render_spend_authorization_dialog_body(&self.summary, row_group, details, cx)
             .children(
                 self.summary
                     .warnings
@@ -749,38 +700,7 @@ impl gpui::Render for SpendAuthorizationDialogContent {
             )
             .children(payload)
             .when(self.review_authorization.is_none(), |this| {
-                let device_auth_dialog = device_auth_dialog.clone();
-                this.child(masked_input_with_device_auth(
-                    &self.password_input,
-                    self.pending || self.cancelled || self.device_auth_pending,
-                    device_auth_buttons(
-                        self.device_auth.as_ref(),
-                        "wallet-spend-auth-touch-id",
-                        self.device_auth_pending,
-                        self.pending || self.cancelled,
-                        move |method, window, cx| {
-                            device_auth_dialog.update(cx, |dialog, cx| {
-                                dialog.submit_with_device_auth(method, window, cx);
-                            });
-                        },
-                    ),
-                ))
-                .child(render_spend_authorization_lifetime_row(
-                    &self.lifetime_select,
-                    self.pending || self.cancelled || self.device_auth_pending,
-                ))
-                .when(
-                    self.device_auth
-                        .as_ref()
-                        .is_some_and(|prompt| prompt.includes(DeviceAuthMethod::AppleWatch)),
-                    |this| {
-                        this.child(
-                            app_muted_text("Apple Watch always authorizes only this spend.")
-                                .text_xs()
-                                .whitespace_normal(),
-                        )
-                    },
-                )
+                self.render_password_entry(this, &device_auth_dialog)
             })
             .when(
                 self.review_authorization.is_none()
@@ -806,29 +726,26 @@ impl gpui::Render for SpendAuthorizationDialogContent {
     }
 }
 
-impl gpui::Render for HardwareSpendAuthorizationDialogContent {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let dialog = cx.entity();
-        let payload_dialog = dialog.clone();
-        let row_group_dialog = dialog.clone();
-        let payload = self.summary.payload.as_ref().map(|payload| {
-            render_spend_authorization_payload(payload, self.payload_open, move |_, _, cx| {
-                payload_dialog.update(cx, Self::toggle_payload);
-            })
-        });
-        let row_group = self.summary.row_group.as_ref().map(|group| {
+impl SpendAuthorizationDialogContent {
+    /// The row group's disclosure, when the summary has one.
+    fn render_row_group(&self, dialog: Entity<Self>, cx: &App) -> Option<AnyElement> {
+        self.summary.row_group.as_ref().map(|group| {
             render_spend_authorization_details(
                 SPEND_AUTHORIZATION_ROW_GROUP_TOGGLE,
                 group,
                 self.row_group_open,
                 move |_, _, cx| {
-                    row_group_dialog.update(cx, Self::toggle_row_group);
+                    dialog.update(cx, Self::toggle_row_group);
                 },
                 cx,
             )
             .into_any_element()
-        });
-        let details = self.summary.details.as_ref().map(|details| {
+        })
+    }
+
+    /// The details disclosure, when the summary has one.
+    fn render_details(&self, dialog: Entity<Self>, cx: &App) -> Option<AnyElement> {
+        self.summary.details.as_ref().map(|details| {
             render_spend_authorization_details(
                 SPEND_AUTHORIZATION_DETAILS_TOGGLE,
                 details,
@@ -839,7 +756,92 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
                 cx,
             )
             .into_any_element()
+        })
+    }
+
+    /// The password input with its device-auth buttons, the lifetime row, and the Apple Watch
+    /// note when Apple Watch is offered, added to `container`.
+    fn render_password_entry(
+        &self,
+        container: gpui::Div,
+        device_auth_dialog: &Entity<Self>,
+    ) -> gpui::Div {
+        let device_auth_dialog = device_auth_dialog.clone();
+        container
+            .child(masked_input_with_device_auth(
+                &self.password_input,
+                self.pending || self.cancelled || self.device_auth_pending,
+                device_auth_buttons(
+                    self.device_auth.as_ref(),
+                    "wallet-spend-auth-touch-id",
+                    self.device_auth_pending,
+                    self.pending || self.cancelled,
+                    move |method, window, cx| {
+                        device_auth_dialog.update(cx, |dialog, cx| {
+                            dialog.submit_with_device_auth(method, window, cx);
+                        });
+                    },
+                ),
+            ))
+            .child(render_spend_authorization_lifetime_row(
+                &self.lifetime_select,
+                self.pending || self.cancelled || self.device_auth_pending,
+            ))
+            .when(
+                self.device_auth
+                    .as_ref()
+                    .is_some_and(|prompt| prompt.includes(DeviceAuthMethod::AppleWatch)),
+                |this| {
+                    this.child(
+                        app_muted_text("Apple Watch always authorizes only this spend.")
+                            .text_xs()
+                            .whitespace_normal(),
+                    )
+                },
+            )
+    }
+}
+
+/// The start of a spend authorization dialog's content: the steps, the detail, the summary,
+/// the context and the notice.
+fn render_spend_authorization_dialog_body(
+    summary: &SpendAuthorizationSummary,
+    row_group: Option<AnyElement>,
+    details: Option<AnyElement>,
+    cx: &App,
+) -> gpui::Div {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .children(summary.steps.as_ref().map(render_spend_authorization_steps))
+        .when(!summary.detail.is_empty(), |this| {
+            this.child(app_muted_text(summary.detail.to_string()).whitespace_normal())
+        })
+        .child(render_spend_authorization_summary(
+            summary, row_group, details, cx,
+        ))
+        .when_some(summary.context.as_ref(), |this, context| {
+            this.child(app_muted_text(context.to_string()).whitespace_normal())
+        })
+        .when_some(summary.notice.as_ref(), |this, (tone, text)| {
+            this.child(app_notice(*tone, text.to_string(), cx))
+        })
+}
+
+impl gpui::Render for HardwareSpendAuthorizationDialogContent {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let dialog = cx.entity();
+        let payload_dialog = dialog.clone();
+        let row_group_dialog = dialog.clone();
+        let payload = self.summary.payload.as_ref().map(|payload| {
+            render_spend_authorization_payload(payload, self.payload_open, move |_, _, cx| {
+                payload_dialog.update(cx, Self::toggle_payload);
+            })
         });
+        let row_group = self.render_row_group(row_group_dialog, cx);
+        let details = self.render_details(dialog, cx);
         let pending = self.pending;
         let device = self.device_label;
         let show_trezor_app_passphrase = self
@@ -849,45 +851,11 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
         #[cfg(feature = "hardware")]
         let trezor_app_passphrase_input = self.root.read(cx).trezor_app_passphrase_input.clone();
         #[cfg(feature = "hardware")]
-        let trezor_pin_matrix_prompt = {
-            let root = self.root.read(cx);
-            root.hardware_profile_unlock
-                .trezor_pin_matrix_prompt
-                .as_ref()
-                .map(|prompt| {
-                    super::super::vault_ui::render_trezor_pin_matrix_prompt(&self.root, prompt)
-                        .into_any_element()
-                })
-        };
+        let trezor_pin_matrix_prompt = self.render_trezor_pin_matrix_prompt(cx);
         #[cfg(not(feature = "hardware"))]
         let trezor_pin_matrix_prompt: Option<AnyElement> = None;
 
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .children(
-                self.summary
-                    .steps
-                    .as_ref()
-                    .map(render_spend_authorization_steps),
-            )
-            .when(!self.summary.detail.is_empty(), |this| {
-                this.child(app_muted_text(self.summary.detail.to_string()).whitespace_normal())
-            })
-            .child(render_spend_authorization_summary(
-                &self.summary,
-                row_group,
-                details,
-                cx,
-            ))
-            .when_some(self.summary.context.as_ref(), |this, context| {
-                this.child(app_muted_text(context.to_string()).whitespace_normal())
-            })
-            .when_some(self.summary.notice.as_ref(), |this, (tone, text)| {
-                this.child(app_notice(*tone, text.to_string(), cx))
-            })
+        render_spend_authorization_dialog_body(&self.summary, row_group, details, cx)
             .children(self.summary.warnings.iter().enumerate().map(|(index, warning)| {
                 Alert::warning(
                     SharedString::from(format!("wallet-hardware-spend-auth-warning-{index}")),
@@ -905,21 +873,10 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
             .when(show_trezor_app_passphrase, |this| {
                 #[cfg(feature = "hardware")]
                 {
-                    this.child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(app_strong_text("Trezor app passphrase"))
-                            .child(
-                                app_muted_text(
-                                    "The Trezor session expired. Enter the passphrase for the wallet you intend to spend from.",
-                                )
-                                .whitespace_normal(),
-                            )
-                            .child(app_masked_input(&trezor_app_passphrase_input, pending)),
-                    )
+                    this.child(render_trezor_app_passphrase(
+                        &trezor_app_passphrase_input,
+                        pending,
+                    ))
                 }
                 #[cfg(not(feature = "hardware"))]
                 {
@@ -941,4 +898,69 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
                 this.child(app_muted_text(error.to_string()).text_color(rgb(theme::DANGER)))
             })
     }
+}
+
+impl HardwareSpendAuthorizationDialogContent {
+    /// The row group's disclosure, when the summary has one.
+    fn render_row_group(&self, dialog: Entity<Self>, cx: &App) -> Option<AnyElement> {
+        self.summary.row_group.as_ref().map(|group| {
+            render_spend_authorization_details(
+                SPEND_AUTHORIZATION_ROW_GROUP_TOGGLE,
+                group,
+                self.row_group_open,
+                move |_, _, cx| {
+                    dialog.update(cx, Self::toggle_row_group);
+                },
+                cx,
+            )
+            .into_any_element()
+        })
+    }
+
+    /// The details disclosure, when the summary has one.
+    fn render_details(&self, dialog: Entity<Self>, cx: &App) -> Option<AnyElement> {
+        self.summary.details.as_ref().map(|details| {
+            render_spend_authorization_details(
+                SPEND_AUTHORIZATION_DETAILS_TOGGLE,
+                details,
+                self.details_open,
+                move |_, _, cx| {
+                    dialog.update(cx, Self::toggle_details);
+                },
+                cx,
+            )
+            .into_any_element()
+        })
+    }
+
+    /// The Trezor PIN matrix, while the device asks for one.
+    #[cfg(feature = "hardware")]
+    fn render_trezor_pin_matrix_prompt(&self, cx: &App) -> Option<AnyElement> {
+        let root = self.root.read(cx);
+        root.hardware_profile_unlock
+            .trezor_pin_matrix_prompt
+            .as_ref()
+            .map(|prompt| {
+                super::super::vault_ui::render_trezor_pin_matrix_prompt(&self.root, prompt)
+                    .into_any_element()
+            })
+    }
+}
+
+/// The Trezor app passphrase prompt, shown when the Trezor session expired.
+#[cfg(feature = "hardware")]
+fn render_trezor_app_passphrase(input: &Entity<InputState>, pending: bool) -> gpui::Div {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(app_strong_text("Trezor app passphrase"))
+        .child(
+            app_muted_text(
+                "The Trezor session expired. Enter the passphrase for the wallet you intend to spend from.",
+            )
+            .whitespace_normal(),
+        )
+        .child(app_masked_input(input, pending))
 }

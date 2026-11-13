@@ -208,113 +208,128 @@ fn render_spend_authorization_card(
             rems(0.75).into(),
             |text| app_muted_text(text).text_xs(),
         ))
+        .child(render_spend_authorization_card_amount_row(card, cx))
+        .children(
+            card.lines
+                .iter()
+                .map(|line| render_spend_authorization_card_line(card_index, line)),
+        )
+}
+
+/// A card's icon and amount with the amount's change beside it and the USD value at the right
+/// edge. In a narrow dialog the USD value wraps under the amount, and the change under the
+/// amount before that. The amount itself never breaks.
+fn render_spend_authorization_card_amount_row(
+    card: &SpendAuthorizationCard,
+    cx: &App,
+) -> gpui::Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_x_2()
         .child(
-            // In a narrow dialog the USD value wraps under the amount, and the change under
-            // the amount before that. The amount itself never breaks.
             div()
-                .w_full()
+                .flex_auto()
                 .min_w_0()
                 .flex()
-                .flex_wrap()
                 .items_center()
-                .gap_x_2()
+                .gap_2()
+                .children(match card.network {
+                    // Larger than the plain icon, so the network chip stays readable
+                    // beside the card's amount.
+                    Some(chain_id) => Some(
+                        network_token_icon(card.icon.clone(), chain_id, 1.75).into_any_element(),
+                    ),
+                    None => card.icon.clone().map(|icon| {
+                        img(icon)
+                            .size(px(20.0))
+                            .rounded_full()
+                            .flex_none()
+                            .into_any_element()
+                    }),
+                })
                 .child(
                     div()
                         .flex_auto()
                         .min_w_0()
                         .flex()
-                        .items_center()
-                        .gap_2()
-                        .children(match card.network {
-                            // Larger than the plain icon, so the network chip stays readable
-                            // beside the card's amount.
-                            Some(chain_id) => Some(
-                                network_token_icon(card.icon.clone(), chain_id, 1.75)
-                                    .into_any_element(),
-                            ),
-                            None => card.icon.clone().map(|icon| {
-                                img(icon)
-                                    .size(px(20.0))
-                                    .rounded_full()
-                                    .flex_none()
-                                    .into_any_element()
-                            }),
-                        })
+                        .flex_wrap()
+                        .items_baseline()
+                        .gap_x_2()
                         .child(
-                            div()
-                                .flex_auto()
-                                .min_w_0()
-                                .flex()
-                                .flex_wrap()
-                                .items_baseline()
-                                .gap_x_2()
-                                .child(
-                                    app_amount_text(card.amount.to_string())
-                                        .text_color(rgb(theme::TEXT))
-                                        .whitespace_nowrap(),
-                                )
-                                .children(
-                                    card.delta
-                                        .as_ref()
-                                        .map(|delta| spend_authorization_delta_text(delta, cx)),
-                                ),
+                            app_amount_text(card.amount.to_string())
+                                .text_color(rgb(theme::TEXT))
+                                .whitespace_nowrap(),
+                        )
+                        .children(
+                            card.delta
+                                .as_ref()
+                                .map(|delta| spend_authorization_delta_text(delta, cx)),
                         ),
-                )
-                .children(card.usd.as_ref().map(|usd| {
-                    app_muted_text(usd.to_string())
-                        .flex_none()
-                        .ml_auto()
-                        .whitespace_nowrap()
-                })),
-        )
-        .children(card.lines.iter().map(|line| {
-            match line {
-                SpendAuthorizationCardLine::Text {
-                    before,
-                    strong,
-                    after,
-                } => div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_wrap()
-                    .items_baseline()
-                    .gap_x_1()
-                    .when(!before.is_empty(), |this| {
-                        this.child(app_muted_text(before.to_string()).text_xs())
-                    })
-                    .when(!strong.is_empty(), |this| {
-                        this.child(app_strong_text(strong.to_string()).text_xs())
-                    })
-                    .when(!after.is_empty(), |this| {
-                        this.child(app_muted_text(after.to_string()).text_xs())
-                    }),
-                SpendAuthorizationCardLine::Receiver {
-                    address,
-                    short,
-                    label,
-                } => spend_authorization_card_address_line(
-                    card_index,
-                    "to",
-                    None,
-                    address,
-                    short,
-                    label.clone(),
-                    "Copy receiver",
                 ),
-                SpendAuthorizationCardLine::Account { name, address } => {
-                    spend_authorization_card_address_line(
-                        card_index,
-                        "from",
-                        Some(name),
-                        address,
-                        &spend_authorization_recipient_display(address),
-                        None,
-                        "Copy address",
-                    )
-                }
-            }
+        )
+        .children(card.usd.as_ref().map(|usd| {
+            app_muted_text(usd.to_string())
+                .flex_none()
+                .ml_auto()
+                .whitespace_nowrap()
         }))
+}
+
+/// One of a card's lines: its text, or its receiver's or account's address line.
+fn render_spend_authorization_card_line(
+    card_index: usize,
+    line: &SpendAuthorizationCardLine,
+) -> gpui::Div {
+    match line {
+        SpendAuthorizationCardLine::Text {
+            before,
+            strong,
+            after,
+        } => div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_wrap()
+            .items_baseline()
+            .gap_x_1()
+            .when(!before.is_empty(), |this| {
+                this.child(app_muted_text(before.to_string()).text_xs())
+            })
+            .when(!strong.is_empty(), |this| {
+                this.child(app_strong_text(strong.to_string()).text_xs())
+            })
+            .when(!after.is_empty(), |this| {
+                this.child(app_muted_text(after.to_string()).text_xs())
+            }),
+        SpendAuthorizationCardLine::Receiver {
+            address,
+            short,
+            label,
+        } => spend_authorization_card_address_line(
+            card_index,
+            "to",
+            None,
+            address,
+            short,
+            label.clone(),
+            "Copy receiver",
+        ),
+        SpendAuthorizationCardLine::Account { name, address } => {
+            spend_authorization_card_address_line(
+                card_index,
+                "from",
+                Some(name),
+                address,
+                &spend_authorization_recipient_display(address),
+                None,
+                "Copy address",
+            )
+        }
+    }
 }
 
 /// A card's address line: `lead`, the account's `name` when the line shows it, and `address`
@@ -388,7 +403,50 @@ fn render_spend_authorization_compact_row(
     row: &SpendAuthorizationSummaryRow,
     cx: &App,
 ) -> gpui::Div {
-    let value = if row.shortened_copyable {
+    let value = render_spend_authorization_compact_row_value(row_index, row);
+    let label = match &row.label_network {
+        Some(label) => spend_authorization_row_label(label, app_muted_text),
+        None => app_muted_text(row.label.to_string()),
+    };
+    div()
+        .w_full()
+        .min_w_0()
+        .min_h(SUMMARY_COMPACT_ROW_MIN_HEIGHT)
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_x_2()
+        .child(label.flex_none().whitespace_nowrap())
+        .child(value)
+        .children(
+            row.delta
+                .as_ref()
+                .map(|delta| spend_authorization_delta_text(delta, cx)),
+        )
+        .child(
+            div()
+                .flex_none()
+                .size_5()
+                .flex()
+                .items_center()
+                .justify_center()
+                .children(row.hint.as_ref().map(|hint| {
+                    spend_authorization_hint(
+                        format!("wallet-spend-auth-row-hint-{row_index}"),
+                        hint,
+                        None,
+                    )
+                })),
+        )
+}
+
+/// A compact row's value: shortened with a copy button, or its text after a network or the
+/// row's mark, at the right edge.
+fn render_spend_authorization_compact_row_value(
+    row_index: usize,
+    row: &SpendAuthorizationSummaryRow,
+) -> gpui::Div {
+    if row.shortened_copyable {
         let copy_tooltip = row.copy_tooltip();
         div()
             .flex_auto()
@@ -440,41 +498,7 @@ fn render_spend_authorization_compact_row(
             .text_right()
             .text_color(rgb(theme::TEXT))
             .whitespace_normal()
-    };
-    let label = match &row.label_network {
-        Some(label) => spend_authorization_row_label(label, app_muted_text),
-        None => app_muted_text(row.label.to_string()),
-    };
-    div()
-        .w_full()
-        .min_w_0()
-        .min_h(SUMMARY_COMPACT_ROW_MIN_HEIGHT)
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .gap_x_2()
-        .child(label.flex_none().whitespace_nowrap())
-        .child(value)
-        .children(
-            row.delta
-                .as_ref()
-                .map(|delta| spend_authorization_delta_text(delta, cx)),
-        )
-        .child(
-            div()
-                .flex_none()
-                .size_5()
-                .flex()
-                .items_center()
-                .justify_center()
-                .children(row.hint.as_ref().map(|hint| {
-                    spend_authorization_hint(
-                        format!("wallet-spend-auth-row-hint-{row_index}"),
-                        hint,
-                        None,
-                    )
-                })),
-        )
+    }
 }
 
 /// The disclosure alert: "Made public:" and the summary on one line, and an info button
@@ -720,40 +744,7 @@ pub(in crate::root) fn render_spend_authorization_steps(
                 },
             )));
         }
-        let badge = div()
-            .flex_none()
-            .size(px(22.0))
-            .rounded_full()
-            .border_1()
-            .flex()
-            .items_center()
-            .justify_center();
-        let badge = if done {
-            badge
-                .border_color(rgb(theme::SUCCESS))
-                .bg(rgb(theme::SUCCESS))
-                .child(
-                    Icon::new(IconName::Check)
-                        .xsmall()
-                        .text_color(rgb(theme::PRIMARY_FOREGROUND)),
-                )
-        } else if current {
-            badge
-                .border_color(rgb(theme::PRIMARY))
-                .bg(rgb(theme::PRIMARY))
-                .child(
-                    app_text(number.to_string())
-                        .text_xs()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(theme::PRIMARY_FOREGROUND)),
-                )
-        } else {
-            badge.border_color(rgb(theme::BORDER_STRONG)).child(
-                app_muted_text(number.to_string())
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD),
-            )
-        };
+        let badge = render_spend_authorization_step_badge(number, done, current);
         let label_color = if done {
             theme::SUCCESS
         } else if current {
@@ -784,6 +775,45 @@ pub(in crate::root) fn render_spend_authorization_steps(
     ))
 }
 
+/// A step's numbered badge: a check in the success colour when `done`, filled when `current`,
+/// else outlined.
+fn render_spend_authorization_step_badge(number: usize, done: bool, current: bool) -> gpui::Div {
+    let badge = div()
+        .flex_none()
+        .size(px(22.0))
+        .rounded_full()
+        .border_1()
+        .flex()
+        .items_center()
+        .justify_center();
+    if done {
+        badge
+            .border_color(rgb(theme::SUCCESS))
+            .bg(rgb(theme::SUCCESS))
+            .child(
+                Icon::new(IconName::Check)
+                    .xsmall()
+                    .text_color(rgb(theme::PRIMARY_FOREGROUND)),
+            )
+    } else if current {
+        badge
+            .border_color(rgb(theme::PRIMARY))
+            .bg(rgb(theme::PRIMARY))
+            .child(
+                app_text(number.to_string())
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(theme::PRIMARY_FOREGROUND)),
+            )
+    } else {
+        badge.border_color(rgb(theme::BORDER_STRONG)).child(
+            app_muted_text(number.to_string())
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD),
+        )
+    }
+}
+
 /// A details disclosure as one more compact row: its title, its summary at the right, and a
 /// chevron where the rows have their info button. Open, its lines and note or its rows follow,
 /// indented, and a row group's summary is left out, since its rows carry the amounts. `id`
@@ -795,6 +825,20 @@ pub(super) fn render_spend_authorization_details(
     on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> Collapsible {
+    let content = render_spend_authorization_details_content(details, cx);
+    let header = render_spend_authorization_details_header(id, details, open, on_toggle);
+    Collapsible::new()
+        .open(open)
+        .w_full()
+        .child(header)
+        .content(content)
+}
+
+/// A details disclosure's open content: its lines and note, or its rows, indented.
+fn render_spend_authorization_details_content(
+    details: &SpendAuthorizationDetails,
+    cx: &App,
+) -> gpui::Div {
     let list = div()
         .min_w_0()
         .ml_1()
@@ -804,7 +848,7 @@ pub(super) fn render_spend_authorization_details(
         .border_l_1()
         .border_color(rgb(theme::BORDER_SUBTLE));
     let content = div().w_full().min_w_0().flex().flex_col().gap_1().py_1();
-    let content = match &details.content {
+    match &details.content {
         SpendAuthorizationDetailsContent::Lines { rows, note } => content
             // The rows end where the values above end, clear of the chevron's column.
             .pr(px(28.0))
@@ -845,65 +889,69 @@ pub(super) fn render_spend_authorization_details(
                 render_spend_authorization_compact_row(row_index, row, cx)
             })),
         ),
-    };
+    }
+}
+
+/// A details disclosure's toggle row: its title, its summary at the right unless open on a row
+/// group, and a chevron. `id` names the toggle.
+fn render_spend_authorization_details_header(
+    id: &'static str,
+    details: &SpendAuthorizationDetails,
+    open: bool,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
     let summarized = !open || !matches!(details.content, SpendAuthorizationDetailsContent::Rows(_));
-    Collapsible::new()
-        .open(open)
+    div()
+        .id(id)
         .w_full()
+        .min_w_0()
+        .min_h(SUMMARY_COMPACT_ROW_MIN_HEIGHT)
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_x_2()
+        .cursor_pointer()
+        .on_click(on_toggle)
+        .child(
+            app_muted_text(details.title.to_string())
+                .flex_none()
+                .whitespace_nowrap(),
+        )
+        // The summary and its chevron wrap under the title together.
         .child(
             div()
-                .id(id)
-                .w_full()
+                .flex_auto()
                 .min_w_0()
-                .min_h(SUMMARY_COMPACT_ROW_MIN_HEIGHT)
                 .flex()
-                .flex_wrap()
                 .items_center()
+                .justify_end()
                 .gap_x_2()
-                .cursor_pointer()
-                .on_click(on_toggle)
-                .child(
-                    app_muted_text(details.title.to_string())
-                        .flex_none()
-                        .whitespace_nowrap(),
-                )
-                // The summary and its chevron wrap under the title together.
+                .when(summarized, |this| {
+                    this.child(
+                        app_text(details.collapsed_summary.to_string())
+                            .min_w_0()
+                            .text_right()
+                            .text_color(rgb(theme::TEXT))
+                            .whitespace_normal(),
+                    )
+                })
                 .child(
                     div()
-                        .flex_auto()
-                        .min_w_0()
+                        .flex_none()
+                        .size_5()
                         .flex()
                         .items_center()
-                        .justify_end()
-                        .gap_x_2()
-                        .when(summarized, |this| {
-                            this.child(
-                                app_text(details.collapsed_summary.to_string())
-                                    .min_w_0()
-                                    .text_right()
-                                    .text_color(rgb(theme::TEXT))
-                                    .whitespace_normal(),
-                            )
-                        })
+                        .justify_center()
                         .child(
-                            div()
-                                .flex_none()
-                                .size_5()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    Icon::new(if open {
-                                        IconName::ChevronUp
-                                    } else {
-                                        IconName::ChevronDown
-                                    })
-                                    .xsmall(),
-                                ),
+                            Icon::new(if open {
+                                IconName::ChevronUp
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .xsmall(),
                         ),
                 ),
         )
-        .content(content)
 }
 
 pub(super) fn render_spend_authorization_payload(
@@ -997,33 +1045,7 @@ fn spend_authorization_summary_value(
     }
 
     if row.shortened_copyable {
-        let display_value = row.shortened_value();
-        let copy_tooltip = row.copy_tooltip();
-        return div()
-            .w_full()
-            .flex()
-            .items_start()
-            .gap_2()
-            .py(px(2.0))
-            .child(
-                app_text(display_value)
-                    .min_w(px(0.0))
-                    .line_height(px(17.0))
-                    .text_color(rgb(theme::TEXT))
-                    .font_family(APP_MONO_FONT_FAMILY)
-                    .whitespace_normal(),
-            )
-            .child(
-                div()
-                    .id(("wallet-spend-auth-copy-action", row_index))
-                    .flex_none()
-                    .tooltip(move |window, cx| Tooltip::new(copy_tooltip.clone()).build(window, cx))
-                    .child(clipboard_with_toast(
-                        ("wallet-spend-auth-copy", row_index),
-                        row.value.to_string(),
-                    )),
-            )
-            .into_any_element();
+        return spend_authorization_summary_copyable_value(row_index, row).into_any_element();
     }
 
     if let Some(delta) = &row.delta {
@@ -1057,6 +1079,39 @@ fn spend_authorization_summary_value(
         .text_color(rgb(theme::TEXT))
         .whitespace_normal()
         .into_any_element()
+}
+
+/// A summary value shortened, with a copy button for the full value.
+fn spend_authorization_summary_copyable_value(
+    row_index: usize,
+    row: &SpendAuthorizationSummaryRow,
+) -> gpui::Div {
+    let display_value = row.shortened_value();
+    let copy_tooltip = row.copy_tooltip();
+    div()
+        .w_full()
+        .flex()
+        .items_start()
+        .gap_2()
+        .py(px(2.0))
+        .child(
+            app_text(display_value)
+                .min_w(px(0.0))
+                .line_height(px(17.0))
+                .text_color(rgb(theme::TEXT))
+                .font_family(APP_MONO_FONT_FAMILY)
+                .whitespace_normal(),
+        )
+        .child(
+            div()
+                .id(("wallet-spend-auth-copy-action", row_index))
+                .flex_none()
+                .tooltip(move |window, cx| Tooltip::new(copy_tooltip.clone()).build(window, cx))
+                .child(clipboard_with_toast(
+                    ("wallet-spend-auth-copy", row_index),
+                    row.value.to_string(),
+                )),
+        )
 }
 
 pub(in crate::root) fn spend_authorization_recipient_display(value: &str) -> String {
