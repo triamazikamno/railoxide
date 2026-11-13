@@ -72,8 +72,9 @@ fn walletconnect_personal_sign_uses_spend_authorized_public_signer() {
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
 
-#[test]
-fn walletconnect_typed_data_signs_for_software_public_account() {
+/// Signs `typed_data` through `eth_signTypedData_v4` with an imported software Public account
+/// and checks that a 65-byte signature comes back.
+fn assert_software_public_account_signs_typed_data(typed_data: Value) {
     let (root_dir, db, store, view_session) = public_action_request_parts();
     let account = store
         .import_public_account(
@@ -84,27 +85,6 @@ fn walletconnect_typed_data_signs_for_software_public_account() {
             false,
         )
         .expect("import public account");
-    let typed_data = serde_json::json!({
-        "types": {
-            "EIP712Domain": [
-                { "name": "name", "type": "string" },
-                { "name": "version", "type": "string" },
-                { "name": "chainId", "type": "uint256" }
-            ],
-            "Message": [
-                { "name": "contents", "type": "string" }
-            ]
-        },
-        "primaryType": "Message",
-        "domain": {
-            "name": "RailOxide",
-            "version": "1",
-            "chainId": 1
-        },
-        "message": {
-            "contents": "hello"
-        }
-    });
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -144,17 +124,33 @@ fn walletconnect_typed_data_signs_for_software_public_account() {
 }
 
 #[test]
+fn walletconnect_typed_data_signs_for_software_public_account() {
+    let typed_data = serde_json::json!({
+        "types": {
+            "EIP712Domain": [
+                { "name": "name", "type": "string" },
+                { "name": "version", "type": "string" },
+                { "name": "chainId", "type": "uint256" }
+            ],
+            "Message": [
+                { "name": "contents", "type": "string" }
+            ]
+        },
+        "primaryType": "Message",
+        "domain": {
+            "name": "RailOxide",
+            "version": "1",
+            "chainId": 1
+        },
+        "message": {
+            "contents": "hello"
+        }
+    });
+    assert_software_public_account_signs_typed_data(typed_data);
+}
+
+#[test]
 fn walletconnect_typed_data_signs_primitive_prefixed_custom_types_for_software_public_account() {
-    let (root_dir, db, store, view_session) = public_action_request_parts();
-    let account = store
-        .import_public_account(
-            TEST_PASSWORD,
-            &view_session,
-            TEST_IMPORTED_PRIVATE_KEY,
-            Some("WalletConnect custom typed data"),
-            false,
-        )
-        .expect("import public account");
     let typed_data = serde_json::json!({
         "types": {
             "EIP712Domain": [
@@ -179,42 +175,7 @@ fn walletconnect_typed_data_signs_primitive_prefixed_custom_types_for_software_p
             }
         }
     });
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build runtime");
-
-    let signature = runtime
-        .block_on(walletconnect_sign_typed_data_v4(
-            WalletConnectTypedDataSignRequest {
-                executor_owner: None,
-                chain_id: 1,
-                request_control: None,
-                view_session: Arc::clone(&view_session),
-                vault_store: Arc::clone(&store),
-                authorization: Some(
-                    crate::DesktopPrivateSpendAuthorization::from_software_credentials(
-                        Zeroizing::new(TEST_PASSWORD.to_owned()),
-                        None,
-                    ),
-                ),
-                trezor_app_passphrase: None,
-                trezor_pin_matrix_provider: None,
-                public_account_uuid: account.public_account_uuid,
-                typed_data,
-                hash_fallback_confirmed: false,
-                event_tx: None,
-            },
-            crate::OperationHttpClient::direct_for_tests(),
-        ))
-        .expect("typed-data sign");
-
-    assert!(signature.starts_with("0x"));
-    assert_eq!(signature.len(), 132);
-
-    drop(store);
-    drop(db);
-    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    assert_software_public_account_signs_typed_data(typed_data);
 }
 
 #[test]
