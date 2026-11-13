@@ -355,7 +355,7 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn one_account_is_read_in_one_call_over_its_own_route() {
         let (url, recorded, _server) = spawn_recording_rpc_mock(node(100)).await;
         let route = route(&[&url]);
@@ -413,7 +413,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn resources_are_read_over_the_isolated_route_and_their_failure_keeps_the_balances() {
         let fixtures: Value = serde_json::from_str(include_str!("fixtures/http_api.json")).unwrap();
         for (answer, expected) in [
@@ -468,7 +468,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_result_below_the_minimum_is_retried_on_another_endpoint() {
         let (behind, behind_log, _behind) = spawn_recording_rpc_mock(node(99)).await;
         let (current, current_log, _current) = spawn_recording_rpc_mock(node(100)).await;
