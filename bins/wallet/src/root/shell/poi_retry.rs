@@ -3,7 +3,8 @@ use std::collections::btree_map::Entry;
 use std::sync::{Arc, Weak};
 
 use gpui::Context;
-use wallet_ops::PoiArtifactCacheAttemptId;
+use tokio::sync::mpsc::UnboundedSender;
+use wallet_ops::{PoiArtifactCacheAttemptId, WalletSession};
 
 use super::super::{ChainUtxoState, WalletRoot};
 
@@ -115,116 +116,125 @@ impl WalletRoot {
             cx.notify();
             return;
         };
-        let retry_wallet_generation = self.active_wallet_generation;
-        let retry_session = Arc::downgrade(&session);
+        let scope = PoiRetryScope {
+            chain_id,
+            request_token,
+            wallet_generation: self.active_wallet_generation,
+            session: Arc::downgrade(&session),
+        };
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let task = self.runtime.spawn(async move {
-            let retry = match session.retry_poi_artifact_cache().await {
-                Ok(retry) => retry,
-                Err(error) => {
-                    let _ = event_tx.send(PoiArtifactCacheRetryTaskEvent::AdmissionFailed(
-                        format!("{error:#}"),
-                    ));
-                    return;
-                }
-            };
-            let attempt_id = retry.attempt_id();
-            if event_tx
-                .send(PoiArtifactCacheRetryTaskEvent::Admitted(attempt_id))
-                .is_err()
-            {
-                return;
-            }
-            let result = retry
-                .wait()
-                .await
-                .map(|_| ())
-                .map_err(|error| format!("{error:#}"));
-            let _ = event_tx.send(PoiArtifactCacheRetryTaskEvent::Finished { attempt_id, result });
-        });
+        let task = self
+            .runtime
+            .spawn(run_poi_artifact_cache_retry(session, event_tx));
         self.wallet_sync_lifecycle.track_wallet_task(task);
         cx.spawn(async move |root, cx| {
             while let Some(event) = event_rx.recv().await {
-                match event {
-                    PoiArtifactCacheRetryTaskEvent::AdmissionFailed(error) => {
-                        let _ = root.update(cx, |root, cx| {
-                            let attempt_released = root
-                                .poi_artifact_cache_retry_attempts
-                                .cancel_pending(chain_id, request_token);
-                            if attempt_released {
-                                cx.notify();
-                            }
-                            let session_is_current = root
-                                .chain_states
-                                .get(&chain_id)
-                                .and_then(ChainUtxoState::poi_refresh_session)
-                                .is_some_and(|current| {
-                                    Weak::ptr_eq(&Arc::downgrade(&current), &retry_session)
-                                });
-                            if attempt_released
-                                && ppoi_retry_completion_is_current(
-                                    root.active_wallet_generation,
-                                    retry_wallet_generation,
-                                    session_is_current,
-                                )
-                            {
-                                tracing::warn!(
-                                    chain_id,
-                                    %error,
-                                    "failed to admit PPOI corpus refresh retry"
-                                );
-                            }
-                        });
-                    }
-                    PoiArtifactCacheRetryTaskEvent::Admitted(attempt_id) => {
-                        let _ = root.update(cx, |root, cx| {
-                            if root.poi_artifact_cache_retry_attempts.bind(
-                                chain_id,
-                                request_token,
-                                attempt_id,
-                            ) {
-                                cx.notify();
-                            }
-                        });
-                    }
-                    PoiArtifactCacheRetryTaskEvent::Finished { attempt_id, result } => {
-                        let _ = root.update(cx, |root, cx| {
-                            let attempt_released = root
-                                .poi_artifact_cache_retry_attempts
-                                .finish(chain_id, attempt_id);
-                            if attempt_released {
-                                cx.notify();
-                            }
-                            let session_is_current = root
-                                .chain_states
-                                .get(&chain_id)
-                                .and_then(ChainUtxoState::poi_refresh_session)
-                                .is_some_and(|current| {
-                                    Weak::ptr_eq(&Arc::downgrade(&current), &retry_session)
-                                });
-                            if !attempt_released
-                                || !ppoi_retry_completion_is_current(
-                                    root.active_wallet_generation,
-                                    retry_wallet_generation,
-                                    session_is_current,
-                                )
-                            {
-                                return;
-                            }
-                            if let Err(error) = result {
-                                tracing::warn!(
-                                    chain_id,
-                                    %error,
-                                    "failed to retry PPOI corpus refresh"
-                                );
-                            }
-                        });
-                    }
-                }
+                let _ = root.update(cx, |root, cx| root.apply_poi_retry_event(&scope, event, cx));
             }
         })
         .detach();
     }
+
+    fn poi_retry_is_current(&self, scope: &PoiRetryScope) -> bool {
+        let session_is_current = self
+            .chain_states
+            .get(&scope.chain_id)
+            .and_then(ChainUtxoState::poi_refresh_session)
+            .is_some_and(|current| Weak::ptr_eq(&Arc::downgrade(&current), &scope.session));
+        ppoi_retry_completion_is_current(
+            self.active_wallet_generation,
+            scope.wallet_generation,
+            session_is_current,
+        )
+    }
+
+    fn apply_poi_retry_event(
+        &mut self,
+        scope: &PoiRetryScope,
+        event: PoiArtifactCacheRetryTaskEvent,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let chain_id = scope.chain_id;
+        match event {
+            PoiArtifactCacheRetryTaskEvent::AdmissionFailed(error) => {
+                let attempt_released = self
+                    .poi_artifact_cache_retry_attempts
+                    .cancel_pending(chain_id, scope.request_token);
+                if attempt_released {
+                    cx.notify();
+                }
+                if attempt_released && self.poi_retry_is_current(scope) {
+                    tracing::warn!(
+                        chain_id,
+                        %error,
+                        "failed to admit PPOI corpus refresh retry"
+                    );
+                }
+            }
+            PoiArtifactCacheRetryTaskEvent::Admitted(attempt_id) => {
+                if self.poi_artifact_cache_retry_attempts.bind(
+                    chain_id,
+                    scope.request_token,
+                    attempt_id,
+                ) {
+                    cx.notify();
+                }
+            }
+            PoiArtifactCacheRetryTaskEvent::Finished { attempt_id, result } => {
+                let attempt_released = self
+                    .poi_artifact_cache_retry_attempts
+                    .finish(chain_id, attempt_id);
+                if attempt_released {
+                    cx.notify();
+                }
+                if !attempt_released || !self.poi_retry_is_current(scope) {
+                    return;
+                }
+                if let Err(error) = result {
+                    tracing::warn!(
+                        chain_id,
+                        %error,
+                        "failed to retry PPOI corpus refresh"
+                    );
+                }
+            }
+        }
+    }
+}
+
+struct PoiRetryScope {
+    chain_id: u64,
+    request_token: u64,
+    wallet_generation: u64,
+    session: Weak<WalletSession>,
+}
+
+async fn run_poi_artifact_cache_retry(
+    session: Arc<WalletSession>,
+    event_tx: UnboundedSender<PoiArtifactCacheRetryTaskEvent>,
+) {
+    let retry = match session.retry_poi_artifact_cache().await {
+        Ok(retry) => retry,
+        Err(error) => {
+            let _ = event_tx.send(PoiArtifactCacheRetryTaskEvent::AdmissionFailed(format!(
+                "{error:#}"
+            )));
+            return;
+        }
+    };
+    let attempt_id = retry.attempt_id();
+    if event_tx
+        .send(PoiArtifactCacheRetryTaskEvent::Admitted(attempt_id))
+        .is_err()
+    {
+        return;
+    }
+    let result = retry
+        .wait()
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("{error:#}"));
+    let _ = event_tx.send(PoiArtifactCacheRetryTaskEvent::Finished { attempt_id, result });
 }
 
 pub(in crate::root) const fn ppoi_retry_completion_is_current(

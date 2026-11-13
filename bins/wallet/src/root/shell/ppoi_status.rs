@@ -45,29 +45,51 @@ impl PpoiStatusHoverCard {
     }
 }
 
+struct PpoiHoverSnapshot {
+    status: PresenceStatus,
+    progress: Option<PoiArtifactCacheProgress>,
+    refreshing: bool,
+    counts: WalletStatusCounts,
+    retrying: bool,
+}
+
+impl PpoiHoverSnapshot {
+    fn read(root: &WalletRoot) -> Self {
+        let state = root.chain_states.get(&root.last_evm_chain);
+        let counts = root.wallet_status_counts(
+            state.and_then(ChainUtxoState::snapshot).map(AsRef::as_ref),
+            state.map_or_else(
+                WalletPpoiWorkflowStatus::default,
+                ChainUtxoState::ppoi_workflow_status,
+            ),
+        );
+        let status = state.map_or(PresenceStatus::Unknown, |state| {
+            root.ppoi_status_for_state(state, counts)
+        });
+        let refreshing = state.is_some_and(ChainUtxoState::poi_refreshing);
+        let progress = root.selected_chain_poi_artifact_progress().cloned();
+        let retrying = root
+            .poi_artifact_cache_retry_attempts
+            .contains(root.last_evm_chain);
+        Self {
+            status,
+            progress,
+            refreshing,
+            counts,
+            retrying,
+        }
+    }
+}
+
 impl Render for PpoiStatusHoverCard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
-        let (status, progress, refreshing, counts, retrying) = {
-            let root = self.root.read(cx);
-            let state = root.chain_states.get(&root.last_evm_chain);
-            let counts = root.wallet_status_counts(
-                state.and_then(ChainUtxoState::snapshot).map(AsRef::as_ref),
-                state.map_or_else(
-                    WalletPpoiWorkflowStatus::default,
-                    ChainUtxoState::ppoi_workflow_status,
-                ),
-            );
-            let status = state.map_or(PresenceStatus::Unknown, |state| {
-                root.ppoi_status_for_state(state, counts)
-            });
-            let refreshing = state.is_some_and(ChainUtxoState::poi_refreshing);
-            let progress = root.selected_chain_poi_artifact_progress().cloned();
-            let retrying = root
-                .poi_artifact_cache_retry_attempts
-                .contains(root.last_evm_chain);
-            (status, progress, refreshing, counts, retrying)
-        };
-        let color = presence_status_color(status);
+        let PpoiHoverSnapshot {
+            status,
+            progress,
+            refreshing,
+            counts,
+            retrying,
+        } = PpoiHoverSnapshot::read(self.root.read(cx));
         let event_label = ppoi_event_header_label(progress.as_ref());
         let dialog_open = window.has_active_dialog(cx);
 
@@ -84,40 +106,11 @@ impl Render for PpoiStatusHoverCard {
             .gap_3()
             .text_size(APP_TEXT_SIZE)
             .text_color(rgb(theme::TEXT))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(status_presence_dot(status).flex_none())
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(rgb(color))
-                                    .truncate()
-                                    .child(ppoi_hover_heading(
-                                        status,
-                                        progress.as_ref(),
-                                        refreshing,
-                                    )),
-                            )
-                            .when_some(event_label, |this, label| {
-                                this.child(
-                                    div()
-                                        .flex_none()
-                                        .text_color(rgb(theme::TEXT_MUTED))
-                                        .child(format!("({label})")),
-                                )
-                            }),
-                    ),
-            )
+            .child(render_ppoi_hover_header(
+                status,
+                ppoi_hover_heading(status, progress.as_ref(), refreshing),
+                event_label,
+            ))
             .child(
                 div()
                     .text_size(px(12.0))
@@ -137,16 +130,7 @@ impl Render for PpoiStatusHoverCard {
             .when_some(
                 progress.as_ref().filter(|progress| !progress.is_ready()),
                 |this, progress| {
-                    if progress.is_error() {
-                        this.child(render_ppoi_artifact_error_section(
-                            self.root.clone(),
-                            progress,
-                            status,
-                            retrying,
-                        ))
-                    } else {
-                        this.child(render_ppoi_artifact_progress_section(progress, status))
-                    }
+                    this.child(render_ppoi_artifact_section(&self.root, progress, status, retrying))
                 },
             )
             .when(refreshing, |this| {
@@ -158,45 +142,92 @@ impl Render for PpoiStatusHoverCard {
             })
             .when(
                 counts.ppoi_workflow_status.has_outstanding() && !refreshing,
-                |this| {
-                    this.child(render_ppoi_hover_note(
-                        ppoi_workflow_status_title(counts.ppoi_workflow_status, false)
-                            .unwrap_or("Outgoing proof recovery"),
-                        &ppoi_workflow_status_detail(counts.ppoi_workflow_status),
-                        if counts.ppoi_workflow_status.needs_attention > 0
-                            || counts.ppoi_workflow_status.recovery_needs_attention > 0
-                        {
-                            theme::DANGER
-                        } else {
-                            theme::WARNING
-                        },
-                    ))
-                },
+                |this| this.child(render_ppoi_outstanding_note(counts.ppoi_workflow_status)),
             )
             .when(counts.ppoi_attention_count() > 0, |this| {
-                let detail = ppoi_attention_detail(counts);
-                let color = ppoi_attention_hover_color(counts);
-                // Above a dialog the note only informs; its action would close the dialog.
-                if dialog_open {
-                    this.child(render_ppoi_hover_note("Needs review", &detail, color))
-                } else {
-                    this.child(render_ppoi_hover_action_note(
-                        self.root.clone(),
-                        "Needs review",
-                        &detail,
-                        color,
-                    ))
-                }
+                this.child(render_ppoi_needs_review_note(&self.root, counts, dialog_open))
             })
     }
 }
 
-fn render_ppoi_artifact_progress_section(
+fn render_ppoi_artifact_section(
+    root: &Entity<WalletRoot>,
     progress: &PoiArtifactCacheProgress,
     status: PresenceStatus,
+    retrying: bool,
 ) -> gpui::Div {
-    let percent = progress.percent();
-    let completed_lists = if percent == 100 && progress.total_lists > 0 {
+    if progress.is_error() {
+        render_ppoi_artifact_error_section(root.clone(), progress, status, retrying)
+    } else {
+        render_ppoi_artifact_progress_section(progress, status)
+    }
+}
+
+fn render_ppoi_needs_review_note(
+    root: &Entity<WalletRoot>,
+    counts: WalletStatusCounts,
+    dialog_open: bool,
+) -> gpui::AnyElement {
+    let detail = ppoi_attention_detail(counts);
+    let color = ppoi_attention_hover_color(counts);
+    // Above a dialog the note only informs; its action would close the dialog.
+    if dialog_open {
+        render_ppoi_hover_note("Needs review", &detail, color).into_any_element()
+    } else {
+        render_ppoi_hover_action_note(root.clone(), "Needs review", &detail, color)
+            .into_any_element()
+    }
+}
+
+fn render_ppoi_hover_header(
+    status: PresenceStatus,
+    heading: &'static str,
+    event_label: Option<String>,
+) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(status_presence_dot(status).flex_none())
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(presence_status_color(status)))
+                        .truncate()
+                        .child(heading),
+                )
+                .when_some(event_label, |this, label| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child(format!("({label})")),
+                    )
+                }),
+        )
+}
+
+fn render_ppoi_outstanding_note(status: WalletPpoiWorkflowStatus) -> gpui::Div {
+    render_ppoi_hover_note(
+        ppoi_workflow_status_title(status, false).unwrap_or("Outgoing proof recovery"),
+        &ppoi_workflow_status_detail(status),
+        if ppoi_workflow_needs_attention(status) {
+            theme::DANGER
+        } else {
+            theme::WARNING
+        },
+    )
+}
+
+fn ppoi_list_ready_text(progress: &PoiArtifactCacheProgress) -> String {
+    let completed_lists = if progress.percent() == 100 && progress.total_lists > 0 {
         progress.total_lists
     } else {
         progress.completed_lists.min(progress.total_lists)
@@ -206,7 +237,7 @@ fn render_ppoi_artifact_progress_section(
     } else {
         "lists"
     };
-    let list_text = if progress.total_lists == 0 {
+    if progress.total_lists == 0 {
         "Preparing POI list metadata".to_string()
     } else if progress.total_lists == 1 && completed_lists == 1 {
         "POI list ready".to_string()
@@ -215,7 +246,21 @@ fn render_ppoi_artifact_progress_section(
             "{} of {} {} ready",
             completed_lists, progress.total_lists, list_count
         )
-    };
+    }
+}
+
+fn ppoi_muted_row(text: impl IntoElement) -> gpui::Div {
+    div()
+        .text_size(px(12.0))
+        .text_color(rgb(theme::TEXT_MUTED))
+        .child(text)
+}
+
+fn render_ppoi_artifact_progress_section(
+    progress: &PoiArtifactCacheProgress,
+    status: PresenceStatus,
+) -> gpui::Div {
+    let percent = progress.percent();
     let color = presence_status_color(status);
 
     div()
@@ -252,44 +297,18 @@ fn render_ppoi_artifact_progress_section(
                 .value(f32::from(percent))
                 .bg(rgb(color)),
         )
-        .child(
-            div()
-                .text_size(px(12.0))
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child(list_text),
-        )
+        .child(ppoi_muted_row(ppoi_list_ready_text(progress)))
         .when_some(
             ppoi_chunk_progress_label(progress),
-            |this, chunk_progress| {
-                this.child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .child(chunk_progress),
-                )
-            },
+            |this, chunk_progress| this.child(ppoi_muted_row(chunk_progress)),
         )
         .when_some(
             ppoi_replay_progress_label(progress),
-            |this, replay_progress| {
-                this.child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .child(replay_progress),
-                )
-            },
+            |this, replay_progress| this.child(ppoi_muted_row(replay_progress)),
         )
         .when(
             progress.current_event_index.is_some() || progress.target_event_index.is_some(),
-            |this| {
-                this.child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .child(ppoi_event_progress_label(progress)),
-                )
-            },
+            |this| this.child(ppoi_muted_row(ppoi_event_progress_label(progress))),
         )
         .when_some(progress.current_list_key.as_ref(), |this, list_key| {
             this.child(
@@ -563,19 +582,31 @@ fn ppoi_event_header_label(progress: Option<&PoiArtifactCacheProgress>) -> Optio
         return None;
     }
     if let [list] = progress.list_progress.as_slice() {
-        return ppoi_inline_event_label(list.current_event_index, list.target_event_index);
+        return ppoi_event_position_label(
+            "event",
+            list.current_event_index,
+            list.target_event_index,
+        );
     }
-    ppoi_inline_event_label(progress.current_event_index, progress.target_event_index)
+    ppoi_event_position_label(
+        "event",
+        progress.current_event_index,
+        progress.target_event_index,
+    )
 }
 
-fn ppoi_inline_event_label(current: Option<u64>, target: Option<u64>) -> Option<String> {
+fn ppoi_event_position_label(
+    word: &str,
+    current: Option<u64>,
+    target: Option<u64>,
+) -> Option<String> {
     match (current, target) {
         (Some(current), Some(target)) if current < target => {
-            Some(format!("event {current}/{target}"))
+            Some(format!("{word} {current}/{target}"))
         }
-        (Some(current), Some(target)) => Some(format!("event {}", current.min(target))),
-        (Some(current), None) => Some(format!("event {current}")),
-        (None, Some(target)) => Some(format!("event {target}")),
+        (Some(current), Some(target)) => Some(format!("{word} {}", current.min(target))),
+        (Some(current), None) => Some(format!("{word} {current}")),
+        (None, Some(target)) => Some(format!("{word} {target}")),
         (None, None) => None,
     }
 }
@@ -647,20 +678,15 @@ fn render_ppoi_list_progress_row(progress: &PoiArtifactCacheListProgress) -> gpu
                 .flex_none()
                 .font_family(APP_MONO_FONT_FAMILY)
                 .text_color(rgb(theme::TEXT_MUTED))
-                .child(ppoi_list_event_label(progress).unwrap_or_else(|| "Not ready".to_string())),
+                .child(
+                    ppoi_event_position_label(
+                        "Event",
+                        progress.current_event_index,
+                        progress.target_event_index,
+                    )
+                    .unwrap_or_else(|| "Not ready".to_string()),
+                ),
         )
-}
-
-fn ppoi_list_event_label(progress: &PoiArtifactCacheListProgress) -> Option<String> {
-    match (progress.current_event_index, progress.target_event_index) {
-        (Some(current), Some(target)) if current < target => {
-            Some(format!("Event {current}/{target}"))
-        }
-        (Some(current), Some(target)) => Some(format!("Event {}", current.min(target))),
-        (Some(current), None) => Some(format!("Event {current}")),
-        (None, Some(target)) => Some(format!("Event {target}")),
-        (None, None) => None,
-    }
 }
 
 fn short_poi_list_key(bytes: &[u8]) -> String {
@@ -671,11 +697,16 @@ fn short_poi_list_key(bytes: &[u8]) -> String {
     format!("{}...{}", &encoded[..8], &encoded[encoded.len() - 6..])
 }
 
+const fn ppoi_workflow_needs_attention(status: WalletPpoiWorkflowStatus) -> bool {
+    status.needs_attention > 0 || status.recovery_needs_attention > 0
+}
+
+const fn ppoi_attention_is_blocking(counts: WalletStatusCounts) -> bool {
+    counts.blocked_shield_outputs > 0 || ppoi_workflow_needs_attention(counts.ppoi_workflow_status)
+}
+
 pub(super) const fn ppoi_attention_badge_color(counts: WalletStatusCounts) -> u32 {
-    if counts.blocked_shield_outputs > 0
-        || counts.ppoi_workflow_status.needs_attention > 0
-        || counts.ppoi_workflow_status.recovery_needs_attention > 0
-    {
+    if ppoi_attention_is_blocking(counts) {
         theme::DANGER
     } else {
         theme::WARNING_BG
@@ -683,10 +714,7 @@ pub(super) const fn ppoi_attention_badge_color(counts: WalletStatusCounts) -> u3
 }
 
 const fn ppoi_attention_hover_color(counts: WalletStatusCounts) -> u32 {
-    if counts.blocked_shield_outputs > 0
-        || counts.ppoi_workflow_status.needs_attention > 0
-        || counts.ppoi_workflow_status.recovery_needs_attention > 0
-    {
+    if ppoi_attention_is_blocking(counts) {
         theme::DANGER
     } else {
         theme::WARNING
