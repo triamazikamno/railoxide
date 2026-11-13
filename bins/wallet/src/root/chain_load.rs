@@ -23,6 +23,7 @@ pub(super) use lifecycle::{
     InstalledObserverToken, WalletPublicSyncCacheResetContext, WalletRootReplacementCleanup,
     WalletSyncLifecycle, WalletSyncLifecycleCleanup, WalletSyncLifecycleCleanupReport,
     WalletSyncLifecycleCleanupTask, WalletSyncLifecycleCleanupWaitGroup,
+    wait_for_wallet_sync_cleanups,
 };
 use lifecycle::{wallet_sync_startup_superseded, wallet_sync_startup_superseded_error};
 use observer::ChainLoadScope;
@@ -1036,6 +1037,8 @@ impl WalletRoot {
         let http = self.http.clone();
         let poi_read_source = self.poi_read_source.clone();
         let vault_db = self.vault_store.as_ref().map(|store| store.db());
+        self.prune_finished_wallet_sync_cleanups();
+        let pending_cleanups = self.wallet_sync_cleanup_tasks.clone();
         let (result_tx, result_rx) = oneshot::channel();
         let join = self.runtime.spawn(async move {
             let result = Box::pin(async move {
@@ -1055,6 +1058,8 @@ impl WalletRoot {
                         let db_path = db_path.clone();
                         let vault_db = vault_db.clone();
                         async move {
+                            // A store from before the last lock may still own the database.
+                            wait_for_wallet_sync_cleanups(pending_cleanups).await;
                             Ok::<Arc<WalletSessionStore>, eyre::Report>(Arc::new(match vault_db {
                                 Some(db) => {
                                     WalletSessionStore::from_db(db, poi_read_source.clone())?

@@ -642,6 +642,19 @@ pub(super) fn wallet_sync_startup_superseded(generation: &AtomicU64, expected: u
     generation.load(Ordering::Acquire) != expected
 }
 
+/// Waits for earlier cleanups to release the session store's database ownership before a
+/// replacement store claims it. A cleanup that ends without a report is left to the ownership
+/// check.
+pub(in crate::root) async fn wait_for_wallet_sync_cleanups(
+    cleanups: Vec<WalletSyncLifecycleCleanupTask>,
+) {
+    for cleanup in cleanups {
+        if let Err(error) = cleanup.wait().await {
+            tracing::warn!(%error, "opening wallet session store after unfinished sync cleanup");
+        }
+    }
+}
+
 pub(super) fn wallet_sync_startup_superseded_error() -> eyre::Report {
     eyre::eyre!(WALLET_SYNC_STARTUP_SUPERSEDED)
 }
