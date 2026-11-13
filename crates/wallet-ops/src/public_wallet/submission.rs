@@ -2343,7 +2343,7 @@ mod tests {
         submitter_server.abort();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn public_action_and_its_handed_off_observation_use_only_the_operation_client() {
         use crate::rpc_broker::tests::{
             RpcResponder, spawn_recording_rpc_mock, tagged_reqwest_client,
@@ -2598,7 +2598,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn governance_action_and_workflow_use_only_the_action_client() {
         use crate::public_wallet::tests::{
             TEST_IMPORTED_PRIVATE_KEY, TEST_PASSWORD, public_action_request_parts,

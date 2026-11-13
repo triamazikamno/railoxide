@@ -1049,7 +1049,7 @@ mod tests {
         })
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn each_send_reads_and_broadcasts_only_over_its_own_operation_client() {
         use crate::rpc_broker::tests::{spawn_recording_rpc_mock, tagged_reqwest_client};
         use crate::settings::{TronEndpointSetting, TronSettings};

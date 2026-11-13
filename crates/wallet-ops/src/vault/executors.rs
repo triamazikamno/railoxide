@@ -1087,46 +1087,105 @@ impl ExecutorStore {
         &self,
         index: u32,
         address: Address,
-        mut delegate: Address,
+        delegate: Address,
         assets: &[ExecutorAsset],
     ) -> Result<ExecutorRecord, ExecutorStoreError> {
-        if index >= INDEX_LIMIT {
-            return Err(ExecutorStoreError::Exhausted);
+        let mut records = self.restore_indices(&[(index, address)], delegate, assets)?;
+        records.pop().ok_or(ExecutorStoreError::InvalidRecord)
+    }
+
+    /// Restore each `(index, address)` in order under one lock, as repeated `restore_index`
+    /// calls would. The first failure is returned; entries before it stay written.
+    pub fn restore_indices(
+        &self,
+        entries: &[(u32, Address)],
+        delegate: Address,
+        assets: &[ExecutorAsset],
+    ) -> Result<Vec<ExecutorRecord>, ExecutorStoreError> {
+        // An out-of-range first entry fails before any lock, read or repair write.
+        match entries.first() {
+            None => return Ok(Vec::new()),
+            Some(&(index, _)) if index >= INDEX_LIMIT => return Err(ExecutorStoreError::Exhausted),
+            Some(_) => {}
         }
         let _guard = EXECUTOR_RECORD_LOCK
             .lock()
             .map_err(|_| ExecutorStoreError::Unavailable)?;
         self.require_wallet()?;
-        let mut allocation = self.allocation()?;
-        if let Some(existing) = self
-            .records()?
-            .into_iter()
-            .find(|record| record.index == index)
-        {
-            // Restoration authorizes nothing, so an existing record keeps its delegate.
-            if existing.address.is_some_and(|known| known != address)
-                || !self.interchangeable(existing.delegate, delegate)
-            {
-                return Err(ExecutorStoreError::OperationMismatch);
+        // Load once: each entry's writes are mirrored in memory instead of decrypted again.
+        let allocation = self.stored_allocation()?;
+        let had_spare = allocation.spare.is_some();
+        let mut records = self.records()?;
+        let mut allocation = self.reconcile_allocation(allocation, &records)?;
+        let mut restored = Vec::with_capacity(entries.len());
+        // Reconciliation may have retained the spare as a record that `records` lacks.
+        let mut stale = had_spare && allocation.spare.is_none();
+        for &(index, address) in entries {
+            if index >= INDEX_LIMIT {
+                return Err(ExecutorStoreError::Exhausted);
             }
-            // A reserved account may have survived a crash before address derivation.
-            let mut existing = existing;
-            existing.address = Some(address);
-            if existing.restored_at.is_none() {
-                existing.restored_at = local_timestamp();
+            if std::mem::take(&mut stale) {
+                // A displaced spare was written as a record that `records` does not hold.
+                records = self.records()?;
             }
-            for asset in assets {
-                if !existing.assets.contains(asset) {
-                    existing.assets.push(*asset);
-                }
-            }
-            self.vault.db.put_desktop_wallet_vault_records(&[self.seal(
-                RecordKind::ExecutorOperation,
-                self.operation_key(existing.operation),
-                &existing,
-            )?])?;
-            return Ok(existing);
+            let record =
+                if let Some(existing) = records.iter_mut().find(|record| record.index == index) {
+                    self.restore_existing(existing, address, delegate, assets)?
+                } else {
+                    stale = allocation
+                        .spare
+                        .as_ref()
+                        .is_some_and(|spare| spare.index < index);
+                    let record =
+                        self.restore_new(&mut allocation, (index, address), delegate, assets)?;
+                    records.push(record.clone());
+                    record
+                };
+            restored.push(record);
         }
+        Ok(restored)
+    }
+
+    /// Update `existing` in place and write it.
+    fn restore_existing(
+        &self,
+        existing: &mut ExecutorRecord,
+        address: Address,
+        delegate: Address,
+        assets: &[ExecutorAsset],
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
+        // Restoration authorizes nothing, so an existing record keeps its delegate.
+        if existing.address.is_some_and(|known| known != address)
+            || !self.interchangeable(existing.delegate, delegate)
+        {
+            return Err(ExecutorStoreError::OperationMismatch);
+        }
+        // A reserved account may have survived a crash before address derivation.
+        existing.address = Some(address);
+        if existing.restored_at.is_none() {
+            existing.restored_at = local_timestamp();
+        }
+        for asset in assets {
+            if !existing.assets.contains(asset) {
+                existing.assets.push(*asset);
+            }
+        }
+        self.vault.db.put_desktop_wallet_vault_records(&[self.seal(
+            RecordKind::ExecutorOperation,
+            self.operation_key(existing.operation),
+            &*existing,
+        )?])?;
+        Ok(existing.clone())
+    }
+
+    /// Record an unrecorded index and write it with `allocation`, which then equals the stored row.
+    fn restore_new(
+        &self,
+        allocation: &mut Allocation,
+        (index, address): (u32, Address),
+        mut delegate: Address,
+        assets: &[ExecutorAsset],
+    ) -> Result<ExecutorRecord, ExecutorStoreError> {
         allocation.next_index = allocation.next_index.max(index + 1);
         let mut updates = Vec::new();
         if allocation
@@ -1149,7 +1208,7 @@ impl ExecutorStore {
             .as_ref()
             .is_some_and(|spare| spare.index < index)
         {
-            self.retain_spare(&mut allocation, &mut updates)?;
+            self.retain_spare(allocation, &mut updates)?;
         }
         let record = ExecutorRecord {
             version: LEGACY_VERSION,
@@ -1810,6 +1869,12 @@ impl ExecutorStore {
     }
 
     fn allocation(&self) -> Result<Allocation, ExecutorStoreError> {
+        let allocation = self.stored_allocation()?;
+        let records = self.records()?;
+        self.reconcile_allocation(allocation, &records)
+    }
+
+    fn stored_allocation(&self) -> Result<Allocation, ExecutorStoreError> {
         let key = self.allocation_key();
         let mut allocation: Allocation = self
             .vault
@@ -1828,9 +1893,16 @@ impl ExecutorStore {
             return Err(ExecutorStoreError::InvalidRecord);
         }
         allocation.version = ALLOCATION_VERSION;
+        Ok(allocation)
+    }
+
+    fn reconcile_allocation(
+        &self,
+        mut allocation: Allocation,
+        records: &[ExecutorRecord],
+    ) -> Result<Allocation, ExecutorStoreError> {
         // Retained operation records establish a lower bound even if the counter was lost.
-        let records = self.records()?;
-        for record in &records {
+        for record in records {
             allocation.next_index = allocation.next_index.max(record.index + 1);
         }
         // Restoring an older allocation row must not make an already claimed
@@ -1844,7 +1916,11 @@ impl ExecutorStore {
             } else {
                 self.retain_spare(&mut allocation, &mut updates)?;
             }
-            updates.push(self.seal(RecordKind::ExecutorAllocation, key, &allocation)?);
+            updates.push(self.seal(
+                RecordKind::ExecutorAllocation,
+                self.allocation_key(),
+                &allocation,
+            )?);
             self.vault.db.put_desktop_wallet_vault_records(&updates)?;
         }
         Ok(allocation)

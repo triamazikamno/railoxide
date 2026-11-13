@@ -1,38 +1,39 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use broadcaster_monitor::{EventRx, EventTx, Shared, publish_revision};
-use broadcaster_monitor_waku::{RelayNetworkMode, WakuMonitorConfig, spawn_workers_until_shutdown};
-use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, Pixels, SharedString, Window, px};
+use broadcaster_monitor::{EventRx, EventTx, Shared};
+use broadcaster_monitor_waku::WakuMonitorConfig;
+#[cfg(test)]
+use gpui::Focusable;
+use gpui::{AppContext, Context, Entity, FocusHandle, Pixels, SharedString, Window, px};
+#[cfg(test)]
+use gpui_component::WindowExt;
 use gpui_component::{
-    WindowExt,
-    input::{InputEvent, InputState, TextareaState},
-    select::{SearchableVec, SelectEvent, SelectState},
-    table::{TableEvent, TableState},
+    input::{InputState, TextareaState},
+    select::{SearchableVec, SelectState},
+    table::TableState,
 };
 use rand::RngExt;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
 // The header's network. EVM-only code reaches a chain id only by matching `Evm`.
 use ui::chain_select::Network as SelectedNetwork;
-use ui::controls::FullWidthSelectItems;
 use ui::logs::LogsPane;
 use ui::theme::APP_TEXT_SIZE;
 use wallet_ops::{
     BlockedShieldRescueUtxoId, BroadcasterFeePolicy, HttpContext, PoiArtifactCacheProgress,
     PoiReadSource, ProverCacheBuildProgress, PublicBalanceCache, PublicBalanceSnapshot,
-    PublicBroadcasterWaku, SponsoredSelfBroadcastCommand, SubmissionNodeScope,
-    TokenAnchorRateCache, TokenAnchorRefreshHandle, WakuDeliveryClient, WalletNetworkHealth,
+    SponsoredSelfBroadcastCommand, SubmissionNodeScope, TokenAnchorRateCache,
+    TokenAnchorRefreshHandle, WalletNetworkHealth,
     hardware::HardwareWalletSyncIntent,
     settings::{
         EffectiveChainRegistry, EffectiveTokenRegistry, WalletUiState, load_wallet_settings,
         save_wallet_ui_state,
     },
-    subscribe_activity_journal_failures, subscribe_prover_cache_build,
+    subscribe_activity_journal_failures,
     vault::{
         BroadcasterPreferences, DesktopVaultStore, DesktopViewSession, DeviceAuthStatus,
         GeneratedSeedMaterial, NonEvmAddressBookEntry, PrivateAddressBookEntry,
@@ -73,6 +74,7 @@ mod private_assets;
 mod private_broadcaster;
 mod private_swap;
 mod proposals;
+mod prover_cache_monitor;
 mod public_account;
 mod public_action;
 mod public_balances;
@@ -96,9 +98,11 @@ mod update_check;
 mod utxo;
 mod vault;
 mod vault_ui;
+mod waku_runtime;
 mod wallet_activity;
 mod wallet_header;
 mod walletconnect;
+mod wiring;
 
 #[cfg(test)]
 mod tests;
@@ -116,7 +120,7 @@ use broadcaster_picker::BroadcasterPickerState;
 use broadcaster_preferences::{
     broadcaster_preference_is_banned, broadcaster_preference_is_favorite,
 };
-use broadcaster_view::{BroadcasterActivityTab, BroadcasterPreferenceListKind};
+use broadcaster_view::BroadcasterActivityTab;
 use chain_load::{
     ChainUtxoState, WalletSyncLifecycle, WalletSyncLifecycleCleanupTask, chain_load_overrides,
 };
@@ -147,7 +151,7 @@ use public_broadcaster::{
     unshield_form_max_entered_amount, unshield_max_entered_amount_for_mode,
     unshield_max_fill_amount,
 };
-use search_field::{SearchField, SearchFieldEvent};
+use search_field::SearchField;
 use settings::WalletSettingsEditor;
 use shell::{PoiArtifactCacheRetryAttempts, WalletTab};
 #[cfg(test)]
@@ -170,12 +174,14 @@ use ui_helpers::{
     dialog_content_max_height, dialog_max_height, labeled_field, rgb_with_alpha,
     secondary_dialog_content_width, token_label_row,
 };
-use utxo::{
-    BlockedShieldRescueRowState, UtxoDelegate, should_focus_utxo_table, should_refresh_utxo_ages,
-};
+use utxo::{BlockedShieldRescueRowState, UtxoDelegate, should_focus_utxo_table};
 use vault::{
     PassphraseOpenUi, PendingSoftwareProfileOpen, VaultState, WalletOption, WalletSetupMode,
     vault_error_kind,
+};
+use waku_runtime::{
+    WakuStoppingState, WakuWorkerCompletionToken, WalletWakuRuntime,
+    release_retired_waku_generation, renew_submission_scope,
 };
 use wallet_header::WalletSelectItem;
 
@@ -304,7 +310,7 @@ use utxo::{
     apply_blocked_shield_rescue_rows, blocked_shield_refund_action_available,
     blocked_shield_refund_origin_resolving, display_rows_from_output, global_poi_retry_available,
     pending_finality_display, poi_retry_button_label, ppoi_row_retry_label, ppoi_state_detail,
-    recoverable_poi_candidate_count, shield_poi_wait_display,
+    recoverable_poi_candidate_count, shield_poi_wait_display, should_refresh_utxo_ages,
     should_show_blocked_shield_refund_action, should_show_ppoi_retry_action,
 };
 #[cfg(test)]
@@ -325,9 +331,16 @@ use vault::{
 #[cfg(test)]
 use vault_ui::should_show_pre_unlock_settings_action;
 #[cfg(test)]
+use waku_runtime::{
+    WakuWorkerCompletionAction, WakuWorkerCompletionKind, WakuWorkerQuiescenceGuard,
+    active_waku_client, build_waku_client_if_needed, complete_waku_worker_generation,
+    run_waku_worker_task, should_start_waku_for_delivery, should_start_waku_runtime,
+    stop_waku_runtime, waku_start_blocked,
+};
+#[cfg(test)]
 use wallet_header::{parse_repair_cache_block, repair_cache_help_text};
 #[cfg(test)]
-use wallet_ops::public_broadcaster_candidates_for_asset;
+use wallet_ops::{PublicBroadcasterWaku, public_broadcaster_candidates_for_asset};
 #[cfg(test)]
 use walletconnect::{
     normalized_walletconnect_account_uuid, walletconnect_account_matches_search,
@@ -358,7 +371,6 @@ const COST_ESTIMATE_DEBOUNCE: Duration = Duration::from_secs(1);
 const SECONDS_PER_MINUTE: u64 = 60;
 const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
 const TABLE_KEY_CONTEXT: &str = "Table";
-const PROVER_CACHE_BUILD_DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(super) const fn should_apply_background_focus(has_active_dialog: bool) -> bool {
     !has_active_dialog
@@ -601,240 +613,6 @@ pub(crate) struct WalletRoot {
     logs_panel_height: Pixels,
 }
 
-struct WalletWakuRuntime {
-    client: Arc<WakuDeliveryClient>,
-    worker_shutdown: watch::Sender<bool>,
-    completion: WakuWorkerCompletionToken,
-    generation: u64,
-}
-
-#[derive(Clone)]
-pub(super) struct WakuWorkerCompletionToken {
-    quiesced_rx: watch::Receiver<bool>,
-}
-
-impl WakuWorkerCompletionToken {
-    async fn wait(mut self) -> Result<(), String> {
-        loop {
-            if *self.quiesced_rx.borrow() {
-                return Ok(());
-            }
-            self.quiesced_rx
-                .changed()
-                .await
-                .map_err(|_| "Waku worker ended before quiescence was established".to_string())?;
-        }
-    }
-
-    #[cfg(test)]
-    fn closed_for_test() -> Self {
-        let (_quiesced_tx, quiesced_rx) = watch::channel(false);
-        Self { quiesced_rx }
-    }
-
-    #[cfg(test)]
-    fn channel_for_test() -> (Self, watch::Sender<bool>) {
-        let (quiesced_tx, quiesced_rx) = watch::channel(false);
-        (Self { quiesced_rx }, quiesced_tx)
-    }
-}
-
-struct WakuWorkerQuiescenceGuard {
-    quiesced_tx: watch::Sender<bool>,
-}
-
-impl WakuWorkerQuiescenceGuard {
-    const fn new(quiesced_tx: watch::Sender<bool>) -> Self {
-        Self { quiesced_tx }
-    }
-}
-
-impl Drop for WakuWorkerQuiescenceGuard {
-    fn drop(&mut self) {
-        let _ = self.quiesced_tx.send(true);
-    }
-}
-
-async fn run_waku_worker_task(
-    worker: impl Future<Output = eyre::Result<()>>,
-    quiescence_guard: WakuWorkerQuiescenceGuard,
-) -> eyre::Result<()> {
-    let result = worker.await;
-    drop(quiescence_guard);
-    result
-}
-
-struct WakuStoppingState {
-    generation: u64,
-    /// Kept so a Tor rotation can await this transport's termination before committing.
-    client: Arc<WakuDeliveryClient>,
-    completion: WakuWorkerCompletionToken,
-}
-
-#[cfg(test)]
-impl WakuStoppingState {
-    fn for_test(generation: u64) -> Self {
-        let config = WakuMonitorConfig {
-            network: broadcaster_monitor_waku::RelayNetworkConfig::proxy(reqwest::Client::new()),
-            ..WakuMonitorConfig::default()
-        };
-        Self {
-            generation,
-            client: config.build_client().expect("proxy Waku delivery client"),
-            completion: WakuWorkerCompletionToken::closed_for_test(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WakuWorkerCompletionKind {
-    Clean,
-    WorkerError,
-    TaskError,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WakuWorkerCompletionAction {
-    FinalizedStop { restart: bool },
-    HandleActiveFailure,
-    Ignore,
-}
-
-fn should_start_waku_runtime(
-    view_unlocked: bool,
-    runtime_active: bool,
-    runtime_stopping: bool,
-    lifecycle_shutdown_started: bool,
-    network_mode: RelayNetworkMode,
-) -> bool {
-    view_unlocked
-        && !runtime_active
-        && !runtime_stopping
-        && !lifecycle_shutdown_started
-        && network_mode != RelayNetworkMode::Proxy
-}
-
-fn should_start_waku_for_delivery(
-    delivery_mode: DeliveryMode,
-    view_unlocked: bool,
-    runtime_active: bool,
-    runtime_stopping: bool,
-    lifecycle_shutdown_started: bool,
-    network_mode: RelayNetworkMode,
-) -> bool {
-    delivery_mode == DeliveryMode::PublicBroadcaster
-        && should_start_waku_runtime(
-            view_unlocked,
-            runtime_active,
-            runtime_stopping,
-            lifecycle_shutdown_started,
-            network_mode,
-        )
-}
-
-/// A pending Tor rotation holds Waku stopped until it commits, like a runtime still stopping.
-const fn waku_start_blocked(
-    stopping: Option<&WakuStoppingState>,
-    rotation: Option<&network::TorRotation>,
-) -> bool {
-    stopping.is_some() || rotation.is_some()
-}
-
-fn build_waku_client_if_needed<C, E>(
-    should_start: bool,
-    build: impl FnOnce() -> Result<C, E>,
-) -> Result<Option<C>, E> {
-    if should_start {
-        build().map(Some)
-    } else {
-        Ok(None)
-    }
-}
-
-fn active_waku_client(runtime: Option<&WalletWakuRuntime>) -> Option<Arc<WakuDeliveryClient>> {
-    runtime.map(|runtime| Arc::clone(&runtime.client))
-}
-
-/// Closes `scope`, which ends every submission node's teardown delay and refuses nodes to
-/// callbacks still holding it, and leaves a fresh open scope in its place.
-fn renew_submission_scope(scope: &mut SubmissionNodeScope) {
-    std::mem::take(scope).close();
-}
-
-fn take_waku_runtime_for_stop(
-    runtime: &mut Option<WalletWakuRuntime>,
-) -> Option<WakuStoppingState> {
-    let runtime = runtime.take()?;
-    let _ = runtime.worker_shutdown.send(true);
-    Some(WakuStoppingState {
-        generation: runtime.generation,
-        client: runtime.client,
-        completion: runtime.completion,
-    })
-}
-
-#[cfg(test)]
-fn stop_waku_runtime(
-    runtime: &mut Option<WalletWakuRuntime>,
-    monitor_state: &Shared,
-    monitor_event_tx: &EventTx,
-) -> bool {
-    let stopped = take_waku_runtime_for_stop(runtime).is_some();
-    if stopped && let Some(rev) = monitor_state.write().clear() {
-        publish_revision(monitor_event_tx, rev);
-    }
-    stopped
-}
-
-fn complete_waku_worker_generation(
-    active_generation: Option<u64>,
-    stopping_generation: &mut Option<WakuStoppingState>,
-    generation: u64,
-    completion: WakuWorkerCompletionKind,
-    view_unlocked: bool,
-    lifecycle_shutdown_started: bool,
-    monitor_state: &Shared,
-    monitor_event_tx: &EventTx,
-) -> WakuWorkerCompletionAction {
-    if stopping_generation
-        .as_ref()
-        .is_some_and(|stopping| stopping.generation == generation)
-    {
-        *stopping_generation = None;
-        if !lifecycle_shutdown_started && let Some(rev) = monitor_state.write().clear() {
-            publish_revision(monitor_event_tx, rev);
-        }
-        return WakuWorkerCompletionAction::FinalizedStop {
-            restart: view_unlocked && !lifecycle_shutdown_started,
-        };
-    }
-
-    if active_generation == Some(generation) && completion != WakuWorkerCompletionKind::Clean {
-        WakuWorkerCompletionAction::HandleActiveFailure
-    } else {
-        WakuWorkerCompletionAction::Ignore
-    }
-}
-
-/// Ends the stopping state of `generation`, whose workers and transport the caller has retired,
-/// and clears rows those workers wrote while stopping. Its late completion then changes nothing.
-fn release_retired_waku_generation(
-    stopping: &mut Option<WakuStoppingState>,
-    generation: u64,
-    monitor_state: &Shared,
-    monitor_event_tx: &EventTx,
-) {
-    if stopping
-        .as_ref()
-        .is_some_and(|stopping| stopping.generation == generation)
-    {
-        *stopping = None;
-    }
-    if let Some(rev) = monitor_state.write().clear() {
-        publish_revision(monitor_event_tx, rev);
-    }
-}
-
 impl Drop for WalletRoot {
     fn drop(&mut self) {
         self.begin_public_transaction_shutdown();
@@ -870,194 +648,6 @@ impl Drop for WalletRoot {
 }
 
 impl WalletRoot {
-    /// Public broadcaster delivery over the active runtime, which supplies only seed peers.
-    pub(super) fn public_broadcaster_waku(&self) -> Option<PublicBroadcasterWaku> {
-        active_waku_client(self.waku_runtime.as_ref()).map(|root| {
-            PublicBroadcasterWaku::new(
-                root,
-                self.waku_config.to_waku_config(),
-                self.http.clone(),
-                self.submission_scope.clone(),
-            )
-        })
-    }
-
-    pub(in crate::root) fn ensure_waku_for_delivery(
-        &mut self,
-        delivery_mode: DeliveryMode,
-        cx: &mut Context<'_, Self>,
-    ) {
-        if should_start_waku_for_delivery(
-            delivery_mode,
-            self.vault_view_unlock.is_some(),
-            self.waku_runtime.is_some(),
-            waku_start_blocked(
-                self.waku_stopping_generation.as_ref(),
-                self.tor_rotation.as_ref(),
-            ),
-            self.wallet_sync_lifecycle_shutdown_started,
-            self.waku_config.network.mode,
-        ) {
-            self.ensure_waku_started(cx);
-        }
-    }
-
-    pub(super) fn ensure_waku_started(&mut self, cx: &mut Context<'_, Self>) {
-        let should_start = should_start_waku_runtime(
-            self.vault_view_unlock.is_some(),
-            self.waku_runtime.is_some(),
-            waku_start_blocked(
-                self.waku_stopping_generation.as_ref(),
-                self.tor_rotation.as_ref(),
-            ),
-            self.wallet_sync_lifecycle_shutdown_started,
-            self.waku_config.network.mode,
-        );
-        let client =
-            match build_waku_client_if_needed(should_start, || self.waku_config.build_client()) {
-                Ok(Some(client)) => client,
-                Ok(None) => return,
-                Err(error) => {
-                    tracing::error!(%error, "wallet Waku delivery runtime failed to start");
-                    self.network_status_error = Some(Arc::from(format!(
-                        "Waku delivery network is unavailable: {}",
-                        format_report_chain(&error)
-                    )));
-                    cx.notify();
-                    return;
-                }
-            };
-        self.waku_session_generation = self.waku_session_generation.wrapping_add(1);
-        let generation = self.waku_session_generation;
-        let (worker_shutdown, shutdown_rx) = watch::channel(false);
-        let (quiesced_tx, quiesced_rx) = watch::channel(false);
-        let completion = WakuWorkerCompletionToken { quiesced_rx };
-        let config = self.waku_config.clone();
-        let worker_client = Arc::clone(&client);
-        let worker_monitor_state = self.monitor_state.clone();
-        let worker_event_tx = self.monitor_event_tx.clone();
-        let quiescence_guard = WakuWorkerQuiescenceGuard::new(quiesced_tx);
-        let worker = self.runtime.spawn(async move {
-            run_waku_worker_task(
-                spawn_workers_until_shutdown(
-                    config,
-                    worker_client,
-                    worker_monitor_state,
-                    worker_event_tx,
-                    shutdown_rx,
-                ),
-                quiescence_guard,
-            )
-            .await
-        });
-        self.waku_runtime = Some(WalletWakuRuntime {
-            client,
-            worker_shutdown,
-            completion,
-            generation,
-        });
-        self.network_status_error = None;
-
-        cx.spawn(async move |this, cx| {
-            let result = worker.await;
-            let completion = match &result {
-                Ok(Ok(())) => WakuWorkerCompletionKind::Clean,
-                Ok(Err(_)) => WakuWorkerCompletionKind::WorkerError,
-                Err(_) => WakuWorkerCompletionKind::TaskError,
-            };
-            let _ = this.update(cx, |root, cx| {
-                let action = complete_waku_worker_generation(
-                    root.waku_runtime.as_ref().map(|runtime| runtime.generation),
-                    &mut root.waku_stopping_generation,
-                    generation,
-                    completion,
-                    root.vault_view_unlock.is_some(),
-                    root.wallet_sync_lifecycle_shutdown_started,
-                    &root.monitor_state,
-                    &root.monitor_event_tx,
-                );
-                match (action, result) {
-                    (
-                        WakuWorkerCompletionAction::FinalizedStop { restart },
-                        stopping_result,
-                    ) => {
-                        match stopping_result {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
-                                tracing::debug!(%error, "Waku delivery worker failed while stopping");
-                            }
-                            Err(error) => {
-                                tracing::warn!(%error, "Waku delivery worker task failed while stopping");
-                            }
-                        }
-                        if restart
-                            && network::restart_now_or_defer_to_rotation(
-                                root.tor_rotation.as_mut(),
-                                generation,
-                            )
-                        {
-                            root.ensure_waku_started(cx);
-                        } else {
-                            cx.notify();
-                        }
-                    }
-                    (WakuWorkerCompletionAction::HandleActiveFailure, Ok(Err(error))) => {
-                        root.stop_waku();
-                        root.waku_stopping_generation = None;
-                        tracing::error!(%error, "wallet Waku delivery monitor workers failed to start");
-                        root.network_status_error = Some(Arc::from(format!(
-                            "Waku delivery network is unavailable: {}",
-                            format_report_chain(&error)
-                        )));
-                        cx.notify();
-                    }
-                    (WakuWorkerCompletionAction::HandleActiveFailure, Err(error)) => {
-                        root.stop_waku();
-                        root.waku_stopping_generation = None;
-                        tracing::error!(%error, "wallet Waku delivery monitor task failed");
-                        root.network_status_error = Some(Arc::from(format!(
-                            "Waku delivery network monitor failed: {error}"
-                        )));
-                        cx.notify();
-                    }
-                    (
-                        WakuWorkerCompletionAction::HandleActiveFailure,
-                        Ok(Ok(())),
-                    )
-                    | (WakuWorkerCompletionAction::Ignore, _) => {}
-                }
-            });
-        })
-        .detach();
-    }
-
-    pub(super) fn stop_waku(&mut self) -> bool {
-        let stopping = take_waku_runtime_for_stop(&mut self.waku_runtime);
-        let stopped = stopping.is_some();
-        if stopped {
-            self.waku_stopping_generation = stopping;
-            if !self.wallet_sync_lifecycle_shutdown_started
-                && let Some(rev) = self.monitor_state.write().clear()
-            {
-                publish_revision(&self.monitor_event_tx, rev);
-            }
-        }
-        stopped
-    }
-
-    pub(super) fn stop_waku_for_root_replacement(&mut self) -> Option<WakuWorkerCompletionToken> {
-        if let Some(stopping) = take_waku_runtime_for_stop(&mut self.waku_runtime) {
-            self.waku_stopping_generation = Some(stopping);
-        }
-        self.waku_stopping_generation
-            .as_ref()
-            .map(|stopping| stopping.completion.clone())
-    }
-
-    const fn is_prover_cache_building(&self) -> bool {
-        self.prover_cache_build_progress.is_some()
-    }
-
     fn wallet_db_root_dir(&self) -> Option<PathBuf> {
         self.vault_store
             .as_ref()
@@ -1070,92 +660,6 @@ impl WalletRoot {
         };
         if let Err(error) = save_wallet_ui_state(store.db().as_ref(), &self.ui_state) {
             tracing::warn!(%error, "failed to save wallet UI state");
-        }
-    }
-
-    fn ensure_prover_cache_build_monitor(&mut self, cx: &Context<'_, Self>) {
-        if self.prover_cache_build_monitor_active {
-            return;
-        }
-        let Some(db_path) = self.wallet_db_root_dir() else {
-            return;
-        };
-        self.prover_cache_build_monitor_active = true;
-        cx.spawn(async move |this, cx| {
-            loop {
-                if let Some(mut progress_rx) = subscribe_prover_cache_build(&db_path) {
-                    let progress = progress_rx.borrow().clone();
-                    if this
-                        .update(cx, |root, cx| {
-                            root.set_prover_cache_build_progress(progress, cx);
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-
-                    loop {
-                        if progress_rx.changed().await.is_err() {
-                            let _ = this.update(cx, |root, cx| {
-                                root.set_prover_cache_build_progress(None, cx);
-                            });
-                            break;
-                        }
-                        let progress = progress_rx.borrow().clone();
-                        let is_complete = progress.is_none();
-                        if this
-                            .update(cx, |root, cx| {
-                                root.set_prover_cache_build_progress(progress, cx);
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
-                        if is_complete {
-                            break;
-                        }
-                    }
-                }
-
-                cx.background_executor()
-                    .timer(PROVER_CACHE_BUILD_DISCOVERY_INTERVAL)
-                    .await;
-            }
-        })
-        .detach();
-    }
-
-    fn set_prover_cache_build_progress(
-        &mut self,
-        progress: Option<ProverCacheBuildProgress>,
-        cx: &mut Context<'_, Self>,
-    ) {
-        self.prover_cache_build_progress = progress;
-        if self.prover_cache_build_progress.is_none() {
-            self.prover_cache_build_popover_open = false;
-        }
-        cx.notify();
-    }
-
-    fn update_prover_cache_build_progress(
-        &mut self,
-        progress: ProverCacheBuildProgress,
-        cx: &mut Context<'_, Self>,
-    ) {
-        self.prover_cache_build_progress = Some(progress);
-        cx.notify();
-    }
-
-    fn finish_prover_cache_build_progress(&mut self, cx: &mut Context<'_, Self>) {
-        self.prover_cache_build_progress = None;
-        self.prover_cache_build_popover_open = false;
-        cx.notify();
-    }
-
-    fn set_prover_cache_build_popover_open(&mut self, open: bool, cx: &mut Context<'_, Self>) {
-        if self.prover_cache_build_popover_open != open {
-            self.prover_cache_build_popover_open = open;
-            cx.notify();
         }
     }
 }
@@ -1185,7 +689,7 @@ impl WalletRoot {
         monitor_event_tx: EventTx,
         public_broadcaster_anchor_cache: Arc<TokenAnchorRateCache>,
         public_broadcaster_anchor_refresh: TokenAnchorRefreshHandle,
-        mut monitor_event_rx: EventRx,
+        monitor_event_rx: EventRx,
         monitor: Entity<broadcaster_monitor_gpui::BroadcasterMonitorPane>,
         logs: Entity<LogsPane>,
         startup_root: &gpui::WeakEntity<WalletStartupRoot>,
@@ -1372,7 +876,7 @@ impl WalletRoot {
             import_private_key_input: new_masked_input(window, cx, "private key hex"),
             import_password_input: new_masked_input(window, cx, "vault password"),
             edit_label_input: new_text_input(window, cx, "account label"),
-            search_input: public_account_search_input.clone(),
+            search_input: public_account_search_input,
             send_recipient_input: new_text_input(window, cx, "0x recipient"),
             send_amount_input: new_text_input(window, cx, "amount"),
             advanced_send_to_input: new_text_input(window, cx, "0x…"),
@@ -1526,7 +1030,7 @@ impl WalletRoot {
             ethereum_weth_public_broadcaster_count(&monitor_state.read().fee_rows());
         let mut public_broadcaster_sort_seed = [0_u8; 32];
         rand::rng().fill(public_broadcaster_sort_seed.as_mut_slice());
-        let mut anchor_refresh_rx = public_broadcaster_anchor_cache.subscribe_refreshes();
+        let anchor_refresh_rx = public_broadcaster_anchor_cache.subscribe_refreshes();
         if let Some(settings) = &settings_editor {
             let editor = settings.read(cx).chain_editor.clone();
             editor.update(cx, |editor, cx| {
@@ -1647,7 +1151,7 @@ impl WalletRoot {
             sidebar_manually_collapsed: false,
             sidebar_narrow_expanded: false,
             sidebar_public_broadcaster_count,
-            wallet_select: wallet_select.clone(),
+            wallet_select,
             wallet_metadata: Vec::new(),
             wallet_options: Vec::new(),
             manage_wallets: ManageWalletsState::default(),
@@ -1660,7 +1164,7 @@ impl WalletRoot {
             wallet_switch_loading_generation: None,
             wallet_switch_delayed: false,
             ui_state,
-            chain_select: chain_select.clone(),
+            chain_select,
             window_handle: window.window_handle(),
             chain_states,
             pending_ppoi_validation_toast: None,
@@ -1698,8 +1202,8 @@ impl WalletRoot {
             broadcaster_preference_snapshot,
             broadcaster_preference_error: None,
             active_broadcaster_tab: BroadcasterActivityTab::default(),
-            favorite_broadcaster_input: favorite_broadcaster_input.clone(),
-            banned_broadcaster_input: banned_broadcaster_input.clone(),
+            favorite_broadcaster_input,
+            banned_broadcaster_input,
             address_book_label_input,
             address_book_save_error: None,
             public_form,
@@ -1726,7 +1230,7 @@ impl WalletRoot {
             broadcaster_picker: None,
             unshield_spinner_tick: 0,
             repair_cache_block_input,
-            tx_search_input: tx_search_input.clone(),
+            tx_search_input,
             tx_search_query: Arc::from(""),
             platform_attention_count: 0,
             platform_attention_window_active: window.is_window_active(),
@@ -1765,613 +1269,21 @@ impl WalletRoot {
             logs_panel_height: LOGS_DRAWER_HEIGHT,
         };
         Self::start_auto_lock_monitor(window, cx);
-        cx.observe_window_activation(window, |root, window, cx| {
-            if window.is_window_active() {
-                root.enforce_auto_lock(window, cx);
-                root.refresh_device_auth_status();
-                cx.notify();
-            }
-            root.sync_platform_attention_for_window(window);
-        })
-        .detach();
-        cx.on_focus_lost(window, |root, window, cx| {
-            root.focus_wallet_view_after_focus_loss(window, cx);
-        })
-        .detach();
-        cx.subscribe(
-            &root.logs_search,
-            |root, search, _: &SearchFieldEvent, cx| {
-                let filter = logs_search::log_filter(search.read(cx).filter());
-                root.logs.update(cx, |logs, cx| logs.set_filter(filter, cx));
-            },
-        )
-        .detach();
-        cx.subscribe_in(&root.logs, window, Self::logs_pane_event)
-            .detach();
-        // The open panel's title bar shows the pane's line counts.
-        cx.observe(&root.logs, |root, _, cx| {
-            if root.logs_open {
-                cx.notify();
-            }
-        })
-        .detach();
-        cx.subscribe(&tx_search_input, |this, input, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                let query = input.read(cx).value().trim().to_ascii_lowercase();
-                this.tx_search_query = Arc::from(query);
-                this.sync_utxo_table(cx);
-                cx.notify();
-            }
-        })
-        .detach();
-        cx.subscribe(
-            &public_account_search_input,
-            |this, input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let query = input.read(cx).value().trim().to_ascii_lowercase();
-                    this.public_form.search_query = Arc::from(query);
-                    this.public_form
-                        .list_scroll
-                        .set_offset(gpui::Point::default());
-                    this.reconcile_public_account_selection();
-                    cx.notify();
-                }
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &root.governance.participant_picker,
-            window,
-            |this, _picker, event, window, cx| {
-                this.participant_picker_event(event, window, cx);
-            },
-        )
-        .detach();
-        cx.subscribe(
-            &root.governance.proposal_action_amount_input,
-            |_this, _input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    cx.notify();
-                }
-            },
-        )
-        .detach();
-        for input in [
-            root.public_form.send_amount_input.clone(),
-            root.public_form.shield_amount_input.clone(),
-            root.public_form.send_gas_fee.max_fee_input.clone(),
-            root.public_form.send_gas_fee.max_priority_fee_input.clone(),
-            root.public_form.shield_gas_fee.max_fee_input.clone(),
-            root.public_form
-                .shield_gas_fee
-                .max_priority_fee_input
-                .clone(),
-            root.public_form.wrap_gas_fee.max_fee_input.clone(),
-            root.public_form.wrap_gas_fee.max_priority_fee_input.clone(),
-            root.public_form.unwrap_gas_fee.max_fee_input.clone(),
-            root.public_form
-                .unwrap_gas_fee
-                .max_priority_fee_input
-                .clone(),
-        ] {
-            cx.subscribe(&input, |_this, _input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    cx.notify();
-                }
-            })
-            .detach();
-        }
-        cx.subscribe(
-            &root.public_form.shield_amount_input,
-            |this, _input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.refresh_native_shield_preparation(cx);
-                }
-            },
-        )
-        .detach();
-        for input in [
-            root.governance.reward_gas_fee.max_fee_input.clone(),
-            root.governance
-                .reward_gas_fee
-                .max_priority_fee_input
-                .clone(),
-        ] {
-            cx.subscribe(&input, |this, _input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.governance_gas_fee_changed(cx);
-                }
-            })
-            .detach();
-        }
-        for input in [
-            root.public_form.advanced_send_to_input.clone(),
-            root.public_form.advanced_send_value_input.clone(),
-            root.public_form.send_gas_fee.max_fee_input.clone(),
-            root.public_form.send_gas_fee.max_priority_fee_input.clone(),
-        ] {
-            cx.subscribe(&input, |this, _input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.invalidate_advanced_public_send_estimate();
-                    cx.notify();
-                }
-            })
-            .detach();
-        }
-        cx.subscribe(
-            &root.public_form.advanced_send_data_input,
-            |this, _input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.invalidate_advanced_public_send_estimate();
-                    cx.notify();
-                }
-            },
-        )
-        .detach();
-        cx.subscribe(
-            &root.address_book.search_input,
-            |this, input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let query = input.read(cx).value().trim().to_ascii_lowercase();
-                    this.address_book.search_query = Arc::from(query);
-                    cx.notify();
-                }
-            },
-        )
-        .detach();
-        for input in [
-            root.address_book.add_label_input.clone(),
-            root.address_book.add_address_input.clone(),
-            root.address_book.edit_label_input.clone(),
-            root.address_book.edit_address_input.clone(),
-        ] {
-            cx.subscribe(&input, |_this, _input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    cx.notify();
-                }
-            })
-            .detach();
-        }
-        for (input, kind) in [
-            (
-                favorite_broadcaster_input,
-                BroadcasterPreferenceListKind::Favorite,
-            ),
-            (
-                banned_broadcaster_input,
-                BroadcasterPreferenceListKind::Banned,
-            ),
-        ] {
-            cx.subscribe_in(
-                &input,
-                window,
-                move |this, _input, event: &InputEvent, window, cx| match event {
-                    InputEvent::PressEnter { .. } => {
-                        this.add_broadcaster_preference_from_input(kind, window, cx);
-                    }
-                    InputEvent::Change => {
-                        this.broadcaster_preference_error = None;
-                        cx.notify();
-                    }
-                    _ => {}
-                },
-            )
-            .detach();
-        }
-        cx.subscribe_in(
-            &chain_select,
-            window,
-            |this, _select, event: &SelectEvent<wallet_header::NetworkSelectItems>, window, cx| {
-                match event {
-                    SelectEvent::Confirm(Some(SelectedNetwork::Evm(chain_id))) => {
-                        this.select_chain(*chain_id, window, cx);
-                    }
-                    SelectEvent::Confirm(Some(SelectedNetwork::Tron)) => {
-                        this.select_tron(window, cx);
-                    }
-                    SelectEvent::Confirm(None) => return,
-                }
-                cx.defer_in(window, |_this, window, cx| {
-                    if should_apply_background_focus(window.has_active_dialog(cx)) {
-                        window.blur(cx);
-                    }
-                });
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &root.walletconnect.uri_input,
-            window,
-            |this, _input, event: &InputEvent, window, cx| match event {
-                InputEvent::PressEnter { .. } => {
-                    this.start_walletconnect_pairing_from_input(window, cx);
-                }
-                InputEvent::Change => {
-                    this.walletconnect.error = None;
-                    cx.notify();
-                }
-                _ => {}
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &root.walletconnect.account_select,
-            window,
-            |this,
-             _select,
-             event: &SelectEvent<
-                FullWidthSelectItems<walletconnect::WalletConnectAccountSelectItem>,
-            >,
-             window,
-             cx| {
-                let SelectEvent::Confirm(Some(public_account_uuid)) = event else {
-                    return;
-                };
-                this.set_walletconnect_selected_account(public_account_uuid.clone(), cx);
-                cx.defer_in(window, |_this, window, cx| {
-                    if should_apply_background_focus(window.has_active_dialog(cx)) {
-                        window.blur(cx);
-                    }
-                });
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &wallet_select,
-            window,
-            |this, _select, event: &SelectEvent<SearchableVec<WalletSelectItem>>, window, cx| {
-                let SelectEvent::Confirm(Some(value)) = event else {
-                    return;
-                };
-                this.select_wallet(value.as_ref(), window, cx);
-                cx.defer_in(window, |_this, window, cx| {
-                    if should_apply_background_focus(window.has_active_dialog(cx)) {
-                        window.blur(cx);
-                    }
-                });
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &root.unlock_password_input,
-            window,
-            |this, _input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.unlock_vault_from_input(window, cx);
-                }
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &root.new_password_input,
-            window,
-            |this, input, event: &InputEvent, window, cx| {
-                if !matches!(event, InputEvent::PressEnter { .. }) {
-                    return;
-                }
-                let password_entered = !input.read(cx).value().trim().is_empty();
-                let confirm_empty = this
-                    .confirm_password_input
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .is_empty();
-                if password_entered && confirm_empty {
-                    this.confirm_password_input
-                        .read(cx)
-                        .focus_handle(cx)
-                        .focus(window, cx);
-                } else {
-                    this.create_vault_from_inputs(window, cx);
-                }
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &root.confirm_password_input,
-            window,
-            |this, _input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.create_vault_from_inputs(window, cx);
-                }
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &root.wallet_name_input,
-            window,
-            |this, _input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.submit_wallet_setup_from_input(window, cx);
-                }
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &root.add_wallet_password_input,
-            window,
-            |this, _input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.submit_wallet_setup_from_input(window, cx);
-                }
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &root.hardware_wallet_restore_account_index_input,
-            window,
-            |this, input, event: &InputEvent, window, cx| match event {
-                InputEvent::PressEnter { .. } => {
-                    this.submit_default_hardware_wallet_setup(window, cx);
-                }
-                InputEvent::Change => {
-                    this.hardware_wallet_restore_account_index_set =
-                        !input.read(cx).value().trim().is_empty();
-                    this.vault_error = None;
-                    cx.notify();
-                }
-                _ => {}
-            },
-        )
-        .detach();
-        #[cfg(feature = "hardware")]
-        {
-            cx.subscribe_in(
-                &root.hardware_profile_password_input,
-                window,
-                |this, _input, event: &InputEvent, window, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
-                        this.unlock_hardware_profile_from_dialog(window, cx);
-                    }
-                },
-            )
-            .detach();
-            for input in [
-                root.hardware_profile_label_input.clone(),
-                root.hardware_profile_recovery_start_input.clone(),
-                root.hardware_profile_recovery_count_input.clone(),
-                root.hardware_profile_exact_index_input.clone(),
-            ] {
-                cx.subscribe(&input, |this, _input, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        this.hardware_profile_unlock.error = None;
-                        cx.notify();
-                    }
-                })
-                .detach();
-            }
-            cx.subscribe_in(
-                &root.trezor_app_passphrase_input,
-                window,
-                |this, _input, event: &InputEvent, window, cx| match event {
-                    InputEvent::PressEnter { .. } => {
-                        this.submit_trezor_profile_passphrase_input(window, cx);
-                    }
-                    InputEvent::Change => {
-                        this.hardware_profile_unlock.error = None;
-                        cx.notify();
-                    }
-                    _ => {}
-                },
-            )
-            .detach();
-        }
-        cx.subscribe(
-            &root.repair_cache_block_input,
-            |this, _input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.repair_wallet_cache_from_input(cx);
-                }
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &root.manage_wallet_label_input,
-            window,
-            |this, _input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.save_wallet_label_edit(window, cx);
-                }
-            },
-        )
-        .detach();
-        cx.subscribe(&root.utxo_table, |_, table, event: &TableEvent, cx| {
-            if let TableEvent::ColumnWidthsChanged(widths) = event {
-                table.update(cx, |table, cx| {
-                    table.delegate_mut().set_column_widths(widths);
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
-        cx.spawn(async move |this, cx| {
-            while monitor_event_rx.changed().await.is_ok() {
-                if this
-                    .update(cx, |root, cx| {
-                        let current_public_broadcaster_count =
-                            ethereum_weth_public_broadcaster_count(&root.monitor_fee_rows());
-                        let public_broadcaster_count_changed = root
-                            .sidebar_public_broadcaster_count
-                            != current_public_broadcaster_count;
-                        root.sidebar_public_broadcaster_count = current_public_broadcaster_count;
-                        if root
-                            .send_forms
-                            .values()
-                            .any(|form| form.delivery_mode == DeliveryMode::PublicBroadcaster)
-                            || root
-                                .unshield_forms
-                                .values()
-                                .any(|form| form.delivery_mode == DeliveryMode::PublicBroadcaster)
-                            || public_broadcaster_count_changed
-                        {
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
-        cx.spawn(async move |this, cx| {
-            while anchor_refresh_rx.changed().await.is_ok() {
-                if this
-                    .update(cx, |root, cx| {
-                        root.refresh_walletconnect_fee_usd_values();
-                        if let Some(settings) = &root.settings_editor {
-                            let editor = settings.read(cx).chain_editor.clone();
-                            editor.update(cx, |editor, cx| {
-                                editor.set_pricing_status(
-                                    root.public_broadcaster_anchor_cache.native_usd_statuses(),
-                                    cx,
-                                );
-                            });
-                        }
-                        root.publish_gateway_desktop_state();
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
-        for input in [
-            &root.public_form.import_label_input,
-            &root.public_form.import_private_key_input,
-        ] {
-            cx.subscribe_in(
-                input,
-                window,
-                |this, _input, event: &InputEvent, window, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
-                        this.import_public_account_from_input(window, cx);
-                    }
-                },
-            )
-            .detach();
-        }
-        cx.subscribe_in(
-            &root.public_form.add_password_input,
-            window,
-            |this, _input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.add_public_derived_account_from_input(window, cx);
-                }
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &root.public_form.import_password_input,
-            window,
-            |this, _input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.import_public_account_from_input(window, cx);
-                }
-            },
-        )
-        .detach();
-        cx.subscribe_in(
-            &root.public_form.edit_label_input,
-            window,
-            |this, _input, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.update_selected_public_account_label(window, cx);
-                }
-            },
-        )
-        .detach();
-        // Owner notifications include private snapshots, progress, metadata, and device outcomes.
-        // Publication does not notify this entity; the gateway coalesces unchanged presentation.
-        cx.observe_self(|root, _cx| {
-            if root.gateway_has_connected_browser() {
-                root.publish_gateway_desktop_state();
-            }
-        })
-        .detach();
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(UTXO_AGE_REFRESH_INTERVAL)
-                    .await;
-                if this
-                    .update(cx, |root, cx| {
-                        if root
-                            .activity_journal_failures
-                            .has_changed()
-                            .unwrap_or(false)
-                        {
-                            root.activity_journal_failures.borrow_and_update();
-                            root.pending_activity_journal_notice = true;
-                            cx.notify();
-                        }
-                        if should_refresh_utxo_ages(
-                            root.active_activity,
-                            root.active_wallet_tab,
-                            root.chain_states
-                                .get(&root.last_evm_chain)
-                                .is_some_and(|state| state.snapshot().is_some()),
-                        ) {
-                            root.utxo_table.update(cx, |_table, cx| cx.notify());
-                        }
-                        root.tick_wallet_activity(cx);
-                        if (root.private_pending_status_dialog_open
-                            || root.gateway_has_connected_browser())
-                            && root.private_pending_status_has_shield_timer()
-                        {
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(UNSHIELD_SPINNER_REFRESH_INTERVAL)
-                    .await;
-                if this
-                    .update(cx, |root, cx| {
-                        if root.send_forms.values().any(|form| {
-                            form.generating || form.cost_estimate_pending || form.estimating_cost
-                        }) || root.unshield_forms.values().any(|form| {
-                            form.generating || form.cost_estimate_pending || form.estimating_cost
-                        }) {
-                            root.unshield_spinner_tick = root.unshield_spinner_tick.wrapping_add(1);
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
-        let public_balance_refresh_interval = root.public_balance_refresh_interval;
-        cx.spawn(async move |this, cx| {
-            let interval = public_balance_refresh_interval;
-            loop {
-                cx.background_executor().timer(interval).await;
-                if this
-                    .update(cx, |root, cx| {
-                        if root.active_wallet_tab == WalletTab::Public {
-                            root.schedule_automatic_public_balance_refresh(cx);
-                        }
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
+        Self::observe_window_focus(window, cx);
+        root.subscribe_logs(window, cx);
+        root.subscribe_utxo_inputs(cx);
+        root.subscribe_public_action_inputs(cx);
+        root.subscribe_governance_inputs(window, cx);
+        root.subscribe_address_book_inputs(window, cx);
+        root.subscribe_header_selects(window, cx);
+        root.subscribe_walletconnect_inputs(window, cx);
+        root.subscribe_vault_inputs(window, cx);
+        root.subscribe_hardware_wallet_inputs(window, cx);
+        root.subscribe_wallet_maintenance_inputs(window, cx);
+        root.subscribe_public_account_inputs(window, cx);
+        Self::start_state_watchers(monitor_event_rx, anchor_refresh_rx, cx);
+        Self::spawn_utxo_age_refresh(cx);
+        root.spawn_form_and_balance_refresh(cx);
         root.spawn_network_health_monitor(cx);
         root.spawn_tor_bridge_activity_sampler(cx);
         root.watch_public_transactions(cx);
@@ -2393,7 +1305,7 @@ pub(super) fn new_text_input<T>(
     cx: &mut Context<'_, T>,
     placeholder: &'static str,
 ) -> Entity<InputState> {
-    cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
+    new_input(window, cx, placeholder, false)
 }
 
 pub(super) fn new_masked_input<T>(
@@ -2401,10 +1313,19 @@ pub(super) fn new_masked_input<T>(
     cx: &mut Context<'_, T>,
     placeholder: &'static str,
 ) -> Entity<InputState> {
+    new_input(window, cx, placeholder, true)
+}
+
+fn new_input<T>(
+    window: &mut Window,
+    cx: &mut Context<'_, T>,
+    placeholder: &'static str,
+    masked: bool,
+) -> Entity<InputState> {
     cx.new(|cx| {
         InputState::new(window, cx)
             .placeholder(placeholder)
-            .masked(true)
+            .masked(masked)
     })
 }
 

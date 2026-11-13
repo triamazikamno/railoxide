@@ -370,6 +370,48 @@ fn hardware_executor_reservations_survive_restart_and_never_recycle_or_enter_pos
     }
 }
 
+#[test]
+fn batch_restore_stops_at_a_mismatched_entry_and_keeps_earlier_entries() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let store = ExecutorStore::new(db.clone(), view.clone(), 1).unwrap();
+    store
+        .restore_index(7, Address::repeat_byte(7), Address::ZERO, &[])
+        .unwrap();
+    assert!(matches!(
+        store.restore_indices(
+            &[
+                (5, Address::repeat_byte(5)),
+                (7, Address::repeat_byte(8)),
+                (9, Address::repeat_byte(9)),
+            ],
+            Address::ZERO,
+            &[],
+        ),
+        Err(ExecutorStoreError::OperationMismatch)
+    ));
+    let records = store.records().unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (record.index(), record.address()))
+            .collect::<Vec<_>>(),
+        [
+            (5, Some(Address::repeat_byte(5))),
+            (7, Some(Address::repeat_byte(7))),
+        ]
+    );
+    drop(store);
+    drop(view);
+    drop(vault);
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test]
 async fn executor_payload_handoff_is_durable_and_does_not_duplicate_on_retry() {
     let (root, db, vault) = desktop_store_with_vault();

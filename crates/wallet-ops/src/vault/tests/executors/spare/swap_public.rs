@@ -2294,7 +2294,7 @@ impl PublicPayment {
 // deposit. The path and its terms are in the record before the deposit is broadcast, each
 // transaction is in it before its own broadcast, and the hand-off is read from the deposit's
 // block once that block is final.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_public_swap_approves_then_deposits_with_its_path_recorded_first() {
     let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::ONE).await;
 
@@ -2446,7 +2446,7 @@ async fn a_public_swap_approves_then_deposits_with_its_path_recorded_first() {
 
 // The native asset is deposited as the transaction's value: one transaction, no approval and
 // no allowance read.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_native_public_swap_deposits_its_amount_as_value_without_an_approval() {
     let (payment, owner) = PublicPayment::start(Address::ZERO, U256::ZERO).await;
     payment.approve(&owner).await.unwrap();
@@ -2485,7 +2485,7 @@ async fn a_native_public_swap_deposits_its_amount_as_value_without_an_approval()
 
 // A deposit that reverts bridged nothing: its failed inclusion is recorded, no hand-off ever
 // is, and the destination account's shield stays recorded as it was.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_reverted_public_swap_deposit_hands_nothing_off() {
     for succeeds_after_reorg in [false, true] {
         let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::MAX).await;
@@ -2911,7 +2911,7 @@ async fn a_deposit_reorganized_below_its_sending_head_is_found_not_ruled_out() {
 // after the nonce read. The rule-out survives a restart and admits no late inclusion. Before
 // it the swap takes no other deposit. After it the swap is back in preparation with its
 // destination shield kept, and either deposits again under the next nonce or is cancelled.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_deposit_whose_nonce_another_transaction_used_is_ruled_out() {
     for cancels in [false, true] {
         let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::MAX).await;
@@ -3078,7 +3078,7 @@ async fn a_deposit_whose_nonce_another_transaction_used_is_ruled_out() {
 // inclusion stays recorded and doesn't hold the deposit live: the final block holds the other
 // transaction instead, so the deposit is ruled out, and the swap deposits again under the next
 // nonce with its destination shield kept.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_deposit_whose_provisional_block_was_orphaned_for_its_nonce_is_ruled_out() {
     let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::MAX).await;
     let shield_state = payment.saved().record.payload_state(payment.shield);
@@ -3634,7 +3634,7 @@ async fn an_order_is_refused_until_the_math_contract_is_deployed_on_its_chain() 
 
 // A direct deposit runs no hook, so it never reads the math contract and goes through on a
 // chain that doesn't have it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_direct_deposit_needs_no_math_contract() {
     let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::ZERO).await;
     payment.chain.lock().unwrap().math_code = Bytes::new();
@@ -3905,7 +3905,7 @@ async fn a_late_run_of_a_public_orders_batch_is_found_at_its_deadline() {
 // deploys the proxy, carrying a batch of its own that pays only the account. It is recorded
 // before its broadcast, and the withdrawal counts once its block is final. Tracking continues
 // until the final query at the hook batch's deadline rules out a deposit.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn held_public_order_proceeds_are_withdrawn_to_the_public_account_through_the_factory() {
     let (payment, owner) = PublicPayment::start_order().await;
     let (orderbook, _requests, orderbook_task) = payment.orderbook(false).await;
@@ -4282,7 +4282,7 @@ async fn invalidate(
 
 // The invalidation succeeds on an order that already filled, so its inclusion decides nothing:
 // the orderbook reports the trade, and the swap follows its settlement.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_invalidation_included_after_a_fill_leaves_the_public_order_traded() {
     let (payment, owner) = PublicPayment::start_order().await;
     let (orderbook, _requests, orderbook_task) = payment.orderbook(false).await;
@@ -4324,7 +4324,7 @@ async fn an_invalidation_included_after_a_fill_leaves_the_public_order_traded() 
 // expired. The orderbook doesn't report the trade at the first lookup but does when asked again
 // before either is recorded, so neither is: the swap stays tracked past its batch's deadline,
 // and the next observation reads the trade.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_invalidated_fill_the_orderbook_reports_late_is_neither_cancelled_nor_expired() {
     for past_valid_to in [false, true] {
         let (payment, owner) = PublicPayment::start_order().await;
@@ -4375,7 +4375,7 @@ async fn an_invalidated_fill_the_orderbook_reports_late_is_neither_cancelled_nor
 // An invalidation only cancels once the settlement holds it in final canonical state. A
 // provisional receipt that is reorganized out cannot release same-token selling or prevent
 // another invalidation. The hook batch stays signed, so same-token buying remains blocked.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_invalidation_without_a_trade_cancels_the_public_order_and_keeps_its_batch() {
     let (payment, owner) = PublicPayment::start_order().await;
     let (orderbook, _requests, orderbook_task) = payment.orderbook(false).await;
@@ -5010,7 +5010,7 @@ async fn a_public_swap_is_delivered_by_the_fill_of_its_deposited_amounts_and_its
 
 // The fill completed and its receipt holds no shield: the destination account holds the token,
 // and its shield payload can still run.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_public_swaps_fill_without_its_shield_is_held_on_the_destination() {
     let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::MAX).await;
     let (across, reply, _lookups, across_task) = across_stub().await;
@@ -5141,7 +5141,7 @@ async fn a_public_swaps_fill_without_its_shield_is_held_on_the_destination() {
 // Across reports the deposit filled, but no endpoint of the destination chain serves
 // whole-block receipts. The delivery is private, so Across's word is not recorded: the swap
 // stays tracked, and is delivered once the fill can be read.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_public_swaps_fill_that_cant_be_read_is_not_recorded_on_the_word_of_across() {
     let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::MAX).await;
     let (across, reply, _lookups, across_task) = across_stub().await;
@@ -5205,7 +5205,7 @@ async fn a_public_swaps_fill_that_cant_be_read_is_not_recorded_on_the_word_of_ac
 // final receipts of the block holding the transaction Across names: the deposited amount of the
 // deposit's token from the pinned pool to the Public account. A verified refund is returned
 // once, ends the swap's tracking, and releases nothing of the destination account.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_refunding_public_swaps_refund_to_its_public_account_is_verified_on_the_origin_chain() {
     let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::MAX).await;
     let (across, reply, _lookups, across_task) = across_stub().await;
@@ -5308,7 +5308,7 @@ async fn a_refunding_public_swaps_refund_to_its_public_account_is_verified_on_th
 // Across can fill a deposit it reported expired. Routine polling stops at the refund, and an
 // explicit status check asks again: the verified fill replaces the refund, and the destination
 // account's shield payload is recorded as run.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_explicit_check_replaces_a_public_swaps_refund_with_its_verified_fill() {
     let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::MAX).await;
     let (across, reply, _lookups, across_task) = across_stub().await;
@@ -5378,7 +5378,7 @@ const NO_PROGRESS: PublicSwapProgress = PublicSwapProgress {
 // loaded again: no owner of the chain the Public account pays on, and no wallet session. It
 // lists the swap, and its tracking steps read the hand-off, the fill and the shield, after
 // which the swap is finished and no longer listed.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_public_swap_resumes_from_its_destination_chains_owner_alone() {
     let (payment, owner) = PublicPayment::start(DESTINATION_TOKEN, U256::MAX).await;
     let (across, reply, _lookups, across_task) = across_stub().await;

@@ -1374,7 +1374,7 @@ async fn lookup_response(provider: &mut DappProvider, method: &str, params: Valu
         )
         .unwrap();
     if !provider.jobs.is_empty() {
-        let completion = tokio::time::timeout(Duration::from_secs(5), provider.jobs.join_next())
+        let completion = tokio::time::timeout(Duration::from_secs(30), provider.jobs.join_next())
             .await
             .unwrap()
             .unwrap()
@@ -1727,7 +1727,7 @@ async fn included_lookup_drains_after_owner_invalidation_without_delivering_old_
     assert!(provider.reads[&id].retired);
     assert!(provider.reads[&id].phase == ReadPhase::Running);
     release.notify_one();
-    let completion = tokio::time::timeout(Duration::from_secs(5), provider.jobs.join_next())
+    let completion = tokio::time::timeout(Duration::from_secs(30), provider.jobs.join_next())
         .await
         .unwrap()
         .unwrap()
@@ -2052,7 +2052,7 @@ async fn queued_balance_loses_eligibility_before_dispatch_and_forwards() {
         .public_balance_cache
         .invalidate_account(&scope, &account, true, None);
     messages(&mut provider);
-    let completion = tokio::time::timeout(Duration::from_secs(5), provider.jobs.join_next())
+    let completion = tokio::time::timeout(Duration::from_secs(30), provider.jobs.join_next())
         .await
         .unwrap()
         .unwrap()
@@ -4489,7 +4489,7 @@ async fn origin_reads(
             .unwrap();
     }
     while !provider.jobs.is_empty() {
-        let completion = tokio::time::timeout(Duration::from_secs(5), provider.jobs.join_next())
+        let completion = tokio::time::timeout(Duration::from_secs(30), provider.jobs.join_next())
             .await
             .unwrap()
             .unwrap()

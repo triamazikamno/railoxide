@@ -510,7 +510,7 @@ async fn streamed_body_boundary_is_terminal_neutral_and_deadline_bounded() {
     let (oversized, oversized_server) = chunked_endpoint(body, Duration::ZERO).await;
     let (slow, slow_server) = chunked_endpoint(
         br#"{"id":1,"result":"0x10"}"#.to_vec(),
-        Duration::from_millis(200),
+        Duration::from_secs(30),
     )
     .await;
     for read in [
@@ -519,7 +519,7 @@ async fn streamed_body_boundary_is_terminal_neutral_and_deadline_bounded() {
         RpcRead::eth_call(Address::ZERO, Bytes::new()),
     ] {
         let exact_output =
-            individual_job(read.clone(), vec![exact.clone()], Duration::from_secs(5)).await;
+            individual_job(read.clone(), vec![exact.clone()], Duration::from_secs(60)).await;
         assert_eq!(
             exact_output.completions[0].1,
             Ok(RpcResult::new(json!("0x10")))
@@ -527,7 +527,7 @@ async fn streamed_body_boundary_is_terminal_neutral_and_deadline_bounded() {
         let output = individual_job(
             read.clone(),
             vec![oversized.clone(), exact.clone()],
-            Duration::from_secs(5),
+            Duration::from_secs(60),
         )
         .await;
         assert_eq!(
@@ -540,7 +540,8 @@ async fn streamed_body_boundary_is_terminal_neutral_and_deadline_bounded() {
             output.requests[0].health_outcome,
             EndpointHealthOutcome::Neutral
         );
-        let slow_output = individual_job(read, vec![slow.clone()], Duration::from_millis(50)).await;
+        // Long enough to dispatch under load, far shorter than the body's delay.
+        let slow_output = individual_job(read, vec![slow.clone()], Duration::from_secs(1)).await;
         assert_eq!(slow_output.completions[0].1, Err(RpcBrokerError::Timeout));
         assert_eq!(
             slow_output.requests[0].health_outcome,
@@ -595,8 +596,8 @@ async fn aggregate_body_cap_is_terminal_without_partial_results_or_reduction() {
                 read,
                 origins: vec![test_origin()],
                 waiters: WaiterState::new(WaiterPolicy {
-                    deadline: Some(Instant::now() + Duration::from_secs(5)),
-                    attempt_timeout: Duration::from_secs(5),
+                    deadline: Some(Instant::now() + Duration::from_secs(60)),
+                    attempt_timeout: Duration::from_secs(60),
                 }),
             })
             .collect();

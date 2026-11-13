@@ -2,12 +2,13 @@ use super::*;
 use crate::root::auto_lock::AutoLockTimestamp;
 use crate::root::chain_load::{
     ChainProgressProjection, ChainSyncProgress, InstalledObserverProjection,
-    WalletReadinessDisposition, WalletSyncLifecycle, WalletSyncLifecycleCleanupTask,
-    WalletSyncLifecycleCleanupWaitGroup, chain_load_start_is_allowed,
-    chain_progress_update_is_current, destructive_cache_reset_admission_is_allowed,
-    installed_observer_is_exact_current, installed_observer_terminal_transition,
-    ppoi_validation_completion_is_current, ppoi_validation_toast_scope_is_current,
-    retain_auxiliary_stream, wallet_readiness_disposition, wallet_sync_maintenance_allows_start,
+    WalletReadinessDisposition, WalletSyncLifecycle, WalletSyncLifecycleCleanupReport,
+    WalletSyncLifecycleCleanupTask, WalletSyncLifecycleCleanupWaitGroup,
+    chain_load_start_is_allowed, chain_progress_update_is_current,
+    destructive_cache_reset_admission_is_allowed, installed_observer_is_exact_current,
+    installed_observer_terminal_transition, ppoi_validation_completion_is_current,
+    ppoi_validation_toast_scope_is_current, retain_auxiliary_stream, wait_for_wallet_sync_cleanups,
+    wallet_readiness_disposition, wallet_sync_maintenance_allows_start,
     wallet_sync_start_is_admitted,
 };
 use crate::root::maintenance::{PublicSyncResetCompletion, public_sync_reset_restart_is_safe};
@@ -905,6 +906,21 @@ async fn wallet_sync_lifecycle_cleanup_detects_late_initialized_store() {
     drop(db);
     drop(vault_store);
     let _ = fs::remove_dir_all(root_dir);
+}
+
+#[tokio::test]
+async fn session_store_open_waits_for_pending_wallet_sync_cleanup() {
+    let (pending, pending_tx) = WalletSyncLifecycleCleanupTask::channel_for_test();
+    let mut wait = Box::pin(wait_for_wallet_sync_cleanups(vec![
+        WalletSyncLifecycleCleanupTask::closed_for_test(),
+        pending,
+    ]));
+
+    assert!(futures_util::poll!(wait.as_mut()).is_pending());
+    pending_tx
+        .send(Some(WalletSyncLifecycleCleanupReport::default()))
+        .expect("cleanup receiver is alive");
+    assert!(futures_util::poll!(wait.as_mut()).is_ready());
 }
 
 #[tokio::test]

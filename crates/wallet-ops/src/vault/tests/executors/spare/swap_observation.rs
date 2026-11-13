@@ -6865,7 +6865,7 @@ async fn across_fills_need_the_pinned_pool_or_the_token_transfer_and_are_otherwi
 /// every Sensitive endpoint lacks whole-block receipts, yields one. A read that could still turn
 /// out otherwise leaves the swap to be checked again. An endpoint whose identity check passes
 /// after the first ones were tried is still asked. A General-only endpoint is never asked.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn across_reports_a_delivery_only_when_no_later_read_could_verify_it() {
     // The final fill block holds a fill event without evidence, as for a native delivery. 0: it
     // leaves the chain during the read. 1: the chain's only endpoint has no whole-block

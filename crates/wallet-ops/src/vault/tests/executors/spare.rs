@@ -1250,7 +1250,7 @@ async fn hardware_stopping_restore_keeps_the_derived_range_without_applying_a_la
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn hardware_restore_checks_64_addresses_on_own_routes_and_keeps_success_after_failure_and_restart()
  {
     // Building a client loads TLS roots, so each tagged client is built once and reused by

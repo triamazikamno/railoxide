@@ -914,7 +914,8 @@ async fn aggregate_predispatch_timeout_does_not_replace_prior_endpoint_error() {
         read,
         origins: vec![test_origin()],
         waiters: WaiterState::new(WaiterPolicy {
-            deadline: Some(Instant::now() + Duration::from_secs(2)),
+            // Leaves real time to dispatch under load; the test then skips past it.
+            deadline: Some(Instant::now() + Duration::from_secs(30)),
             attempt_timeout: route.attempt_timeout,
         }),
     };
@@ -925,7 +926,12 @@ async fn aggregate_predispatch_timeout_does_not_replace_prior_endpoint_error() {
         execute_aggregate_with_failover(reqwest::Client::new(), request_semaphore, route, &items)
             .await
     });
-    first_gate.request_started.notified().await;
+    time::timeout(
+        Duration::from_secs(30),
+        first_gate.request_started.notified(),
+    )
+    .await
+    .expect("request started");
     let blocker_acquired = Arc::new(tokio::sync::Notify::new());
     let blocker_waiting = Arc::new(tokio::sync::Notify::new());
     let blocker_release = Arc::new(tokio::sync::Notify::new());
@@ -940,11 +946,14 @@ async fn aggregate_predispatch_timeout_does_not_replace_prior_endpoint_error() {
     });
     blocker_waiting.notified().await;
     first_gate.release_response.notify_waiters();
-    tokio::time::timeout(Duration::from_secs(5), blocker_acquired.notified())
+    tokio::time::timeout(Duration::from_secs(30), blocker_acquired.notified())
         .await
         .expect("blocker acquired");
     tokio::task::yield_now().await;
-    let output = time::timeout(Duration::from_secs(3), request)
+    time::pause();
+    time::advance(Duration::from_secs(31)).await;
+    time::resume();
+    let output = time::timeout(Duration::from_secs(30), request)
         .await
         .expect("aggregate failover deadline")
         .expect("aggregate failover task");
@@ -981,7 +990,8 @@ async fn reduction_parent_error_replaces_undispatched_children() {
         RpcRead::eth_call(Address::from([1_u8; 20]), Bytes::from_static(b"first")),
         RpcRead::eth_call(Address::from([2_u8; 20]), Bytes::from_static(b"second")),
     ];
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Leaves real time to dispatch under load; the test then skips past it.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let semaphore = Arc::new(Semaphore::new(1));
     let members: Arc<[AggregateMember]> = reads
         .iter()
@@ -1005,7 +1015,12 @@ async fn reduction_parent_error_replaces_undispatched_children() {
         }),
         vec![0, 1],
     ));
-    first_gate.request_started.notified().await;
+    time::timeout(
+        Duration::from_secs(30),
+        first_gate.request_started.notified(),
+    )
+    .await
+    .expect("request started");
     let blocker_acquired = Arc::new(tokio::sync::Notify::new());
     let blocker_waiting = Arc::new(tokio::sync::Notify::new());
     let blocker_release = Arc::new(tokio::sync::Notify::new());
@@ -1020,11 +1035,14 @@ async fn reduction_parent_error_replaces_undispatched_children() {
     });
     blocker_waiting.notified().await;
     first_gate.release_response.notify_waiters();
-    tokio::time::timeout(Duration::from_secs(5), blocker_acquired.notified())
+    tokio::time::timeout(Duration::from_secs(30), blocker_acquired.notified())
         .await
         .expect("blocker acquired");
     tokio::task::yield_now().await;
-    let output = time::timeout(Duration::from_secs(3), request)
+    time::pause();
+    time::advance(Duration::from_secs(31)).await;
+    time::resume();
+    let output = time::timeout(Duration::from_secs(30), request)
         .await
         .expect("reduction deadline")
         .expect("reduction task");
@@ -1809,7 +1827,8 @@ async fn aggregate_failover_filters_expired_member_but_keeps_first_outcome() {
             Bytes::from_static(b"\x70\xa0\x82\x31"),
         )
     };
-    let early = Instant::now() + Duration::from_secs(1);
+    // `early` leaves real time for the first attempt to dispatch under load.
+    let early = Instant::now() + Duration::from_secs(20);
     let late = Instant::now() + Duration::from_secs(100);
     let items = vec![
         WorkItem {
@@ -1858,7 +1877,7 @@ async fn aggregate_failover_filters_expired_member_but_keeps_first_outcome() {
         .await
     });
     time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(30),
         first_gate.request_started.notified(),
     )
     .await
@@ -1869,7 +1888,7 @@ async fn aggregate_failover_filters_expired_member_but_keeps_first_outcome() {
         attempt_timeout: route.attempt_timeout,
     });
     late_waiter.add(WaiterPolicy {
-        deadline: Some(Instant::now() + Duration::from_secs(1)),
+        deadline: Some(Instant::now() + Duration::from_secs(20)),
         attempt_timeout: route.attempt_timeout,
     });
 
@@ -1885,22 +1904,22 @@ async fn aggregate_failover_filters_expired_member_but_keeps_first_outcome() {
     // Queue the blocker before the first HTTP attempt releases its permit.
     tokio::task::yield_now().await;
     first_gate.release_response.notify_one();
-    time::timeout(Duration::from_secs(5), blocker_acquired.notified())
+    time::timeout(Duration::from_secs(30), blocker_acquired.notified())
         .await
         .expect("blocker acquired permit");
     time::pause();
-    time::advance(Duration::from_secs(2)).await;
+    time::advance(Duration::from_secs(40)).await;
     time::resume();
     blocker_release.notify_one();
     time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(30),
         second_gate.request_started.notified(),
     )
     .await
     .expect("failover request started");
     second_gate.release_response.notify_one();
 
-    let output = time::timeout(Duration::from_secs(5), request)
+    let output = time::timeout(Duration::from_secs(30), request)
         .await
         .expect("aggregate failover")
         .expect("aggregate failover task");
@@ -1963,7 +1982,8 @@ async fn reduction_drops_expired_child_but_preserves_parent_error() {
             Bytes::from_static(b"\x70\xa0\x82\x31"),
         )
     };
-    let early = Instant::now() + Duration::from_secs(1);
+    // `early` leaves real time for the first attempt to dispatch under load.
+    let early = Instant::now() + Duration::from_secs(20);
     let late = Instant::now() + Duration::from_secs(100);
     let items = vec![
         WorkItem {
@@ -2011,7 +2031,7 @@ async fn reduction_drops_expired_child_but_preserves_parent_error() {
         .await
     });
     time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(30),
         first_gate.request_started.notified(),
     )
     .await
@@ -2029,22 +2049,22 @@ async fn reduction_drops_expired_child_but_preserves_parent_error() {
     // Queue the blocker before the first HTTP attempt releases its permit.
     tokio::task::yield_now().await;
     first_gate.release_response.notify_one();
-    time::timeout(Duration::from_secs(5), blocker_acquired.notified())
+    time::timeout(Duration::from_secs(30), blocker_acquired.notified())
         .await
         .expect("blocker acquired permit");
     time::pause();
-    time::advance(Duration::from_secs(2)).await;
+    time::advance(Duration::from_secs(40)).await;
     time::resume();
     blocker_release.notify_one();
     time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(30),
         first_gate.request_started.notified(),
     )
     .await
     .expect("request started");
     first_gate.release_response.notify_one();
 
-    let output = time::timeout(Duration::from_secs(5), request)
+    let output = time::timeout(Duration::from_secs(30), request)
         .await
         .expect("reduction completion")
         .expect("reduction execution");

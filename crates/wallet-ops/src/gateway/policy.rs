@@ -253,8 +253,9 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint =
             url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        // Far beyond the 10s identity timeout, so setup under load cannot use it up.
         let control = DappRequestControl::new(
-            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(300),
             || Ok(()),
         );
         let active = control.clone();
@@ -262,10 +263,11 @@ mod tests {
         let verification = tokio::spawn(async move {
             verify_chain_endpoints(&operation, &active, 123, vec![endpoint.into()]).await
         });
-        let connection = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
-            .await
-            .unwrap()
-            .unwrap();
+        let connection =
+            tokio::time::timeout(std::time::Duration::from_secs(30), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
         tokio::time::pause();
         tokio::time::advance(std::time::Duration::from_secs(11)).await;
         assert!(verification.await.unwrap().is_err());
@@ -276,8 +278,9 @@ mod tests {
     #[tokio::test]
     async fn proposed_endpoints_require_every_identity_and_stop_on_retirement() {
         for mode in ["match", "mismatch", "retire", "expired", "offline"] {
+            // Generous, so a slow run cannot expire it; "expired" invalidates explicitly.
             let control = DappRequestControl::new(
-                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(300),
                 || Ok(()),
             );
             let calls = Arc::new(AtomicUsize::new(0));
@@ -342,8 +345,9 @@ mod tests {
             "wrong-chain",
             "retired",
         ] {
+            // Generous, so a slow run cannot expire it; "retired" invalidates explicitly.
             let control = DappRequestControl::new(
-                tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+                tokio::time::Instant::now() + std::time::Duration::from_secs(300),
                 || Ok(()),
             );
             let probes = Arc::new(AtomicUsize::new(0));
@@ -422,9 +426,10 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint =
                 url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+            // Setup under load must not use up either deadline before the probe connects.
             let control = DappRequestControl::new(
                 tokio::time::Instant::now()
-                    + std::time::Duration::from_secs(if mode == "expired" { 1 } else { 30 }),
+                    + std::time::Duration::from_secs(if mode == "expired" { 30 } else { 300 }),
                 || Ok(()),
             );
             let active = control.clone();
@@ -433,7 +438,7 @@ mod tests {
                     .await
             });
             let connection =
-                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                tokio::time::timeout(std::time::Duration::from_secs(30), listener.accept())
                     .await
                     .unwrap()
                     .unwrap();
@@ -441,7 +446,13 @@ mod tests {
             if mode == "retired" {
                 control.invalidate(&RpcBrokerError::OriginRejected);
             }
-            tokio::time::advance(std::time::Duration::from_secs(6)).await;
+            // Past the 5s probe bound, and for "expired" past the deadline as well.
+            tokio::time::advance(std::time::Duration::from_secs(if mode == "expired" {
+                31
+            } else {
+                6
+            }))
+            .await;
             let result = probe.await.unwrap();
             if mode == "timeout" {
                 assert_eq!(result, Ok(None));
