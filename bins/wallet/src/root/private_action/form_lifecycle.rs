@@ -32,6 +32,25 @@ impl BroadcasterFilter {
     }
 }
 
+/// Opens or closes one of a private form's fee breakdowns.
+#[derive(Clone, Copy)]
+enum FeeBreakdownOpen {
+    TransactionFee(bool),
+    SponsoredFunding(bool),
+}
+
+impl FeeBreakdownOpen {
+    /// Applies the change to the `(transaction_fee, sponsored_funding)` open flags and
+    /// reports whether the flag changed.
+    const fn apply(self, (transaction_fee, sponsored_funding): (&mut bool, &mut bool)) -> bool {
+        let (flag, open) = match self {
+            Self::TransactionFee(open) => (transaction_fee, open),
+            Self::SponsoredFunding(open) => (sponsored_funding, open),
+        };
+        std::mem::replace(flag, open) != open
+    }
+}
+
 impl WalletRoot {
     /// Runs `change` once the user accepts that an earlier proof of this payment may still
     /// execute alongside the next one. Cancel leaves everything as it was.
@@ -492,27 +511,7 @@ impl WalletRoot {
         open: bool,
         cx: &mut Context<'_, Self>,
     ) {
-        let changed = match kind {
-            DeliveryFormKind::Send => self.send_forms.get_mut(&key).is_some_and(|form| {
-                if form.transaction_fee_breakdown_open == open {
-                    false
-                } else {
-                    form.transaction_fee_breakdown_open = open;
-                    true
-                }
-            }),
-            DeliveryFormKind::Unshield => self.unshield_forms.get_mut(&key).is_some_and(|form| {
-                if form.transaction_fee_breakdown_open == open {
-                    false
-                } else {
-                    form.transaction_fee_breakdown_open = open;
-                    true
-                }
-            }),
-        };
-        if changed {
-            cx.notify();
-        }
+        self.set_fee_breakdown_open(kind, key, FeeBreakdownOpen::TransactionFee(open), cx);
     }
 
     pub(in crate::root) fn set_sponsored_funding_breakdown_open(
@@ -522,22 +521,28 @@ impl WalletRoot {
         open: bool,
         cx: &mut Context<'_, Self>,
     ) {
+        self.set_fee_breakdown_open(kind, key, FeeBreakdownOpen::SponsoredFunding(open), cx);
+    }
+
+    fn set_fee_breakdown_open(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        change: FeeBreakdownOpen,
+        cx: &mut Context<'_, Self>,
+    ) {
         let changed = match kind {
             DeliveryFormKind::Send => self.send_forms.get_mut(&key).is_some_and(|form| {
-                if form.sponsored_funding_breakdown_open == open {
-                    false
-                } else {
-                    form.sponsored_funding_breakdown_open = open;
-                    true
-                }
+                change.apply((
+                    &mut form.transaction_fee_breakdown_open,
+                    &mut form.sponsored_funding_breakdown_open,
+                ))
             }),
             DeliveryFormKind::Unshield => self.unshield_forms.get_mut(&key).is_some_and(|form| {
-                if form.sponsored_funding_breakdown_open == open {
-                    false
-                } else {
-                    form.sponsored_funding_breakdown_open = open;
-                    true
-                }
+                change.apply((
+                    &mut form.transaction_fee_breakdown_open,
+                    &mut form.sponsored_funding_breakdown_open,
+                ))
             }),
         };
         if changed {

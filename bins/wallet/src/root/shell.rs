@@ -245,12 +245,16 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if matches!(self.vault_state, VaultState::ViewUnlocked)
-            && self.active_activity == Activity::Wallet
+        if self.unlocked_wallet_activity_is_active()
             && should_apply_background_focus(window.has_active_dialog(cx))
         {
             self.wallet_focus.focus(window, cx);
         }
+    }
+
+    fn unlocked_wallet_activity_is_active(&self) -> bool {
+        matches!(self.vault_state, VaultState::ViewUnlocked)
+            && self.active_activity == Activity::Wallet
     }
 
     pub(super) fn focus_public_account_search_if_requested(
@@ -258,10 +262,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if !self.focus_public_account_search_on_render
-            || self.active_activity != Activity::Wallet
-            || self.active_wallet_tab != WalletTab::Public
-        {
+        if !self.focus_public_account_search_on_render || !self.public_wallet_tab_is_active() {
             return;
         }
 
@@ -271,6 +272,10 @@ impl WalletRoot {
             .focus_handle(cx)
             .focus(window, cx);
         self.focus_public_account_search_on_render = false;
+    }
+
+    fn public_wallet_tab_is_active(&self) -> bool {
+        self.active_activity == Activity::Wallet && self.active_wallet_tab == WalletTab::Public
     }
 }
 

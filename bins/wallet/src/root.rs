@@ -1305,7 +1305,7 @@ pub(super) fn new_text_input<T>(
     cx: &mut Context<'_, T>,
     placeholder: &'static str,
 ) -> Entity<InputState> {
-    cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
+    new_input(window, cx, placeholder, false)
 }
 
 pub(super) fn new_masked_input<T>(
@@ -1313,10 +1313,19 @@ pub(super) fn new_masked_input<T>(
     cx: &mut Context<'_, T>,
     placeholder: &'static str,
 ) -> Entity<InputState> {
+    new_input(window, cx, placeholder, true)
+}
+
+fn new_input<T>(
+    window: &mut Window,
+    cx: &mut Context<'_, T>,
+    placeholder: &'static str,
+    masked: bool,
+) -> Entity<InputState> {
     cx.new(|cx| {
         InputState::new(window, cx)
             .placeholder(placeholder)
-            .masked(true)
+            .masked(masked)
     })
 }
 
