@@ -734,10 +734,10 @@ impl WalletRoot {
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
     }
 
-    pub(in crate::root) fn set_unshield_allow_suspicious_broadcasters(
+    pub(super) fn set_unshield_broadcaster_filter(
         &mut self,
         key: UnshieldAssetKey,
-        allow: bool,
+        filter: BroadcasterFilter,
         cx: &mut Context<'_, Self>,
     ) {
         let Some((
@@ -747,8 +747,7 @@ impl WalletRoot {
             native_top_up,
             choice,
             generating,
-            current_allow,
-            favorites_only,
+            current_filters,
             resolved_random_broadcaster,
             random_estimate_in_flight,
         )) = self.unshield_forms.get(&key).map(|form| {
@@ -759,8 +758,10 @@ impl WalletRoot {
                 form.native_top_up_enabled && form.native_top_up.is_some(),
                 form.broadcaster_choice.clone(),
                 form.generating,
-                form.allow_suspicious_broadcasters,
-                form.favorites_only_broadcasters,
+                (
+                    form.allow_suspicious_broadcasters,
+                    form.favorites_only_broadcasters,
+                ),
                 form.cost_estimate
                     .as_ref()
                     .map(|estimate| estimate.broadcaster.railgun_address.clone()),
@@ -770,89 +771,8 @@ impl WalletRoot {
         else {
             return;
         };
-        if generating || current_allow == allow {
-            return;
-        }
-        let policy = self.public_broadcaster_fee_policy(allow);
-        let candidates = self.current_public_broadcaster_candidates(
-            chain_id,
-            fee_token,
-            unwrap,
-            native_top_up,
-            favorites_only,
-            policy,
-        );
-        let preserve_estimate = should_preserve_estimate_after_broadcaster_policy_change(
-            &choice,
-            resolved_random_broadcaster.as_deref(),
-            random_estimate_in_flight,
-            &candidates,
-            policy,
-        );
-        let reset_specific =
-            matches!(choice, BroadcasterChoice::Specific { .. }) && !preserve_estimate;
-        let Some(form) = self.unshield_forms.get_mut(&key) else {
-            return;
-        };
-        form.allow_suspicious_broadcasters = allow;
-        if reset_specific {
-            form.broadcaster_choice = BroadcasterChoice::Random;
-            form.custom_fee_amount = None;
-        }
-        let should_reestimate = !preserve_estimate;
-        if should_reestimate {
-            form.error = None;
-            form.result = None;
-            form.estimate_id = 0;
-            form.cost_estimate_pending = false;
-            form.estimating_cost = false;
-        }
-        cx.notify();
-        if should_reestimate {
-            self.invalidate_broadcaster_picker_fee_estimate(DeliveryFormKind::Unshield, key, cx);
-            self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
-            self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
-            self.schedule_broadcaster_picker_fee_estimate(DeliveryFormKind::Unshield, key, cx);
-        }
-    }
-
-    pub(super) fn set_unshield_favorites_only_broadcasters(
-        &mut self,
-        key: UnshieldAssetKey,
-        enabled: bool,
-        cx: &mut Context<'_, Self>,
-    ) {
-        let Some((
-            chain_id,
-            fee_token,
-            unwrap,
-            native_top_up,
-            choice,
-            generating,
-            allow_suspicious,
-            current_enabled,
-            resolved_random_broadcaster,
-            random_estimate_in_flight,
-        )) = self.unshield_forms.get(&key).map(|form| {
-            (
-                form.asset.chain_id,
-                form.selected_fee_token,
-                form.unwrap,
-                form.native_top_up_enabled && form.native_top_up.is_some(),
-                form.broadcaster_choice.clone(),
-                form.generating,
-                form.allow_suspicious_broadcasters,
-                form.favorites_only_broadcasters,
-                form.cost_estimate
-                    .as_ref()
-                    .map(|estimate| estimate.broadcaster.railgun_address.clone()),
-                form.cost_estimate_pending || form.estimating_cost,
-            )
-        })
-        else {
-            return;
-        };
-        if generating || current_enabled == enabled {
+        let (allow_suspicious, favorites_only) = filter.apply(current_filters);
+        if generating || (allow_suspicious, favorites_only) == current_filters {
             return;
         }
         let policy = self.public_broadcaster_fee_policy(allow_suspicious);
@@ -861,7 +781,7 @@ impl WalletRoot {
             fee_token,
             unwrap,
             native_top_up,
-            enabled,
+            favorites_only,
             policy,
         );
         let preserve_estimate = should_preserve_estimate_after_broadcaster_policy_change(
@@ -876,7 +796,8 @@ impl WalletRoot {
         let Some(form) = self.unshield_forms.get_mut(&key) else {
             return;
         };
-        form.favorites_only_broadcasters = enabled;
+        form.allow_suspicious_broadcasters = allow_suspicious;
+        form.favorites_only_broadcasters = favorites_only;
         if reset_specific {
             form.broadcaster_choice = BroadcasterChoice::Random;
             form.custom_fee_amount = None;

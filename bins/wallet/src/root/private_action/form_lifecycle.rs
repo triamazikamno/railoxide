@@ -15,6 +15,23 @@ const DOUBLE_PAYMENT_RISK: ConfirmationDialogProps = ConfirmationDialogProps::da
     "Continue anyway",
 );
 
+/// A change to one of a private form's public broadcaster filters.
+#[derive(Clone, Copy)]
+enum BroadcasterFilter {
+    AllowSuspicious(bool),
+    FavoritesOnly(bool),
+}
+
+impl BroadcasterFilter {
+    /// Applies the change to `(allow_suspicious, favorites_only)`.
+    const fn apply(self, (allow_suspicious, favorites_only): (bool, bool)) -> (bool, bool) {
+        match self {
+            Self::AllowSuspicious(allow) => (allow, favorites_only),
+            Self::FavoritesOnly(enabled) => (allow_suspicious, enabled),
+        }
+    }
+}
+
 impl WalletRoot {
     /// Runs `change` once the user accepts that an earlier proof of this payment may still
     /// execute alongside the next one. Cancel leaves everything as it was.
@@ -442,12 +459,7 @@ impl WalletRoot {
         enabled: bool,
         cx: &mut Context<'_, Self>,
     ) {
-        match kind {
-            DeliveryFormKind::Send => self.set_send_favorites_only_broadcasters(key, enabled, cx),
-            DeliveryFormKind::Unshield => {
-                self.set_unshield_favorites_only_broadcasters(key, enabled, cx);
-            }
-        }
+        self.set_broadcaster_filter(kind, key, BroadcasterFilter::FavoritesOnly(enabled), cx);
     }
 
     pub(in crate::root) fn set_allow_suspicious_broadcasters(
@@ -457,11 +469,19 @@ impl WalletRoot {
         allow: bool,
         cx: &mut Context<'_, Self>,
     ) {
+        self.set_broadcaster_filter(kind, key, BroadcasterFilter::AllowSuspicious(allow), cx);
+    }
+
+    fn set_broadcaster_filter(
+        &mut self,
+        kind: DeliveryFormKind,
+        key: UnshieldAssetKey,
+        filter: BroadcasterFilter,
+        cx: &mut Context<'_, Self>,
+    ) {
         match kind {
-            DeliveryFormKind::Send => self.set_send_allow_suspicious_broadcasters(key, allow, cx),
-            DeliveryFormKind::Unshield => {
-                self.set_unshield_allow_suspicious_broadcasters(key, allow, cx);
-            }
+            DeliveryFormKind::Send => self.set_send_broadcaster_filter(key, filter, cx),
+            DeliveryFormKind::Unshield => self.set_unshield_broadcaster_filter(key, filter, cx),
         }
     }
 
