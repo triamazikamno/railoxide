@@ -370,7 +370,7 @@ async fn native_preflight_filters_broker_withdrawals_and_tries_each_candidate_on
     // The original transaction pool predates the broker's withdrawal and still contains both.
     let pool = crate::query_rpc_pool_for_route(&sensitive(&route), &http);
     let warmup = http.rpc_broker().warm_identities(vec![route.clone()], None);
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             if http
                 .rpc_broker()

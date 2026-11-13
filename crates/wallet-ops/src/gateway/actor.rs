@@ -1674,7 +1674,7 @@ mod integration_tests {
     }
 
     async fn read(socket: &mut Socket) -> Vec<u8> {
-        match tokio::time::timeout(Duration::from_secs(5), socket.next())
+        match tokio::time::timeout(Duration::from_secs(30), socket.next())
             .await
             .unwrap()
             .unwrap()
@@ -1709,10 +1709,27 @@ mod integration_tests {
         }
     }
 
-    async fn state(socket: &mut Socket, protocol: &mut Connection) -> serde_json::Value {
+    async fn next_message(socket: &mut Socket, protocol: &mut Connection) -> serde_json::Value {
         let bytes = read(socket).await;
         let message = protocol.receive_frame(&bytes, 0).unwrap().unwrap();
         serde_json::from_slice(&message).unwrap()
+    }
+
+    /// The next message other than a heartbeat. The gateway sends one after 20s without other
+    /// output, so in a slow run it can arrive between any two expected messages.
+    async fn state(socket: &mut Socket, protocol: &mut Connection) -> serde_json::Value {
+        // One bound for the whole wait: heartbeats keep arriving, so the per-read bound alone
+        // would never expire while an expected message is missing.
+        tokio::time::timeout(Duration::from_secs(30), async move {
+            loop {
+                let message = next_message(socket, protocol).await;
+                if message["type"] != "heartbeat" {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("no message other than heartbeats within 30s")
     }
 
     async fn idle_ui_snapshot(
@@ -2064,7 +2081,7 @@ mod integration_tests {
         )
         .await;
         assert_eq!(
-            state(&mut connection, &mut protocol).await["type"],
+            next_message(&mut connection, &mut protocol).await["type"],
             "heartbeat"
         );
         assert_eq!(
@@ -2250,7 +2267,7 @@ mod integration_tests {
             )
             .await;
             assert_eq!(
-                state(&mut connection, &mut protocol).await["type"],
+                next_message(&mut connection, &mut protocol).await["type"],
                 "heartbeat"
             );
             connections.push(connection);
