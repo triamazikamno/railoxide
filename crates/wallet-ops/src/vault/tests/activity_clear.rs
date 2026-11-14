@@ -3,15 +3,16 @@ use std::path::Path;
 
 use alloy::primitives::B256;
 use local_db::{LOCAL_DB_TABLES, LocalDbTable};
-use redb::{Database, ReadableDatabase, ReadableTable};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use super::super::executors::executor_operation_prefix;
 use super::super::*;
 use super::helpers::*;
 use crate::tests::activity::{activity_attempt, activity_entry, received_note};
 use crate::{
-    ActivityStatus, ActivityUtxoClassification, StatusInputs, SwapRow, UtxoOutput,
-    has_unread_received, is_in_flight, owned_hashes, received_rows,
+    APP_SETTINGS_TABLE, ActivityStatus, ActivityUtxoClassification, DESKTOP_WALLET_VAULT_TABLE,
+    StatusInputs, SwapRow, UtxoOutput, has_unread_received, is_in_flight, owned_hashes,
+    received_rows,
 };
 
 const DAY: u64 = 86_400;
@@ -90,12 +91,21 @@ fn put_recovery_rows(db_path: &Path) {
     let txn = db.begin_write().unwrap();
     let executor = format!("{}sentinel", executor_operation_prefix(TEST_WALLET_ID, 1));
     for (table, key) in [
-        (LocalDbTable::WalletUtxo, "note"),
-        (LocalDbTable::PendingOutputPoiContextV2, "poi-context"),
-        (LocalDbTable::OutputPoiRecoveryV2, "poi-recovery"),
-        (LocalDbTable::DesktopWalletVault, executor.as_str()),
+        (LocalDbTable::WalletUtxo.definition(), "note"),
+        (
+            LocalDbTable::PendingOutputPoiContextV2.definition(),
+            "poi-context",
+        ),
+        (
+            LocalDbTable::OutputPoiRecoveryV2.definition(),
+            "poi-recovery",
+        ),
+        (
+            TableDefinition::new(DESKTOP_WALLET_VAULT_TABLE.name()),
+            executor.as_str(),
+        ),
     ] {
-        txn.open_table(table.definition())
+        txn.open_table(table)
             .unwrap()
             .insert(key, b"sentinel".as_slice())
             .unwrap();
@@ -108,17 +118,21 @@ fn non_journal_rows(db_path: &Path) -> BTreeMap<(&'static str, String), Vec<u8>>
     let db = Database::open(db_path).unwrap();
     let txn = db.begin_read().unwrap();
     let mut rows = BTreeMap::new();
-    for info in LOCAL_DB_TABLES {
-        let Ok(table) = txn.open_table(info.table.definition()) else {
+    let names = LOCAL_DB_TABLES
+        .iter()
+        .map(|info| info.name)
+        .chain([DESKTOP_WALLET_VAULT_TABLE.name(), APP_SETTINGS_TABLE.name()]);
+    for name in names {
+        let Ok(table) = txn.open_table(TableDefinition::<&str, &[u8]>::new(name)) else {
             continue;
         };
         for row in table.iter().unwrap() {
             let (key, value) = row.unwrap();
             let key = key.value().to_owned();
-            if info.table == LocalDbTable::DesktopWalletVault && key.starts_with("activity") {
+            if name == DESKTOP_WALLET_VAULT_TABLE.name() && key.starts_with("activity") {
                 continue;
             }
-            rows.insert((info.name, key), value.value().to_vec());
+            rows.insert((name, key), value.value().to_vec());
         }
     }
     rows

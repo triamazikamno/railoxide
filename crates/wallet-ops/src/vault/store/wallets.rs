@@ -10,6 +10,7 @@ use super::{
     wallet_keys_from_seed, wallet_metadata_record_key, wallet_spend_record_key,
     wallet_view_record_key, zeroize_wallet_keys,
 };
+use crate::DesktopWalletVaultDbExt as _;
 
 impl DesktopVaultStore {
     pub fn store_wallet_from_entropy(

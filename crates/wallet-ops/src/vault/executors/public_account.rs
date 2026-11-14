@@ -2,6 +2,7 @@ use super::{
     Address, EXECUTOR_RECORD_LOCK, ExecutorOperationId, ExecutorStore, ExecutorStoreError,
     RecordKind, VaultError,
 };
+use crate::DesktopWalletVaultDbExt as _;
 use crate::vault::{
     ExecutorPublicAccountSource, PublicAccountMetadata, PublicAccountScope, PublicAccountSource,
     PublicAccountStatus, generate_opaque_id, next_public_account_display_order,

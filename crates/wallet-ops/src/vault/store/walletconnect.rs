@@ -8,6 +8,7 @@ use super::{
     walletconnect_relay_identity_record_key, walletconnect_session_record_entry,
     walletconnect_session_record_key,
 };
+use crate::DesktopWalletVaultDbExt as _;
 
 impl DesktopVaultStore {
     pub fn load_walletconnect_relay_identity(

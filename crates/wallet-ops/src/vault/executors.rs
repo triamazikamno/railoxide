@@ -21,6 +21,7 @@ use super::{
     DesktopVaultStore, DesktopViewSession, EncryptedRecord, RecordKind, VaultError,
     wallet_view_record_key,
 };
+use crate::DesktopWalletVaultDbExt as _;
 
 /// Records without swap-use metadata keep this version, which earlier builds read.
 const LEGACY_VERSION: u32 = 1;

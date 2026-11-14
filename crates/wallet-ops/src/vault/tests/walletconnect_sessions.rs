@@ -1,5 +1,6 @@
 use super::super::*;
 use super::helpers::*;
+use crate::DesktopWalletVaultDbExt as _;
 use std::fs;
 
 #[test]

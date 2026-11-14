@@ -3,6 +3,7 @@ use super::{
     VAULT_METADATA_KEY, VaultError, VaultMetadata, ViewUnlock, create_spend_grant,
     create_with_params, current_vault_version, reencrypt_metadata, unlock_view,
 };
+use crate::DesktopWalletVaultDbExt as _;
 
 const DESKTOP_DB_CACHE_SIZE_BYTES: usize = 128 * 1024 * 1024;
 

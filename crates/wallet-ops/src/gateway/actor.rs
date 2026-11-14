@@ -1656,6 +1656,7 @@ mod tests {
 mod integration_tests {
     use super::super::GatewayHandle;
     use super::*;
+    use crate::AppSettingsDbExt as _;
     use futures_util::{SinkExt, StreamExt};
     use local_db::DbConfig;
     use std::net::{Ipv4Addr, Ipv6Addr};

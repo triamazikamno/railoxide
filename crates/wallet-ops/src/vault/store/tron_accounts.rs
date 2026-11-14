@@ -14,6 +14,7 @@ use super::{
     tron_account_metadata_record_entry, tron_account_metadata_record_key,
     tron_account_secret_record_entry, tron_account_secret_record_key, unlock_spend, unlock_view,
 };
+use crate::DesktopWalletVaultDbExt as _;
 
 impl DesktopVaultStore {
     pub fn list_tron_accounts_for_session(

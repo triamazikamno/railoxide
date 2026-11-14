@@ -3,6 +3,7 @@ use super::super::activity::{
 };
 use super::super::*;
 use super::helpers::*;
+use crate::DesktopWalletVaultDbExt as _;
 use crate::desktop::{
     ActivitySubmission, PrivateActivity, PublicActivity, observe_activity_inclusion,
     observe_activity_rollback,

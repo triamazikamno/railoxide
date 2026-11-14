@@ -1,5 +1,6 @@
 use super::super::*;
 use super::helpers::*;
+use crate::DesktopWalletVaultDbExt as _;
 use alloy::primitives::FixedBytes;
 use local_db::{
     OpaqueWalletPrivateRow, OutputPoiRecoveryRecord, OutputPoiRecoveryStatus,

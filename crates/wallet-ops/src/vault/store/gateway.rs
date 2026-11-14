@@ -8,6 +8,7 @@ use super::{
     DesktopVaultStore, DesktopViewSession, EncryptedRecord, PublicAccountScope, RecordKind,
     VaultError, WalletConnectSessionAccountResolution, Zeroizing, generate_opaque_id,
 };
+use crate::DesktopWalletVaultDbExt as _;
 use crate::RpcOrigin;
 
 const GATEWAY_PERMISSION_PREFIX: &str = "gateway-permission|";

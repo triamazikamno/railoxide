@@ -1,5 +1,6 @@
 use super::super::*;
 use super::helpers::*;
+use crate::{AppSettingsDbExt as _, DesktopWalletVaultDbExt as _};
 use local_db::{
     OpaqueWalletPrivateRow, WalletMeta, WalletPrivateNamespaceId, WalletPrivateRecordKind,
 };

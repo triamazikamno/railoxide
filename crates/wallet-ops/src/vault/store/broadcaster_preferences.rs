@@ -6,6 +6,7 @@ use super::{
     broadcaster_favorite_record_key, broadcaster_preference_entry_identity, generate_opaque_id,
     sort_broadcaster_preference_entries, validate_broadcaster_preference_address,
 };
+use crate::DesktopWalletVaultDbExt as _;
 
 #[derive(Clone)]
 struct LoadedBroadcasterPreferenceEntry {

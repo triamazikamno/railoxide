@@ -7,6 +7,7 @@ use super::{
     SwapApprovedAccount, SwapDelivery, SwapDestinationOutcome, SwapDestinationRecord,
     SwapOperationRecord, SwapOrderRecord, U256, VERSION, local_timestamp, swap_account_refusal,
 };
+use crate::DesktopWalletVaultDbExt as _;
 
 /// One logical swap: its review, account pair, setup choices and order attempts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

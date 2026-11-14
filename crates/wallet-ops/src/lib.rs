@@ -95,6 +95,7 @@ static ACTIVE_PROVER_CACHE_BUILDS: LazyLock<
 mod activity;
 mod amounts;
 mod anchors;
+mod app_tables;
 mod block_observer;
 pub mod bridge;
 pub mod cow;
@@ -142,6 +143,10 @@ pub use anchors::{
     average_non_outlier_anchor_rates, check_quote_against_anchor, fixed_token_anchor_rate,
     known_token_anchor_sources, oracle_answer_to_anchor_rate, probe_native_usd_quote,
     read_fresh_pair_anchor, refresh_token_anchor_rates, spawn_token_anchor_refresh_worker,
+};
+pub use app_tables::{
+    APP_SETTINGS_TABLE, AppSettingsDbExt, AppSettingsRecord, DESKTOP_WALLET_VAULT_TABLE,
+    DesktopWalletVaultDbExt, DesktopWalletVaultRecord, WalletDeletionBatch, WalletDeletionReport,
 };
 pub use desktop::*;
 pub use governance::{

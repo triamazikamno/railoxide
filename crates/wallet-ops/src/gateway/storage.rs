@@ -1,4 +1,5 @@
 use super::{GatewayConfig, GatewayError};
+use crate::AppSettingsDbExt as _;
 use local_db::DbStore;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};

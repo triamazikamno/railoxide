@@ -781,6 +781,7 @@ mod tests {
     use std::path::PathBuf;
 
     use gpui::{AnyWindowHandle, TestAppContext};
+    use wallet_ops::AppSettingsDbExt as _;
     use wallet_ops::settings::{WALLET_SETTINGS_KEY, WalletSettings, save_wallet_settings};
 
     use super::*;

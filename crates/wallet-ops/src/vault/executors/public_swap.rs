@@ -11,6 +11,7 @@ use super::{
     SwapSubmissionStatus, SwapTradeAmounts, SwapUseId, SwapUseRecord, SwapUseRelease, SwapUseRole,
     U256, local_timestamp, next_destination_outcome,
 };
+use crate::DesktopWalletVaultDbExt as _;
 use crate::vault::PublicAccountScope;
 
 /// A swap paid from a Public account and delivered to this account's chain, kept with the

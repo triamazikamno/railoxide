@@ -1,12 +1,12 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use local_db::{
-    DesktopWalletVaultRecord, OpaqueWalletPrivateRowMutation, WalletMetaMutation,
-    WalletPrivateNamespaceId, WalletPrivateStateBatch, WalletSyncActorStateRecord,
-    WalletUtxoRowMutation,
+    OpaqueWalletPrivateRowMutation, WalletMetaMutation, WalletPrivateNamespaceId,
+    WalletPrivateStateBatch, WalletSyncActorStateRecord, WalletUtxoRowMutation,
 };
 
 use crate::vault::DesktopEncryptedWalletCacheStore;
+use crate::{DesktopWalletVaultDbExt as _, DesktopWalletVaultRecord};
 
 use super::{
     DesktopVaultStore, DesktopViewSession, EncryptedRecord, VaultError, WALLET_CHAIN_INDEX_PREFIX,

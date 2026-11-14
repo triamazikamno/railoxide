@@ -1,5 +1,6 @@
 use super::super::*;
 use super::helpers::*;
+use crate::DesktopWalletVaultDbExt as _;
 use alloy::primitives::{FixedBytes, U256};
 use alloy::uint;
 use local_db::{

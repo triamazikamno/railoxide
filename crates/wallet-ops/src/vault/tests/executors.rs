@@ -1,5 +1,6 @@
 use super::super::*;
 use super::helpers::*;
+use crate::DesktopWalletVaultDbExt as _;
 use alloy::eips::BlockNumHash;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use railgun_wallet::{Utxo, UtxoCommitmentKind, UtxoSource};

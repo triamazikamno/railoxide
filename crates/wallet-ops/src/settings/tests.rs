@@ -26,6 +26,7 @@ use super::{
     load_wallet_ui_state, resolve_effective_chain_rpc_route, save_first_start,
     save_wallet_settings, save_wallet_ui_state,
 };
+use crate::AppSettingsDbExt as _;
 use crate::WALLETCONNECT_DEFAULT_PROJECT_ID;
 use crate::{RpcChainRoute, RpcTransport};
 

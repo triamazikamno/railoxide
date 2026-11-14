@@ -1,4 +1,5 @@
 use super::*;
+use crate::DesktopWalletVaultDbExt as _;
 
 #[test]
 fn public_action_attempt_errors_distinguish_signing_from_retryable_sending() {

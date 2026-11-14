@@ -14,6 +14,7 @@ use super::{
     ViewUnlock, public_account_metadata_record_key, tron_account_metadata_record_key,
     wallet_view_record_key,
 };
+use crate::DesktopWalletVaultDbExt as _;
 
 // Serializes journal read/modify/write against owner deletion, which holds it while collecting
 // keys so a stale writer can't recreate a deleted owner's records. Never hold it across async work.

@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{DesktopVaultStore, SALT_LEN, VaultError, Zeroizing};
+use crate::DesktopWalletVaultDbExt as _;
 use crate::device_auth::{self, DeviceAuthError, DeviceAuthMethod, SealedSecret};
 
 const BIOMETRIC_UNLOCK_KEY: &str = "biometric-unlock|vault-password";
@@ -252,6 +253,7 @@ mod tests {
         BIOMETRIC_UNLOCK_VERSION, DesktopVaultStore, DeviceAuthStatus, PASSWORD_PADDING_BLOCK,
         StoredDeviceAuth, VaultError, pad_password, unpad_password,
     };
+    use crate::DesktopWalletVaultDbExt as _;
     use crate::device_auth::{DeviceAuthError, DeviceAuthMethod, device_auth_available};
     use crate::vault::KdfParams;
 

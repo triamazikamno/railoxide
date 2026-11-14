@@ -6,6 +6,7 @@ use super::{
     ExecutorRecord, ExecutorRecordOrigin, ExecutorStore, ExecutorStoreError, ExecutorUseCheck,
     LEGACY_VERSION, RecordKind, ordinary_index,
 };
+use crate::DesktopWalletVaultDbExt as _;
 
 /// A durably allocated account that has not yet been claimed by an operation.
 #[derive(Clone, Serialize, Deserialize)]

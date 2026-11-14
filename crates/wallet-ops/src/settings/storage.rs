@@ -6,6 +6,7 @@ use super::{
     WalletFirstStart, WalletFirstStartError, WalletSettings, WalletSettingsError, WalletUiState,
     WalletUiStateError,
 };
+use crate::AppSettingsDbExt as _;
 
 // All application settings writers share this lock, including startup repair and migration.
 // DbStore commits each record atomically; this also serializes revision comparison with writing.

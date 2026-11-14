@@ -1,4 +1,5 @@
 use super::{DesktopVaultStore, EncryptedRecord, VaultError};
+use crate::DesktopWalletVaultDbExt as _;
 
 impl DesktopVaultStore {
     pub(super) fn encrypted_record(&self, key: &str) -> Result<EncryptedRecord, VaultError> {

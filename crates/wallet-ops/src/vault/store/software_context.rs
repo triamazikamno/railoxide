@@ -11,6 +11,7 @@ use super::{
     wallet_chain_metadata_record_key, wallet_keys_from_seed, wallet_metadata_record_key,
     wallet_spend_record_key, wallet_view_record_key, zeroize_wallet_keys,
 };
+use crate::DesktopWalletVaultDbExt as _;
 use zeroize::Zeroizing;
 
 pub enum SoftwareContextMatch {

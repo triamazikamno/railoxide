@@ -1,4 +1,4 @@
-use local_db::WalletDeletionBatch;
+use crate::{DesktopWalletVaultDbExt as _, WalletDeletionBatch};
 
 static WALLET_METADATA_UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

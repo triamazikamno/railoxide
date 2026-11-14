@@ -15,6 +15,7 @@ use super::{
     validate_address_book_label, validate_private_address_book_address,
     validate_public_address_book_address,
 };
+use crate::DesktopWalletVaultDbExt as _;
 use crate::bridge::NonEvmNetwork;
 
 impl DesktopVaultStore {

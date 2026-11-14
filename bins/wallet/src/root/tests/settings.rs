@@ -11,6 +11,7 @@ use crate::root::settings::{
     should_show_indexed_artifact_custom_settings, stored_token_address,
 };
 use crate::root::startup::tor_bootstrap_recovery_is_current;
+use wallet_ops::AppSettingsDbExt as _;
 use wallet_ops::WalletNetworkProgressStage;
 use wallet_ops::settings::{IndexedArtifactSettings, IndexedArtifactSourceModeSetting};
 

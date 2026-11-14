@@ -1,5 +1,6 @@
 use super::super::*;
 use super::helpers::*;
+use crate::DesktopWalletVaultDbExt as _;
 use crate::tron::address::encode_tron_address;
 use alloy::primitives::address;
 use std::fs;

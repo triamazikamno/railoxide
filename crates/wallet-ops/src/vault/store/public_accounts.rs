@@ -16,6 +16,7 @@ use super::{
     public_account_secret_record_key, public_evm_address_from_private_key,
     sort_public_account_metadata, unlock_spend, unlock_view,
 };
+use crate::DesktopWalletVaultDbExt as _;
 
 impl DesktopVaultStore {
     pub fn list_active_public_accounts_for_session(

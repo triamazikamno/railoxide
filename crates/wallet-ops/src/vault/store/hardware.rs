@@ -12,6 +12,7 @@ use super::{
     wallet_chain_index_complete_record_entry, wallet_metadata_record_entry,
     wallet_metadata_record_key, wallet_view_record_key,
 };
+use crate::DesktopWalletVaultDbExt as _;
 
 fn hardware_wallet_receive_address(wallet: &WalletKeys) -> Result<String, VaultError> {
     wallet
