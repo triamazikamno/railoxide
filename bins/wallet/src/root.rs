@@ -102,6 +102,7 @@ mod waku_runtime;
 mod wallet_activity;
 mod wallet_header;
 mod walletconnect;
+mod widgets;
 mod wiring;
 
 #[cfg(test)]
@@ -184,6 +185,7 @@ use waku_runtime::{
     release_retired_waku_generation, renew_submission_scope,
 };
 use wallet_header::WalletSelectItem;
+use widgets::WalletRootWidgets;
 
 #[cfg(test)]
 use broadcaster_picker::{
@@ -752,87 +754,8 @@ impl WalletRoot {
         let unwrap_unshields_by_default = settings_editor
             .as_ref()
             .is_some_and(|editor| editor.read(cx).saved.privacy.unwrap_unshields_by_default);
-        let (vault_state, vault_error) = initial_vault_state(&vault_store);
-        let focus_vault_input_on_render = matches!(
-            vault_state,
-            VaultState::CreateVault | VaultState::UnlockVault
-        );
-        let touch_id_supported = wallet_ops::device_auth::device_auth_supported(
-            wallet_ops::device_auth::DeviceAuthMethod::TouchId,
-        );
-        let touch_id_status = vault_store
-            .device_auth_status(wallet_ops::device_auth::DeviceAuthMethod::TouchId)
-            .unwrap_or(DeviceAuthStatus::Disabled);
-        let apple_watch_supported = wallet_ops::device_auth::device_auth_supported(
-            wallet_ops::device_auth::DeviceAuthMethod::AppleWatch,
-        );
-        let apple_watch_status = vault_store
-            .device_auth_status(wallet_ops::device_auth::DeviceAuthMethod::AppleWatch)
-            .unwrap_or(DeviceAuthStatus::Disabled);
-        let touch_id_unlock_on_render = matches!(vault_state, VaultState::UnlockVault)
-            && touch_id_supported
-            && touch_id_status == DeviceAuthStatus::Enabled;
-        let unlock_password_input = new_masked_input(window, cx, "vault password");
-        let new_password_input = new_masked_input(window, cx, "new vault password");
-        let confirm_password_input = new_masked_input(window, cx, "confirm vault password");
-        let wallet_name_input = new_text_input(window, cx, "wallet name");
-        let manage_wallet_label_input = new_text_input(window, cx, "wallet label");
-        let add_wallet_password_input = new_masked_input(window, cx, "vault password");
-        let hardware_wallet_restore_account_index_input =
-            new_text_input(window, cx, "optional restore account index");
-        #[cfg(feature = "hardware")]
-        let hardware_profile_password_input = new_masked_input(window, cx, "vault password");
-        #[cfg(feature = "hardware")]
-        let hardware_profile_label_input = new_text_input(window, cx, "hardware profile label");
-        #[cfg(feature = "hardware")]
-        let hardware_profile_recovery_start_input = new_text_input(window, cx, "start index");
-        #[cfg(feature = "hardware")]
-        let hardware_profile_recovery_count_input = new_text_input(window, cx, "count");
-        #[cfg(feature = "hardware")]
-        let hardware_profile_exact_index_input = new_text_input(window, cx, "account index");
-        #[cfg(feature = "hardware")]
-        let trezor_app_passphrase_input = new_masked_input(window, cx, "Trezor passphrase");
-        #[cfg(feature = "hardware")]
-        let trezor_passphrase_mode_focus = cx.focus_handle();
-        let import_mnemonic_input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(3, 6)
-                .placeholder("paste recovery phrase")
-        });
-        let public_account_search_input = new_text_input(window, cx, "Search accounts");
-        let wallet_activity = wallet_activity::WalletActivityState::new(window, cx);
-        let log_store = logs.read(cx).store().clone();
-        // Debug UI fixture: the `logs` mode fills the buffer with representative lines.
-        #[cfg(debug_assertions)]
-        private_swap::ui_fixture_fill_logs(&log_store);
-        let logs_search =
-            cx.new(|cx| SearchField::new(LogsSearchSource { store: log_store }, window, cx));
-        let governance_participant_picker = cx.new(|cx| {
-            gpui_component::combobox::ComboboxState::new(
-                SearchableVec::<governance::ParticipantChoice>::new(Vec::new()),
-                Vec::new(),
-                window,
-                cx,
-            )
-            .multiple(true)
-            .searchable(true)
-        });
-        let governance_proposal_action_amount_input = new_text_input(window, cx, "amount");
-        let governance_staking_delegate_input = new_text_input(window, cx, "delegate address");
-        let address_book_search_input = new_text_input(window, cx, "search saved recipients");
-        let favorite_broadcaster_input =
-            new_text_input(window, cx, "favorite broadcaster 0zk address");
-        let banned_broadcaster_input = new_text_input(window, cx, "banned broadcaster 0zk address");
-        let address_book_label_input = new_text_input(window, cx, "recipient label");
-        let address_book = AddressBookState::new(address_book_search_input, window, cx);
-        let public_form = PublicAccountFormState::new(
-            public_account_search_input,
-            mimic_railway_shields_by_default,
-            window,
-            cx,
-        );
-        let repair_cache_block_input = new_text_input(window, cx, "0 = deployment block");
-        let tx_search_input = new_text_input(window, cx, "search tx hash");
+        let vault_startup = VaultStartup::new(&vault_store);
+        let widgets = WalletRootWidgets::new(&logs, mimic_railway_shields_by_default, window, cx);
         let mut platform_attention = platform_attention::PlatformAttentionState::new(window);
         platform_attention.sync_badge_count(0);
         platform_attention.clear_attention();
@@ -868,7 +791,7 @@ impl WalletRoot {
         );
         let utxo_table = cx.new(|cx| {
             TableState::new(
-                UtxoDelegate::new(root_weak.clone(), tx_search_input.clone()),
+                UtxoDelegate::new(root_weak.clone(), widgets.tx_search_input.clone()),
                 window,
                 cx,
             )
@@ -910,9 +833,9 @@ impl WalletRoot {
             default_allow_suspicious_broadcasters,
             mimic_railway_shields_by_default,
             unwrap_unshields_by_default,
-            vault_state,
+            vault_state: vault_startup.state,
             wallet_setup_mode: WalletSetupMode::Choose,
-            vault_error,
+            vault_error: vault_startup.error,
             unlock_in_progress: false,
             repair_cache_error: None,
             setup_password: None,
@@ -932,26 +855,27 @@ impl WalletRoot {
             hardware_wallet_creation_in_progress: false,
             hardware_wallet_creation_generation: 0,
             hardware_wallet_creation_intent: None,
-            hardware_wallet_restore_account_index_input,
+            hardware_wallet_restore_account_index_input: widgets
+                .hardware_wallet_restore_account_index_input,
             hardware_wallet_restore_account_index_set: false,
             #[cfg(feature = "hardware")]
             hardware_profile_unlock: vault::HardwareProfileUnlockState::default(),
             #[cfg(feature = "hardware")]
             active_hardware_profile: None,
             #[cfg(feature = "hardware")]
-            hardware_profile_password_input,
+            hardware_profile_password_input: widgets.hardware_profile_password_input,
             #[cfg(feature = "hardware")]
-            hardware_profile_label_input,
+            hardware_profile_label_input: widgets.hardware_profile_label_input,
             #[cfg(feature = "hardware")]
-            hardware_profile_recovery_start_input,
+            hardware_profile_recovery_start_input: widgets.hardware_profile_recovery_start_input,
             #[cfg(feature = "hardware")]
-            hardware_profile_recovery_count_input,
+            hardware_profile_recovery_count_input: widgets.hardware_profile_recovery_count_input,
             #[cfg(feature = "hardware")]
-            hardware_profile_exact_index_input,
+            hardware_profile_exact_index_input: widgets.hardware_profile_exact_index_input,
             #[cfg(feature = "hardware")]
-            trezor_app_passphrase_input,
+            trezor_app_passphrase_input: widgets.trezor_app_passphrase_input,
             #[cfg(feature = "hardware")]
-            trezor_passphrase_mode_focus,
+            trezor_passphrase_mode_focus: widgets.trezor_passphrase_mode_focus,
             http,
             rpc_identity_warmup: None,
             active_rpc_chains: BTreeSet::new(),
@@ -987,7 +911,7 @@ impl WalletRoot {
             public_broadcaster_anchor_refresh,
             monitor,
             logs,
-            logs_search,
+            logs_search: widgets.logs_search,
             logs_panel_focus: cx.focus_handle(),
             logs_panel_trap: cx.focus_handle(),
             logs_return_focus: None,
@@ -1006,7 +930,7 @@ impl WalletRoot {
             manage_wallets: ManageWalletsState::default(),
             key_export: KeyExportState::default(),
             update_check: update_check::UpdateCheckUi::default(),
-            manage_wallet_label_input,
+            manage_wallet_label_input: widgets.manage_wallet_label_input,
             selected_wallet_id: None,
             active_wallet_generation: 0,
             wallet_switch_generation: 0,
@@ -1028,18 +952,18 @@ impl WalletRoot {
             wallet_sync_lifecycle_shutdown_started: false,
             public_sync_cache_resetting,
             merkle_forest_cache_resetting,
-            unlock_password_input,
-            new_password_input,
-            confirm_password_input,
-            wallet_name_input,
-            add_wallet_password_input,
-            import_mnemonic_input,
+            unlock_password_input: widgets.unlock_password_input,
+            new_password_input: widgets.new_password_input,
+            confirm_password_input: widgets.confirm_password_input,
+            wallet_name_input: widgets.wallet_name_input,
+            add_wallet_password_input: widgets.add_wallet_password_input,
+            import_mnemonic_input: widgets.import_mnemonic_input,
             public_accounts: Vec::new(),
-            address_book,
+            address_book: widgets.address_book,
             governance: GovernanceState::new(
-                governance_participant_picker,
-                governance_proposal_action_amount_input,
-                governance_staking_delegate_input,
+                widgets.governance_participant_picker,
+                widgets.governance_proposal_action_amount_input,
+                widgets.governance_staking_delegate_input,
                 Eip1559GasFeeEditorState::new(window, cx),
             ),
             proposals: ProposalsState::new(initial_chain_id),
@@ -1051,14 +975,14 @@ impl WalletRoot {
             broadcaster_preference_snapshot,
             broadcaster_preference_error: None,
             active_broadcaster_tab: BroadcasterActivityTab::default(),
-            favorite_broadcaster_input,
-            banned_broadcaster_input,
-            address_book_label_input,
+            favorite_broadcaster_input: widgets.favorite_broadcaster_input,
+            banned_broadcaster_input: widgets.banned_broadcaster_input,
+            address_book_label_input: widgets.address_book_label_input,
             address_book_save_error: None,
-            public_form,
+            public_form: widgets.public_form,
             stealth_accounts: None,
             private_swaps: None,
-            wallet_activity,
+            wallet_activity: widgets.wallet_activity,
             public_balance_cache: PublicBalanceCache::default(),
             tron_public,
             public_transaction_tracker,
@@ -1078,8 +1002,8 @@ impl WalletRoot {
             public_broadcaster_task_abort_handles: Vec::new(),
             broadcaster_picker: None,
             unshield_spinner_tick: 0,
-            repair_cache_block_input,
-            tx_search_input,
+            repair_cache_block_input: widgets.repair_cache_block_input,
+            tx_search_input: widgets.tx_search_input,
             tx_search_query: Arc::from(""),
             platform_attention_count: 0,
             platform_attention_window_active: window.is_window_active(),
@@ -1093,19 +1017,19 @@ impl WalletRoot {
             blocked_shield_refunds_in_flight: BTreeSet::new(),
             executor_locked_note_count: 0,
             utxo_table,
-            focus_vault_input_on_render,
-            touch_id_supported,
+            focus_vault_input_on_render: vault_startup.focus_input_on_render,
+            touch_id_supported: vault_startup.touch_id_supported,
             touch_id_available: wallet_ops::device_auth::device_auth_available(
                 wallet_ops::device_auth::DeviceAuthMethod::TouchId,
             ),
-            touch_id_status,
-            apple_watch_supported,
+            touch_id_status: vault_startup.touch_id_status,
+            apple_watch_supported: vault_startup.apple_watch_supported,
             apple_watch_available: wallet_ops::device_auth::device_auth_available(
                 wallet_ops::device_auth::DeviceAuthMethod::AppleWatch,
             ),
-            apple_watch_status,
+            apple_watch_status: vault_startup.apple_watch_status,
             device_auth_in_progress: false,
-            touch_id_unlock_on_render,
+            touch_id_unlock_on_render: vault_startup.touch_id_unlock_on_render,
             enable_device_auth_on_create: true,
             add_wallet_dialog_lease: std::rc::Weak::new(),
             add_wallet_device_auth_password: None,
@@ -1175,16 +1099,56 @@ impl WalletRoot {
     }
 }
 
-/// The vault screen to start on, and the error to show when the vault can't
-/// be inspected.
-fn initial_vault_state(store: &DesktopVaultStore) -> (VaultState, Option<Arc<str>>) {
-    match store.vault_exists() {
-        Ok(true) => (VaultState::UnlockVault, None),
-        Ok(false) => (VaultState::CreateVault, None),
-        Err(error) => (
-            VaultState::Error(Arc::from("Failed to inspect wallet vault storage")),
-            Some(Arc::from(error.to_string())),
-        ),
+/// The vault screen to start on, the error to show when the vault can't be
+/// inspected, and the device-auth state the first render acts on.
+struct VaultStartup {
+    state: VaultState,
+    error: Option<Arc<str>>,
+    focus_input_on_render: bool,
+    touch_id_supported: bool,
+    touch_id_status: DeviceAuthStatus,
+    apple_watch_supported: bool,
+    apple_watch_status: DeviceAuthStatus,
+    touch_id_unlock_on_render: bool,
+}
+
+impl VaultStartup {
+    fn new(store: &DesktopVaultStore) -> Self {
+        let (state, error) = match store.vault_exists() {
+            Ok(true) => (VaultState::UnlockVault, None),
+            Ok(false) => (VaultState::CreateVault, None),
+            Err(error) => (
+                VaultState::Error(Arc::from("Failed to inspect wallet vault storage")),
+                Some(Arc::from(error.to_string())),
+            ),
+        };
+        let focus_input_on_render =
+            matches!(state, VaultState::CreateVault | VaultState::UnlockVault);
+        let touch_id_supported = wallet_ops::device_auth::device_auth_supported(
+            wallet_ops::device_auth::DeviceAuthMethod::TouchId,
+        );
+        let touch_id_status = store
+            .device_auth_status(wallet_ops::device_auth::DeviceAuthMethod::TouchId)
+            .unwrap_or(DeviceAuthStatus::Disabled);
+        let apple_watch_supported = wallet_ops::device_auth::device_auth_supported(
+            wallet_ops::device_auth::DeviceAuthMethod::AppleWatch,
+        );
+        let apple_watch_status = store
+            .device_auth_status(wallet_ops::device_auth::DeviceAuthMethod::AppleWatch)
+            .unwrap_or(DeviceAuthStatus::Disabled);
+        let touch_id_unlock_on_render = matches!(state, VaultState::UnlockVault)
+            && touch_id_supported
+            && touch_id_status == DeviceAuthStatus::Enabled;
+        Self {
+            state,
+            error,
+            focus_input_on_render,
+            touch_id_supported,
+            touch_id_status,
+            apple_watch_supported,
+            apple_watch_status,
+            touch_id_unlock_on_render,
+        }
     }
 }
 
