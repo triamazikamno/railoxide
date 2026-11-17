@@ -41,28 +41,31 @@ use super::settings::{
     open_data_folder, settings_dialog_dimensions, startup_settings_action_state,
 };
 use super::shell::{WalletAppOptions, render_wallet_hero_screen, render_wallet_window_frame};
-use super::{WalletMaintenanceController, WalletRoot, format_report_chain, rgb_with_alpha};
+use super::{
+    WalletMaintenanceController, WalletRoot, WalletRootDependencies, format_report_chain,
+    rgb_with_alpha,
+};
 
 mod first_start;
 
-struct WalletStartupReady {
-    http: HttpContext,
-    waku_config: WakuMonitorConfig,
-    monitor_event_tx: EventTx,
-    vault_store: Arc<DesktopVaultStore>,
-    chain_ids: Vec<u64>,
-    initial_chain_id: u64,
-    ui_state: wallet_ops::settings::WalletUiState,
-    effective_chain_configs: EffectiveChainRegistry,
-    effective_token_registry: EffectiveTokenRegistry,
-    public_balance_refresh_interval: Duration,
-    auto_lock_timeout: Option<Duration>,
-    public_broadcaster_policy: BroadcasterFeePolicy,
-    public_broadcaster_response_timeout: Duration,
-    public_broadcaster_republish_interval: Duration,
-    default_allow_suspicious_broadcasters: bool,
-    mimic_railway_shields_by_default: bool,
-    poi_read_source: PoiReadSource,
+pub(in crate::root) struct WalletStartupReady {
+    pub(in crate::root) http: HttpContext,
+    pub(in crate::root) waku_config: WakuMonitorConfig,
+    pub(in crate::root) monitor_event_tx: EventTx,
+    pub(in crate::root) vault_store: Arc<DesktopVaultStore>,
+    pub(in crate::root) chain_ids: Vec<u64>,
+    pub(in crate::root) initial_chain_id: u64,
+    pub(in crate::root) ui_state: wallet_ops::settings::WalletUiState,
+    pub(in crate::root) effective_chain_configs: EffectiveChainRegistry,
+    pub(in crate::root) effective_token_registry: EffectiveTokenRegistry,
+    pub(in crate::root) public_balance_refresh_interval: Duration,
+    pub(in crate::root) auto_lock_timeout: Option<Duration>,
+    pub(in crate::root) public_broadcaster_policy: BroadcasterFeePolicy,
+    pub(in crate::root) public_broadcaster_response_timeout: Duration,
+    pub(in crate::root) public_broadcaster_republish_interval: Duration,
+    pub(in crate::root) default_allow_suspicious_broadcasters: bool,
+    pub(in crate::root) mimic_railway_shields_by_default: bool,
+    pub(in crate::root) poi_read_source: PoiReadSource,
 }
 
 enum StartupNetworkContext {
@@ -341,7 +344,6 @@ impl WalletStartupRoot {
         let logs = self.logs.clone();
         let monitor_state = self.monitor_state.clone();
         let public_broadcaster_anchor_cache = Arc::new(TokenAnchorRateCache::new());
-        let enabled_chain_ids = ready.chain_ids.clone();
         let private_chain_ids: Vec<u64> = ready
             .effective_chain_configs
             .railgun_chains()
@@ -389,34 +391,20 @@ impl WalletStartupRoot {
         let maintenance_controller = self.maintenance_controller.clone();
         let root = cx.new(|cx| {
             WalletRoot::new(
-                self.options.clone(),
-                self.public_transaction_tracker.clone(),
-                ready.http,
-                ready.vault_store,
-                &enabled_chain_ids,
-                initial_chain_id,
-                ready.ui_state,
-                ready.effective_chain_configs,
-                ready.effective_token_registry,
-                ready.public_balance_refresh_interval,
-                ready.auto_lock_timeout,
-                ready.public_broadcaster_policy,
-                ready.public_broadcaster_response_timeout,
-                ready.public_broadcaster_republish_interval,
-                ready.default_allow_suspicious_broadcasters,
-                ready.mimic_railway_shields_by_default,
-                ready.poi_read_source,
-                self.runtime.clone(),
-                monitor_state,
-                ready.waku_config,
-                ready.monitor_event_tx,
-                public_broadcaster_anchor_cache,
-                public_broadcaster_anchor_refresh,
-                wallet_monitor_event_rx,
-                monitor,
-                logs,
-                &startup_root,
-                &maintenance_controller,
+                ready,
+                WalletRootDependencies {
+                    options: self.options.clone(),
+                    public_transaction_tracker: self.public_transaction_tracker.clone(),
+                    runtime: self.runtime.clone(),
+                    monitor_state,
+                    monitor_event_rx: wallet_monitor_event_rx,
+                    monitor,
+                    public_broadcaster_anchor_cache,
+                    public_broadcaster_anchor_refresh,
+                    logs,
+                    startup_root: &startup_root,
+                    maintenance_controller: &maintenance_controller,
+                },
                 window,
                 cx,
             )

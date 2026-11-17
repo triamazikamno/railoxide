@@ -1,6 +1,9 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use gpui::Context;
+use broadcaster_monitor_gpui::{
+    BroadcasterMonitorPane, BroadcasterPreferenceHooks, BroadcasterPreferenceStatus,
+};
+use gpui::{Context, Entity, WeakEntity};
 use wallet_ops::{
     parse_railgun_recipient,
     vault::{BroadcasterPreferences, VaultError},
@@ -303,6 +306,55 @@ impl WalletRoot {
             form.error = None;
             form.result = None;
         }
+    }
+}
+
+/// Installs the monitor callbacks that read the wallet's broadcaster
+/// preferences from `snapshot` and toggle them on `root`.
+pub(super) fn install_broadcaster_preference_hooks(
+    monitor: &Entity<BroadcasterMonitorPane>,
+    snapshot: Arc<RwLock<BroadcasterPreferences>>,
+    root: WeakEntity<WalletRoot>,
+    cx: &mut Context<'_, WalletRoot>,
+) {
+    let favorite_root = root.clone();
+    let banned_root = root;
+    monitor.update(cx, |monitor, cx| {
+        monitor.set_preference_hooks(
+            Some(BroadcasterPreferenceHooks::new(
+                move |address| {
+                    snapshot
+                        .read()
+                        .map_or(BroadcasterPreferenceStatus::Neutral, |preferences| {
+                            broadcaster_preference_status(&preferences, address)
+                        })
+                },
+                move |address, _window, cx| {
+                    let _ = favorite_root.update(cx, |root, cx| {
+                        root.toggle_favorite_broadcaster(&address, cx);
+                    });
+                },
+                move |address, _window, cx| {
+                    let _ = banned_root.update(cx, |root, cx| {
+                        root.toggle_banned_broadcaster(&address, cx);
+                    });
+                },
+            )),
+            cx,
+        );
+    });
+}
+
+fn broadcaster_preference_status(
+    preferences: &BroadcasterPreferences,
+    address: &str,
+) -> BroadcasterPreferenceStatus {
+    if broadcaster_preference_is_banned(preferences, address) {
+        BroadcasterPreferenceStatus::Banned
+    } else if broadcaster_preference_is_favorite(preferences, address) {
+        BroadcasterPreferenceStatus::Favorite
+    } else {
+        BroadcasterPreferenceStatus::Neutral
     }
 }
 

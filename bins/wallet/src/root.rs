@@ -117,9 +117,7 @@ use auto_lock::{
     AutoLockState, InitialCatchUpFingerprint, InitialSyncActivity, InitialSyncObservation,
 };
 use broadcaster_picker::BroadcasterPickerState;
-use broadcaster_preferences::{
-    broadcaster_preference_is_banned, broadcaster_preference_is_favorite,
-};
+use broadcaster_preferences::install_broadcaster_preference_hooks;
 use broadcaster_view::BroadcasterActivityTab;
 use chain_load::{
     ChainUtxoState, WalletSyncLifecycle, WalletSyncLifecycleCleanupTask, chain_load_overrides,
@@ -137,8 +135,10 @@ use private_action::{
 };
 use private_broadcaster::PrivateBroadcasterProgressState;
 use proposals::ProposalsState;
-use public_account::{DerivePreviewState, PublicAccountFormState, TronPublicState, TronSendState};
-use public_action::{PublicActionMode, PublicActionProgressLifecycle, PublicSendKind};
+use public_account::{PublicAccountFormState, TronPublicState, TronSendState};
+use public_action::PublicActionMode;
+#[cfg(test)]
+use public_action::PublicSendKind;
 use public_balances::{
     public_account_visible_balances_for_chain, public_asset_decimals, public_asset_label,
     public_balance_amount_label,
@@ -158,7 +158,7 @@ use shell::{PoiArtifactCacheRetryAttempts, WalletTab};
 use shell::{ppoi_hover_detail, ppoi_hover_heading};
 use sidebar::Activity;
 use spend_authorization::{SpendAuthorizationCache, SpendAuthorizationLifetime};
-use startup::WalletStartupRoot;
+use startup::{WalletStartupReady, WalletStartupRoot};
 use tokens::{
     format_exact_token_amount_for_display, format_native_token_amount_ceiling_for_display,
     format_native_token_amount_for_display, format_native_top_up_recipient_suffix,
@@ -664,39 +664,48 @@ impl WalletRoot {
     }
 }
 
+/// The application services and panes `WalletRoot::new` wires in beside the
+/// startup result.
+pub(in crate::root) struct WalletRootDependencies<'a> {
+    pub(in crate::root) options: WalletAppOptions,
+    pub(in crate::root) public_transaction_tracker: wallet_ops::PublicTransactionTracker,
+    pub(in crate::root) runtime: Handle,
+    pub(in crate::root) monitor_state: Shared,
+    pub(in crate::root) monitor_event_rx: EventRx,
+    pub(in crate::root) monitor: Entity<broadcaster_monitor_gpui::BroadcasterMonitorPane>,
+    pub(in crate::root) public_broadcaster_anchor_cache: Arc<TokenAnchorRateCache>,
+    pub(in crate::root) public_broadcaster_anchor_refresh: TokenAnchorRefreshHandle,
+    pub(in crate::root) logs: Entity<LogsPane>,
+    pub(in crate::root) startup_root: &'a gpui::WeakEntity<WalletStartupRoot>,
+    pub(in crate::root) maintenance_controller: &'a Entity<WalletMaintenanceController>,
+}
+
 impl WalletRoot {
     fn new(
-        options: WalletAppOptions,
-        public_transaction_tracker: wallet_ops::PublicTransactionTracker,
-        http: HttpContext,
-        vault_store: Arc<DesktopVaultStore>,
-        chain_ids: &[u64],
-        initial_chain_id: u64,
-        ui_state: WalletUiState,
-        effective_chain_configs: EffectiveChainRegistry,
-        effective_token_registry: EffectiveTokenRegistry,
-        public_balance_refresh_interval: Duration,
-        auto_lock_timeout: Option<Duration>,
-        public_broadcaster_policy: BroadcasterFeePolicy,
-        public_broadcaster_response_timeout: Duration,
-        public_broadcaster_republish_interval: Duration,
-        default_allow_suspicious_broadcasters: bool,
-        mimic_railway_shields_by_default: bool,
-        poi_read_source: PoiReadSource,
-        runtime: Handle,
-        monitor_state: Shared,
-        waku_config: WakuMonitorConfig,
-        monitor_event_tx: EventTx,
-        public_broadcaster_anchor_cache: Arc<TokenAnchorRateCache>,
-        public_broadcaster_anchor_refresh: TokenAnchorRefreshHandle,
-        monitor_event_rx: EventRx,
-        monitor: Entity<broadcaster_monitor_gpui::BroadcasterMonitorPane>,
-        logs: Entity<LogsPane>,
-        startup_root: &gpui::WeakEntity<WalletStartupRoot>,
-        maintenance_controller: &Entity<WalletMaintenanceController>,
+        ready: WalletStartupReady,
+        dependencies: WalletRootDependencies<'_>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
+        let WalletStartupReady {
+            http,
+            waku_config,
+            monitor_event_tx,
+            vault_store,
+            chain_ids,
+            initial_chain_id,
+            ui_state,
+            effective_chain_configs,
+            effective_token_registry,
+            public_balance_refresh_interval,
+            auto_lock_timeout,
+            public_broadcaster_policy,
+            public_broadcaster_response_timeout,
+            public_broadcaster_republish_interval,
+            default_allow_suspicious_broadcasters,
+            mimic_railway_shields_by_default,
+            poi_read_source,
+        } = ready;
         let initial_wallet_tab = if effective_chain_configs.railgun(initial_chain_id).is_ok() {
             WalletTab::default()
         } else {
@@ -712,68 +721,38 @@ impl WalletRoot {
             })
             .collect();
         let mut chain_states = BTreeMap::new();
-        for chain_id in chain_ids {
+        for chain_id in &chain_ids {
             chain_states.insert(*chain_id, ChainUtxoState::Idle);
         }
+        let maintenance_controller = dependencies.maintenance_controller;
         let active_root = cx.weak_entity();
         maintenance_controller.update(cx, |controller, _cx| {
-            controller.set_active_root(active_root.clone());
+            controller.set_active_root(active_root);
         });
         let merkle_forest_cache_resetting =
             maintenance_controller.read(cx).reset() == maintenance::WalletMaintenanceReset::Merkle;
         let public_sync_cache_resetting =
             maintenance_blocks_public_sync(maintenance_controller.read(cx).reset());
-        let gateway = gateway::GatewayUi::start(vault_store.as_ref(), &runtime, window, cx);
-        let vault_store = Some(vault_store);
-        let (settings_editor, settings_error) = match vault_store.as_ref() {
-            Some(store) => {
-                let db = store.db();
-                match load_wallet_settings(db.as_ref()) {
-                    Ok(settings) => (
-                        Some(cx.new({
-                            let store = Arc::clone(store);
-                            let runtime = runtime.clone();
-                            let startup_root = startup_root.clone();
-                            let maintenance_controller = maintenance_controller.clone();
-                            let active_root = active_root.clone();
-                            |cx| {
-                                WalletSettingsEditor::new(
-                                    store,
-                                    &options.db_path,
-                                    runtime,
-                                    settings,
-                                    maintenance_controller,
-                                    Some(startup_root),
-                                    Some(active_root),
-                                    window,
-                                    cx,
-                                )
-                            }
-                        })),
-                        None,
-                    ),
-                    Err(error) => (None, Some(Arc::from(error.to_string()))),
-                }
-            }
-            None => (None, Some(Arc::from("Wallet database is unavailable"))),
-        };
+        let gateway =
+            gateway::GatewayUi::start(vault_store.as_ref(), &dependencies.runtime, window, cx);
+        let (settings_editor, settings_error) =
+            Self::initial_settings_editor(&dependencies, &vault_store, window, cx);
+        let WalletRootDependencies {
+            options,
+            public_transaction_tracker,
+            runtime,
+            monitor_state,
+            monitor_event_rx,
+            monitor,
+            public_broadcaster_anchor_cache,
+            public_broadcaster_anchor_refresh,
+            logs,
+            ..
+        } = dependencies;
         let unwrap_unshields_by_default = settings_editor
             .as_ref()
             .is_some_and(|editor| editor.read(cx).saved.privacy.unwrap_unshields_by_default);
-        let (vault_state, vault_error) = match vault_store.as_ref() {
-            Some(store) => match store.vault_exists() {
-                Ok(true) => (VaultState::UnlockVault, None),
-                Ok(false) => (VaultState::CreateVault, None),
-                Err(error) => (
-                    VaultState::Error(Arc::from("Failed to inspect wallet vault storage")),
-                    Some(Arc::from(error.to_string())),
-                ),
-            },
-            None => (
-                VaultState::Error(Arc::from("Failed to open wallet vault storage")),
-                None,
-            ),
-        };
+        let (vault_state, vault_error) = initial_vault_state(&vault_store);
         let focus_vault_input_on_render = matches!(
             vault_state,
             VaultState::CreateVault | VaultState::UnlockVault
@@ -782,23 +761,13 @@ impl WalletRoot {
             wallet_ops::device_auth::DeviceAuthMethod::TouchId,
         );
         let touch_id_status = vault_store
-            .as_ref()
-            .and_then(|store| {
-                store
-                    .device_auth_status(wallet_ops::device_auth::DeviceAuthMethod::TouchId)
-                    .ok()
-            })
+            .device_auth_status(wallet_ops::device_auth::DeviceAuthMethod::TouchId)
             .unwrap_or(DeviceAuthStatus::Disabled);
         let apple_watch_supported = wallet_ops::device_auth::device_auth_supported(
             wallet_ops::device_auth::DeviceAuthMethod::AppleWatch,
         );
         let apple_watch_status = vault_store
-            .as_ref()
-            .and_then(|store| {
-                store
-                    .device_auth_status(wallet_ops::device_auth::DeviceAuthMethod::AppleWatch)
-                    .ok()
-            })
+            .device_auth_status(wallet_ops::device_auth::DeviceAuthMethod::AppleWatch)
             .unwrap_or(DeviceAuthStatus::Disabled);
         let touch_id_unlock_on_render = matches!(vault_state, VaultState::UnlockVault)
             && touch_id_supported
@@ -855,103 +824,13 @@ impl WalletRoot {
             new_text_input(window, cx, "favorite broadcaster 0zk address");
         let banned_broadcaster_input = new_text_input(window, cx, "banned broadcaster 0zk address");
         let address_book_label_input = new_text_input(window, cx, "recipient label");
-        let address_book = AddressBookState {
-            search_input: address_book_search_input,
-            add_label_input: new_text_input(window, cx, "recipient label"),
-            add_address_input: new_text_input(
-                window,
-                cx,
-                "0zk, 0x, Bitcoin, Solana, Tron or Zcash recipient",
-            ),
-            edit_label_input: new_text_input(window, cx, "recipient label"),
-            edit_address_input: new_text_input(window, cx, "recipient address"),
-            search_query: Arc::from(""),
-            editing_entry: None,
-            error: None,
-        };
-        let public_list_scroll = gpui::ScrollHandle::new();
-        let public_form = PublicAccountFormState {
-            add_password_input: new_masked_input(window, cx, "vault password"),
-            import_label_input: new_text_input(window, cx, "account label"),
-            import_private_key_input: new_masked_input(window, cx, "private key hex"),
-            import_password_input: new_masked_input(window, cx, "vault password"),
-            edit_label_input: new_text_input(window, cx, "account label"),
-            search_input: public_account_search_input,
-            send_recipient_input: new_text_input(window, cx, "0x recipient"),
-            send_amount_input: new_text_input(window, cx, "amount"),
-            advanced_send_to_input: new_text_input(window, cx, "0x…"),
-            advanced_send_value_input: new_text_input(window, cx, "0"),
-            advanced_send_data_input: cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .auto_grow(4, 12)
-                    .placeholder("0x…")
-            }),
-            shield_amount_input: new_text_input(window, cx, "amount"),
-            send_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
-            shield_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
-            wrap_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
-            unwrap_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
-            shield_gas_fee_authorization_ceiling: None,
-            shield_gas_fee_route: None,
-            native_shield_preparation: public_action::NativeShieldPreparationState::default(),
-            native_shield_operation: None,
-            import_global: false,
-            import_tron: false,
-            selected_account_uuid: None,
-            editing_account_uuid: None,
-            search_query: Arc::from(""),
-            selected_asset: None,
-            mimic_railway_shield: mimic_railway_shields_by_default,
-            shield_approval_mode: wallet_ops::PublicShieldApprovalMode::Exact,
-            action_mode: PublicActionMode::Shield,
-            action_progress_mode: PublicActionMode::Shield,
-            public_send_kind: PublicSendKind::Transfer,
-            advanced_send_estimate: None,
-            advanced_send_estimate_invalidated: false,
-            advanced_send_estimate_pending: false,
-            advanced_send_estimate_generation: 0,
-            advanced_send_to_error: None,
-            advanced_send_value_error: None,
-            advanced_send_data_error: None,
-            action_generation: 0,
-            action_progress: Vec::new(),
-            action_progress_lifecycle: PublicActionProgressLifecycle::Clear,
-            action_fee_authorization_review: None,
-            expanded_action_error_steps: BTreeSet::new(),
-            action_progress_dialog_open: false,
-            action_requires_device_approval: false,
-            action_progress_title_override: None,
-            action_progress_asset_label: Arc::from(""),
-            action_progress_icon_path: None,
-            action_task_abort_handle: None,
-            action_stop_available: false,
-            action_stopped: false,
-            action_command_tx: None,
-            action_attempts: Vec::new(),
-            action_current_gas_fee: None,
-            action_fees_authorized: false,
-            action_action_error: None,
-            action_error_summary: None,
-            action_contract_address: None,
-            next_derived_index: None,
-            derive_preview: DerivePreviewState::new(window, cx),
-            next_account_label_number: 1,
-            error: None,
-            send_error: None,
-            shield_error: None,
-            importing_account: false,
-            sending: false,
-            shielding: false,
-            list_scroll: public_list_scroll,
-            selected_row_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
-            list_focus: cx.focus_handle(),
-            focused_asset_index: None,
-            asset_menu: None,
-            asset_menu_subscription: None,
-            open_section: wallet_ops::vault::PublicAccountStatus::Active,
-            refresh_help_open: false,
-            operation: None,
-        };
+        let address_book = AddressBookState::new(address_book_search_input, window, cx);
+        let public_form = PublicAccountFormState::new(
+            public_account_search_input,
+            mimic_railway_shields_by_default,
+            window,
+            cx,
+        );
         let repair_cache_block_input = new_text_input(window, cx, "0 = deployment block");
         let tx_search_input = new_text_input(window, cx, "search tx hash");
         let mut platform_attention = platform_attention::PlatformAttentionState::new(window);
@@ -981,42 +860,12 @@ impl WalletRoot {
         let passphrase_open_ui = cx.new(|cx| PassphraseOpenUi::new(root_entity, window, cx));
         let broadcaster_preference_snapshot =
             Arc::new(RwLock::new(BroadcasterPreferences::default()));
-        let preference_status_snapshot = Arc::clone(&broadcaster_preference_snapshot);
-        let preference_root = root_weak.clone();
-        let favorite_root = preference_root.clone();
-        let banned_root = preference_root;
-        monitor.update(cx, |monitor, cx| {
-            monitor.set_preference_hooks(
-                Some(broadcaster_monitor_gpui::BroadcasterPreferenceHooks::new(
-                    move |address| {
-                        preference_status_snapshot.read().map_or(
-                            broadcaster_monitor_gpui::BroadcasterPreferenceStatus::Neutral,
-                            |preferences| {
-                                if broadcaster_preference_is_banned(&preferences, address) {
-                                    broadcaster_monitor_gpui::BroadcasterPreferenceStatus::Banned
-                                } else if broadcaster_preference_is_favorite(&preferences, address)
-                                {
-                                    broadcaster_monitor_gpui::BroadcasterPreferenceStatus::Favorite
-                                } else {
-                                    broadcaster_monitor_gpui::BroadcasterPreferenceStatus::Neutral
-                                }
-                            },
-                        )
-                    },
-                    move |address, _window, cx| {
-                        let _ = favorite_root.update(cx, |root, cx| {
-                            root.toggle_favorite_broadcaster(&address, cx);
-                        });
-                    },
-                    move |address, _window, cx| {
-                        let _ = banned_root.update(cx, |root, cx| {
-                            root.toggle_banned_broadcaster(&address, cx);
-                        });
-                    },
-                )),
-                cx,
-            );
-        });
+        install_broadcaster_preference_hooks(
+            &monitor,
+            Arc::clone(&broadcaster_preference_snapshot),
+            root_weak.clone(),
+            cx,
+        );
         let utxo_table = cx.new(|cx| {
             TableState::new(
                 UtxoDelegate::new(root_weak.clone(), tx_search_input.clone()),
@@ -1047,7 +896,7 @@ impl WalletRoot {
             selected_network: SelectedNetwork::Evm(initial_chain_id),
             last_evm_chain: initial_chain_id,
             options,
-            vault_store,
+            vault_store: Some(vault_store),
             poi_read_source,
             effective_chain_configs,
             effective_token_registry,
@@ -1288,6 +1137,54 @@ impl WalletRoot {
         root.spawn_tor_bridge_activity_sampler(cx);
         root.watch_public_transactions(cx);
         root
+    }
+
+    /// The settings editor over the saved settings, or the error shown in its
+    /// place when they don't load.
+    fn initial_settings_editor(
+        dependencies: &WalletRootDependencies<'_>,
+        store: &Arc<DesktopVaultStore>,
+        window: &Window,
+        cx: &mut Context<'_, Self>,
+    ) -> (Option<Entity<WalletSettingsEditor>>, Option<Arc<str>>) {
+        let db = store.db();
+        match load_wallet_settings(db.as_ref()) {
+            Ok(settings) => {
+                let store = Arc::clone(store);
+                let runtime = dependencies.runtime.clone();
+                let startup_root = dependencies.startup_root.clone();
+                let maintenance_controller = dependencies.maintenance_controller.clone();
+                let active_root = cx.weak_entity();
+                let editor = cx.new(|cx| {
+                    WalletSettingsEditor::new(
+                        store,
+                        &dependencies.options.db_path,
+                        runtime,
+                        settings,
+                        maintenance_controller,
+                        Some(startup_root),
+                        Some(active_root),
+                        window,
+                        cx,
+                    )
+                });
+                (Some(editor), None)
+            }
+            Err(error) => (None, Some(Arc::from(error.to_string()))),
+        }
+    }
+}
+
+/// The vault screen to start on, and the error to show when the vault can't
+/// be inspected.
+fn initial_vault_state(store: &DesktopVaultStore) -> (VaultState, Option<Arc<str>>) {
+    match store.vault_exists() {
+        Ok(true) => (VaultState::UnlockVault, None),
+        Ok(false) => (VaultState::CreateVault, None),
+        Err(error) => (
+            VaultState::Error(Arc::from("Failed to inspect wallet vault storage")),
+            Some(Arc::from(error.to_string())),
+        ),
     }
 }
 

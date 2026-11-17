@@ -48,7 +48,6 @@ pub(super) use components::{
     next_public_account_label_number, public_account_display_label, public_account_matches_search,
     public_account_source_label,
 };
-pub(super) use derive_preview::DerivePreviewState;
 #[cfg(test)]
 pub(super) use hardware::hardware_public_account_setup_copy;
 #[cfg(test)]

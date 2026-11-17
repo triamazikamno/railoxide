@@ -27,7 +27,7 @@ use crate::root::ui_helpers::dialog_footer;
 use super::utxo::short_hash;
 use super::{
     ConfirmationDialogProps, WalletRoot, app_status_tag, confirmation_dialog, dialog_max_height,
-    parse_address, secondary_dialog_content_width, vault_error_kind,
+    new_text_input, parse_address, secondary_dialog_content_width, vault_error_kind,
 };
 
 const ADDRESS_BOOK_CONTENT_WIDTH: Pixels = px(980.0);
@@ -140,6 +140,27 @@ pub(super) struct AddressBookState {
 }
 
 impl AddressBookState {
+    pub(super) fn new(
+        search_input: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<'_, WalletRoot>,
+    ) -> Self {
+        Self {
+            search_input,
+            add_label_input: new_text_input(window, cx, "recipient label"),
+            add_address_input: new_text_input(
+                window,
+                cx,
+                "0zk, 0x, Bitcoin, Solana, Tron or Zcash recipient",
+            ),
+            edit_label_input: new_text_input(window, cx, "recipient label"),
+            edit_address_input: new_text_input(window, cx, "recipient address"),
+            search_query: Arc::from(""),
+            editing_entry: None,
+            error: None,
+        }
+    }
+
     pub(super) fn clear_dialog_state(
         &mut self,
         window: &mut Window,

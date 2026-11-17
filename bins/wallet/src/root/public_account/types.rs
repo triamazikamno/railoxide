@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui::Entity;
+use gpui::{AppContext as _, Context, Entity, Window};
 use gpui_component::input::{InputState, TextareaState};
 use wallet_ops::{
     PublicActionAttemptInfo, PublicActionCommandSender, PublicActionGasFeeSelection,
@@ -17,6 +17,7 @@ use crate::root::public_action::{
     PublicActionMode, PublicActionProgressLifecycle, PublicActionStepState, PublicSendKind,
     PublicShieldRoute,
 };
+use crate::root::{WalletRoot, new_masked_input, new_text_input};
 
 use super::derive_preview::DerivePreviewState;
 
@@ -115,6 +116,97 @@ pub(in crate::root) struct PublicAccountFormState {
 }
 
 impl PublicAccountFormState {
+    pub(in crate::root) fn new(
+        search_input: Entity<InputState>,
+        mimic_railway_shield: bool,
+        window: &mut Window,
+        cx: &mut Context<'_, WalletRoot>,
+    ) -> Self {
+        let public_list_scroll = gpui::ScrollHandle::new();
+        Self {
+            add_password_input: new_masked_input(window, cx, "vault password"),
+            import_label_input: new_text_input(window, cx, "account label"),
+            import_private_key_input: new_masked_input(window, cx, "private key hex"),
+            import_password_input: new_masked_input(window, cx, "vault password"),
+            edit_label_input: new_text_input(window, cx, "account label"),
+            search_input,
+            send_recipient_input: new_text_input(window, cx, "0x recipient"),
+            send_amount_input: new_text_input(window, cx, "amount"),
+            advanced_send_to_input: new_text_input(window, cx, "0x…"),
+            advanced_send_value_input: new_text_input(window, cx, "0"),
+            advanced_send_data_input: cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .auto_grow(4, 12)
+                    .placeholder("0x…")
+            }),
+            shield_amount_input: new_text_input(window, cx, "amount"),
+            send_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
+            shield_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
+            wrap_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
+            unwrap_gas_fee: Eip1559GasFeeEditorState::new(window, cx),
+            shield_gas_fee_authorization_ceiling: None,
+            shield_gas_fee_route: None,
+            native_shield_preparation: NativeShieldPreparationState::default(),
+            native_shield_operation: None,
+            import_global: false,
+            import_tron: false,
+            selected_account_uuid: None,
+            editing_account_uuid: None,
+            search_query: Arc::from(""),
+            selected_asset: None,
+            mimic_railway_shield,
+            shield_approval_mode: wallet_ops::PublicShieldApprovalMode::Exact,
+            action_mode: PublicActionMode::Shield,
+            action_progress_mode: PublicActionMode::Shield,
+            public_send_kind: PublicSendKind::Transfer,
+            advanced_send_estimate: None,
+            advanced_send_estimate_invalidated: false,
+            advanced_send_estimate_pending: false,
+            advanced_send_estimate_generation: 0,
+            advanced_send_to_error: None,
+            advanced_send_value_error: None,
+            advanced_send_data_error: None,
+            action_generation: 0,
+            action_progress: Vec::new(),
+            action_progress_lifecycle: PublicActionProgressLifecycle::Clear,
+            action_fee_authorization_review: None,
+            expanded_action_error_steps: BTreeSet::new(),
+            action_progress_dialog_open: false,
+            action_requires_device_approval: false,
+            action_progress_title_override: None,
+            action_progress_asset_label: Arc::from(""),
+            action_progress_icon_path: None,
+            action_task_abort_handle: None,
+            action_stop_available: false,
+            action_stopped: false,
+            action_command_tx: None,
+            action_attempts: Vec::new(),
+            action_current_gas_fee: None,
+            action_fees_authorized: false,
+            action_action_error: None,
+            action_error_summary: None,
+            action_contract_address: None,
+            next_derived_index: None,
+            derive_preview: DerivePreviewState::new(window, cx),
+            next_account_label_number: 1,
+            error: None,
+            send_error: None,
+            shield_error: None,
+            importing_account: false,
+            sending: false,
+            shielding: false,
+            list_scroll: public_list_scroll,
+            selected_row_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
+            list_focus: cx.focus_handle(),
+            focused_asset_index: None,
+            asset_menu: None,
+            asset_menu_subscription: None,
+            open_section: wallet_ops::vault::PublicAccountStatus::Active,
+            refresh_help_open: false,
+            operation: None,
+        }
+    }
+
     pub(in crate::root) const fn gas_fee(
         &self,
         mode: PublicActionMode,
