@@ -1,0 +1,1187 @@
+use crate::{RpcChainRoute, RpcRevert};
+
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, TcpListener};
+use std::sync::mpsc;
+use std::thread;
+
+use alloy::primitives::address;
+use alloy::providers::bindings::IMulticall3;
+use reqwest::Url;
+use serde_json::{Value, json};
+
+use super::*;
+
+const MULTICALL: Address = address!("0x0000000000000000000000000000000000000604");
+
+struct GovernanceFixture {
+    url: String,
+    calls: mpsc::Receiver<Vec<(Address, U256)>>,
+    task: thread::JoinHandle<()>,
+}
+
+struct ParticipationFixture {
+    url: String,
+    calls: mpsc::Receiver<Vec<(&'static str, Address)>>,
+    shutdown: mpsc::Sender<()>,
+    task: thread::JoinHandle<()>,
+}
+
+sol! {
+    interface SnapshotReads {
+        function accountSnapshotLength(address owner) external view returns (uint256);
+        function accountSnapshot(address owner, uint256 index)
+            external view returns (uint256 interval, uint256 votingPower);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ActionFault {
+    None,
+    Failed,
+    Malformed,
+    WrongCount,
+}
+
+fn read_request(stream: &mut std::net::TcpStream) -> Value {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let (header_end, content_length) = loop {
+        let read = stream.read(&mut buffer).expect("read fixture request");
+        assert!(read > 0);
+        bytes.extend_from_slice(&buffer[..read]);
+        if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+            let end = index + 4;
+            let headers = String::from_utf8_lossy(&bytes[..end]);
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("content length"))
+                })
+                .expect("content length");
+            break (end, length);
+        }
+    };
+    while bytes.len() < header_end + content_length {
+        let read = stream.read(&mut buffer).expect("read fixture body");
+        assert!(read > 0);
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    serde_json::from_slice(&bytes[header_end..header_end + content_length]).expect("fixture JSON")
+}
+
+fn spawn_governance_rpc_fixture(
+    v2: Address,
+    v1: Address,
+    malformed_v1: bool,
+    action_fault: ActionFault,
+) -> GovernanceFixture {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind fixture");
+    let url = format!("http://{}", listener.local_addr().expect("fixture address"));
+    let (calls_tx, calls_rx) = mpsc::channel();
+    let task = thread::spawn(move || {
+        let mut page_calls = Vec::new();
+        let mut application_calls = 0;
+        while application_calls < 2 {
+            let (mut stream, _) = listener.accept().expect("accept fixture request");
+            let request = read_request(&mut stream);
+            application_calls += 1;
+            let call_data = request["params"][0]
+                .get("input")
+                .or_else(|| request["params"][0].get("data"))
+                .and_then(Value::as_str)
+                .expect("eth_call data")
+                .parse::<alloy::primitives::Bytes>()
+                .expect("call bytes");
+            let decoded = IMulticall3::tryAggregateCall::abi_decode(&call_data)
+                .expect("tryAggregate calldata");
+            let page_batch = decoded.calls.iter().any(|call| {
+                call.callData
+                    .starts_with(&GovernanceVoting::getActionsCall::SELECTOR)
+            });
+            if !page_batch {
+                assert_eq!(decoded.calls.len(), 18);
+            }
+            let target = request["params"][0]["to"]
+                .as_str()
+                .expect("multicall target")
+                .parse::<Address>()
+                .expect("multicall address");
+            assert_eq!(target, MULTICALL);
+            let returns = decoded
+                .calls
+                .into_iter()
+                .map(|call| {
+                    let return_data = if call
+                        .callData
+                        .starts_with(&GovernanceVoting::proposalsLengthCall::SELECTOR)
+                    {
+                        assert!(call.target == v2 || call.target == v1);
+                        let count = U256::from(2);
+                        GovernanceVoting::proposalsLengthCall::abi_encode_returns(&count).into()
+                    } else if call
+                        .callData
+                        .starts_with(&GovernanceVoting::PROPOSAL_SPONSOR_THRESHOLDCall::SELECTOR)
+                    {
+                        GovernanceVoting::PROPOSAL_SPONSOR_THRESHOLDCall::abi_encode_returns(
+                            &U256::from(77),
+                        )
+                        .into()
+                    } else if call
+                        .callData
+                        .starts_with(&GovernanceVoting::QUORUMCall::SELECTOR)
+                    {
+                        GovernanceVoting::QUORUMCall::abi_encode_returns(&U256::from(50)).into()
+                    } else if call
+                        .callData
+                        .starts_with(&GovernanceVoting::SPONSOR_WINDOWCall::SELECTOR)
+                    {
+                        GovernanceVoting::SPONSOR_WINDOWCall::abi_encode_returns(&U256::from(20))
+                            .into()
+                    } else if call
+                        .callData
+                        .starts_with(&GovernanceVoting::VOTING_START_OFFSETCall::SELECTOR)
+                    {
+                        GovernanceVoting::VOTING_START_OFFSETCall::abi_encode_returns(&U256::from(
+                            5,
+                        ))
+                        .into()
+                    } else if call
+                        .callData
+                        .starts_with(&GovernanceVoting::VOTING_YAY_END_OFFSETCall::SELECTOR)
+                    {
+                        GovernanceVoting::VOTING_YAY_END_OFFSETCall::abi_encode_returns(
+                            &U256::from(10),
+                        )
+                        .into()
+                    } else if call
+                        .callData
+                        .starts_with(&GovernanceVoting::VOTING_NAY_END_OFFSETCall::SELECTOR)
+                    {
+                        GovernanceVoting::VOTING_NAY_END_OFFSETCall::abi_encode_returns(
+                            &U256::from(15),
+                        )
+                        .into()
+                    } else if call
+                        .callData
+                        .starts_with(&GovernanceVoting::EXECUTION_START_OFFSETCall::SELECTOR)
+                    {
+                        GovernanceVoting::EXECUTION_START_OFFSETCall::abi_encode_returns(
+                            &U256::from(20),
+                        )
+                        .into()
+                    } else if call
+                        .callData
+                        .starts_with(&GovernanceVoting::EXECUTION_END_OFFSETCall::SELECTOR)
+                    {
+                        GovernanceVoting::EXECUTION_END_OFFSETCall::abi_encode_returns(&U256::from(
+                            30,
+                        ))
+                        .into()
+                    } else if call
+                        .callData
+                        .starts_with(&GovernanceVoting::getActionsCall::SELECTOR)
+                    {
+                        let decoded = GovernanceVoting::getActionsCall::abi_decode(&call.callData)
+                            .expect("getActions calldata");
+                        let marker = decoded.id.to::<u64>();
+                        let marker_byte =
+                            u8::try_from(marker).expect("fixture marker fits in an address");
+                        let actions = if marker == 0 {
+                            Vec::new()
+                        } else if call.target == v2 {
+                            vec![
+                                (
+                                    Address::from([marker_byte; 20]),
+                                    Bytes::from(vec![0xde, 0xad, marker_byte]),
+                                    U256::ZERO,
+                                ),
+                                (
+                                    Address::from([marker_byte.saturating_add(1); 20]),
+                                    Bytes::new(),
+                                    U256::from(7),
+                                ),
+                            ]
+                        } else {
+                            assert_eq!(call.target, v1);
+                            vec![(
+                                Address::from([marker_byte; 20]),
+                                Bytes::from(vec![0x01, 0x02]),
+                                U256::from(11),
+                            )]
+                        };
+                        if matches!(action_fault, ActionFault::Malformed) && call.target == v2 {
+                            Bytes::from(vec![0])
+                        } else {
+                            GovernanceVoting::getActionsCall::abi_encode_returns(&actions).into()
+                        }
+                    } else {
+                        let decoded = GovernanceVoting::proposalsCall::abi_decode(&call.callData)
+                            .expect("proposal calldata");
+                        page_calls.push((call.target, decoded.index));
+                        let marker = decoded.index.to::<u64>();
+                        let marker_byte =
+                            u8::try_from(marker).expect("fixture marker fits in an address");
+                        if call.target == v2 {
+                            let proposal = GovernanceVotingV2::proposalsReturn {
+                                executed: marker % 2 == 0,
+                                proposer: Address::from([marker_byte; 20]),
+                                proposalDocument: format!("cid-{marker}"),
+                                publishTime: U256::from(100_u64 + marker),
+                                voteCallTime: U256::from(200_u64 + marker),
+                                sponsorship: U256::from(300_u64 + marker),
+                                yayVotes: U256::from(400_u64 + marker),
+                                nayVotes: U256::from(500_u64 + marker),
+                                sponsorInterval: U256::from(600_u64 + marker),
+                                votingInterval: U256::from(700_u64 + marker),
+                            };
+                            GovernanceVotingV2::proposalsCall::abi_encode_returns(&proposal).into()
+                        } else {
+                            assert_eq!(call.target, v1);
+                            let (yay_votes, nay_votes) = if malformed_v1 && marker == 1 {
+                                (U256::MAX, U256::from(1))
+                            } else {
+                                (U256::from(400_u64 + marker), U256::from(500_u64 + marker))
+                            };
+                            let proposal = GovernanceVoting::proposalsReturn {
+                                proposer: Address::from([marker_byte; 20]),
+                                proposalDocument: format!("cid-{marker}"),
+                                publishTime: U256::from(100_u64 + marker),
+                                voteCallTime: U256::from(200_u64 + marker),
+                                sponsorship: U256::from(300_u64 + marker),
+                                executed: marker % 2 == 0,
+                                yayVotes: yay_votes,
+                                nayVotes: nay_votes,
+                                sponsorInterval: U256::from(600_u64 + marker),
+                                votingInterval: U256::from(700_u64 + marker),
+                            };
+                            GovernanceVoting::proposalsCall::abi_encode_returns(&proposal).into()
+                        }
+                    };
+                    IMulticall3::Result {
+                        success: !(matches!(action_fault, ActionFault::Failed)
+                            && call
+                                .callData
+                                .starts_with(&GovernanceVoting::getActionsCall::SELECTOR)
+                            && call.target == v2),
+                        returnData: return_data,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut returns = returns;
+            if matches!(action_fault, ActionFault::WrongCount) && page_batch {
+                returns.pop();
+            }
+            let response_data = IMulticall3::tryAggregateCall::abi_encode_returns(&returns);
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": format!("0x{}", alloy::hex::encode(response_data)),
+            });
+            let body = serde_json::to_string(&body).expect("serialize fixture response");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write fixture response");
+        }
+        calls_tx.send(page_calls).expect("send fixture calls");
+    });
+    GovernanceFixture {
+        url,
+        calls: calls_rx,
+        task,
+    }
+}
+
+fn spawn_governance_participation_fixture() -> ParticipationFixture {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind fixture");
+    let url = format!("http://{}", listener.local_addr().expect("fixture address"));
+    let (calls_tx, calls_rx) = mpsc::channel();
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    let task = thread::spawn(move || {
+        let serve = |mut stream: std::net::TcpStream,
+                     observed: &mut Vec<(&'static str, Address)>| {
+            let request = read_request(&mut stream);
+            let call_data = request["params"][0]
+                .get("input")
+                .or_else(|| request["params"][0].get("data"))
+                .and_then(Value::as_str)
+                .expect("eth_call data")
+                .parse::<alloy::primitives::Bytes>()
+                .expect("call bytes");
+            let decoded = IMulticall3::tryAggregateCall::abi_decode(&call_data)
+                .expect("tryAggregate calldata");
+            let target = request["params"][0]["to"]
+                .as_str()
+                .expect("multicall target")
+                .parse::<Address>()
+                .expect("multicall address");
+            assert_eq!(target, MULTICALL);
+            let uint = |value: u64| -> Bytes {
+                <alloy::sol_types::sol_data::Uint<256> as alloy::sol_types::SolType>::abi_encode(
+                    &U256::from(value),
+                )
+                .into()
+            };
+            let returns = decoded
+                .calls
+                .iter()
+                .map(|call| {
+                    let data = &call.callData;
+                    let (name, account, return_data) = if let Ok(call) =
+                        SnapshotReads::accountSnapshotLengthCall::abi_decode(data)
+                    {
+                        ("accountSnapshotLength", call.owner, uint(2))
+                    } else if let Ok(call) = SnapshotReads::accountSnapshotCall::abi_decode(data) {
+                        let interval = U256::from(4) * (call.index + U256::ONE);
+                        let snapshot = SnapshotReads::accountSnapshotCall::abi_encode_returns(
+                            &SnapshotReads::accountSnapshotReturn {
+                                interval,
+                                votingPower: U256::ONE,
+                            },
+                        );
+                        ("accountSnapshot", call.owner, snapshot.into())
+                    } else if let Ok(call) = GovernanceStaking::votingPowerCall::abi_decode(data) {
+                        ("votingPower", call.owner, uint(40))
+                    } else if let Ok(call) =
+                        GovernanceStaking::accountSnapshotAtCall::abi_decode(data)
+                    {
+                        let snapshot = GovernanceStaking::accountSnapshotAtCall::abi_encode_returns(
+                            &GovernanceStaking::accountSnapshotAtReturn {
+                                interval: call.index,
+                                votingPower: U256::from(15),
+                            },
+                        );
+                        ("accountSnapshotAt", call.owner, snapshot.into())
+                    } else if let Ok(call) = GovernanceVoting::getSponsoredCall::abi_decode(data) {
+                        ("getSponsored", call.account, uint(3))
+                    } else if let Ok(call) = GovernanceVoting::getVotesCall::abi_decode(data) {
+                        ("getVotes", call.account, uint(5))
+                    } else if let Ok(call) = GovernanceVoting::lastSponsoredCall::abi_decode(data) {
+                        let last = GovernanceVoting::lastSponsoredCall::abi_encode_returns(
+                            &GovernanceVoting::lastSponsoredReturn {
+                                lastSponsorTime: U256::from(10),
+                                proposalID: U256::from(6),
+                            },
+                        );
+                        ("lastSponsored", call.account, last.into())
+                    } else {
+                        panic!("unexpected participation call");
+                    };
+                    observed.push((name, account));
+                    IMulticall3::Result {
+                        success: true,
+                        returnData: return_data,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let response_data = IMulticall3::tryAggregateCall::abi_encode_returns(&returns);
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": format!("0x{}", alloy::hex::encode(response_data)),
+            });
+            let body = serde_json::to_string(&body).expect("serialize fixture response");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write fixture response");
+        };
+
+        listener
+            .set_nonblocking(true)
+            .expect("set fixture listener nonblocking");
+        let mut observed = Vec::new();
+        loop {
+            if shutdown_rx.try_recv().is_ok() {
+                break;
+            }
+            match listener.accept() {
+                Ok((stream, _)) => serve(stream, &mut observed),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    match shutdown_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+                Err(error) => panic!("accept fixture request: {error}"),
+            }
+        }
+        calls_tx.send(observed).expect("send fixture calls");
+    });
+    ParticipationFixture {
+        url,
+        calls: calls_rx,
+        shutdown: shutdown_tx,
+        task,
+    }
+}
+
+#[tokio::test]
+async fn overview_and_page_decode_across_v2_v1_seam() {
+    let contracts = railgun_ui::governance_contracts(1).expect("Ethereum governance");
+    let GovernanceFixture { url, calls, task } = spawn_governance_rpc_fixture(
+        contracts.voting,
+        contracts.voting_legacy.expect("V1"),
+        false,
+        ActionFault::None,
+    );
+    let route = RpcChainRoute::new(1, vec![Url::parse(&url).unwrap()])
+        .with_multicall(MULTICALL)
+        .for_class(crate::RpcTrafficClass::General)
+        .unwrap();
+    let http = HttpContext::direct_for_tests();
+
+    let overview = fetch_governance_overview(1, &route, &http)
+        .await
+        .expect("overview request")
+        .expect("Ethereum governance");
+    assert_eq!(overview.v2.proposal_count, U256::from(2));
+    assert_eq!(
+        overview.v1.as_ref().expect("V1").rules.sponsor_threshold,
+        U256::from(77)
+    );
+
+    let page = fetch_governance_page(
+        &overview,
+        0,
+        NonZeroUsize::new(3).expect("nonzero page size"),
+        &route,
+        &http,
+    )
+    .await
+    .expect("page request");
+    assert_eq!(page.len(), 3);
+    assert_eq!(page[0].contract_version, GovernanceContractVersion::V2);
+    assert_eq!(page[0].index, U256::from(1));
+    assert_eq!(page[1].contract_version, GovernanceContractVersion::V2);
+    assert_eq!(page[1].index, U256::ZERO);
+    assert_eq!(page[0].proposer, Address::from([1; 20]));
+    assert_eq!(page[0].proposal_document, "cid-1");
+    assert_eq!(page[0].actions.len(), 2);
+    assert_eq!(page[0].actions[0].call_contract, Address::from([1; 20]));
+    assert_eq!(
+        page[0].actions[0].calldata,
+        Bytes::from(vec![0xde, 0xad, 1])
+    );
+    assert_eq!(page[0].actions[1].calldata, Bytes::new());
+    assert_eq!(page[0].actions[1].value, U256::from(7));
+    assert!(!page[0].executed);
+    assert_eq!(page[1].proposer, Address::from([0; 20]));
+    assert_eq!(page[1].proposal_document, "cid-0");
+    assert_eq!(page[1].actions, [] as [GovernanceProposalAction; 0]);
+    assert!(page[1].executed);
+    assert_eq!(page[2].contract_version, GovernanceContractVersion::V1);
+    assert_eq!(page[2].index, U256::from(1));
+    assert_eq!(page[2].proposal_document, "cid-1");
+    assert_eq!(page[2].actions.len(), 1);
+    assert_eq!(page[2].actions[0].value, U256::from(11));
+    assert_eq!(page[2].publish_time, U256::from(101));
+    assert_eq!(page[2].vote_call_time, U256::from(201));
+    assert_eq!(page[2].sponsorship, U256::from(301));
+    assert!(!page[2].executed);
+    assert_eq!(page[2].yay_votes, U256::from(401));
+    assert_eq!(page[2].nay_votes, U256::from(501));
+    assert_eq!(page[2].sponsor_snapshot_interval, U256::from(601));
+    assert_eq!(page[2].voting_snapshot_interval, U256::from(701));
+    assert_eq!(
+        calls.recv().expect("fixture calls"),
+        vec![
+            (contracts.voting, U256::from(1)),
+            (contracts.voting, U256::ZERO),
+            (contracts.voting_legacy.expect("V1"), U256::from(1))
+        ]
+    );
+    task.join().expect("fixture task");
+}
+
+#[tokio::test]
+async fn page_rejects_v1_vote_total_overflow() {
+    let contracts = railgun_ui::governance_contracts(1).expect("Ethereum governance");
+    let GovernanceFixture { url, calls, task } = spawn_governance_rpc_fixture(
+        contracts.voting,
+        contracts.voting_legacy.expect("V1"),
+        true,
+        ActionFault::None,
+    );
+    let route = RpcChainRoute::new(1, vec![Url::parse(&url).unwrap()])
+        .with_multicall(MULTICALL)
+        .for_class(crate::RpcTrafficClass::General)
+        .unwrap();
+    let http = HttpContext::direct_for_tests();
+
+    let overview = fetch_governance_overview(1, &route, &http)
+        .await
+        .expect("overview request")
+        .expect("Ethereum governance");
+    let error = fetch_governance_page(
+        &overview,
+        0,
+        NonZeroUsize::new(3).expect("nonzero page size"),
+        &route,
+        &http,
+    )
+    .await
+    .expect_err("malformed page should be rejected");
+    assert!(error.to_string().contains("arithmetic is invalid"));
+    assert_eq!(
+        calls.recv().expect("fixture calls"),
+        vec![
+            (contracts.voting, U256::from(1)),
+            (contracts.voting, U256::ZERO),
+            (contracts.voting_legacy.expect("V1"), U256::from(1))
+        ]
+    );
+    task.join().expect("fixture task");
+}
+
+async fn action_fault_page_error(action_fault: ActionFault) -> String {
+    let contracts = railgun_ui::governance_contracts(1).expect("Ethereum governance");
+    let GovernanceFixture { url, calls, task } = spawn_governance_rpc_fixture(
+        contracts.voting,
+        contracts.voting_legacy.expect("V1"),
+        false,
+        action_fault,
+    );
+    let route = RpcChainRoute::new(1, vec![Url::parse(&url).unwrap()])
+        .with_multicall(MULTICALL)
+        .for_class(crate::RpcTrafficClass::General)
+        .unwrap();
+    let http = HttpContext::direct_for_tests();
+    let overview = fetch_governance_overview(1, &route, &http)
+        .await
+        .expect("overview request")
+        .expect("Ethereum governance");
+    let error = fetch_governance_page(
+        &overview,
+        0,
+        NonZeroUsize::new(3).expect("nonzero page size"),
+        &route,
+        &http,
+    )
+    .await
+    .expect_err("malformed action page should be rejected");
+    let _ = calls.recv().expect("fixture calls");
+    task.join().expect("fixture task");
+    error.to_string()
+}
+
+#[tokio::test]
+async fn page_rejects_failed_malformed_and_wrong_count_actions() {
+    let failed = action_fault_page_error(ActionFault::Failed).await;
+    assert!(failed.contains("governance V2 getActions call failed at index"));
+    let malformed = action_fault_page_error(ActionFault::Malformed).await;
+    assert!(malformed.contains("governance V2 getActions return decoding failed at index"));
+    let wrong_count = action_fault_page_error(ActionFault::WrongCount).await;
+    assert!(wrong_count.contains("governance proposal multicall failed"));
+    assert!(wrong_count.contains("invalid RPC response"));
+}
+
+fn stage_test_proposal() -> GovernanceProposal {
+    GovernanceProposal {
+        contract_version: GovernanceContractVersion::V2,
+        index: U256::ZERO,
+        contract_address: Address::ZERO,
+        proposer: Address::ZERO,
+        proposal_document: String::new(),
+        publish_time: U256::from(100_u64),
+        vote_call_time: U256::ZERO,
+        sponsorship: U256::ZERO,
+        executed: false,
+        yay_votes: U256::ZERO,
+        nay_votes: U256::ZERO,
+        sponsor_snapshot_interval: U256::from(999_u64),
+        voting_snapshot_interval: U256::from(888_u64),
+        actions: Vec::new(),
+    }
+}
+
+fn stage_rules() -> GovernanceContractRules {
+    GovernanceContractRules {
+        sponsor_threshold: U256::from(10),
+        quorum: U256::from(3),
+        sponsor_window: U256::from(20),
+        voting_start_offset: U256::from(5),
+        voting_yay_end_offset: U256::from(10),
+        voting_nay_end_offset: U256::from(15),
+        execution_start_offset: U256::from(20),
+        execution_end_offset: U256::from(30),
+    }
+}
+
+#[test]
+fn stage_awaits_sponsorship_before_deadline() {
+    let proposal = stage_test_proposal();
+    assert_eq!(
+        derive_governance_proposal_stage(&proposal, &stage_rules(), U256::from(119_u64))
+            .expect("stage derivation"),
+        GovernanceProposalStage::AwaitingSponsorship
+    );
+}
+
+#[test]
+fn stage_expires_at_sponsorship_deadline() {
+    let proposal = stage_test_proposal();
+    let status = derive_governance_proposal_status(&proposal, &stage_rules(), U256::from(120_u64))
+        .expect("status derivation");
+    assert_eq!(status.deadlines.sponsorship, U256::from(120));
+    assert_eq!(status.stage, GovernanceProposalStage::SponsorshipExpired);
+}
+
+#[test]
+fn threshold_reached_without_vote_call_is_not_expired() {
+    let mut proposal = stage_test_proposal();
+    proposal.sponsorship = U256::from(10_u64);
+    assert_eq!(
+        derive_governance_proposal_stage(&proposal, &stage_rules(), U256::from(120_u64))
+            .expect("stage derivation"),
+        GovernanceProposalStage::VoteCallExpired
+    );
+}
+
+#[test]
+fn stage_is_voting_open_immediately_before_voting_end() {
+    let mut proposal = stage_test_proposal();
+    proposal.vote_call_time = U256::from(200_u64);
+    assert_eq!(
+        derive_governance_proposal_stage(&proposal, &stage_rules(), U256::from(209_u64))
+            .expect("stage derivation"),
+        GovernanceProposalStage::VotingOpen
+    );
+}
+
+#[test]
+fn strict_stage_boundaries_are_protocol_accurate() {
+    let mut proposal = stage_test_proposal();
+    proposal.sponsorship = U256::from(10);
+    assert_eq!(
+        derive_governance_proposal_stage(&proposal, &stage_rules(), U256::from(119)).unwrap(),
+        GovernanceProposalStage::ReadyToCallVote
+    );
+    proposal.vote_call_time = U256::from(200);
+    assert_eq!(
+        derive_governance_proposal_stage(&proposal, &stage_rules(), U256::from(205)).unwrap(),
+        GovernanceProposalStage::VotingDelay
+    );
+    assert_eq!(
+        derive_governance_proposal_stage(&proposal, &stage_rules(), U256::from(210)).unwrap(),
+        GovernanceProposalStage::NayOnlyVoting
+    );
+    proposal.yay_votes = U256::from(4);
+    proposal.nay_votes = U256::from(1);
+    assert_eq!(
+        derive_governance_proposal_stage(&proposal, &stage_rules(), U256::from(220)).unwrap(),
+        GovernanceProposalStage::PassedAwaitingExecution
+    );
+    assert_eq!(
+        derive_governance_proposal_stage(&proposal, &stage_rules(), U256::from(221)).unwrap(),
+        GovernanceProposalStage::PassedExecutable
+    );
+    assert_eq!(
+        derive_governance_proposal_stage(&proposal, &stage_rules(), U256::from(230)).unwrap(),
+        GovernanceProposalStage::ExecutionExpired
+    );
+}
+
+#[test]
+fn quorum_basis_is_version_specific_and_checked() {
+    let mut v2 = stage_test_proposal();
+    v2.vote_call_time = U256::from(200);
+    v2.yay_votes = U256::from(2);
+    v2.nay_votes = U256::from(1);
+    let v2_status =
+        derive_governance_proposal_status(&v2, &stage_rules(), U256::from(215)).unwrap();
+    assert_eq!(
+        v2_status.quorum_basis,
+        GovernanceQuorumBasis::AffirmativeOnly
+    );
+    assert_eq!(v2_status.quorum_progress, U256::from(2));
+    assert!(!v2_status.quorum_met);
+
+    let mut v1 = v2;
+    v1.contract_version = GovernanceContractVersion::V1;
+    v1.yay_votes = U256::from(2);
+    v1.nay_votes = U256::from(1);
+    let status = derive_governance_proposal_status(&v1, &stage_rules(), U256::from(215)).unwrap();
+    assert_eq!(status.quorum_basis, GovernanceQuorumBasis::TotalVotes);
+    assert_eq!(status.quorum_progress, U256::from(3));
+    assert!(status.quorum_met);
+    assert_eq!(status.majority, GovernanceMajorityResult::Yay);
+}
+
+#[test]
+fn invalid_rules_and_vote_total_overflow_are_errors() {
+    let proposal = stage_test_proposal();
+    let mut invalid = stage_rules();
+    invalid.execution_start_offset = invalid.voting_yay_end_offset;
+    assert!(derive_governance_proposal_status(&proposal, &invalid, U256::ZERO).is_err());
+    let mut overflow = stage_test_proposal();
+    overflow.contract_version = GovernanceContractVersion::V1;
+    overflow.yay_votes = U256::MAX;
+    overflow.nay_votes = U256::from(1);
+    assert!(derive_governance_proposal_status(&overflow, &stage_rules(), U256::ZERO).is_err());
+}
+
+#[test]
+fn stage_outcome_is_resolved_at_voting_end_and_ties_fail() {
+    let mut proposal = stage_test_proposal();
+    proposal.vote_call_time = U256::from(200_u64);
+    proposal.yay_votes = U256::from(3_u64);
+    proposal.nay_votes = U256::from(1_u64);
+    assert_eq!(
+        derive_governance_proposal_stage(&proposal, &stage_rules(), U256::from(215_u64))
+            .expect("stage derivation"),
+        GovernanceProposalStage::PassedAwaitingExecution
+    );
+
+    proposal.yay_votes = U256::from(3_u64);
+    proposal.nay_votes = U256::from(4_u64);
+    assert_eq!(
+        derive_governance_proposal_stage(&proposal, &stage_rules(), U256::from(215_u64))
+            .expect("stage derivation"),
+        GovernanceProposalStage::Failed
+    );
+
+    proposal.yay_votes = U256::from(3_u64);
+    proposal.nay_votes = U256::from(3_u64);
+    assert_eq!(
+        derive_governance_proposal_stage(&proposal, &stage_rules(), U256::from(215_u64))
+            .expect("stage derivation"),
+        GovernanceProposalStage::Failed
+    );
+}
+
+#[test]
+fn executed_stage_takes_precedence() {
+    let mut proposal = stage_test_proposal();
+    proposal.executed = true;
+    proposal.vote_call_time = U256::from(200_u64);
+    assert_eq!(
+        derive_governance_proposal_stage(&proposal, &stage_rules(), U256::from(205_u64))
+            .expect("stage derivation"),
+        GovernanceProposalStage::Executed
+    );
+}
+
+fn participation_proposal(version: GovernanceContractVersion) -> GovernanceProposal {
+    let contracts = governance_contracts(1).expect("Ethereum governance contracts");
+    GovernanceProposal {
+        contract_version: version,
+        index: U256::from(7),
+        contract_address: match version {
+            GovernanceContractVersion::V2 => contracts.voting,
+            GovernanceContractVersion::V1 => contracts.voting_legacy.expect("legacy voting"),
+        },
+        proposer: Address::from([1_u8; 20]),
+        proposal_document: String::new(),
+        publish_time: U256::from(100),
+        vote_call_time: U256::from(200),
+        sponsorship: U256::ZERO,
+        executed: false,
+        yay_votes: U256::ZERO,
+        nay_votes: U256::ZERO,
+        sponsor_snapshot_interval: U256::from(8),
+        voting_snapshot_interval: U256::from(9),
+        actions: Vec::new(),
+    }
+}
+
+fn encoded_participation_values() -> Vec<std::result::Result<Bytes, RpcBrokerError>> {
+    vec![
+        Ok(
+            <alloy::sol_types::sol_data::Uint<256> as alloy::sol_types::SolType>::abi_encode(
+                &U256::from(40),
+            )
+            .into(),
+        ),
+        Ok(
+            GovernanceStaking::accountSnapshotAtCall::abi_encode_returns(
+                &GovernanceStaking::accountSnapshotAtReturn {
+                    interval: U256::from(8),
+                    votingPower: U256::from(15),
+                },
+            )
+            .into(),
+        ),
+        Ok(
+            GovernanceStaking::accountSnapshotAtCall::abi_encode_returns(
+                &GovernanceStaking::accountSnapshotAtReturn {
+                    interval: U256::from(9),
+                    votingPower: U256::from(22),
+                },
+            )
+            .into(),
+        ),
+        Ok(
+            <alloy::sol_types::sol_data::Uint<256> as alloy::sol_types::SolType>::abi_encode(
+                &U256::from(3),
+            )
+            .into(),
+        ),
+        Ok(
+            <alloy::sol_types::sol_data::Uint<256> as alloy::sol_types::SolType>::abi_encode(
+                &U256::from(5),
+            )
+            .into(),
+        ),
+        Ok(GovernanceVoting::lastSponsoredCall::abi_encode_returns(
+            &GovernanceVoting::lastSponsoredReturn {
+                lastSponsorTime: U256::from(10),
+                proposalID: U256::from(6),
+            },
+        )
+        .into()),
+    ]
+}
+
+#[tokio::test]
+async fn participation_reads_carry_only_the_requested_account() {
+    let fixture = spawn_governance_participation_fixture();
+    let route = RpcChainRoute::new(1, vec![Url::parse(&fixture.url).unwrap()])
+        .with_multicall(MULTICALL)
+        .for_class(crate::RpcTrafficClass::Sensitive)
+        .unwrap();
+    let account = Address::from([3_u8; 20]);
+    let http = HttpContext::direct_for_tests();
+    let row = fetch_governance_participation(
+        1,
+        &participation_proposal(GovernanceContractVersion::V2),
+        account,
+        &route,
+        &http,
+    )
+    .await
+    .expect("participation row");
+    assert_eq!(row.account, account);
+    assert!(row.state.is_ok());
+
+    fixture.shutdown.send(()).expect("stop fixture");
+    let observed = fixture.calls.recv().expect("fixture calls");
+    assert_eq!(
+        observed,
+        [
+            "accountSnapshotLength",
+            "accountSnapshot",
+            "accountSnapshot",
+            "votingPower",
+            "accountSnapshotAt",
+            "accountSnapshotAt",
+            "getSponsored",
+            "getVotes",
+            "lastSponsored",
+        ]
+        .map(|name| (name, account))
+    );
+    fixture.task.join().expect("fixture task");
+}
+
+#[test]
+fn participation_decode_preserves_v1_and_v2_identity_routing() {
+    let account = Address::from([3_u8; 20]);
+    for version in [GovernanceContractVersion::V1, GovernanceContractVersion::V2] {
+        let proposal = participation_proposal(version);
+        let row = decode_governance_participation(
+            &proposal,
+            proposal.contract_address,
+            account,
+            U256::from(1),
+            U256::from(2),
+            &encoded_participation_values(),
+        )
+        .expect("participation decode");
+        assert_eq!(row.proposal_version, version);
+        assert_eq!(row.voting_contract, proposal.contract_address);
+        assert_eq!(row.current_voting_power, U256::from(40));
+        assert_eq!(row.sponsorship_snapshot.voting_power, U256::from(15));
+        assert_eq!(row.voting_snapshot.voting_power, U256::from(22));
+        assert_eq!(row.sponsored, U256::from(3));
+        assert_eq!(row.voted, U256::from(5));
+        assert_eq!(row.last_sponsored.proposal_id, U256::from(6));
+    }
+}
+
+#[test]
+fn participation_decode_accepts_later_snapshot_boundaries_but_rejects_earlier() {
+    let proposal = participation_proposal(GovernanceContractVersion::V2);
+    let account = Address::from([3_u8; 20]);
+    let mut values = encoded_participation_values();
+    values[1] = Ok(
+        GovernanceStaking::accountSnapshotAtCall::abi_encode_returns(
+            &GovernanceStaking::accountSnapshotAtReturn {
+                interval: U256::from(10),
+                votingPower: U256::from(17),
+            },
+        )
+        .into(),
+    );
+    values[2] = Ok(
+        GovernanceStaking::accountSnapshotAtCall::abi_encode_returns(
+            &GovernanceStaking::accountSnapshotAtReturn {
+                interval: U256::from(12),
+                votingPower: U256::from(24),
+            },
+        )
+        .into(),
+    );
+    let row = decode_governance_participation(
+        &proposal,
+        proposal.contract_address,
+        account,
+        U256::from(4),
+        U256::from(5),
+        &values,
+    )
+    .expect("later snapshot boundaries should decode");
+    assert_eq!(
+        row.sponsorship_snapshot.interval,
+        proposal.sponsor_snapshot_interval
+    );
+    assert_eq!(row.sponsorship_snapshot.voting_power, U256::from(17));
+    assert_eq!(row.sponsorship_snapshot.hint, U256::from(4));
+    assert_eq!(
+        row.voting_snapshot.interval,
+        proposal.voting_snapshot_interval
+    );
+    assert_eq!(row.voting_snapshot.voting_power, U256::from(24));
+    assert_eq!(row.voting_snapshot.hint, U256::from(5));
+
+    values[1] = Ok(
+        GovernanceStaking::accountSnapshotAtCall::abi_encode_returns(
+            &GovernanceStaking::accountSnapshotAtReturn {
+                interval: U256::from(7),
+                votingPower: U256::from(17),
+            },
+        )
+        .into(),
+    );
+    let error = decode_governance_participation(
+        &proposal,
+        proposal.contract_address,
+        account,
+        U256::from(4),
+        U256::from(5),
+        &values,
+    )
+    .expect_err("an earlier snapshot boundary should be rejected");
+    assert!(matches!(
+        error,
+        GovernanceParticipationError::InvalidSnapshotHint(_)
+    ));
+}
+
+#[test]
+fn participation_decode_keeps_allow_failure_field_errors_local() {
+    let proposal = participation_proposal(GovernanceContractVersion::V2);
+    let account = Address::from([3_u8; 20]);
+    let mut values = encoded_participation_values();
+    values[4] = Err(RpcBrokerError::InnerRevert(RpcRevert::from_multicall(
+        Bytes::new(),
+    )));
+    let error = decode_governance_participation(
+        &proposal,
+        proposal.contract_address,
+        account,
+        U256::from(1),
+        U256::from(2),
+        &values,
+    )
+    .expect_err("failed voted field should isolate the row");
+    assert!(matches!(
+        error,
+        GovernanceParticipationError::Read { field: "voted", .. }
+    ));
+}
+
+#[test]
+fn capacity_distinguishes_unavailable_exhausted_and_inconsistent_data() {
+    let snapshot = GovernanceAccountSnapshot {
+        interval: U256::from(8),
+        voting_power: U256::from(10),
+        hint: U256::from(2),
+    };
+    assert_eq!(
+        calculate_governance_capacity(Some(&snapshot), U256::from(4))
+            .expect("remaining capacity")
+            .remaining,
+        Some(U256::from(6))
+    );
+    assert_eq!(
+        calculate_governance_capacity(Some(&snapshot), U256::from(10))
+            .expect("exhausted capacity")
+            .remaining,
+        Some(U256::ZERO)
+    );
+    assert_eq!(
+        calculate_governance_capacity(None, U256::ZERO),
+        Err(GovernanceCapacityError::SnapshotUnavailable)
+    );
+    assert_eq!(
+        calculate_governance_capacity(Some(&snapshot), U256::from(11)),
+        Err(GovernanceCapacityError::AllocatedExceedsSnapshot)
+    );
+}
+
+#[test]
+fn governance_calls_route_to_both_versions_with_zero_native_value() {
+    let account = Address::from([4_u8; 20]);
+    for version in [GovernanceContractVersion::V1, GovernanceContractVersion::V2] {
+        let sponsor = build_sponsor_call(
+            1,
+            version,
+            U256::from(7),
+            U256::from(3),
+            account,
+            U256::from(2),
+        )
+        .expect("sponsor call");
+        assert_eq!(sponsor.value, U256::ZERO);
+        assert_eq!(sponsor.to, participation_proposal(version).contract_address);
+        let decoded = GovernanceVoting::sponsorProposalCall::abi_decode(&sponsor.data)
+            .expect("sponsor calldata");
+        assert_eq!(decoded.proposalID, U256::from(7));
+        assert_eq!(decoded.amount, U256::from(3));
+        assert_eq!(decoded.account, account);
+        assert_eq!(decoded.hint, U256::from(2));
+
+        let unsponsor = build_unsponsor_call(1, version, U256::from(7), U256::from(3), account)
+            .expect("unsponsor call");
+        assert_eq!(unsponsor.value, U256::ZERO);
+        assert_eq!(
+            unsponsor.to,
+            participation_proposal(version).contract_address
+        );
+        let decoded = GovernanceVoting::unsponsorProposalCall::abi_decode(&unsponsor.data)
+            .expect("unsponsor calldata");
+        assert_eq!(decoded.proposalID, U256::from(7));
+        assert_eq!(decoded.amount, U256::from(3));
+        assert_eq!(decoded.account, account);
+
+        let call_vote =
+            build_call_vote_call(1, version, U256::from(7), account).expect("call vote");
+        assert_eq!(call_vote.value, U256::ZERO);
+        let decoded = GovernanceVoting::callVoteCall::abi_decode(&call_vote.data)
+            .expect("call vote calldata");
+        assert_eq!(decoded.proposalID, U256::from(7));
+
+        for yay in [true, false] {
+            let vote = build_vote_call(
+                1,
+                version,
+                U256::from(7),
+                U256::from(6),
+                yay,
+                account,
+                U256::from(2),
+            )
+            .expect("vote call");
+            assert_eq!(vote.value, U256::ZERO);
+            assert_eq!(vote.to, participation_proposal(version).contract_address);
+            let decoded =
+                GovernanceVoting::voteCall::abi_decode(&vote.data).expect("vote calldata");
+            assert_eq!(decoded.proposalID, U256::from(7));
+            assert_eq!(decoded.amount, U256::from(6));
+            assert_eq!(decoded.yay, yay);
+            assert_eq!(decoded.account, account);
+            assert_eq!(decoded.hint, U256::from(2));
+        }
+    }
+    assert_eq!(
+        build_sponsor_call(
+            1,
+            GovernanceContractVersion::V2,
+            U256::ZERO,
+            U256::ZERO,
+            account,
+            U256::ZERO,
+        ),
+        Err(GovernanceCallError::ZeroAmount)
+    );
+}
+
+#[test]
+fn guards_follow_strict_protocol_boundaries_and_chain_time() {
+    let mut proposal = participation_proposal(GovernanceContractVersion::V2);
+    let rules = stage_rules();
+    proposal.publish_time = U256::from(100);
+    proposal.vote_call_time = U256::ZERO;
+    assert!(
+        guard_sponsor(
+            &proposal,
+            &rules,
+            Some(U256::from(119)),
+            U256::from(1),
+            None
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        guard_sponsor(
+            &proposal,
+            &rules,
+            Some(U256::from(120)),
+            U256::from(1),
+            None
+        ),
+        Err(GovernanceGuardError::WrongStage)
+    );
+    let mut cooldown_proposal = proposal.clone();
+    cooldown_proposal.publish_time = U256::from(1_000_000);
+    cooldown_proposal.sponsorship = U256::ZERO;
+    let cooldown_now = U256::from(1_000_019);
+    let equal_last_time = cooldown_now - U256::from(GOVERNANCE_SPONSOR_LOCKOUT_TIME_SECONDS);
+    assert_eq!(
+        guard_sponsor(
+            &cooldown_proposal,
+            &rules,
+            Some(cooldown_now),
+            U256::from(1),
+            Some(&GovernanceLastSponsored {
+                last_sponsor_time: equal_last_time,
+                proposal_id: U256::from(3),
+            }),
+        ),
+        Err(GovernanceGuardError::SponsorshipCooldown)
+    );
+    assert!(
+        guard_sponsor(
+            &cooldown_proposal,
+            &rules,
+            Some(cooldown_now),
+            U256::from(1),
+            Some(&GovernanceLastSponsored {
+                last_sponsor_time: equal_last_time - U256::from(1),
+                proposal_id: U256::from(3),
+            }),
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        guard_sponsor(&proposal, &rules, None, U256::from(1), None),
+        Err(GovernanceGuardError::ChainTimeUnavailable)
+    );
+
+    proposal.sponsorship = U256::from(10);
+    proposal.vote_call_time = U256::ZERO;
+    assert!(guard_call_vote(&proposal, &rules, Some(U256::from(119))).is_ok());
+    proposal.vote_call_time = U256::from(200);
+    assert_eq!(
+        guard_yay_vote(&proposal, &rules, Some(U256::from(205)), U256::from(1)),
+        Err(GovernanceGuardError::WrongStage)
+    );
+    assert_eq!(
+        guard_yay_vote(&proposal, &rules, Some(U256::from(210)), U256::from(1)),
+        Err(GovernanceGuardError::WrongStage)
+    );
+    assert!(guard_yay_vote(&proposal, &rules, Some(U256::from(209)), U256::from(1)).is_ok());
+    assert!(guard_nay_vote(&proposal, &rules, Some(U256::from(210)), U256::from(1)).is_ok());
+    assert_eq!(
+        guard_nay_vote(&proposal, &rules, Some(U256::from(215)), U256::from(1)),
+        Err(GovernanceGuardError::WrongStage)
+    );
+}
