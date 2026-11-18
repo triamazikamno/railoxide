@@ -1956,7 +1956,7 @@ fn public_broadcaster_response_decodes_tx_hash() {
 mod submission_nodes {
     use super::*;
     use crate::desktop::{
-        SubmissionNode, SubmissionNodeSpec, SubmissionRouteHealth,
+        PublicBroadcasterDelivery, SubmissionNode, SubmissionNodeSpec, SubmissionRouteHealth,
         submit_public_broadcaster_transaction,
     };
     use crate::http::{OperationHttpClient, OperationNetworkIsolation};
@@ -2202,10 +2202,12 @@ mod submission_nodes {
             BTreeMap::default(),
             broadcaster,
             1_000_000_000,
-            None,
-            route_tx,
-            timeout,
-            REPUBLISH_INTERVAL,
+            PublicBroadcasterDelivery {
+                progress_tx: None,
+                route_tx,
+                timeout,
+                republish_interval: REPUBLISH_INTERVAL,
+            },
         )
         .await
     }

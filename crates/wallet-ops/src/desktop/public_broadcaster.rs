@@ -431,6 +431,65 @@ pub(super) struct PreparedPublicBroadcasterPlan<P> {
     pub(super) native_top_up: Option<DesktopNativeTopUpPlan>,
 }
 
+impl<P> PreparedPublicBroadcasterPlan<P> {
+    pub(super) fn into_submission_result(
+        self,
+        result: PublicBroadcasterResultKind,
+        payload_inputs: Option<Vec<SelectedInputIdentity>>,
+    ) -> PublicBroadcasterSubmissionResult {
+        let Self {
+            transaction: _,
+            plan: _,
+            pre_transaction_pois_per_txid_leaf_per_list: _,
+            broadcaster,
+            action_token,
+            fee_token,
+            entered_amount,
+            receiver_amount,
+            recipient_amount,
+            total_private_spend,
+            fee_amount,
+            protocol_fee_amount,
+            protocol_fee_bps,
+            fee_mode,
+            gas_limit,
+            min_gas_price,
+            bound_min_gas_price: _,
+            transaction_count,
+            input_count,
+            private_output_count,
+            public_output_count,
+            relay_call_count,
+            uses_relay_adapt,
+            native_top_up,
+        } = self;
+        PublicBroadcasterSubmissionResult {
+            broadcaster,
+            action_token,
+            fee_token,
+            entered_amount,
+            receiver_amount,
+            recipient_amount,
+            total_private_spend,
+            fee_amount,
+            protocol_fee_amount,
+            protocol_fee_bps,
+            fee_mode,
+            gas_limit,
+            min_gas_price,
+            transaction_count,
+            input_count,
+            private_output_count,
+            public_output_count,
+            relay_call_count,
+            uses_relay_adapt,
+            result,
+            native_top_up,
+            payload_inputs,
+        }
+    }
+}
+
 pub fn eligible_public_broadcasters_for_asset(
     rows: &[FeeRow],
     chain_id: u64,

@@ -19,11 +19,12 @@ use crate::desktop::executor_observation::trace_step;
 use crate::desktop::executors::IssueRetry;
 use crate::desktop::executors::swap::swap_recovery_call_bound;
 use crate::desktop::{
-    ApproximateTransactionShape, PUBLIC_BROADCASTER_FEE_ATTEMPTS, acquire_fee_candidates,
-    approximate_public_broadcaster_gas, artifact_source, bounded_public_broadcaster_fee,
-    buffered_gas_price_from_candidates, effective_desktop_chain_config,
-    estimate_public_broadcaster_fee_from_rpc_pool, query_rpc_pool_for_route,
-    submit_public_broadcaster_transaction, update_transaction_generation_stage,
+    ApproximateTransactionShape, PUBLIC_BROADCASTER_FEE_ATTEMPTS, PublicBroadcasterDelivery,
+    acquire_fee_candidates, approximate_public_broadcaster_gas, artifact_source,
+    bounded_public_broadcaster_fee, buffered_gas_price_from_candidates,
+    effective_desktop_chain_config, estimate_public_broadcaster_fee_from_rpc_pool,
+    query_rpc_pool_for_route, submit_public_broadcaster_transaction,
+    update_transaction_generation_stage,
 };
 use crate::poi_contexts::{
     persist_pending_mixed_output_poi_contexts, public_broadcaster_pre_transaction_pois,
@@ -667,10 +668,12 @@ impl ExecutorOwner {
                     pois.request_pois,
                     candidate,
                     bound_min_gas_price,
-                    progress_tx.cloned(),
-                    route_tx.cloned(),
-                    response_timeout,
-                    republish_interval,
+                    PublicBroadcasterDelivery {
+                        progress_tx: progress_tx.cloned(),
+                        route_tx: route_tx.cloned(),
+                        timeout: response_timeout,
+                        republish_interval,
+                    },
                 ),
             )
             .instrument(span.clone())

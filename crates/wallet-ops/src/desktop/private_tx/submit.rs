@@ -22,7 +22,7 @@ pub async fn submit_desktop_unshield_public_broadcaster(
         request.recipient,
     );
     let gateway_origin = request.gateway_origin.clone();
-    let prepared = Box::pin(prepare_desktop_unshield_public_broadcaster(request, http)).await?;
+    let mut prepared = Box::pin(prepare_desktop_unshield_public_broadcaster(request, http)).await?;
     let pending_spent_inputs = prepared.plan.input_utxos();
     let payload_inputs = match &prepared.plan {
         DesktopUnshieldPreparedPlan::Single(plan) => single_payload_inputs(
@@ -33,7 +33,7 @@ pub async fn submit_desktop_unshield_public_broadcaster(
         ),
         DesktopUnshieldPreparedPlan::Composite(_) => None,
     };
-    let transaction = prepared.transaction.unwrap_or_else(|| {
+    let transaction = prepared.transaction.take().unwrap_or_else(|| {
         TransactionRequest::default()
             .to(prepared.plan.call_to())
             .input(prepared.plan.call_data().into())
@@ -73,33 +73,14 @@ pub async fn submit_desktop_unshield_public_broadcaster(
     let result = submit_public_broadcaster_plan(
         &waku,
         transaction,
-        prepared.pre_transaction_pois_per_txid_leaf_per_list,
-        prepared.broadcaster,
-        prepared.action_token,
-        prepared.fee_token,
-        prepared.entered_amount,
-        prepared.receiver_amount,
-        prepared.recipient_amount,
-        prepared.total_private_spend,
-        prepared.fee_amount,
-        prepared.protocol_fee_amount,
-        prepared.protocol_fee_bps,
-        prepared.fee_mode,
-        prepared.gas_limit,
-        prepared.min_gas_price,
-        prepared.bound_min_gas_price,
-        prepared.transaction_count,
-        prepared.input_count,
-        prepared.private_output_count,
-        prepared.public_output_count,
-        prepared.relay_call_count,
-        prepared.uses_relay_adapt,
-        prepared.native_top_up,
+        prepared,
         payload_inputs,
-        progress_tx,
-        route_tx,
-        timeout,
-        republish_interval,
+        PublicBroadcasterDelivery {
+            progress_tx,
+            route_tx,
+            timeout,
+            republish_interval,
+        },
     )
     .await;
     activity.finish_relay(result.as_ref().ok().map(|result| &result.result));
@@ -133,7 +114,7 @@ pub async fn submit_desktop_send_public_broadcaster(
     let (chain_id, token, amount) = (request.chain_id, request.token, request.amount);
     let recipient = request.recipient.trim().to_owned();
     let gateway_origin = request.gateway_origin.clone();
-    let prepared = prepare_desktop_send_public_broadcaster(request, http).await?;
+    let mut prepared = prepare_desktop_send_public_broadcaster(request, http).await?;
     let pending_spent_inputs = prepared
         .plan
         .inputs
@@ -171,40 +152,22 @@ pub async fn submit_desktop_send_public_broadcaster(
         let _ = tx.send(inputs.clone());
     }
     activity.begin();
+    let transaction = prepared.transaction.take().unwrap_or_else(|| {
+        TransactionRequest::default()
+            .to(prepared.plan.call.to)
+            .input(prepared.plan.call.data.clone().into())
+    });
     let result = submit_public_broadcaster_plan(
         &waku,
-        prepared.transaction.unwrap_or_else(|| {
-            TransactionRequest::default()
-                .to(prepared.plan.call.to)
-                .input(prepared.plan.call.data.into())
-        }),
-        prepared.pre_transaction_pois_per_txid_leaf_per_list,
-        prepared.broadcaster,
-        prepared.action_token,
-        prepared.fee_token,
-        prepared.entered_amount,
-        prepared.receiver_amount,
-        prepared.recipient_amount,
-        prepared.total_private_spend,
-        prepared.fee_amount,
-        prepared.protocol_fee_amount,
-        prepared.protocol_fee_bps,
-        prepared.fee_mode,
-        prepared.gas_limit,
-        prepared.min_gas_price,
-        prepared.bound_min_gas_price,
-        prepared.transaction_count,
-        prepared.input_count,
-        prepared.private_output_count,
-        prepared.public_output_count,
-        prepared.relay_call_count,
-        prepared.uses_relay_adapt,
-        prepared.native_top_up,
+        transaction,
+        prepared,
         payload_inputs,
-        progress_tx,
-        route_tx,
-        timeout,
-        republish_interval,
+        PublicBroadcasterDelivery {
+            progress_tx,
+            route_tx,
+            timeout,
+            republish_interval,
+        },
     )
     .await;
     activity.finish_relay(result.as_ref().ok().map(|result| &result.result));
