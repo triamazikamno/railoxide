@@ -859,6 +859,13 @@ impl WalletRoot {
             self.discard_walletconnect_fee_state(window, cx);
             return;
         }
+        // Debug UI fixture: the canned request's chain isn't activated, and its fee is a fixed
+        // estimate in place of a quote.
+        #[cfg(debug_assertions)]
+        if super::ui_fixture::is_fixture_request(&request) {
+            self.attach_ui_fixture_walletconnect_fee_state(&request, window, cx);
+            return;
+        }
         let Ok(payload_fingerprint) = walletconnect_request_payload_fingerprint(&request) else {
             self.discard_walletconnect_fee_state(window, cx);
             return;
@@ -895,6 +902,57 @@ impl WalletRoot {
             editor_generation,
         ));
         self.refresh_walletconnect_gas_fee_quote(request_key_arc, cx);
+    }
+
+    /// Debug UI fixture: attach the canned request's fee state as `attach_walletconnect_fee_state`
+    /// does, without activating its chain, and show its fixed estimate in place of a quote.
+    #[cfg(debug_assertions)]
+    fn attach_ui_fixture_walletconnect_fee_state(
+        &mut self,
+        request: &WalletConnectRequestUi,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        // The canned transaction is well formed, so this always has a fingerprint.
+        let Ok(payload_fingerprint) = walletconnect_request_payload_fingerprint(request) else {
+            return;
+        };
+        if self
+            .walletconnect
+            .walletconnect_fee_state
+            .as_ref()
+            .is_some_and(|state| {
+                state.request_key.as_ref() == request.key
+                    && state.review_token == request.review_token
+                    && state.payload_fingerprint == payload_fingerprint
+            })
+        {
+            return;
+        }
+        self.walletconnect_fee_lifecycle_reset(window, cx);
+        self.walletconnect.walletconnect_fee_request_generation = self
+            .walletconnect
+            .walletconnect_fee_request_generation
+            .wrapping_add(1);
+        self.walletconnect.walletconnect_fee_state = Some(WalletConnectFeeState::new(
+            request,
+            payload_fingerprint,
+            self.walletconnect.walletconnect_fee_request_generation,
+            self.walletconnect.request_dialog_refresh_generation,
+            self.walletconnect.walletconnect_gas_fee.refresh_id,
+        ));
+        self.install_ui_fixture_walletconnect_fee(cx);
+    }
+
+    /// Debug UI fixture: apply the canned request's fixed quote as a successful refresh does,
+    /// without asking the network.
+    #[cfg(debug_assertions)]
+    fn install_ui_fixture_walletconnect_fee(&mut self, cx: &Context<'_, Self>) {
+        let gas_fee = &mut self.walletconnect.walletconnect_gas_fee;
+        gas_fee.refresh_id = gas_fee.refresh_id.wrapping_add(1);
+        gas_fee.quote = Some(super::ui_fixture::FEE_QUOTE);
+        gas_fee.quote_error = None;
+        self.walletconnect_fee_state_changed_by_editor(cx);
     }
 
     pub(super) fn discard_walletconnect_fee_state(
@@ -1130,6 +1188,12 @@ impl WalletRoot {
         else {
             return;
         };
+        // Debug UI fixture: Refresh shows the canned request's fixed estimate again.
+        #[cfg(debug_assertions)]
+        if super::ui_fixture::is_fixture_request(&request) {
+            self.install_ui_fixture_walletconnect_fee(cx);
+            return;
+        }
         let Ok(chain_id) = parse_chain_id(&request.item.chain_id) else {
             return;
         };

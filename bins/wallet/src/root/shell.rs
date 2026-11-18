@@ -327,6 +327,9 @@ impl Render for WalletRoot {
             self.open_ui_fixture_update_check(window, cx);
             return self.render_locked_vault_screen(root, window);
         }
+        // Debug UI fixture: a `walletconnect-request` mode stages its canned dapp request.
+        #[cfg(debug_assertions)]
+        self.stage_ui_fixture_walletconnect_request();
         self.open_next_walletconnect_request_dialog_if_idle(window, cx);
         let sidebar_is_narrow = window.viewport_size().width < SIDEBAR_AUTO_COLLAPSE_WIDTH;
         if !sidebar_is_narrow {

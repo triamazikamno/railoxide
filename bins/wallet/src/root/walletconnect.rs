@@ -95,6 +95,8 @@ mod relay;
 mod render;
 mod requests;
 mod root;
+#[cfg(debug_assertions)]
+mod ui_fixture;
 
 #[cfg(test)]
 mod tests;

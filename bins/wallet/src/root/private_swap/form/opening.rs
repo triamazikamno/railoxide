@@ -299,7 +299,10 @@ impl PrivateSwapsView {
         let (Some(owner), Some(profile), Some(http)) =
             (self.private_owner().cloned(), profile, self.http(cx))
         else {
-            tracing::warn!(target: LOG_TARGET, "the debug UI fixture's review needs the network's private session");
+            tracing::warn!(
+                target: LOG_TARGET,
+                "the debug UI fixture's review needs the network's private session"
+            );
             return;
         };
         let runtime = self.runtime.clone();
@@ -314,7 +317,10 @@ impl PrivateSwapsView {
                 if let Ok(Ok(orderbook)) = orderbook {
                     view.stage_ui_fixture_retry_review(&profile, orderbook, window, cx);
                 } else {
-                    tracing::warn!(target: LOG_TARGET, "the debug UI fixture couldn't open its orderbook route");
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        "the debug UI fixture couldn't open its orderbook route"
+                    );
                 }
             });
         })
@@ -361,7 +367,10 @@ impl PrivateSwapsView {
         let Some((record, review, open)) =
             crate::root::private_swap::ui_fixture::retry_review(profile, orderbook.isolation())
         else {
-            tracing::warn!(target: LOG_TARGET, "the debug UI fixture couldn't synthesize its retry");
+            tracing::warn!(
+                target: LOG_TARGET,
+                "the debug UI fixture couldn't synthesize its retry"
+            );
             return;
         };
         // A speed-up mode's form speeds up the synthesized swap's open order.
