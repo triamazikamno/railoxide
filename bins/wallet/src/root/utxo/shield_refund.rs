@@ -93,7 +93,10 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let Some(row) = self.active_blocked_shield_rescue_display_row(utxo_id) else {
-            tracing::warn!(target: LOG_TARGET, "blocked Shield hardware refund requested without display row");
+            tracing::warn!(
+                target: LOG_TARGET,
+                "blocked Shield hardware refund requested without display row"
+            );
             return;
         };
         let Some(rescue) = self
@@ -102,11 +105,17 @@ impl WalletRoot {
             .map(BlockedShieldRescueRowState::info)
             .filter(|rescue| rescue.eligible)
         else {
-            tracing::warn!(target: LOG_TARGET, "blocked Shield hardware refund requested for ineligible UTXO");
+            tracing::warn!(
+                target: LOG_TARGET,
+                "blocked Shield hardware refund requested for ineligible UTXO"
+            );
             return;
         };
         let Some(origin_address) = rescue.origin_address.clone() else {
-            tracing::warn!(target: LOG_TARGET, "blocked Shield hardware refund requested without origin address");
+            tracing::warn!(
+                target: LOG_TARGET,
+                "blocked Shield hardware refund requested without origin address"
+            );
             return;
         };
         let summary =
@@ -137,19 +146,24 @@ impl WalletRoot {
             return;
         }
         let Some(session) = self.selected_chain_session() else {
-            tracing::warn!(target: LOG_TARGET,
+            tracing::warn!(
+                target: LOG_TARGET,
                 "blocked Shield refund origin resolution requested without selected chain session"
             );
             return;
         };
         let Some(view_session) = self.view_session.clone() else {
-            tracing::warn!(target: LOG_TARGET,
+            tracing::warn!(
+                target: LOG_TARGET,
                 "blocked Shield refund origin resolution requested without unlocked wallet"
             );
             return;
         };
         let Some(vault_store) = self.vault_store.clone() else {
-            tracing::warn!(target: LOG_TARGET, "blocked Shield refund origin resolution requested without vault store");
+            tracing::warn!(
+                target: LOG_TARGET,
+                "blocked Shield refund origin resolution requested without vault store"
+            );
             return;
         };
         let Ok(effective_chain) = self
@@ -416,7 +430,10 @@ impl WalletRoot {
         };
         let protected_seed_session = spend_authorization.protected_seed_session();
         let Some(session) = self.selected_chain_session() else {
-            tracing::warn!(target: LOG_TARGET, "blocked Shield refund requested without selected chain session");
+            tracing::warn!(
+                target: LOG_TARGET,
+                "blocked Shield refund requested without selected chain session"
+            );
             return;
         };
         if self.blocked_shield_refunds_in_flight.contains(&utxo_id) {
@@ -424,11 +441,17 @@ impl WalletRoot {
             return;
         }
         let Some(view_session) = self.view_session.clone() else {
-            tracing::warn!(target: LOG_TARGET, "blocked Shield refund requested without unlocked wallet");
+            tracing::warn!(
+                target: LOG_TARGET,
+                "blocked Shield refund requested without unlocked wallet"
+            );
             return;
         };
         let Some(vault_store) = self.vault_store.clone() else {
-            tracing::warn!(target: LOG_TARGET, "blocked Shield refund requested without vault store");
+            tracing::warn!(
+                target: LOG_TARGET,
+                "blocked Shield refund requested without vault store"
+            );
             return;
         };
         let Some(rescue) = self
@@ -437,11 +460,17 @@ impl WalletRoot {
             .map(BlockedShieldRescueRowState::info)
             .filter(|rescue| rescue.eligible)
         else {
-            tracing::warn!(target: LOG_TARGET, "blocked Shield refund requested for ineligible UTXO");
+            tracing::warn!(
+                target: LOG_TARGET,
+                "blocked Shield refund requested for ineligible UTXO"
+            );
             return;
         };
         let Some(public_account_uuid) = rescue.public_account_uuid.clone() else {
-            tracing::warn!(target: LOG_TARGET, "blocked Shield refund requested without origin public account");
+            tracing::warn!(
+                target: LOG_TARGET,
+                "blocked Shield refund requested without origin public account"
+            );
             return;
         };
         let password = if let Some(password) = vault_password {
@@ -461,7 +490,8 @@ impl WalletRoot {
                 DesktopPrivateSpendAuthorization::PreauthorizedSigner(_)
                 | DesktopPrivateSpendAuthorization::HardwareExecutor(_)
                 | DesktopPrivateSpendAuthorization::HardwarePublic => {
-                    tracing::warn!(target: LOG_TARGET,
+                    tracing::warn!(
+                        target: LOG_TARGET,
                         "blocked Shield refund self-broadcast requested without gas-payer password"
                     );
                     self.set_vault_error(
@@ -544,10 +574,18 @@ impl WalletRoot {
                                 blocked_shield_rescue_error_info(message.clone()),
                             ),
                         );
-                        tracing::warn!(target: LOG_TARGET, %message, "blocked Shield refund submission failed");
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            %message,
+                            "blocked Shield refund submission failed"
+                        );
                     }
                     Err(error) => {
-                        tracing::warn!(target: LOG_TARGET, %error, "blocked Shield refund task failed");
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            %error,
+                            "blocked Shield refund task failed"
+                        );
                     }
                 }
                 root.sync_utxo_table(cx);
