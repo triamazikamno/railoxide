@@ -682,6 +682,15 @@ impl WalletRoot {
         else {
             return;
         };
+        // Debug UI fixture: the canned request has no session to answer, so Approve stops here.
+        #[cfg(debug_assertions)]
+        if super::super::ui_fixture::is_fixture_request(&request) {
+            self.walletconnect.error = Some(Arc::from(
+                "The debug UI fixture's request can't be approved.",
+            ));
+            cx.notify();
+            return;
+        }
         if !request.approval_admitted(current_unix_seconds()) {
             self.walletconnect.error = Some(Arc::from(
                 "WalletConnect request expired before approval could start.",

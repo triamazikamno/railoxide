@@ -383,6 +383,15 @@
 //!   time the setup record is read, so a profile that finished first-start setup shows only
 //!   the notice step again. The fixture writes no record; the notice's Continue saves the
 //!   current version as it always does. A swap form doesn't take this mode as active.
+//! - `walletconnect-request` opens the Dapp request dialog, the first time the unlocked wallet
+//!   renders, on a pending `eth_sendTransaction` from Uniswap at `https://app.uniswap.org`: an
+//!   unlimited approval of Ethereum's WETH to Uniswap's Permit2 from the first software Public
+//!   account on Ethereum. The request is staged in memory, with no session, route or record,
+//!   and a wallet without such an account gets none. Its fee is a fixed estimate at a base fee
+//!   of 1 gwei and a tip of 0.1 gwei, which Refresh shows again without asking the network.
+//!   Approve shows "The debug UI fixture's request can't be approved." and does nothing else,
+//!   and Reject fails for lack of a route and sends nothing. A swap form doesn't take this mode
+//!   as active.
 //!
 //! In every mode the jobs of a swap are scripted or held back: nothing is claimed, proved,
 //! signed, paid or sent, and no record is written. The synthesized records live in memory
@@ -495,6 +504,7 @@ enum Mode {
     UpdateCheck(UpdateCheck),
     Logs,
     FirstStartOldNotice,
+    WalletConnectRequest,
 }
 
 /// The canned result an `update-check:` mode shows.
@@ -736,6 +746,9 @@ fn parse(value: &str) -> Option<Mode> {
     if value == "first-start:old-notice" {
         return Some(Mode::FirstStartOldNotice);
     }
+    if value == "walletconnect-request" {
+        return Some(Mode::WalletConnectRequest);
+    }
     if value == "unshield" {
         return Some(Mode::Unshield);
     }
@@ -958,13 +971,16 @@ pub(super) fn route_error() -> bool {
 }
 
 /// Whether a fixture mode is on. The form of a swap paid from a Public account then works
-/// without private funds, and its jobs are scripted. An `update-check:`, `logs` or
-/// `first-start:` mode leaves swaps alone.
+/// without private funds, and its jobs are scripted. An `update-check:`, `logs`,
+/// `first-start:` or `walletconnect-request` mode leaves swaps alone.
 pub(super) fn active() -> bool {
     mode().is_some_and(|mode| {
         !matches!(
             mode,
-            Mode::UpdateCheck(_) | Mode::Logs | Mode::FirstStartOldNotice
+            Mode::UpdateCheck(_)
+                | Mode::Logs
+                | Mode::FirstStartOldNotice
+                | Mode::WalletConnectRequest
         )
     })
 }
@@ -3589,6 +3605,11 @@ pub(in crate::root) fn tron() -> Option<Tron> {
 /// `hardware-derive` mode's stand-in Ledger.
 pub(in crate::root) fn hardware_derive() -> bool {
     matches!(mode(), Some(Mode::HardwareDerive))
+}
+
+/// Whether the `walletconnect-request` mode stages its canned dapp request.
+pub(in crate::root) fn walletconnect_request() -> bool {
+    matches!(mode(), Some(Mode::WalletConnectRequest))
 }
 
 /// The result an `update-check:` mode shows in place of a check, which sends nothing. The

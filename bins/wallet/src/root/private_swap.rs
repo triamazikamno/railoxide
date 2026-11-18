@@ -74,6 +74,8 @@ pub(super) use ui_fixture::update_check as ui_fixture_update_check;
 pub(super) use ui_fixture::utxo_finality_context as ui_fixture_utxo_finality_context;
 pub(super) use ui_fixture::utxo_rows as ui_fixture_utxo_rows;
 #[cfg(debug_assertions)]
+pub(super) use ui_fixture::walletconnect_request as ui_fixture_walletconnect_request;
+#[cfg(debug_assertions)]
 pub(super) use ui_fixture::{Tron as UiFixtureTron, tron as ui_fixture_tron};
 /// The debug UI fixture's queries in a release build, which has no fixture.
 #[cfg(not(debug_assertions))]
