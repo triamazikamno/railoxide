@@ -91,6 +91,8 @@ class ExtensionPackagingTests(unittest.TestCase):
                     for path in icons.values():
                         source = ROOT / 'bins/wallet/packaging/icons/png' / f'logo-{Path(path).name}'
                         self.assertEqual(archive.read(path), source.read_bytes())
+                self.assertEqual(archive.read('gateway-presentation.js'),
+                                 (ROOT / 'extensions/railoxide/gateway-presentation.js').read_bytes())
                 self.assertEqual(archive.read(f'assets/icons/{icon_name}'), icon)
                 self.assertIn(icon_name, archive.read('assets/COMPONENT-SOURCES.md').decode('utf-8'))
                 wallet_assets = json.loads(archive.read('assets/WALLET-ASSETS.json'))

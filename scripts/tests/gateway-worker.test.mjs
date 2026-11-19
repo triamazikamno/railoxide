@@ -9,6 +9,8 @@ const configSource = await readFile(new URL('../../extensions/railoxide/gateway-
 const { configuration } = await import(`data:text/javascript,${encodeURIComponent(configSource)}`);
 const bridgeSource = await readFile(new URL('../../extensions/railoxide/gateway-page-bridge.js', import.meta.url), 'utf8');
 const { createPageBridge } = await import(`data:text/javascript,${encodeURIComponent(bridgeSource)}`);
+const presentationSource = await readFile(new URL('../../extensions/railoxide/gateway-presentation.js', import.meta.url), 'utf8');
+const presentation = await import(`data:text/javascript,${encodeURIComponent(presentationSource)}`);
 const endpoint = port => `ws://127.0.0.1:${port}/`;
 const credential = () => ({ version: 1, peerId: Array(16).fill(7), secret: Array(32).fill(9) });
 const flush = async () => { await new Promise(setImmediate); };
@@ -102,7 +104,7 @@ async function worker(initial = {}) {
       onStartup: event(), onInstalled: event() },
   };
   vm.runInNewContext(source.replace(/^import .*;\n/gm, ''), {
-    init: async () => {}, GatewayClient: Client, configuration, chrome, createPageBridge, crypto: webcrypto,
+    ...presentation, init: async () => {}, GatewayClient: Client, configuration, chrome, createPageBridge, crypto: webcrypto,
     WebSocket: Socket, TextEncoder, TextDecoder, URL, Uint8Array, ArrayBuffer, performance,
     setTimeout: timer, clearTimeout: id => timers.delete(id), setInterval: timer, clearInterval: id => timers.delete(id),
   }, { filename: 'gateway-worker.js' });

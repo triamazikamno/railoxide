@@ -1,6 +1,7 @@
 import init, { GatewayClient } from './dapp_gateway_protocol.js';
 import { configuration } from './gateway-config.js';
 import { createPageBridge } from './gateway-page-bridge.js';
+import { acceptsPassword, boundedNetworkText, hasExtraKeys, invalidChainEditorOutcome, invalidChainEditorRun, invalidEditorCommand, invalidNetworkRun, invalidStateMessage, invalidUnlockView, isCredential, nativeUsdPresentation, networkOutcome, pickerDraftOpen, railgunUnavailable, uiSnapshotPresentation, unlockFollowUp, unlockTerminal } from './gateway-presentation.js';
 
 const ports = new Set();
 const privatePickers = new Map();
@@ -72,8 +73,6 @@ function updateRequestAttention(authoritative = false) {
 // Passwords and mnemonic passphrases are never retained in worker state or storage.
 let unlockView = { allowed: false, attempt_id: null, phase: 'password' };
 let unlockOwner = null;
-const unlockPhases = new Set(['password', 'busy', 'opening', 'passphrase', 'unknown', 'desktop', 'complete', 'failed', 'unavailable', 'cancelled', 'rate_limited']);
-const unlockTerminal = phase => ['desktop', 'complete', 'failed', 'unavailable', 'cancelled', 'rate_limited'].includes(phase);
 function clearUnlockOwner(cancel = false) {
   const previous = unlockOwner;
   unlockOwner = null;
@@ -84,129 +83,94 @@ function clearUnlockOwner(cancel = false) {
       attempt_id: previous.id, command: { action: 'cancel' } }); } catch {}
   }
 }
-function unlockFor(port) {
+// The authenticated session of the current owner, if any.
+function liveSession() {
   const session = owner?.candidate;
-  if (!session?.established || !current(session) || status !== 'locked') return { allowed: false };
-  const owned = unlockOwner && unlockOwner.port === port && unlockOwner.id === unlockView.attempt_id;
-  const pending = unlockOwner && unlockOwner.port === port && unlockOwner.waiting;
-  const other = (unlockOwner && unlockOwner.port !== port && (unlockOwner.waiting || !unlockTerminal(unlockView.phase))) ||
+  return session?.established && current(session) ? session : null;
+}
+function unlockFor(port) {
+  const session = liveSession();
+  if (!session || status !== 'locked') return { allowed: false };
+  return { allowed: unlockView.allowed, generation: session.generation, phase: unlockPhase(port) };
+}
+function unlockPhase(port) {
+  const mine = unlockOwner && unlockOwner.port === port;
+  if (mine && unlockOwner.waiting) return 'busy';
+  const owned = mine && unlockOwner.id === unlockView.attempt_id;
+  if (unlockElsewhere(port, owned)) return 'other';
+  return owned || unlockView.phase === 'desktop' ? unlockView.phase : 'password';
+}
+// Another view's attempt is in flight, or the desktop reports an attempt this view does not own.
+function unlockElsewhere(port, owned) {
+  return (unlockOwner && unlockOwner.port !== port && (unlockOwner.waiting || !unlockTerminal(unlockView.phase))) ||
     (unlockView.attempt_id && !owned && !unlockTerminal(unlockView.phase));
-  return { allowed: unlockView.allowed, generation: session.generation,
-    phase: pending ? 'busy' : other ? 'other' : owned || unlockView.phase === 'desktop' ? unlockView.phase : 'password' };
+}
+// The live, locked session an unlock command from this view may address.
+function unlockSession(port, input) {
+  if (!ports.has(port)) return null;
+  const session = liveSession();
+  return session?.locked && unlockView.allowed && input && input.generation === session.generation ? session : null;
+}
+function startUnlock(port, input, phase) {
+  if (!acceptsPassword(input, phase)) return null;
+  clearUnlockOwner();
+  unlockOwner = { port, id: crypto.randomUUID(), waiting: true };
+  const attempt = unlockOwner;
+  attempt.timer = setTimeout(() => {
+    if (unlockOwner !== attempt) return;
+    clearUnlockOwner(true);
+    publish(status);
+  }, 300_000);
+  return { action: 'password', password: input.password };
+}
+function continueUnlock(port, input, phase) {
+  if (input.action === 'cancel' && unlockOwner?.port === port) { clearUnlockOwner(true); publish(status); return null; }
+  if (unlockOwner?.port !== port || unlockOwner.id !== unlockView.attempt_id) return null;
+  const outgoing = unlockFollowUp(input, phase);
+  if (outgoing) unlockOwner.waiting = true;
+  return outgoing;
+}
+function wipeUnlockSecrets(input, outgoing) {
+  if ('password' in input) input.password = '';
+  if ('passphrase' in input) input.passphrase = '';
+  if (outgoing && 'password' in outgoing) outgoing.password = '';
+  if (outgoing && 'passphrase' in outgoing) outgoing.passphrase = '';
 }
 function unlockCommand(port, input) {
-  const session = owner?.candidate;
-  if (!ports.has(port) || !session?.established || !current(session) || !session.locked ||
-      !unlockView.allowed || !input || input.generation !== session.generation) return;
+  const session = unlockSession(port, input);
+  if (!session) return;
   const state = unlockFor(port);
-  let outgoing;
-  if (input.action === 'password') {
-    if (!['password', 'failed', 'unavailable', 'cancelled', 'rate_limited'].includes(state.phase) || typeof input.password !== 'string' ||
-        !input.password.length || encoder.encode(input.password).length > 4096) return;
-    clearUnlockOwner();
-    unlockOwner = { port, id: crypto.randomUUID(), waiting: true };
-    const attempt = unlockOwner;
-    attempt.timer = setTimeout(() => {
-      if (unlockOwner !== attempt) return;
-      clearUnlockOwner(true);
-      publish(status);
-    }, 300_000);
-    outgoing = { action: 'password', password: input.password };
-  } else {
-    if (input.action === 'cancel' && unlockOwner?.port === port) { clearUnlockOwner(true); publish(status); return; }
-    if (unlockOwner?.port !== port || unlockOwner.id !== unlockView.attempt_id) return;
-    if (input.action === 'passphrase' && state.phase === 'passphrase' && typeof input.passphrase === 'string' &&
-        input.passphrase.length && encoder.encode(input.passphrase).length <= 4096) outgoing = { action: 'passphrase', passphrase: input.passphrase };
-    else if (input.action === 'standard' && state.phase === 'passphrase') outgoing = { action: 'standard' };
-    else if (input.action === 'retry' && state.phase === 'unknown') outgoing = { action: 'retry' };
-    else if (input.action === 'desktop' && ['passphrase', 'unknown'].includes(state.phase)) outgoing = { action: 'desktop' };
-    else return;
-    unlockOwner.waiting = true;
-  }
+  const outgoing = input.action === 'password' ? startUnlock(port, input, state.phase) : continueUnlock(port, input, state.phase);
+  if (!outgoing) return;
   try {
     command(session, { type: 'unlock', version: 1, generation: session.generation,
       attempt_id: unlockOwner.id, command: outgoing });
-  } finally {
-    if ('password' in input) input.password = '';
-    if ('passphrase' in input) input.passphrase = '';
-    if (outgoing && 'password' in outgoing) outgoing.password = '';
-    if (outgoing && 'passphrase' in outgoing) outgoing.passphrase = '';
-  }
+  } finally { wipeUnlockSecrets(input, outgoing); }
   publish(status);
 }
 
-// Only aggregate native observations reach authenticated UI ports. No network data is persisted.
-const networkOperations = ['new_tor_session', 'query_exit_ip', 'quit_and_reset'];
-const networkErrors = new Set([
-  'Network control is unavailable. Reopen the popover and try again.',
-  'Could not start a new Tor session. Try again.',
-  'Started a new Tor session, but the broadcaster network could not restart. Try again later.',
-  'Could not query the exit IP through Tor. Try again.',
-  'Could not request the Tor state reset. The wallet remains open.',
-]);
-const boundedNetworkText = (value, limit) => typeof value === 'string' && value.length > 0 && value.length <= limit;
-const networkInteger = value => Number.isSafeInteger(value) && value >= 0;
-const boundedNativeQuote = quote => !!quote && typeof quote.microUsd === 'string' &&
-  /^[1-9][0-9]{0,77}$/.test(quote.microUsd) && BigInt(quote.microUsd) <= (1n << 256n) - 1n &&
-  networkInteger(quote.obtainedAt) && Number.isInteger(quote.feedDecimals) &&
-  quote.feedDecimals >= 0 && quote.feedDecimals <= 255;
-function nativeUsdPresentation(message) {
-  const statuses = message.native_usd_pricing ?? {};
-  if (!statuses || typeof statuses !== 'object' || Array.isArray(statuses) || Object.keys(statuses).length > 68) return null;
-  if (message.locked && Object.keys(statuses).length) return null;
-  for (const [chain, status] of Object.entries(statuses)) {
-    if (!/^[1-9][0-9]{0,19}$/.test(chain) || BigInt(chain) > 18446744073709551615n ||
-        !status || !['unconfigured', 'pending', 'available', 'failed'].includes(status.state) ||
-        (status.reason !== null && !boundedNetworkText(status.reason, 512))) return null;
-    const quote = status.quote;
-    if (quote !== null && !boundedNativeQuote(quote)) return null;
-    if ((status.state === 'available' && quote === null) || (status.state === 'unconfigured' && quote !== null)) return null;
-  }
-  return statuses;
+// The live, unlocked session that is still at this generation.
+function unlockedSessionAt(generation) {
+  const session = liveSession();
+  return session && !session.locked && session.generation === generation ? session : null;
+}
+// UI commands address only the live, unlocked generation that the current snapshot also shows.
+function unlockedCommandSession(message) {
+  const session = unlockedSessionAt(message.generation);
+  return session && !uiSnapshot.locked && uiSnapshot.generation === session.generation ? session : null;
 }
 
-function networkPresentation(message) {
-  const value = message.network_view;
-  if (message.locked || message.network_control_supported !== true || !value ||
-      !boundedNetworkText(value.context_revision, 128) ||
-      !['tor_ready', 'tor_reconnecting', 'tor_degraded', 'proxy', 'direct'].includes(value.status) ||
-      typeof value.detail !== 'string' || value.detail.length > 512 || typeof value.runtime_warning !== 'boolean' ||
-      (value.download_rate != null && !networkInteger(value.download_rate)) ||
-      (value.direct_rpc_endpoints != null && !networkInteger(value.direct_rpc_endpoints))) return null;
-  const rotation = value.rotation ?? null;
-  if (rotation !== null && !(rotation.state === 'in_progress' ||
-      (rotation.state === 'failed' && networkErrors.has(rotation.error)))) return null;
-  let activity = null;
-  if (value.activity != null) {
-    if (!value.status.startsWith('tor_')) return null;
-    const source = value.activity;
-    activity = {};
-    for (const name of ['generation', 'session_duration_ms', 'downloaded_bytes', 'recent_connection_sample_count',
-      'recent_successful_sample_count', 'successful_connections', 'failed_connections']) {
-      if (!networkInteger(source[name])) return null;
-      activity[name] = source[name];
-    }
-    for (const name of ['median_setup_duration_ms', 'last_activity_age_ms']) {
-      if (source[name] != null && !networkInteger(source[name])) return null;
-      activity[name] = source[name] ?? null;
-    }
-  }
-  return { context_revision: value.context_revision, status: value.status, detail: value.detail,
-    runtime_warning: value.runtime_warning, activity, download_rate: value.download_rate ?? null,
-    direct_rpc_endpoints: value.direct_rpc_endpoints ?? 0,
-    rotation: rotation && (rotation.state === 'failed' ? { state: 'failed', error: rotation.error } : { state: 'in_progress' }) };
-}
+// Only aggregate native observations reach authenticated UI ports. No network data is persisted.
 function closeNetworkView(port, send = true) {
   const view = networkViews.get(port);
   networkViews.delete(port);
   if (!view) return;
   for (const pending of view.pending.values()) clearTimeout(pending.timer);
-  const session = owner?.candidate;
-  if (send && session?.established && current(session) && !session.locked && session.generation === view.generation) {
-    try { command(session, { type: 'network', version: 1, generation: view.generation,
-      context_revision: view.context_revision, command: { action: 'close', view_id: view.view_id } }); }
-    catch { failed(session, 'disconnected', true); }
-  }
+  const session = send && unlockedSessionAt(view.generation);
+  if (!session) return;
+  try { command(session, { type: 'network', version: 1, generation: view.generation,
+    context_revision: view.context_revision, command: { action: 'close', view_id: view.view_id } }); }
+  catch { failed(session, 'disconnected', true); }
 }
 function openNetworkView(port, snapshot, session) {
   const view = { view_id: crypto.randomUUID(), context_revision: snapshot.network_view.context_revision,
@@ -215,66 +179,72 @@ function openNetworkView(port, snapshot, session) {
   command(session, { type: 'network', version: 1, generation: view.generation,
     context_revision: view.context_revision, command: { action: 'open', view_id: view.view_id } });
 }
+// A new context revision replaces the view. Returns false when reopening ended the session.
+function reopenNetworkView(port, snapshot) {
+  closeNetworkView(port, false);
+  const session = unlockedSessionAt(snapshot.generation);
+  if (!session) return true;
+  try { openNetworkView(port, snapshot, session); }
+  catch { failed(session, 'disconnected', true); return false; }
+  return true;
+}
+// A reply counts only for the request this view still has pending for its operation.
+function pendingResult(view, result) {
+  const pending = view.pending.get(result.operation);
+  return pending && result.view_id === view.view_id && result.request_id === pending.request_id &&
+    result.context_revision === view.context_revision ? pending : null;
+}
+function applyNetworkResults(view, snapshot) {
+  for (const result of (Array.isArray(snapshot.network_results) ? snapshot.network_results : []).slice(0, 48)) {
+    const pending = pendingResult(view, result);
+    const outcome = pending && networkOutcome(result);
+    if (!outcome) continue;
+    clearTimeout(pending.timer);
+    view.pending.delete(result.operation);
+    view.results.set(result.operation, { request_id: result.request_id, operation: result.operation, outcome });
+  }
+}
 function receiveNetworkResults(snapshot) {
   for (const [port, view] of [...networkViews]) {
     if (snapshot.locked || !snapshot.network_view || snapshot.generation !== view.generation) {
       closeNetworkView(port, false); continue;
     }
-    if (snapshot.network_view.context_revision !== view.context_revision) {
-      closeNetworkView(port, false);
-      const session = owner?.candidate;
-      if (session?.established && current(session) && !session.locked && session.generation === snapshot.generation) {
-        try { openNetworkView(port, snapshot, session); }
-        catch { failed(session, 'disconnected', true); return false; }
-      }
-      continue;
-    }
-    for (const result of (Array.isArray(snapshot.network_results) ? snapshot.network_results : []).slice(0, 48)) {
-      const pending = view.pending.get(result.operation);
-      if (!pending || result.view_id !== view.view_id || result.request_id !== pending.request_id ||
-          result.context_revision !== view.context_revision) continue;
-      const outcome = result.outcome;
-      if (!outcome || !['done', 'exit_ip', 'failed'].includes(outcome.status) ||
-          (outcome.status === 'failed' && !networkErrors.has(outcome.error)) ||
-          (outcome.status === 'exit_ip' && (result.operation !== 'query_exit_ip' || !boundedNetworkText(outcome.ip, 45)))) continue;
-      clearTimeout(pending.timer);
-      view.pending.delete(result.operation);
-      view.results.set(result.operation, { request_id: result.request_id, operation: result.operation,
-        outcome: { status: outcome.status, ...(outcome.status === 'exit_ip' ? { ip: outcome.ip } : {}),
-          ...(outcome.status === 'failed' ? { error: outcome.error } : {}) } });
-    }
+    if (snapshot.network_view.context_revision === view.context_revision) applyNetworkResults(view, snapshot);
+    else if (!reopenNetworkView(port, snapshot)) return false;
   }
   return true;
 }
+function openNetworkCommand(port, input, session) {
+  if (hasExtraKeys(input, ['action', 'context_revision']) || networkViews.has(port) || networkViews.size >= 16) return;
+  try { openNetworkView(port, uiSnapshot, session); }
+  catch { failed(session, 'disconnected', true); return; }
+  port.postMessage(snapshotFor(port));
+}
+function cancelNetworkQuery(view, session) {
+  const pending = view.pending.get('query_exit_ip');
+  if (pending) clearTimeout(pending.timer);
+  view.pending.delete('query_exit_ip'); view.results.delete('query_exit_ip');
+  try { command(session, { type: 'network', version: 1, generation: session.generation,
+    context_revision: view.context_revision, command: { action: 'cancel_query', view_id: view.view_id } }); }
+  catch { failed(session, 'disconnected', true); }
+}
 function networkCommand(port, message) {
-  const session = owner?.candidate;
+  const session = unlockedCommandSession(message);
   const input = message.command;
-  if (!session?.established || !current(session) || session.locked || uiSnapshot.locked ||
-      message.generation !== session.generation || uiSnapshot.generation !== session.generation ||
-      !uiSnapshot.network_view || input?.context_revision !== uiSnapshot.network_view.context_revision) return;
-  if (input.action === 'open') {
-    if (Object.keys(input).some(key => !['action', 'context_revision'].includes(key)) || networkViews.has(port) || networkViews.size >= 16) return;
-    try { openNetworkView(port, uiSnapshot, session); }
-    catch { failed(session, 'disconnected', true); return; }
-    port.postMessage(snapshotFor(port));
-    return;
-  }
+  if (!session || !uiSnapshot.network_view || input?.context_revision !== uiSnapshot.network_view.context_revision) return;
+  if (input.action === 'open') { openNetworkCommand(port, input, session); return; }
   const view = networkViews.get(port);
   if (!view || input.view_id !== view.view_id || view.context_revision !== input.context_revision) return;
-  if (['close', 'cancel_query'].includes(input.action) && Object.keys(input).some(key => !['action', 'context_revision', 'view_id'].includes(key))) return;
+  networkViewCommand(port, view, input, session);
+}
+function networkViewCommand(port, view, input, session) {
+  if (['close', 'cancel_query'].includes(input.action) && hasExtraKeys(input, ['action', 'context_revision', 'view_id'])) return;
   if (input.action === 'close') { closeNetworkView(port); port.postMessage(snapshotFor(port)); return; }
-  if (input.action === 'cancel_query') {
-    const pending = view.pending.get('query_exit_ip');
-    if (pending) clearTimeout(pending.timer);
-    view.pending.delete('query_exit_ip'); view.results.delete('query_exit_ip');
-    try { command(session, { type: 'network', version: 1, generation: session.generation,
-      context_revision: view.context_revision, command: { action: 'cancel_query', view_id: view.view_id } }); }
-    catch { failed(session, 'disconnected', true); }
-    return;
-  }
-  if (input.action !== 'run' || !networkOperations.includes(input.operation) ||
-      !uiSnapshot.network_view.status.startsWith('tor_') || !boundedNetworkText(input.request_id, 128) ||
-      Object.keys(input).some(key => !['action', 'context_revision', 'view_id', 'request_id', 'operation'].includes(key)) ||
+  if (input.action === 'cancel_query') { cancelNetworkQuery(view, session); return; }
+  runNetworkOperation(port, view, input, session);
+}
+function runNetworkOperation(port, view, input, session) {
+  if (invalidNetworkRun(input, uiSnapshot.network_view.status) ||
       view.seen.has(input.request_id) || view.pending.has(input.operation)) return;
   if (view.seen.size >= 32) {
     view.results.set(input.operation, { request_id: input.request_id, operation: input.operation,
@@ -308,37 +278,13 @@ function closeChainEditor(port, send = true) {
   clearTimeout(view.pending?.timer);
   try { port.postMessage({ type: 'chain_editor', editor_token: view.token, generation: view.generation,
     outcome: { status: 'retired' } }); } catch {}
-  const session = owner?.candidate;
-  if (send && session?.established && current(session) && !session.locked && session.generation === view.generation) {
-    try { command(session, { type: 'chain_editor', version: 1, generation: view.generation,
-      command: { action: 'close', view_id: view.id } }); }
-    catch { failed(session, 'disconnected', true); }
-  }
+  const session = send && unlockedSessionAt(view.generation);
+  if (!session) return;
+  try { command(session, { type: 'chain_editor', version: 1, generation: view.generation,
+    command: { action: 'close', view_id: view.id } }); }
+  catch { failed(session, 'disconnected', true); }
 }
-function chainEditorCommand(port, message) {
-  const session = owner?.candidate;
-  const input = message.command;
-  if (!session?.established || !current(session) || session.locked || uiSnapshot.locked ||
-      message.generation !== session.generation || uiSnapshot.generation !== session.generation ||
-      uiSnapshot.chain_management_supported !== true || !input || !boundedNetworkText(input.editor_token, 128)) return;
-  let view = chainEditorViews.get(port);
-  let native;
-  if (input.action === 'open') {
-    if (view || chainEditorViews.size >= 16 || Object.keys(input).some(key => !['action', 'editor_token'].includes(key))) return;
-    session.chainEditorSequence = (session.chainEditorSequence ?? 0n) + 1n;
-    view = { id: session.chainEditorSequence.toString(), token: input.editor_token, generation: session.generation, seen: new Set(), pending: null };
-    chainEditorViews.set(port, view);
-    native = { action: 'open', view_id: view.id, request_id: crypto.randomUUID() };
-  } else {
-    if (!view || input.editor_token !== view.token || view.generation !== session.generation) return;
-    if (input.action === 'close') { closeChainEditor(port); return; }
-    if (input.action !== 'run' || view.pending || view.seen.size >= 256 ||
-        !boundedNetworkText(input.request_id, 128) || view.seen.has(input.request_id) ||
-        !boundedNetworkText(input.revision, 128) || !input.command ||
-        encoder.encode(JSON.stringify(input.command)).length > 65_536 ||
-        Object.keys(input).some(key => !['action', 'editor_token', 'request_id', 'revision', 'command'].includes(key))) return;
-    native = { action: 'run', view_id: view.id, request_id: input.request_id, revision: input.revision, command: input.command };
-  }
+function requestChainEditor(port, view, session, native) {
   view.seen.add(native.request_id);
   const pending = { id: native.request_id, timer: null };
   view.pending = pending;
@@ -349,22 +295,45 @@ function chainEditorCommand(port, message) {
   try { command(session, { type: 'chain_editor', version: 1, generation: session.generation, command: native }); }
   catch { failed(session, 'disconnected', true); }
 }
+function openChainEditor(port, input, session) {
+  session.chainEditorSequence = (session.chainEditorSequence ?? 0n) + 1n;
+  const view = { id: session.chainEditorSequence.toString(), token: input.editor_token, generation: session.generation, seen: new Set(), pending: null };
+  chainEditorViews.set(port, view);
+  requestChainEditor(port, view, session, { action: 'open', view_id: view.id, request_id: crypto.randomUUID() });
+}
+function chainEditorCommand(port, message) {
+  const session = unlockedCommandSession(message);
+  const input = message.command;
+  if (!session || uiSnapshot.chain_management_supported !== true || invalidEditorCommand(input)) return;
+  const view = chainEditorViews.get(port);
+  if (input.action !== 'open') { chainEditorViewCommand(port, view, input, session); return; }
+  if (view || chainEditorViews.size >= 16 || hasExtraKeys(input, ['action', 'editor_token'])) return;
+  openChainEditor(port, input, session);
+}
+function chainEditorViewCommand(port, view, input, session) {
+  if (!view || input.editor_token !== view.token || view.generation !== session.generation) return;
+  if (input.action === 'close') closeChainEditor(port);
+  else runChainEditor(port, view, input, session);
+}
+function runChainEditor(port, view, input, session) {
+  if (input.action !== 'run' || view.pending || view.seen.size >= 256) return;
+  if (!boundedNetworkText(input.request_id, 128) || view.seen.has(input.request_id) || invalidChainEditorRun(input)) return;
+  requestChainEditor(port, view, session,
+    { action: 'run', view_id: view.id, request_id: input.request_id, revision: input.revision, command: input.command });
+}
+// Chain editor replies apply only while the unlocked generation still shows chain management.
+function chainEditorStale(session, message) {
+  return !current(session) || session.locked || uiSnapshot.locked || uiSnapshot.chain_management_supported !== true ||
+    message.generation !== session.generation || uiSnapshot.generation !== session.generation;
+}
 function receiveChainEditor(session, message) {
-  if (!current(session) || session.locked || uiSnapshot.locked || uiSnapshot.chain_management_supported !== true ||
-      message.generation !== session.generation || uiSnapshot.generation !== session.generation) return;
+  if (chainEditorStale(session, message)) return;
   const entry = [...chainEditorViews].find(([, view]) => view.id === message.view_id && view.generation === message.generation);
   if (!entry) return;
   const [port, view] = entry;
   if (!view.pending || view.pending.id !== message.request_id) return;
   const outcome = message.outcome;
-  if (!outcome || !['ready', 'failed', 'probed'].includes(outcome.status) || encoder.encode(JSON.stringify(outcome)).length > 131_072 ||
-      (outcome.status === 'failed' && !boundedNetworkText(outcome.message, 4096)) ||
-      // A test result carries one quote or one reason, never saved pricing or endpoints.
-      (outcome.status === 'probed' && (!outcome.probe ||
-        (outcome.probe.message !== null && !boundedNetworkText(outcome.probe.message, 4096)) ||
-        (outcome.probe.quote !== null && !boundedNativeQuote(outcome.probe.quote)))) ||
-      (outcome.status === 'ready' && (!outcome.snapshot || !boundedNetworkText(outcome.snapshot.revision, 128) ||
-        !Array.isArray(outcome.snapshot.chains) || outcome.snapshot.chains.length > 68))) return;
+  if (invalidChainEditorOutcome(outcome)) return;
   clearTimeout(view.pending.timer);
   view.pending = null;
   // Do not cache this result, spread it into uiSnapshot, or broadcast it to other views.
@@ -372,27 +341,35 @@ function receiveChainEditor(session, message) {
   catch { closeChainEditor(port); }
 }
 
-function publishSnapshot(snapshot, authoritative = true) {
-  if (!receiveNetworkResults(snapshot)) return;
-  if (snapshot.chains?.find(chain => chain.id === snapshot.public_view?.selected_chain)?.railgun === false) {
-    lastHomeTab = 'public';
-    for (const port of ports) homeTabs.set(port, 'public');
-  }
+function retireChainEditors(snapshot) {
   for (const [port, view] of [...chainEditorViews]) {
     if (snapshot.locked || snapshot.chain_management_supported !== true || snapshot.generation !== view.generation) closeChainEditor(port, false);
   }
+}
+function retirePrivatePickers(snapshot) {
   for (const [port, picker] of privatePickers) {
     if (snapshot.locked || snapshot.private_actions_supported !== true || snapshot.generation !== picker.generation ||
-        !snapshot.public_view?.drafts?.some(draft => draft.draft_id === picker.draft_id && draft.revision === picker.revision &&
-          !['attention', 'in_progress', 'done', 'failed'].includes(draft.status))) privatePickers.delete(port);
+        !pickerDraftOpen(snapshot, picker)) privatePickers.delete(port);
   }
+}
+function broadcastSnapshot() {
+  for (const port of ports) {
+    try { port.postMessage(snapshotFor(port)); } catch { closeNetworkView(port); closeChainEditor(port); ports.delete(port); tabContexts.delete(port); homeTabs.delete(port); }
+  }
+}
+function publishSnapshot(snapshot, authoritative = true) {
+  if (!receiveNetworkResults(snapshot)) return;
+  if (railgunUnavailable(snapshot)) {
+    lastHomeTab = 'public';
+    for (const port of ports) homeTabs.set(port, 'public');
+  }
+  retireChainEditors(snapshot);
+  retirePrivatePickers(snapshot);
   // Query replies are retained only by their live originating view.
   const { network_results, ...presentation } = snapshot;
   uiSnapshot = presentation;
   updateRequestAttention(authoritative);
-  for (const port of ports) {
-    try { port.postMessage(snapshotFor(port)); } catch { closeNetworkView(port); closeChainEditor(port); ports.delete(port); tabContexts.delete(port); homeTabs.delete(port); }
-  }
+  broadcastSnapshot();
 }
 function snapshotFor(port) {
   const tab = uiSnapshot.locked ? null : tabContexts.get(port)?.tab;
@@ -540,66 +517,126 @@ function command(session, message) {
     throw new Error('Gateway send failed');
   }
 }
-function isCredential(record) {
-  const bytes = (value, size) => Array.isArray(value) && value.length === size &&
-    value.every(byte => Number.isInteger(byte) && byte >= 0 && byte <= 255);
-  return record && record.version === 1 && bytes(record.peerId, 16) && bytes(record.secret, 32);
-}
 function wipe(record) {
   record?.peerId?.fill?.(0);
   record?.secret?.fill?.(0);
+}
+function establishSession(session) {
+  clearTimeout(session.deadline);
+  backoff = 1;
+  void chrome.alarms.create('gateway-reconnect', { periodInMinutes: 0.5 });
+  command(session, 'get_state');
+  publish('paired');
+  session.lastReceived = performance.now();
+  session.heartbeat = setInterval(() => {
+    if (!current(session)) return;
+    if (performance.now() - session.lastReceived > 60000) {
+      failed(session, 'disconnected', true);
+      return;
+    }
+    try { command(session, 'heartbeat'); } catch { failed(session, 'disconnected', true); }
+  }, 20000);
+  session.established = true;
+  pageBridge.authenticated();
+  clearCredentials(session.discovery);
+  session.finish('authenticated');
+  session.assembly = setInterval(() => {
+    if (!current(session)) return;
+    try { session.client.expireAssembly(now()); } catch { failed(session, 'disconnected', true); }
+  }, 1000);
+}
+async function receiveHandshake(session, bytes) {
+  const response = session.client.receiveHandshake(bytes);
+  if (response.length) send(session, response);
+  if (session.client.lastEvent() === 1) {
+    const peerId = session.client.pendingPeerId();
+    const secret = session.client.exportPendingCredentialForStorage();
+    const record = { version: 1, peerId: Array.from(peerId), secret: Array.from(secret) };
+    try {
+      await stored(async () => {
+        if (!current(session)) return;
+        await chrome.storage.local.set({ gatewayCredential: record });
+        paired = true;
+      });
+    } catch {
+      if (current(session)) failed(session.discovery, 'storage_failed');
+      return;
+    } finally {
+      peerId.fill(0);
+      secret.fill(0);
+      wipe(record);
+    }
+    if (!current(session)) return;
+    send(session, session.client.acknowledgeCredential());
+  }
+  if (session.client.isAuthenticated()) establishSession(session);
+}
+function receiveUnlockState(session, message) {
+  const next = message.view;
+  if (message.generation !== session.generation || invalidUnlockView(next)) return;
+  if (unlockOwner && message.response_to === unlockOwner.id && next.attempt_id !== unlockOwner.id) clearUnlockOwner();
+  if (unlockOwner && next.attempt_id === unlockOwner.id) unlockOwner.waiting = false;
+  unlockView = { allowed: next.allowed, attempt_id: next.attempt_id, phase: next.phase };
+  if (!next.allowed) clearUnlockOwner();
+  publish(status);
+}
+function receiveUiSnapshot(session, message) {
+  // Invalid pricing rejects the whole snapshot. An invalid network view only withdraws network control.
+  const nativeUsd = nativeUsdPresentation(message);
+  if (nativeUsd === null) return;
+  if (message.generation !== session.generation || message.locked !== session.locked) return;
+  const snapshot = uiSnapshotPresentation(message, nativeUsd);
+  if (snapshot) publishSnapshot(snapshot);
+}
+// Generations never go back, and a generation keeps its lock state.
+function staleState(session, message) {
+  return invalidStateMessage(message) || message.generation < session.generation ||
+    (message.generation === session.generation && session.locked !== message.locked);
+}
+// State repeats within a session, so the version is reported once and only to a desktop that reads it.
+function sendClientInfo(session, message) {
+  if (message.client_info_supported !== true || session.clientInfoSent) return;
+  session.clientInfoSent = true;
+  if (extensionVersion) {
+    command(session, { type: 'client_info', version: 1, extension_version: extensionVersion });
+  }
+}
+function requestUnlockState(session, message) {
+  if (message.unlock_supported !== true || session.unlockInfoSent) return;
+  session.unlockInfoSent = true;
+  command(session, { type: 'get_unlock_state', version: 1 });
+}
+function receiveState(session, message) {
+  if (staleState(session, message)) {
+    failed(session, 'disconnected');
+    return;
+  }
+  sendClientInfo(session, message);
+  const generationChanged = session.generation !== message.generation;
+  if (generationChanged) purgeSnapshot(false, !message.locked || message.wallet_transition === true);
+  session.generation = message.generation;
+  session.locked = message.locked;
+  if (!message.locked || (generationChanged && unlockTerminal(unlockView.phase))) {
+    clearUnlockOwner();
+    unlockView = { allowed: unlockView.allowed, attempt_id: null, phase: "password" };
+  }
+  requestUnlockState(session, message);
+  pageBridge.lockState(message.locked, generationChanged);
+  publish(message.locked ? 'locked' : 'unlocked');
+}
+// Each handler ends dispatch. Any other type must be a valid state message or the session disconnects.
+function receiveMessage(session, message) {
+  if (message.type === 'unlock_state') receiveUnlockState(session, message);
+  else if (message.type === 'chain_editor') receiveChainEditor(session, message);
+  else if (message.type === 'ui_snapshot') receiveUiSnapshot(session, message);
+  else if (message.type === 'provider_state' || message.type === 'provider_response') pageBridge.receive(session, message);
+  else receiveState(session, message);
 }
 async function receive(session, bytes) {
   if (!current(session)) return;
   try {
     if (!session.client.isAuthenticated()) {
-      const response = session.client.receiveHandshake(bytes);
-      if (response.length) send(session, response);
-      if (session.client.lastEvent() === 1) {
-        const peerId = session.client.pendingPeerId();
-        const secret = session.client.exportPendingCredentialForStorage();
-        const record = { version: 1, peerId: Array.from(peerId), secret: Array.from(secret) };
-        try {
-          await stored(async () => {
-            if (!current(session)) return;
-            await chrome.storage.local.set({ gatewayCredential: record });
-            paired = true;
-          });
-        } catch {
-          if (current(session)) failed(session.discovery, 'storage_failed');
-          return;
-        } finally {
-          peerId.fill(0);
-          secret.fill(0);
-          wipe(record);
-        }
-        if (!current(session)) return;
-        send(session, session.client.acknowledgeCredential());
-      }
-      if (session.client.isAuthenticated()) {
-        clearTimeout(session.deadline);
-        backoff = 1;
-        void chrome.alarms.create('gateway-reconnect', { periodInMinutes: 0.5 });
-        command(session, 'get_state');
-        publish('paired');
-        session.lastReceived = performance.now();
-        session.heartbeat = setInterval(() => {
-          if (!current(session)) return;
-          if (performance.now() - session.lastReceived > 60000) {
-            failed(session, 'disconnected', true);
-            return;
-          }
-          try { command(session, 'heartbeat'); } catch { failed(session, 'disconnected', true); }
-        }, 20000);
-        session.established = true;
-        pageBridge.authenticated();
-        clearCredentials(session.discovery);
-        session.finish('authenticated');
-        session.assembly = setInterval(() => {
-          if (!current(session)) return;
-          try { session.client.expireAssembly(now()); } catch { failed(session, 'disconnected', true); }
-        }, 1000);
-      }
+      await receiveHandshake(session, bytes);
       return;
     }
     const plain = session.client.receiveFrame(bytes, now());
@@ -613,75 +650,7 @@ async function receive(session, bytes) {
     }
     session.lastReceived = performance.now();
     if (message.type === 'heartbeat') return;
-    if (message.type === 'unlock_state') {
-      const next = message.view;
-      if (message.generation !== session.generation || !next || typeof next.allowed !== 'boolean' ||
-          !unlockPhases.has(next.phase) || (next.attempt_id !== null && (typeof next.attempt_id !== 'string' || next.attempt_id.length > 128))) return;
-      if (unlockOwner && message.response_to === unlockOwner.id && next.attempt_id !== unlockOwner.id) clearUnlockOwner();
-      if (unlockOwner && next.attempt_id === unlockOwner.id) unlockOwner.waiting = false;
-      unlockView = { allowed: next.allowed, attempt_id: next.attempt_id, phase: next.phase };
-      if (!next.allowed) clearUnlockOwner();
-      publish(status);
-      return;
-    }
-    if (message.type === 'chain_editor') { receiveChainEditor(session, message); return; }
-    if (message.type === 'ui_snapshot') {
-      const nativeUsd = nativeUsdPresentation(message);
-      if (nativeUsd === null) return;
-      if (message.generation !== session.generation || message.locked !== session.locked || !Array.isArray(message.accounts) ||
-          !Array.isArray(message.pending_connects) || !Array.isArray(message.pending_requests)) return;
-      if (message.locked && (message.accounts.length ||
-          message.pending_connects.some(prompt => prompt.accounts?.length) ||
-          message.public_view?.selected_account || message.public_view?.selected_chain || message.public_view?.balances?.length || message.public_view?.drafts?.length || message.permissions?.length || message.private_view != null || message.network_view != null || message.network_results?.length)) return;
-      const privateActions = !message.locked && message.private_actions_supported === true;
-      const publicView = message.public_view && { ...message.public_view,
-        ...(Array.isArray(message.public_view.drafts) ? { drafts: message.public_view.drafts.filter(draft =>
-          privateActions || !['private_send', 'unshield'].includes(draft.input?.kind)) } : {}) };
-      const network = networkPresentation(message);
-      publishSnapshot({ ...message, native_usd_pricing: nativeUsd, network_control_supported: network !== null, network_view: network, private_actions_supported: privateActions,
-        private_self_broadcast_supported: privateActions && message.private_self_broadcast_supported === true,
-        private_view: !message.locked && message.private_view_supported === true ? message.private_view : null,
-        public_view: message.locked ? null : publicView,
-        permissions: message.locked ? [] : (message.permissions ?? []),
-        ui_error: message.locked ? null : message.ui_error, pending_requests: message.pending_requests.map(request => ({
-        request_id: request.request_id, url: request.url,
-        needs_unlock: message.locked || request.needs_unlock,
-        summary: message.locked || request.needs_unlock ? null : request.summary,
-      })) });
-      return;
-    }
-    if (message.type === 'provider_state' || message.type === 'provider_response') {
-      pageBridge.receive(session, message);
-      return;
-    }
-    if (message.type !== 'state' || typeof message.locked !== 'boolean' ||
-        !Number.isSafeInteger(message.generation) || message.generation < 0 ||
-        message.generation < session.generation ||
-        (message.generation === session.generation && session.locked !== message.locked)) {
-      failed(session, 'disconnected');
-      return;
-    }
-    // State repeats within a session, so the version is reported once and only to a desktop that reads it.
-    if (message.client_info_supported === true && !session.clientInfoSent) {
-      session.clientInfoSent = true;
-      if (extensionVersion) {
-        command(session, { type: 'client_info', version: 1, extension_version: extensionVersion });
-      }
-    }
-    const generationChanged = session.generation !== message.generation;
-    if (generationChanged) purgeSnapshot(false, !message.locked || message.wallet_transition === true);
-    session.generation = message.generation;
-    session.locked = message.locked;
-    if (!message.locked || (generationChanged && unlockTerminal(unlockView.phase))) {
-      clearUnlockOwner();
-      unlockView = { allowed: unlockView.allowed, attempt_id: null, phase: "password" };
-    }
-    if (message.unlock_supported === true && !session.unlockInfoSent) {
-      session.unlockInfoSent = true;
-      command(session, { type: 'get_unlock_state', version: 1 });
-    }
-    pageBridge.lockState(message.locked, generationChanged);
-    publish(message.locked ? 'locked' : 'unlocked');
+    receiveMessage(session, message);
   } catch (error) {
     // WASM exposes fixed errors. Never stringify a library error or received payload.
     failed(session, error === 'Incompatible gateway protocol version' ? 'version_failed' : 'auth_failed');
