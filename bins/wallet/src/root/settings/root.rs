@@ -1,9 +1,11 @@
+use wallet_ops::TokenAnchorRateCache;
+
 use super::{
-    Arc, Context, Duration, Entity, HttpContext, ProverCacheBuildParams, ProverCacheBuildProgress,
-    WalletNetworkConfig, WalletRoot, WalletSettings, WalletSettingsEditor,
-    begin_prover_cache_build, build_cache_with_context_and_progress_with_session,
-    build_effective_chain_configs, build_wallet_network_context, data_folder_path,
-    open_data_folder, watch,
+    App, Arc, Context, Duration, Entity, HttpContext, ProverCacheBuildParams,
+    ProverCacheBuildProgress, WalletNetworkConfig, WalletRoot, WalletSettings,
+    WalletSettingsEditor, begin_prover_cache_build,
+    build_cache_with_context_and_progress_with_session, build_effective_chain_configs,
+    build_wallet_network_context, data_folder_path, open_data_folder, watch,
 };
 use crate::root::PublicActionMode;
 
@@ -49,6 +51,34 @@ impl WalletRoot {
 
     pub(in crate::root) const fn tron_enabled(&self) -> bool {
         self.tron_public.settings.enabled
+    }
+
+    /// The saved Tron settings, or disabled Tron while the settings editor is unavailable.
+    pub(in crate::root) fn initial_tron_settings(
+        settings_editor: Option<&Entity<WalletSettingsEditor>>,
+        cx: &App,
+    ) -> wallet_ops::settings::TronSettings {
+        settings_editor.map_or_else(
+            || wallet_ops::settings::TronSettings {
+                enabled: false,
+                ..Default::default()
+            },
+            |editor| editor.read(cx).saved.tron.clone(),
+        )
+    }
+
+    /// Shows the anchor cache's native USD pricing in the chain editor.
+    pub(in crate::root) fn sync_chain_editor_pricing(
+        settings_editor: Option<&Entity<WalletSettingsEditor>>,
+        anchor_cache: &TokenAnchorRateCache,
+        cx: &mut App,
+    ) {
+        if let Some(settings) = settings_editor {
+            let editor = settings.read(cx).chain_editor.clone();
+            editor.update(cx, |editor, cx| {
+                editor.set_pricing_status(anchor_cache.native_usd_statuses(), cx);
+            });
+        }
     }
 
     /// Installs saved Tron settings and reconciles Tron's pricing with them. Disabling Tron

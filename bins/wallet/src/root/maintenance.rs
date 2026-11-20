@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use gpui::{Context, WeakEntity};
+use gpui::{Context, Entity, WeakEntity};
 use tokio::runtime::Handle;
 use wallet_ops::vault::DesktopVaultStore;
 
@@ -438,4 +438,15 @@ impl WalletMaintenanceController {
         cx.notify();
         true
     }
+}
+
+/// Makes the root that `cx` builds `controller`'s active root.
+pub(in crate::root) fn attach_active_root(
+    controller: &Entity<WalletMaintenanceController>,
+    cx: &mut Context<'_, WalletRoot>,
+) {
+    let active_root = cx.weak_entity();
+    controller.update(cx, |controller, _cx| {
+        controller.set_active_root(active_root);
+    });
 }

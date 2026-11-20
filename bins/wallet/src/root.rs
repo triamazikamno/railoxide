@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use broadcaster_monitor::{EventRx, EventTx, Shared};
@@ -34,10 +34,9 @@ use wallet_ops::{
     },
     subscribe_activity_journal_failures,
     vault::{
-        BroadcasterPreferences, DesktopVaultStore, DesktopViewSession, DeviceAuthStatus,
-        GeneratedSeedMaterial, NonEvmAddressBookEntry, PrivateAddressBookEntry,
-        ProtectedSoftwareSeedSession, PublicAccountMetadata, PublicAddressBookEntry, ViewUnlock,
-        WalletMetadataBundle,
+        DesktopVaultStore, DesktopViewSession, DeviceAuthStatus, GeneratedSeedMaterial,
+        NonEvmAddressBookEntry, PrivateAddressBookEntry, ProtectedSoftwareSeedSession,
+        PublicAccountMetadata, PublicAddressBookEntry, ViewUnlock, WalletMetadataBundle,
     },
 };
 use zeroize::Zeroizing;
@@ -117,7 +116,7 @@ use auto_lock::{
     AutoLockState, InitialCatchUpFingerprint, InitialSyncActivity, InitialSyncObservation,
 };
 use broadcaster_picker::BroadcasterPickerState;
-use broadcaster_preferences::{BroadcasterPreferencesUi, install_broadcaster_preference_hooks};
+use broadcaster_preferences::{BroadcasterPreferencesUi, install_broadcaster_preference_snapshot};
 use broadcaster_view::BroadcasterActivityTab;
 use chain_load::{
     ChainUtxoState, WalletSyncLifecycle, WalletSyncLifecycleCleanupTask, chain_load_overrides,
@@ -638,33 +637,19 @@ impl WalletRoot {
             mimic_railway_shields_by_default,
             poi_read_source,
         } = ready;
-        let initial_wallet_tab = if effective_chain_configs.railgun(initial_chain_id).is_ok() {
-            WalletTab::default()
-        } else {
-            WalletTab::Public
-        };
-        let chain_select_items: Vec<_> = chain_ids
-            .iter()
-            .copied()
-            .filter_map(|chain_id| {
-                effective_chain_configs
-                    .get(chain_id)
-                    .map(|chain| (chain_id, chain.name.clone()))
-            })
-            .collect();
+        let initial_wallet_tab =
+            shell::initial_wallet_tab(&effective_chain_configs, initial_chain_id);
+        let chain_select_items =
+            wallet_header::chain_select_items(&effective_chain_configs, &chain_ids);
         let mut chain_states = BTreeMap::new();
         for chain_id in &chain_ids {
             chain_states.insert(*chain_id, ChainUtxoState::Idle);
         }
         let maintenance_controller = dependencies.maintenance_controller;
-        let active_root = cx.weak_entity();
-        maintenance_controller.update(cx, |controller, _cx| {
-            controller.set_active_root(active_root);
-        });
-        let merkle_forest_cache_resetting =
-            maintenance_controller.read(cx).reset() == maintenance::WalletMaintenanceReset::Merkle;
-        let public_sync_cache_resetting =
-            maintenance_blocks_public_sync(maintenance_controller.read(cx).reset());
+        maintenance::attach_active_root(maintenance_controller, cx);
+        let reset = maintenance_controller.read(cx).reset();
+        let merkle_forest_cache_resetting = reset == maintenance::WalletMaintenanceReset::Merkle;
+        let public_sync_cache_resetting = maintenance_blocks_public_sync(reset);
         let gateway =
             gateway::GatewayUi::start(vault_store.as_ref(), &dependencies.runtime, window, cx);
         let (settings_editor, settings_error) =
@@ -690,42 +675,20 @@ impl WalletRoot {
         platform_attention.sync_badge_count(0);
         platform_attention.clear_attention();
         let walletconnect = walletconnect::WalletConnectUiState::new(window, cx);
-        let tron_settings = settings_editor.as_ref().map_or_else(
-            || wallet_ops::settings::TronSettings {
-                enabled: false,
-                ..Default::default()
-            },
-            |editor| editor.read(cx).saved.tron.clone(),
+        let tron_settings = Self::initial_tron_settings(settings_editor.as_ref(), cx);
+        let chain_select = wallet_header::new_chain_select(
+            wallet_header::network_select_items(chain_select_items, tron_settings.enabled),
+            SelectedNetwork::Evm(initial_chain_id),
+            window,
+            cx,
         );
-        let chain_select = cx.new(|cx| {
-            ui::chain_select::chain_select_state(
-                wallet_header::network_select_items(chain_select_items, tron_settings.enabled),
-                Some(SelectedNetwork::Evm(initial_chain_id)),
-                window,
-                cx,
-            )
-        });
-        let wallet_select = cx.new(|cx| {
-            SelectState::new(SearchableVec::new(Vec::new()), None, window, cx).searchable(true)
-        });
+        let wallet_select = wallet_header::new_wallet_select(window, cx);
         let root_weak = cx.weak_entity();
         let root_entity = cx.entity();
         let passphrase_open_ui = cx.new(|cx| PassphraseOpenUi::new(root_entity, window, cx));
         let broadcaster_preference_snapshot =
-            Arc::new(RwLock::new(BroadcasterPreferences::default()));
-        install_broadcaster_preference_hooks(
-            &monitor,
-            Arc::clone(&broadcaster_preference_snapshot),
-            root_weak.clone(),
-            cx,
-        );
-        let utxo_table = cx.new(|cx| {
-            TableState::new(
-                UtxoDelegate::new(root_weak.clone(), widgets.tx_search_input.clone()),
-                window,
-                cx,
-            )
-        });
+            install_broadcaster_preference_snapshot(&monitor, root_weak.clone(), cx);
+        let utxo_table = utxo::new_utxo_table(&root_weak, &widgets.tx_search_input, window, cx);
         let network_health = http.network_health();
         let tor_bridge_activity = http.tor_bridge_activity_snapshot();
         let sidebar_public_broadcaster_count =
@@ -733,13 +696,11 @@ impl WalletRoot {
         let mut public_broadcaster_sort_seed = [0_u8; 32];
         rand::rng().fill(public_broadcaster_sort_seed.as_mut_slice());
         let anchor_refresh_rx = public_broadcaster_anchor_cache.subscribe_refreshes();
-        if let Some(settings) = &settings_editor {
-            let editor = settings.read(cx).chain_editor.clone();
-            editor.update(cx, |editor, cx| {
-                editor
-                    .set_pricing_status(public_broadcaster_anchor_cache.native_usd_statuses(), cx);
-            });
-        }
+        Self::sync_chain_editor_pricing(
+            settings_editor.as_ref(),
+            &public_broadcaster_anchor_cache,
+            cx,
+        );
         // Tron's pricing source is installed now and reads nothing until Tron is selected.
         let tron_public = TronPublicState::new(tron_settings, TronSendState::new(window, cx));
         public_broadcaster_anchor_refresh
@@ -908,25 +869,9 @@ impl WalletRoot {
             focus_public_account_search_on_render: false,
             wallet_focus: cx.focus_handle(),
         };
-        Self::start_auto_lock_monitor(window, cx);
-        Self::observe_window_focus(window, cx);
-        root.subscribe_logs(window, cx);
-        root.subscribe_utxo_inputs(cx);
-        root.subscribe_public_action_inputs(cx);
-        root.subscribe_governance_inputs(window, cx);
-        root.subscribe_address_book_inputs(window, cx);
-        root.subscribe_header_selects(window, cx);
-        root.subscribe_walletconnect_inputs(window, cx);
-        root.subscribe_vault_inputs(window, cx);
-        root.subscribe_hardware_wallet_inputs(window, cx);
-        root.subscribe_wallet_maintenance_inputs(window, cx);
-        root.subscribe_public_account_inputs(window, cx);
+        root.subscribe_root_inputs(window, cx);
         Self::start_state_watchers(monitor_event_rx, anchor_refresh_rx, cx);
-        Self::spawn_utxo_age_refresh(cx);
-        root.spawn_form_and_balance_refresh(cx);
-        root.spawn_network_health_monitor(cx);
-        root.spawn_tor_bridge_activity_sampler(cx);
-        root.watch_public_transactions(cx);
+        root.spawn_background_refreshes(cx);
         root
     }
 

@@ -23,6 +23,7 @@ use ui::icons;
 use ui::logs::LogStore;
 use ui::theme::{self, APP_FONT_FAMILY, APP_TEXT_SIZE};
 use wallet_ops::WalletPpoiWorkflowStatus;
+use wallet_ops::settings::EffectiveChainRegistry;
 
 use crate::assets::LOGO_ICON_PATH;
 
@@ -110,6 +111,18 @@ impl WalletTab {
     /// Activity work on every network.
     pub(super) const fn needs_railgun(self) -> bool {
         matches!(self, Self::Private | Self::UTXOs)
+    }
+}
+
+/// The tab a new root opens on: the default where the initial chain has Railgun, else Public.
+pub(super) fn initial_wallet_tab(
+    effective_chain_configs: &EffectiveChainRegistry,
+    initial_chain_id: u64,
+) -> WalletTab {
+    if effective_chain_configs.railgun(initial_chain_id).is_ok() {
+        WalletTab::default()
+    } else {
+        WalletTab::Public
     }
 }
 

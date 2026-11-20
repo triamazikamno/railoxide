@@ -2,14 +2,14 @@ use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, px, rgb,
+    App, AppContext as _, Context, Entity, InteractiveElement, IntoElement, ParentElement, Pixels,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 use gpui_component::{
     Icon, IconName, Sizable,
     kbd::Kbd,
     menu::{DropdownMenu, PopupMenuItem},
-    select::{Select, SelectItem},
+    select::{SearchableVec, Select, SelectItem, SelectState},
     separator::Separator,
     tooltip::Tooltip,
 };
@@ -19,6 +19,7 @@ use ui::controls::{app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::dialog::WalletDialogExt as _;
 use ui::{icons, theme};
 use wallet_ops::hardware::HardwareDeviceKind;
+use wallet_ops::settings::EffectiveChainRegistry;
 use wallet_ops::vault::{HardwareProfileMetadata, WalletMetadataBundle, WalletSource};
 
 use crate::assets::RailgunActionIcon;
@@ -77,6 +78,40 @@ impl SelectItem for WalletSelectItem {
 }
 
 pub(super) type NetworkSelectItems = ui::chain_select::ChainSelectItems<NetworkSelectItem>;
+
+/// The configured chains among `chain_ids` with their names, in `chain_ids` order.
+pub(super) fn chain_select_items(
+    effective_chain_configs: &EffectiveChainRegistry,
+    chain_ids: &[u64],
+) -> Vec<(u64, String)> {
+    chain_ids
+        .iter()
+        .copied()
+        .filter_map(|chain_id| {
+            effective_chain_configs
+                .get(chain_id)
+                .map(|chain| (chain_id, chain.name.clone()))
+        })
+        .collect()
+}
+
+/// The header's network selector over `items`, with `selected` chosen.
+pub(super) fn new_chain_select(
+    items: Vec<NetworkSelectItem>,
+    selected: super::SelectedNetwork,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<SelectState<NetworkSelectItems>> {
+    cx.new(|cx| ui::chain_select::chain_select_state(items, Some(selected), window, cx))
+}
+
+/// The header's wallet selector, empty until the wallets load.
+pub(super) fn new_wallet_select(
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<SelectState<SearchableVec<WalletSelectItem>>> {
+    cx.new(|cx| SelectState::new(SearchableVec::new(Vec::new()), None, window, cx).searchable(true))
+}
 
 /// The header selector's choices: the enabled EVM chains, then Tron while it is enabled.
 pub(super) fn network_select_items(

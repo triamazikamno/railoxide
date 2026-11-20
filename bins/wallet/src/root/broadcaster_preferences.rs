@@ -339,6 +339,18 @@ impl WalletRoot {
     }
 }
 
+/// Installs the monitor's broadcaster preference hooks over a new, empty
+/// snapshot and returns that snapshot.
+pub(super) fn install_broadcaster_preference_snapshot(
+    monitor: &Entity<BroadcasterMonitorPane>,
+    root: WeakEntity<WalletRoot>,
+    cx: &mut Context<'_, WalletRoot>,
+) -> Arc<RwLock<BroadcasterPreferences>> {
+    let snapshot = Arc::new(RwLock::new(BroadcasterPreferences::default()));
+    install_broadcaster_preference_hooks(monitor, Arc::clone(&snapshot), root, cx);
+    snapshot
+}
+
 /// Installs the monitor callbacks that read the wallet's broadcaster
 /// preferences from `snapshot` and toggle them on `root`.
 pub(super) fn install_broadcaster_preference_hooks(

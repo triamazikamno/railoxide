@@ -6,9 +6,9 @@ use alloy::hex;
 use alloy::primitives::{FixedBytes, U256};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
-    App, Context, Entity, Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    Pixels, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window, div,
-    prelude::FluentBuilder as _, px, relative, rgb,
+    App, AppContext as _, Context, Entity, Focusable, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Pixels, SharedString, StatefulInteractiveElement, Styled, WeakEntity, Window,
+    div, prelude::FluentBuilder as _, px, relative, rgb,
 };
 use gpui_component::{
     Disableable, Icon, IconName, Sizable, StyledExt, WindowExt,
@@ -240,6 +240,22 @@ pub(super) struct UtxoDelegate {
     poi_refreshing: bool,
     poi_retry_session_available: bool,
     finality_context: UtxoFinalityContext,
+}
+
+/// The UTXO table, empty until a chain's notes load.
+pub(super) fn new_utxo_table(
+    root_weak: &WeakEntity<WalletRoot>,
+    tx_search_input: &Entity<InputState>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<TableState<UtxoDelegate>> {
+    cx.new(|cx| {
+        TableState::new(
+            UtxoDelegate::new(root_weak.clone(), tx_search_input.clone()),
+            window,
+            cx,
+        )
+    })
 }
 
 impl UtxoDelegate {

@@ -23,6 +23,23 @@ use super::{
 };
 
 impl WalletRoot {
+    /// Starts the auto-lock and focus monitors and subscribes the root to its inputs.
+    pub(super) fn subscribe_root_inputs(&self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        Self::start_auto_lock_monitor(window, cx);
+        Self::observe_window_focus(window, cx);
+        self.subscribe_logs(window, cx);
+        self.subscribe_utxo_inputs(cx);
+        self.subscribe_public_action_inputs(cx);
+        self.subscribe_governance_inputs(window, cx);
+        self.subscribe_address_book_inputs(window, cx);
+        self.subscribe_header_selects(window, cx);
+        self.subscribe_walletconnect_inputs(window, cx);
+        self.subscribe_vault_inputs(window, cx);
+        self.subscribe_hardware_wallet_inputs(window, cx);
+        self.subscribe_wallet_maintenance_inputs(window, cx);
+        self.subscribe_public_account_inputs(window, cx);
+    }
+
     pub(super) fn observe_window_focus(window: &mut Window, cx: &mut Context<'_, Self>) {
         cx.observe_window_activation(window, |root, window, cx| {
             if window.is_window_active() {
@@ -621,6 +638,15 @@ impl WalletRoot {
             }
         })
         .detach();
+    }
+
+    /// Starts the root's periodic refreshes, network samplers and transaction watcher.
+    pub(super) fn spawn_background_refreshes(&self, cx: &Context<'_, Self>) {
+        Self::spawn_utxo_age_refresh(cx);
+        self.spawn_form_and_balance_refresh(cx);
+        self.spawn_network_health_monitor(cx);
+        self.spawn_tor_bridge_activity_sampler(cx);
+        self.watch_public_transactions(cx);
     }
 
     pub(super) fn spawn_utxo_age_refresh(cx: &Context<'_, Self>) {
