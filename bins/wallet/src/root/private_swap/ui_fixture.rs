@@ -847,6 +847,17 @@ const REPORTED_SHIELDED: u64 = 101_059_199;
 /// The block the orderbook reports a `reported:` mode's trade in.
 const REPORTED_TRADE_BLOCK: u64 = SWAP_ORIGIN_BLOCK + 160;
 
+/// The origin block a `detail:` mode's destination record trades and approves in.
+const STAGED_ORIGIN_BLOCK: u64 = 31_204_518;
+/// The destination block a `detail:` mode's destination record is set up in.
+const STAGED_DESTINATION_BLOCK: u64 = 402_118_977;
+/// The transaction a `detail:` mode's destination record observes its steps in.
+const STAGED_TRANSACTION: B256 = B256::repeat_byte(0x7a);
+/// The destination account a `detail:` mode's record is for.
+const STAGED_ACCOUNT: Address = Address::repeat_byte(0x3a);
+/// The delegate a `detail:` mode's destination account is set up with.
+const STAGED_DELEGATE: Address = Address::repeat_byte(0x5d);
+
 /// The Solana receiver of a `non-evm:` mode's swap: 32 bytes no wallet holds, in base58.
 const NON_EVM_RECEIVER: &str = "9jQtwHhZT1H2TYSMt74msmBmy8UPen4GUysNynPUVkkv";
 /// The Zcash receiver of a `non-evm:zcash:` mode's swap: a unified address with stand-in

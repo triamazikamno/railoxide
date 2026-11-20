@@ -7,8 +7,6 @@ pub(super) fn staged_record(
     identity: SwapIdentity,
     swap: &Staged,
 ) -> Option<ExecutorRecord> {
-    const ORIGIN_BLOCK: u64 = 31_204_518;
-    const DESTINATION_BLOCK: u64 = 402_118_977;
     let now = now_unix();
     // An open order's validity is still ahead. An expired order's is behind.
     let valid_to = u32::try_from(if stage == Detail::Expired {
@@ -17,16 +15,48 @@ pub(super) fn staged_record(
         now.saturating_add(1_200)
     })
     .ok()?;
-    let hash = B256::repeat_byte(0x7a);
-    let at = |number| SwapObservation {
+    let saved = staged_saved_swap(stage, swap, valid_to)?;
+    let issued = staged_issued_setup(stage)?;
+    // A confirmed setup is one whose nonce an account read showed consumed.
+    let consumed = staged_set_up(stage)
+        .then(|| ExecutorNonceWatermark::new(U256::ONE, STAGED_DESTINATION_BLOCK));
+    serde_json::from_value(serde_json::json!({
+        "version": 2, "derivation": "Railgun7702V1", "origin": "Reserved",
+        "operation": identity.operation, "index": 3,
+        "address": STAGED_ACCOUNT, "delegate": STAGED_DELEGATE, "retired": false,
+        "issued": issued, "nonce_watermark": consumed,
+        "swap_uses": [{ "id": identity.swap_use, "started_at": now.saturating_sub(240),
+            "fresh": true,
+            "role": { "PublicSourceDestination": { "origin_chain": swap.origin,
+                "source": swap.source, "destination_token": swap.delivered, "swap": saved
+            }}
+        }]
+    }))
+    .ok()
+}
+
+/// An observation at origin block `number`, in the destination record's transaction.
+const fn staged_observation(number: u64) -> SwapObservation {
+    SwapObservation {
         block: BlockNumHash::new(number, B256::repeat_byte(0xb1)),
-        transaction_hash: Some(hash),
-    };
-    let fill = BlockNumHash::new(DESTINATION_BLOCK + 640, B256::repeat_byte(0xb2));
+        transaction_hash: Some(STAGED_TRANSACTION),
+    }
+}
+
+/// Whether the destination account's setup was sent and confirmed by `stage`.
+const fn staged_set_up(stage: Detail) -> bool {
+    !matches!(stage, Detail::SetupNotSent | Detail::SetupPending)
+}
+
+/// What `swap` has observed by `stage`.
+fn staged_observations(stage: Detail, swap: &Staged) -> PublicSwapObservations {
+    let at = staged_observation;
+    let hash = STAGED_TRANSACTION;
+    let fill = BlockNumHash::new(STAGED_DESTINATION_BLOCK + 640, B256::repeat_byte(0xb2));
     let handed_off = |outcome| PublicSwapObservations {
-        traded: Some(at(ORIGIN_BLOCK + 21)),
+        traded: Some(at(STAGED_ORIGIN_BLOCK + 21)),
         bridge_handoff: Some(SwapBridgeHandoff {
-            observation: at(ORIGIN_BLOCK + 21),
+            observation: at(STAGED_ORIGIN_BLOCK + 21),
             deposit_id: Some(U256::from(1_279_830_u32)),
         }),
         deposited: Some(PublicSwapDeposited {
@@ -36,7 +66,7 @@ pub(super) fn staged_record(
         bridge_outcome: outcome,
         ..Default::default()
     };
-    let observed = match stage {
+    match stage {
         Detail::SetupNotSent
         | Detail::SetupPending
         | Detail::AccountReady
@@ -47,7 +77,7 @@ pub(super) fn staged_record(
         Detail::Expired => PublicSwapObservations {
             expired: Some(SwapObservation {
                 transaction_hash: None,
-                ..at(ORIGIN_BLOCK + 60)
+                ..at(STAGED_ORIGIN_BLOCK + 60)
             }),
             ..Default::default()
         },
@@ -66,12 +96,19 @@ pub(super) fn staged_record(
             }))
         }
         Detail::Refunded => PublicSwapObservations {
-            bridge_refund: Some(at(ORIGIN_BLOCK + 900)),
+            bridge_refund: Some(at(STAGED_ORIGIN_BLOCK + 900)),
             ..handed_off(Some(SwapBridgeOutcome::Refunding))
         },
-    };
-    let account = Address::repeat_byte(0x3a);
-    let delegate = Address::repeat_byte(0x5d);
+    }
+}
+
+/// The public swap a destination record saves for `swap` at `stage`, as stored-record JSON:
+/// its approval, observations, approval transaction and order path.
+fn staged_saved_swap(stage: Detail, swap: &Staged, valid_to: u32) -> Option<serde_json::Value> {
+    let at = staged_observation;
+    let hash = STAGED_TRANSACTION;
+    let account = STAGED_ACCOUNT;
+    let observed = staged_observations(stage, swap);
     // An approval signed as a permit binds its pre-hook's gas limit and sends no transaction.
     let permit = matches!(stage, Detail::PermitOrderOpen | Detail::PermitUsedUp);
     let pre_hook_gas_limit = if permit { 110_000_u64 } else { 0 };
@@ -116,12 +153,11 @@ pub(super) fn staged_record(
         });
     }
     // The setup is on its way until the Public account approves, and its order follows.
-    let set_up = !matches!(stage, Detail::SetupNotSent | Detail::SetupPending);
-    let approves = set_up && stage != Detail::AccountReady;
+    let approves = staged_set_up(stage) && stage != Detail::AccountReady;
     if approves && !permit {
         let inclusion = (stage != Detail::Approving).then(|| {
             serde_json::json!({
-                "observation": at(ORIGIN_BLOCK), "finalized": true, "succeeded": true
+                "observation": at(STAGED_ORIGIN_BLOCK), "finalized": true, "succeeded": true
             })
         });
         saved["transactions"] = serde_json::json!([{
@@ -147,10 +183,16 @@ pub(super) fn staged_record(
             });
         }
     }
-    let setup_block = BlockNumHash::new(DESTINATION_BLOCK, B256::repeat_byte(0xb3));
+    Some(saved)
+}
+
+/// The setup payloads a destination record issued by `stage`, as stored-record JSON. `None`
+/// only when the payload fails to serialize.
+fn staged_issued_setup(stage: Detail) -> Option<Vec<serde_json::Value>> {
+    let setup_block = BlockNumHash::new(STAGED_DESTINATION_BLOCK, B256::repeat_byte(0xb3));
     let setup = serde_json::to_value(IssuedExecutorPayload::new(
         U256::ZERO,
-        delegate,
+        STAGED_DELEGATE,
         B256::repeat_byte(0x5e),
         ExecutorPayloadPurpose::Operation,
         ExecutorPayloadContext::new(
@@ -161,26 +203,11 @@ pub(super) fn staged_record(
     ))
     .ok()?;
     // A setup that wasn't sent issued no payload.
-    let issued = if stage == Detail::SetupNotSent {
+    Some(if stage == Detail::SetupNotSent {
         Vec::new()
     } else {
         vec![setup]
-    };
-    // A confirmed setup is one whose nonce an account read showed consumed.
-    let consumed = set_up.then(|| ExecutorNonceWatermark::new(U256::ONE, DESTINATION_BLOCK));
-    serde_json::from_value(serde_json::json!({
-        "version": 2, "derivation": "Railgun7702V1", "origin": "Reserved",
-        "operation": identity.operation, "index": 3,
-        "address": account, "delegate": delegate, "retired": false, "issued": issued,
-        "nonce_watermark": consumed,
-        "swap_uses": [{ "id": identity.swap_use, "started_at": now.saturating_sub(240),
-            "fresh": true,
-            "role": { "PublicSourceDestination": { "origin_chain": swap.origin,
-                "source": swap.source, "destination_token": swap.delivered, "swap": saved
-            }}
-        }]
-    }))
-    .ok()
+    })
 }
 
 impl Reported {
