@@ -14,6 +14,7 @@ const reload = document.querySelector('#reload');
 const controller = new AbortController();
 let phase = 'local browser code';
 let state = 'loading';
+const isLive = () => state === 'loading' || state === 'ready';
 let runtime;
 let runtimeInitialized = false;
 let uiPort;
@@ -56,7 +57,7 @@ function deliverSnapshot(snapshot) {
   connectSnapshot = snapshot;
   const callback = snapshotCallback;
   queueMicrotask(() => {
-    if (callback && callback === snapshotCallback && (state === 'loading' || state === 'ready')) callback(connectSnapshot);
+    if (callback && callback === snapshotCallback && isLive()) callback(connectSnapshot);
   });
 }
 let gatewayStatus = 'disconnected';
@@ -91,16 +92,57 @@ function cancelViewChange() {
   viewChange = null;
   viewNotice = 'View switch interrupted. Try again.';
 }
+const soleTabPopup = win => win?.type === 'popup' && win.tabs?.length === 1;
 async function closePreviousView(change) {
   if (!currentViewChange(change)) return;
   if (isToolbarPopup || (isSidePanel && !isBrowserTab)) {
     window.close();
   } else if (['?mode=window', '?mode=notification'].includes(new URL(location.href).search) &&
-      documentWindow?.type === 'popup' && documentWindow.tabs?.length === 1) {
+      soleTabPopup(documentWindow)) {
     const current = await chrome.windows.getCurrent({ populate: true });
-    if (currentViewChange(change) && current.id === documentWindow.id && current.type === 'popup' &&
-        current.tabs?.length === 1 && current.tabs[0].id === documentWindow.tabs[0].id) window.close();
+    if (currentViewChange(change) && current.id === documentWindow.id && soleTabPopup(current) &&
+        current.tabs[0].id === documentWindow.tabs[0].id) window.close();
   }
+}
+async function openManually(change) {
+  viewNotice = `Mode saved. Click the toolbar icon to open ${change.value === 'popup' ? 'Popup' : 'Side panel'}. Close this view manually if it stays open.`;
+  await closePreviousView(change);
+}
+// Opens the saved view once the worker acknowledges the preference, then closes this one.
+async function completeViewSwitch(change, saved, opened) {
+  const result = await saved;
+  if (!currentViewChange(change)) return;
+  if (!result?.success) {
+    viewNotice = 'Could not save or apply toolbar mode. Try again.';
+    return;
+  }
+  if (change.handoff) {
+    if (result.opened !== true) await openManually(change);
+    return;
+  }
+  if (!Number.isInteger(hostingWindowId)) {
+    await openManually(change);
+    return;
+  }
+  if (change.value === 'popup') {
+    if (typeof chrome.action.openPopup !== 'function') {
+      await openManually(change);
+      return;
+    }
+    opened = chrome.action.openPopup({ windowId: hostingWindowId }).then(() => true, () => false);
+  }
+  const didOpen = await opened;
+  if (!currentViewChange(change)) return;
+  if (!didOpen) {
+    await openManually(change);
+    return;
+  }
+  try { await closePreviousView(change); }
+  catch { viewNotice = 'New view opened. Close this view manually.'; }
+}
+// The browser window a side panel hands the popup back to, when one is known.
+function handoffField(change) {
+  return change.handoff && Number.isSafeInteger(hostingWindowId) && hostingWindowId > 0 ? { handoff_window_id: hostingWindowId } : {};
 }
 function switchView(value) {
   if (viewChange) return;
@@ -115,8 +157,7 @@ function switchView(value) {
   }, 10_000);
   let opened;
   try {
-    change.port.postMessage({ type: 'preferences', key: 'view', value, request_id: change.id,
-      ...(change.handoff && Number.isSafeInteger(hostingWindowId) && hostingWindowId > 0 ? { handoff_window_id: hostingWindowId } : {}) });
+    change.port.postMessage({ type: 'preferences', key: 'view', value, request_id: change.id, ...handoffField(change) });
   } catch {
     cancelViewChange();
     deliverStatus(gatewayStatus);
@@ -128,41 +169,7 @@ function switchView(value) {
       opened = chrome.sidePanel.open({ windowId: hostingWindowId }).then(() => true, () => false);
     }
   } catch { opened = Promise.resolve(false); }
-  void (async () => {
-    const result = await saved;
-    if (!currentViewChange(change)) return;
-    if (!result?.success) {
-      viewNotice = 'Could not save or apply toolbar mode. Try again.';
-      return;
-    }
-    const manualOpen = async () => {
-      viewNotice = `Mode saved. Click the toolbar icon to open ${value === 'popup' ? 'Popup' : 'Side panel'}. Close this view manually if it stays open.`;
-      await closePreviousView(change);
-    };
-    if (change.handoff) {
-      if (result.opened !== true) await manualOpen();
-      return;
-    }
-    if (!Number.isInteger(hostingWindowId)) {
-      await manualOpen();
-      return;
-    }
-    if (value === 'popup') {
-      if (typeof chrome.action.openPopup !== 'function') {
-        await manualOpen();
-        return;
-      }
-      opened = chrome.action.openPopup({ windowId: hostingWindowId }).then(() => true, () => false);
-    }
-    const didOpen = await opened;
-    if (!currentViewChange(change)) return;
-    if (!didOpen) {
-      await manualOpen();
-      return;
-    }
-    try { await closePreviousView(change); }
-    catch { viewNotice = 'New view opened. Close this view manually.'; }
-  })().catch(() => {
+  void completeViewSwitch(change, saved, opened).catch(() => {
     if (currentViewChange(change)) viewNotice = 'View switch failed. Click the toolbar icon or try again.';
   }).finally(() => {
     if (!currentViewChange(change)) return;
@@ -180,46 +187,55 @@ function deliverStatus(next, endpoint = gatewayEndpoint) {
   const unlock = gatewayUnlock;
   const callback = stateCallback;
   queueMicrotask(() => {
-    if (callback && callback === stateCallback && (state === 'loading' || state === 'ready')) callback({ status: next, endpoint, paired: gatewayPaired,
+    if (callback && callback === stateCallback && isLive()) callback({ status: next, endpoint, paired: gatewayPaired,
       takeover: providerPreferences.takeover, metamask: providerPreferences.metamask, view, unlock,
       view_notice: viewNotice || (viewError ? 'Could not save or apply toolbar mode. Try again or reload the extension.' : ''),
       ...(extensionVersion ? { version: extensionVersion } : {}) });
   });
 }
+function receiveViewResult(port, message) {
+  if (viewChange?.port === port && message.request_id === viewChange.id && typeof message.success === 'boolean') {
+    viewChange.saved(message);
+  }
+}
+function receiveUiSnapshot(port, message) {
+  if (openingSnapshotPending) {
+    openingSnapshotPending = false;
+    if (message.locked === false && Number.isSafeInteger(message.generation)) {
+      popupOpening = { port, generation: message.generation };
+    }
+  }
+  deliverSnapshot(message);
+  deliverPopupOpening();
+}
+function receiveWorkerState(message) {
+  if (typeof message.status !== 'string') return;
+  providerPreferences = { takeover: message.takeover === true, metamask: message.metamask === true };
+  gatewayPaired = message.paired === true;
+  gatewayUnlock = message.unlock?.allowed === true ? {
+    allowed: true, generation: message.unlock.generation, phase: message.unlock.phase,
+  } : { allowed: false };
+  extensionVersion = typeof message.version === 'string' ? message.version : '';
+  if (message.view === 'popup' || message.view === 'sidepanel') view = message.view;
+  if (typeof message.viewError === 'boolean') viewError = message.viewError;
+  if (message.status === 'disconnected') clearPopupOpening();
+  deliverStatus(message.status, typeof message.endpoint === 'string' ? message.endpoint : gatewayEndpoint);
+}
+function receiveWorkerMessage(port, message) {
+  if (uiPort !== port) return;
+  switch (message?.type) {
+    case 'view_result': receiveViewResult(port, message); break;
+    case 'chain_editor': if (chainEditorCallback) chainEditorCallback(message); break;
+    case 'ui_snapshot': receiveUiSnapshot(port, message); break;
+    case 'state': receiveWorkerState(message); break;
+  }
+}
 function attachWorker() {
-  if (state !== 'loading' && state !== 'ready') return;
+  if (!isLive()) return;
   const port = chrome.runtime.connect({ name: 'gateway-ui-v1' });
   uiPort = port;
   if (Number.isInteger(hostingWindowId)) port.postMessage({ type: 'tab_context', window_id: hostingWindowId });
-  port.onMessage.addListener(message => {
-    if (uiPort === port && message?.type === 'view_result' && viewChange?.port === port &&
-        message.request_id === viewChange.id && typeof message.success === 'boolean') {
-      viewChange.saved(message);
-    }
-    if (uiPort === port && message?.type === 'chain_editor' && chainEditorCallback) chainEditorCallback(message);
-    if (uiPort === port && message?.type === 'ui_snapshot') {
-      if (openingSnapshotPending) {
-        openingSnapshotPending = false;
-        if (message.locked === false && Number.isSafeInteger(message.generation)) {
-          popupOpening = { port, generation: message.generation };
-        }
-      }
-      deliverSnapshot(message);
-      deliverPopupOpening();
-    }
-    if (uiPort === port && message?.type === 'state' && typeof message.status === 'string') {
-      providerPreferences = { takeover: message.takeover === true, metamask: message.metamask === true };
-      gatewayPaired = message.paired === true;
-      gatewayUnlock = message.unlock?.allowed === true ? {
-        allowed: true, generation: message.unlock.generation, phase: message.unlock.phase,
-      } : { allowed: false };
-      extensionVersion = typeof message.version === 'string' ? message.version : '';
-      if (message.view === 'popup' || message.view === 'sidepanel') view = message.view;
-      if (typeof message.viewError === 'boolean') viewError = message.viewError;
-      if (message.status === 'disconnected') clearPopupOpening();
-      deliverStatus(message.status, typeof message.endpoint === 'string' ? message.endpoint : gatewayEndpoint);
-    }
-  });
+  port.onMessage.addListener(message => receiveWorkerMessage(port, message));
   port.onDisconnect.addListener(() => {
     if (uiPort !== port) return;
     cancelViewChange();
@@ -292,25 +308,93 @@ const deadline = setTimeout(() => fail('The 30-second startup limit expired.'), 
 // Recovery remains available after the startup fetches have been aborted.
 reload.addEventListener('click', () => location.reload());
 
+function copyContextCurrent(generation) {
+  return state === 'ready' && !!uiPort && gatewayStatus === 'unlocked' && !connectSnapshot.locked &&
+    connectSnapshot.generation === generation;
+}
+function privateAddressCopyable(identity, address) {
+  const view = connectSnapshot.private_view;
+  return connectSnapshot.private_view_supported === true && view?.selected_wallet === identity &&
+    view.receive_address === address;
+}
+function publicAddressCopyable(identity, address) {
+  return connectSnapshot.public_view?.selected_account === identity &&
+    connectSnapshot.accounts?.some(account => account.uuid === identity && account.address === address) === true;
+}
+// Invoke permission request directly under the GPUI click's user gesture.
+function postAfterPermission(config, expected, message) {
+  const permission = config.permission ? chrome.permissions.request({ origins: [config.permission] }) : Promise.resolve(true);
+  void permission.then(granted => {
+    if (state !== 'ready' || hostEpoch !== expected || !uiPort) return;
+    if (granted) uiPort.postMessage(message);
+    else deliverStatus('config_failed');
+  }).catch(() => { if (hostEpoch === expected) deliverStatus('config_failed'); });
+}
+function postScopedCommand(value, command) {
+  try {
+    uiPort.postMessage({ type: command, generation: connectSnapshot.generation,
+      tab_token: connectSnapshot.current_tab_token, command: JSON.parse(value) });
+  } catch { /* Only the packaged frontend supplies serialized UI commands. */ }
+}
+function postDesktopCommand(value, command) {
+  uiPort.postMessage({ type: command, generation: connectSnapshot.generation,
+    ...(command === 'request_wallet_switch' ? { request_id: value } : {}) });
+}
+function postPreference(value, command) {
+  uiPort.postMessage({ type: 'preferences', key: command, value: value === 'true' });
+}
+function configureEndpoint(value) {
+  let config;
+  try { config = configuration(value); } catch { deliverStatus('config_failed'); return; }
+  const expected = ++hostEpoch;
+  postAfterPermission(config, expected, { type: 'configure', endpoint: config.value });
+}
+// railoxideHost.command handlers, called as handler(value, command) once the view is ready.
+const hostCommands = Object.freeze({
+  unlock(value) {
+    try { uiPort.postMessage({ type: 'unlock', command: JSON.parse(value) }); } catch {}
+  },
+  public_view: postScopedCommand,
+  private_view: postScopedCommand,
+  network: postScopedCommand,
+  chain_editor: postScopedCommand,
+  home_tab(value) {
+    uiPort.postMessage({ type: 'home_tab', generation: connectSnapshot.generation, value });
+  },
+  request_wallet_switch: postDesktopCommand,
+  summon_desktop: postDesktopCommand,
+  view(value) {
+    if (['popup', 'sidepanel'].includes(value)) switchView(value);
+  },
+  takeover: postPreference,
+  metamask: postPreference,
+  pair(value) {
+    hostEpoch += 1;
+    if (/^\d{6}$/.test(value)) uiPort.postMessage({ type: 'pair', code: value });
+  },
+  unpair() {
+    hostEpoch += 1;
+    uiPort.postMessage({ type: 'unpair' });
+  },
+  retry() {
+    hostEpoch += 1;
+    uiPort.postMessage({ type: 'retry' });
+  },
+  configure: configureEndpoint,
+});
+
 Object.defineProperty(globalThis, 'railoxideHost', { value: Object.freeze({
   isMac: () => isMac,
   isSidePanel: () => isSidePanel,
-  isActive: () => state === 'loading' || state === 'ready',
+  isActive: isLive,
   canCopyAddress(kind, generation, identity, address) {
     // The GPUI callback submits synchronously after this check. Browser writes cannot be cancelled after submission.
-    if (state !== 'ready' || !uiPort || gatewayStatus !== 'unlocked' || connectSnapshot.locked ||
-        connectSnapshot.generation !== generation) return false;
-    if (kind === 'private') {
-      const view = connectSnapshot.private_view;
-      return connectSnapshot.private_view_supported === true && view?.selected_wallet === identity &&
-        view.receive_address === address;
-    }
-    return kind === 'public' && connectSnapshot.public_view?.selected_account === identity &&
-      connectSnapshot.accounts?.some(account => account.uuid === identity && account.address === address) === true;
+    if (!copyContextCurrent(generation)) return false;
+    if (kind === 'private') return privateAddressCopyable(identity, address);
+    return kind === 'public' && publicAddressCopyable(identity, address);
   },
   canCopyNetwork(generation, revision, viewId, address) {
-    return state === 'ready' && !!uiPort && gatewayStatus === 'unlocked' && !connectSnapshot.locked &&
-      connectSnapshot.generation === generation && connectSnapshot.network_view?.context_revision === revision &&
+    return copyContextCurrent(generation) && connectSnapshot.network_view?.context_revision === revision &&
       connectSnapshot.network_popover?.view_id === viewId && connectSnapshot.network_popover.results?.some(result =>
         result.operation === 'query_exit_ip' && result.outcome?.status === 'exit_ip' && result.outcome.ip === address) === true;
   },
@@ -346,56 +430,14 @@ Object.defineProperty(globalThis, 'railoxideHost', { value: Object.freeze({
   },
   command(command, value) {
     if (state !== 'ready' || !uiPort) return;
-    if (command === 'unlock') {
-      try { uiPort.postMessage({ type: 'unlock', command: JSON.parse(value) }); } catch {}
-    } else if (command === 'public_view' || command === 'private_view' || command === 'network' || command === 'chain_editor') {
-      try {
-        uiPort.postMessage({ type: command, generation: connectSnapshot.generation,
-          tab_token: connectSnapshot.current_tab_token, command: JSON.parse(value) });
-      } catch { /* Only the packaged frontend supplies serialized UI commands. */ }
-    } else if (command === 'home_tab') {
-      uiPort.postMessage({ type: 'home_tab', generation: connectSnapshot.generation, value });
-    } else if (command === 'request_wallet_switch' || command === 'summon_desktop') {
-      uiPort.postMessage({ type: command, generation: connectSnapshot.generation,
-        ...(command === 'request_wallet_switch' ? { request_id: value } : {}) });
-    } else if (command === 'view' && ['popup', 'sidepanel'].includes(value)) {
-      switchView(value);
-    } else if (command === 'takeover' || command === 'metamask') {
-      uiPort.postMessage({ type: 'preferences', key: command, value: value === 'true' });
-    } else if (command === 'pair') {
-      hostEpoch += 1;
-      if (/^\d{6}$/.test(value)) uiPort.postMessage({ type: 'pair', code: value });
-    } else if (command === 'unpair') {
-      hostEpoch += 1;
-      uiPort.postMessage({ type: 'unpair' });
-    } else if (command === 'retry') {
-      hostEpoch += 1;
-      uiPort.postMessage({ type: 'retry' });
-    } else if (command === 'configure') {
-      let config;
-      try { config = configuration(value); } catch { deliverStatus('config_failed'); return; }
-      const expected = ++hostEpoch;
-      // Invoke permission request directly under the GPUI click's user gesture.
-      const permission = config.permission ? chrome.permissions.request({ origins: [config.permission] }) : Promise.resolve(true);
-      void permission.then(granted => {
-        if (state !== 'ready' || hostEpoch !== expected || !uiPort) return;
-        if (granted) uiPort.postMessage({ type: 'configure', endpoint: config.value });
-        else deliverStatus('config_failed');
-      }).catch(() => { if (hostEpoch === expected) deliverStatus('config_failed'); });
-    }
+    if (typeof command === 'string' && Object.hasOwn(hostCommands, command)) hostCommands[command](value, command);
   },
   pair(code, endpoint) {
     if (state !== 'ready' || !uiPort || !/^\d{6}$/.test(code)) return;
     const expected = ++hostEpoch;
     let config;
     try { config = configuration(endpoint); } catch { deliverStatus('config_failed'); return; }
-    // Invoke permission request directly under the GPUI click's user gesture.
-    const permission = config.permission ? chrome.permissions.request({ origins: [config.permission] }) : Promise.resolve(true);
-    void permission.then(granted => {
-      if (state !== 'ready' || hostEpoch !== expected || !uiPort) return;
-      if (granted) uiPort.postMessage({ type: 'pair', code, endpoint: config.value });
-      else deliverStatus('config_failed');
-    }).catch(() => { if (hostEpoch === expected) deliverStatus('config_failed'); });
+    postAfterPermission(config, expected, { type: 'pair', code, endpoint: config.value });
   },
 }) });
 
