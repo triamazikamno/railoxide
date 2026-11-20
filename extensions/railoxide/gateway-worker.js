@@ -52,15 +52,22 @@ let uiSnapshot = { type: 'ui_snapshot', version: 1, generation: 0, locked: true,
 let attentionPending = [];
 let attentionSeen = new Set();
 let popupOpening = false;
-function updateRequestAttention(authoritative = false) {
-  if (authoritative) attentionPending = [
+function pendingAttentionIds() {
+  return [
     ...uiSnapshot.pending_connects.map(request => `connect:${request.request_id}`),
     ...uiSnapshot.pending_requests.map(request => `request:${request.request_id}`),
   ];
+}
+function updateRequestAttention(authoritative = false) {
+  if (authoritative) attentionPending = pendingAttentionIds();
   void chrome.action.setBadgeText({ text: attentionPending.length ? String(attentionPending.length) : '' }).catch(() => {});
   const fresh = attentionPending.filter(id => !attentionSeen.has(id));
   attentionSeen = new Set(attentionPending);
   if (!fresh.length || walletViewVisible() || popupOpening) return;
+  openAttentionPopup(fresh);
+}
+// Opens the popup for requests that are still pending once the saved view is known.
+function openAttentionPopup(fresh) {
   const expected = epoch;
   popupOpening = true;
   void preferencesReady.then(async () => {
@@ -77,8 +84,8 @@ function clearUnlockOwner(cancel = false) {
   const previous = unlockOwner;
   unlockOwner = null;
   clearTimeout(previous?.timer);
-  const session = owner?.candidate;
-  if (cancel && previous && session?.established && current(session)) {
+  const session = cancel && previous ? liveSession() : null;
+  if (session) {
     try { command(session, { type: 'unlock', version: 1, generation: session.generation,
       attempt_id: previous.id, command: { action: 'cancel' } }); } catch {}
   }
@@ -231,11 +238,19 @@ function cancelNetworkQuery(view, session) {
 function networkCommand(port, message) {
   const session = unlockedCommandSession(message);
   const input = message.command;
-  if (!session || !uiSnapshot.network_view || input?.context_revision !== uiSnapshot.network_view.context_revision) return;
+  if (!session || !networkContextCurrent(input)) return;
   if (input.action === 'open') { openNetworkCommand(port, input, session); return; }
   const view = networkViews.get(port);
-  if (!view || input.view_id !== view.view_id || view.context_revision !== input.context_revision) return;
+  if (!networkViewMatches(view, input)) return;
   networkViewCommand(port, view, input, session);
+}
+// Whether a network command names the snapshot's current network context.
+function networkContextCurrent(input) {
+  return uiSnapshot.network_view && input?.context_revision === uiSnapshot.network_view.context_revision;
+}
+// Whether a network command names this port's open network view.
+function networkViewMatches(view, input) {
+  return view && input.view_id === view.view_id && view.context_revision === input.context_revision;
 }
 function networkViewCommand(port, view, input, session) {
   if (['close', 'cancel_query'].includes(input.action) && hasExtraKeys(input, ['action', 'context_revision', 'view_id'])) return;
@@ -348,9 +363,13 @@ function retireChainEditors(snapshot) {
 }
 function retirePrivatePickers(snapshot) {
   for (const [port, picker] of privatePickers) {
-    if (snapshot.locked || snapshot.private_actions_supported !== true || snapshot.generation !== picker.generation ||
-        !pickerDraftOpen(snapshot, picker)) privatePickers.delete(port);
+    if (pickerRetired(snapshot, picker)) privatePickers.delete(port);
   }
+}
+// A picker outlives neither its generation, private actions, nor its open draft.
+function pickerRetired(snapshot, picker) {
+  return snapshot.locked || snapshot.private_actions_supported !== true || snapshot.generation !== picker.generation ||
+    !pickerDraftOpen(snapshot, picker);
 }
 function broadcastSnapshot() {
   for (const port of ports) {
@@ -387,13 +406,24 @@ async function updateTab(port) {
     const [tab] = await chrome.tabs.query({ active: true, windowId: context.windowId });
     if (!Number.isInteger(tab?.id)) return;
     const frame = await chrome.webNavigation.getFrame({ tabId: tab.id, frameId: 0 });
-    if (tabContexts.get(port) !== context || context.revision !== revision ||
-        frame?.documentLifecycle !== 'active' || !frame.documentId) return;
-    const url = new URL(frame.url);
-    if (!['http:', 'https:'].includes(url.protocol)) return;
-    context.tab = { id: tab.id, documentId: frame.documentId, origin: url.origin, token: crypto.randomUUID() };
+    if (!tabContextCurrent(port, context, revision) || !activeTopDocument(frame)) return;
+    const origin = webOrigin(frame.url);
+    if (!origin) return;
+    context.tab = { id: tab.id, documentId: frame.documentId, origin, token: crypto.randomUUID() };
     port.postMessage(snapshotFor(port));
   } catch { /* A closed tab or a browser page has no connect action. */ }
+}
+// Whether `context` is still the port's context and `revision` its latest lookup.
+function tabContextCurrent(port, context, revision) {
+  return tabContexts.get(port) === context && context.revision === revision;
+}
+function activeTopDocument(frame) {
+  return frame?.documentLifecycle === 'active' && Boolean(frame.documentId);
+}
+// The origin of an http(s) document, or null for any other scheme.
+function webOrigin(href) {
+  const url = new URL(href);
+  return ['http:', 'https:'].includes(url.protocol) ? url.origin : null;
 }
 function updateTabs() {
   for (const port of tabContexts.keys()) void updateTab(port);
@@ -413,7 +443,7 @@ const preferencesReady = ready.then(() => stored(async () => {
   lastHomeTab = saved.gatewayPreferences?.home_tab === 'private' ? 'private' : 'public';
   for (const port of ports) homeTabs.set(port, lastHomeTab);
   publishSnapshot(uiSnapshot, false);
-  providerPreferences = { takeover: saved.gatewayPreferences?.takeover === true, metamask: saved.gatewayPreferences?.metamask === true };
+  providerPreferences = providerPreferencesFrom(saved.gatewayPreferences);
   const savedView = saved.gatewayPreferences?.view === 'sidepanel' ? 'sidepanel' : 'popup';
   try {
     await applyView(savedView);
@@ -497,9 +527,13 @@ function failed(session, reason, retry = false) {
   if (retry) scheduleRetry();
 }
 function send(session, bytes) {
-  if (!current(session) || session.sendFailed || session.socket.readyState !== WebSocket.OPEN ||
-      session.socket.bufferedAmount + bytes.length > MAX_BUFFERED_BYTES) throw new Error('Gateway send failed');
+  if (!canSend(session, bytes)) throw new Error('Gateway send failed');
   session.socket.send(bytes);
+}
+// A session takes bytes while current, unfailed, open and within its buffer limit.
+function canSend(session, bytes) {
+  return current(session) && !session.sendFailed && session.socket.readyState === WebSocket.OPEN &&
+    session.socket.bufferedAmount + bytes.length <= MAX_BUFFERED_BYTES;
 }
 function command(session, message) {
   if (session.sendFailed) throw new Error('Gateway send failed');
@@ -574,11 +608,17 @@ async function receiveHandshake(session, bytes) {
 function receiveUnlockState(session, message) {
   const next = message.view;
   if (message.generation !== session.generation || invalidUnlockView(next)) return;
-  if (unlockOwner && message.response_to === unlockOwner.id && next.attempt_id !== unlockOwner.id) clearUnlockOwner();
-  if (unlockOwner && next.attempt_id === unlockOwner.id) unlockOwner.waiting = false;
+  trackUnlockOwner(message, next);
   unlockView = { allowed: next.allowed, attempt_id: next.attempt_id, phase: next.phase };
   if (!next.allowed) clearUnlockOwner();
   publish(status);
+}
+// A reply to the owner's attempt that names another attempt releases the owner; a view of
+// the owner's own attempt ends its wait.
+function trackUnlockOwner(message, next) {
+  if (!unlockOwner) return;
+  if (message.response_to === unlockOwner.id && next.attempt_id !== unlockOwner.id) clearUnlockOwner();
+  else if (next.attempt_id === unlockOwner.id) unlockOwner.waiting = false;
 }
 function receiveUiSnapshot(session, message) {
   // Invalid pricing rejects the whole snapshot. An invalid network view only withdraws network control.
@@ -639,11 +679,8 @@ async function receive(session, bytes) {
       await receiveHandshake(session, bytes);
       return;
     }
-    const plain = session.client.receiveFrame(bytes, now());
-    if (!plain) return;
-    let message;
-    try { message = JSON.parse(decoder.decode(plain)); } finally { plain.fill(0); }
-    if (!current(session)) return;
+    const message = openFrame(session, bytes);
+    if (message === undefined || !current(session)) return;
     if (message.version !== 1 || message.type === 'unsupported') {
       failed(session, 'version_failed');
       return;
@@ -655,6 +692,19 @@ async function receive(session, bytes) {
     // WASM exposes fixed errors. Never stringify a library error or received payload.
     failed(session, error === 'Incompatible gateway protocol version' ? 'version_failed' : 'auth_failed');
   } finally { bytes.fill(0); }
+}
+// Decrypts and parses one authenticated frame, wiping its plaintext. `undefined` means the
+// frame completed no message; JSON never parses to `undefined`.
+function openFrame(session, bytes) {
+  const plain = session.client.receiveFrame(bytes, now());
+  if (!plain) return undefined;
+  try { return JSON.parse(decoder.decode(plain)); } finally { plain.fill(0); }
+}
+// A frame is admitted from a started handshake, as an ArrayBuffer within the size limit of its
+// handshake stage.
+function acceptableFrame(session, data) {
+  return session.client && data instanceof ArrayBuffer && data.byteLength <= 65535 &&
+    (session.client.isAuthenticated() || data.byteLength <= 1024);
 }
 function attempt(discovery, endpoint) {
   return new Promise(resolve => {
@@ -693,8 +743,7 @@ function attempt(discovery, endpoint) {
       };
       socket.onmessage = event => {
         if (!current(session)) return;
-        if (!session.client || !(event.data instanceof ArrayBuffer) || event.data.byteLength > 65535 ||
-            (!session.client.isAuthenticated() && event.data.byteLength > 1024) || ++session.queued > 64) {
+        if (!acceptableFrame(session, event.data) || ++session.queued > 64) {
           failed(session, 'auth_failed');
           return;
         }
@@ -715,8 +764,7 @@ async function connect(code = null) {
     try {
       await ready;
       if (!current(discovery)) return;
-      saved = await stored(() => current(discovery) ?
-        chrome.storage.local.get(['gatewayCredential', 'gatewayPreferences']) : {});
+      saved = await stored(() => readGatewayStorage(discovery));
     } catch { failed(discovery, 'storage_failed'); return; }
     record = saved.gatewayCredential;
     paired = isCredential(record) === true; // A missing record must report a boolean.
@@ -724,9 +772,7 @@ async function connect(code = null) {
     discovery.record = record;
     let config;
     try {
-      config = configuration(saved.gatewayPreferences?.endpoint ?? '');
-      configuredEndpoint = config.value;
-      providerPreferences = { takeover: saved.gatewayPreferences?.takeover === true, metamask: saved.gatewayPreferences?.metamask === true };
+      config = applyGatewayPreferences(saved.gatewayPreferences);
       publish('connecting');
       if (config.permission && !await chrome.permissions.contains({ origins: [config.permission] })) {
         failed(discovery, 'config_failed');
@@ -741,26 +787,45 @@ async function connect(code = null) {
   } catch { failed(discovery, 'disconnected', !code); }
   finally { wipe(record); clearCredentials(discovery); }
 }
+// The saved credential and preferences, read only while `discovery` is still current.
+function readGatewayStorage(discovery) {
+  return current(discovery) ? chrome.storage.local.get(['gatewayCredential', 'gatewayPreferences']) : {};
+}
+// Adopts the saved endpoint and provider preferences and returns the endpoint configuration.
+// An unusable endpoint throws.
+function applyGatewayPreferences(preferences) {
+  const config = configuration(preferences?.endpoint ?? '');
+  configuredEndpoint = config.value;
+  providerPreferences = providerPreferencesFrom(preferences);
+  return config;
+}
+function providerPreferencesFrom(preferences) {
+  return { takeover: preferences?.takeover === true, metamask: preferences?.metamask === true };
+}
 // Saving an endpoint retires the session; pairing codes wait for the saved value.
 function saveEndpoint(config, code = null) {
   commandPending = true;
   retire();
   const expected = epoch;
-  void (async () => {
-    await ready;
+  void persistEndpoint(config, code, expected)
+    .catch(() => { if (epoch === expected) publish('storage_failed'); })
+    .finally(() => { if (epoch === expected) commandPending = false; });
+}
+// Saves the endpoint and reconnects with it, unless a later command moved the epoch on.
+async function persistEndpoint(config, code, expected) {
+  await ready;
+  if (epoch !== expected) return;
+  if (config.permission && !await chrome.permissions.contains({ origins: [config.permission] })) {
+    if (epoch === expected) publish('config_failed');
+    return;
+  }
+  await stored(async () => {
     if (epoch !== expected) return;
-    if (config.permission && !await chrome.permissions.contains({ origins: [config.permission] })) {
-      if (epoch === expected) publish('config_failed');
-      return;
-    }
-    await stored(async () => {
-      if (epoch !== expected) return;
-      const saved = await chrome.storage.local.get('gatewayPreferences');
-      if (epoch === expected) await chrome.storage.local.set({ gatewayPreferences: { ...saved.gatewayPreferences, endpoint: config.value } });
-    });
-    commandPending = false;
-    if (epoch === expected) void connect(code);
-  })().catch(() => { if (epoch === expected) publish('storage_failed'); }).finally(() => { if (epoch === expected) commandPending = false; });
+    const saved = await chrome.storage.local.get('gatewayPreferences');
+    if (epoch === expected) await chrome.storage.local.set({ gatewayPreferences: { ...saved.gatewayPreferences, endpoint: config.value } });
+  });
+  commandPending = false;
+  if (epoch === expected) void connect(code);
 }
 
 chrome.runtime.onConnect.addListener(port => {
