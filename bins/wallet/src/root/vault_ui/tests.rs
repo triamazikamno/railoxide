@@ -64,19 +64,21 @@ fn unlock_device_auth_is_inside_the_password_field_and_activates_from_the_keyboa
             root.update(cx, |root, cx| {
                 root.lock_vault(window, cx);
                 // Display the macOS action without requiring a device_auth record in the fixture.
-                root.touch_id_supported = true;
-                root.touch_id_status = DeviceAuthStatus::Enabled;
-                root.unlock_password_input.update(cx, |input, cx| {
-                    input.set_value("unsubmitted password", window, cx);
-                    input.focus(window, cx);
-                });
+                root.device_auth.touch_id_supported = true;
+                root.device_auth.touch_id_status = DeviceAuthStatus::Enabled;
+                root.vault_inputs
+                    .unlock_password_input
+                    .update(cx, |input, cx| {
+                        input.set_value("unsubmitted password", window, cx);
+                        input.focus(window, cx);
+                    });
                 cx.notify();
             });
         });
         cx.run_until_parked();
         cx.update(|window, cx| {
             window.render_frame(cx);
-            let input_id = root.read(cx).unlock_password_input.entity_id();
+            let input_id = root.read(cx).vault_inputs.unlock_password_input.entity_id();
             let input = window.find(("input", input_id));
             assert_eq!(input.role(), Some(gpui::accesskit::Role::PasswordInput));
             assert!(
@@ -113,7 +115,7 @@ fn unlock_device_auth_is_inside_the_password_field_and_activates_from_the_keyboa
             assert!(window.try_find("unlock-wallet-vault-touch-id").is_none());
             let root = root.read(cx);
             assert_eq!(
-                root.unlock_password_input.read(cx).value(),
+                root.vault_inputs.unlock_password_input.read(cx).value(),
                 "unsubmitted password"
             );
             assert!(matches!(root.vault_state, VaultState::UnlockVault));
@@ -124,20 +126,22 @@ fn unlock_device_auth_is_inside_the_password_field_and_activates_from_the_keyboa
     for (password_pending, device_auth_pending) in [(true, false), (false, true)] {
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                root.touch_id_supported = true;
-                root.touch_id_status = DeviceAuthStatus::Enabled;
+                root.device_auth.touch_id_supported = true;
+                root.device_auth.touch_id_status = DeviceAuthStatus::Enabled;
                 root.unlock_in_progress = password_pending;
-                root.device_auth_in_progress = device_auth_pending;
-                root.unlock_password_input.update(cx, |input, cx| {
-                    input.focus(window, cx);
-                });
+                root.device_auth.in_progress = device_auth_pending;
+                root.vault_inputs
+                    .unlock_password_input
+                    .update(cx, |input, cx| {
+                        input.focus(window, cx);
+                    });
                 cx.notify();
             });
         });
         cx.run_until_parked();
         cx.update(|window, cx| {
             window.render_frame(cx);
-            let input_id = root.read(cx).unlock_password_input.entity_id();
+            let input_id = root.read(cx).vault_inputs.unlock_password_input.entity_id();
             window.click(("input", input_id), cx);
             window.input("blocked", cx);
             window.press("tab", cx);
@@ -154,7 +158,11 @@ fn unlock_device_auth_is_inside_the_password_field_and_activates_from_the_keyboa
             window.render_frame(cx);
             assert!(window.try_find("unlock-wallet-vault-touch-id").is_some());
             assert_eq!(
-                root.read(cx).unlock_password_input.read(cx).value(),
+                root.read(cx)
+                    .vault_inputs
+                    .unlock_password_input
+                    .read(cx)
+                    .value(),
                 "unsubmitted password"
             );
         });

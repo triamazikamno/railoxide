@@ -85,10 +85,10 @@ fn spend_device_auth_is_inside_the_password_field_and_activates_from_the_keyboar
         cx.update(|window, cx| {
             let prompt = root.update(cx, |root, _| {
                 // Show the action without enrolling or opening a native device_auth prompt.
-                root.touch_id_supported = true;
-                root.apple_watch_supported = true;
-                root.apple_watch_status = DeviceAuthStatus::Enabled;
-                root.touch_id_status = DeviceAuthStatus::Enabled;
+                root.device_auth.touch_id_supported = true;
+                root.device_auth.apple_watch_supported = true;
+                root.device_auth.apple_watch_status = DeviceAuthStatus::Enabled;
+                root.device_auth.touch_id_status = DeviceAuthStatus::Enabled;
                 root.device_auth_prompt_cached()
             });
             dialog.update(cx, |dialog, cx| {
@@ -352,7 +352,8 @@ fn password_check_refreshes_device_auth_without_authorizing_stale_requests(
         });
         cx.update(|window, cx| {
             root.update(cx, |root, _| {
-                root.touch_id_status = wallet_ops::vault::DeviceAuthStatus::NeedsReenrollment;
+                root.device_auth.touch_id_status =
+                    wallet_ops::vault::DeviceAuthStatus::NeedsReenrollment;
             });
             dialog.update(cx, |dialog, cx| {
                 dialog.password_input.update(cx, |input, cx| {
@@ -373,7 +374,7 @@ fn password_check_refreshes_device_auth_without_authorizing_stale_requests(
         while dialog.as_ref().map_or_else(
             || {
                 root.read_with(cx, |root, _| {
-                    root.touch_id_status != current_touch_id_status
+                    root.device_auth.touch_id_status != current_touch_id_status
                 })
             },
             |dialog| dialog.read_with(cx, |dialog, _| dialog.pending),
@@ -383,7 +384,7 @@ fn password_check_refreshes_device_auth_without_authorizing_stale_requests(
             cx.run_until_parked();
         }
         assert_eq!(
-            root.read_with(cx, |root, _| root.touch_id_status),
+            root.read_with(cx, |root, _| root.device_auth.touch_id_status),
             current_touch_id_status,
             "password verification did not refresh persisted device_auth status"
         );

@@ -4,13 +4,43 @@ use broadcaster_monitor_gpui::{
     BroadcasterMonitorPane, BroadcasterPreferenceHooks, BroadcasterPreferenceStatus,
 };
 use gpui::{Context, Entity, WeakEntity};
+use gpui_component::input::InputState;
 use wallet_ops::{
     parse_railgun_recipient,
     vault::{BroadcasterPreferences, VaultError},
 };
 
 use super::broadcaster_picker::{BroadcasterChoice, broadcaster_choice_supported_by_candidates};
-use super::{DeliveryFormKind, DeliveryMode, UnshieldAssetKey, WalletRoot, vault_error_kind};
+use super::{
+    BroadcasterActivityTab, DeliveryFormKind, DeliveryMode, UnshieldAssetKey, WalletRoot,
+    vault_error_kind,
+};
+
+pub(super) struct BroadcasterPreferencesUi {
+    pub(super) saved: BroadcasterPreferences,
+    pub(super) snapshot: Arc<RwLock<BroadcasterPreferences>>,
+    pub(super) error: Option<Arc<str>>,
+    pub(super) active_tab: BroadcasterActivityTab,
+    pub(super) favorite_broadcaster_input: Entity<InputState>,
+    pub(super) banned_broadcaster_input: Entity<InputState>,
+}
+
+impl BroadcasterPreferencesUi {
+    pub(super) fn new(
+        snapshot: Arc<RwLock<BroadcasterPreferences>>,
+        favorite_broadcaster_input: Entity<InputState>,
+        banned_broadcaster_input: Entity<InputState>,
+    ) -> Self {
+        Self {
+            saved: BroadcasterPreferences::default(),
+            snapshot,
+            error: None,
+            active_tab: BroadcasterActivityTab::default(),
+            favorite_broadcaster_input,
+            banned_broadcaster_input,
+        }
+    }
+}
 
 impl WalletRoot {
     pub(super) fn reload_broadcaster_preferences(&mut self, cx: &mut Context<'_, Self>) {
@@ -25,7 +55,7 @@ impl WalletRoot {
         match store.list_broadcaster_preferences_for_session(view_session.as_ref()) {
             Ok(preferences) => {
                 self.set_broadcaster_preferences(preferences, cx);
-                self.broadcaster_preference_error = None;
+                self.broadcaster_preferences.error = None;
             }
             Err(error) => {
                 tracing::warn!(
@@ -33,7 +63,7 @@ impl WalletRoot {
                     "load broadcaster preferences failed"
                 );
                 self.set_broadcaster_preferences(BroadcasterPreferences::default(), cx);
-                self.broadcaster_preference_error = Some(Arc::from(error.to_string()));
+                self.broadcaster_preferences.error = Some(Arc::from(error.to_string()));
             }
         }
         cx.notify();
@@ -120,11 +150,11 @@ impl WalletRoot {
     }
 
     pub(super) fn is_favorite_broadcaster(&self, address: &str) -> bool {
-        broadcaster_preference_is_favorite(&self.broadcaster_preferences, address)
+        broadcaster_preference_is_favorite(&self.broadcaster_preferences.saved, address)
     }
 
     pub(super) fn is_banned_broadcaster(&self, address: &str) -> bool {
-        broadcaster_preference_is_banned(&self.broadcaster_preferences, address)
+        broadcaster_preference_is_banned(&self.broadcaster_preferences.saved, address)
     }
 
     pub(super) fn set_broadcaster_preferences(
@@ -132,8 +162,8 @@ impl WalletRoot {
         preferences: BroadcasterPreferences,
         cx: &mut Context<'_, Self>,
     ) {
-        self.broadcaster_preferences = preferences.clone();
-        match self.broadcaster_preference_snapshot.write() {
+        self.broadcaster_preferences.saved = preferences.clone();
+        match self.broadcaster_preferences.snapshot.write() {
             Ok(mut snapshot) => {
                 *snapshot = preferences;
             }
@@ -179,7 +209,7 @@ impl WalletRoot {
                     operation,
                     "broadcaster preference operation failed"
                 );
-                self.broadcaster_preference_error =
+                self.broadcaster_preferences.error =
                     Some(Arc::from(broadcaster_preference_error_message(&error)));
                 cx.notify();
                 false

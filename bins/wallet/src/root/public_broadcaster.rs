@@ -50,7 +50,7 @@ impl WalletRoot {
         favorites_only: bool,
     ) -> PublicBroadcasterTrustFilter {
         PublicBroadcasterTrustFilter {
-            preferences: self.broadcaster_preferences.clone(),
+            preferences: self.broadcaster_preferences.saved.clone(),
             favorites_only,
         }
     }

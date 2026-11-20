@@ -248,9 +248,9 @@ impl WalletRoot {
             Err(error) => return Err(Arc::from(error.to_string())),
         };
         let initial_progress = ProverCacheBuildProgress::preparing();
-        self.prover_cache_build_completed = false;
-        self.prover_cache_build_progress = Some(initial_progress.clone());
-        self.prover_cache_build_popover_open = false;
+        self.prover_cache_build.completed = false;
+        self.prover_cache_build.progress = Some(initial_progress.clone());
+        self.prover_cache_build.popover_open = false;
         let (progress_tx, mut progress_rx) = watch::channel(initial_progress);
         let runtime = self.runtime.clone();
         let join = runtime.spawn(async move {
@@ -285,7 +285,7 @@ impl WalletRoot {
                         let _ = this.update(cx, |root, cx| {
                             root.finish_prover_cache_build_progress(cx);
                             if succeeded {
-                                root.prover_cache_build_completed = true;
+                                root.prover_cache_build.completed = true;
                             }
                         });
                         editor.update(cx, |editor, cx| {

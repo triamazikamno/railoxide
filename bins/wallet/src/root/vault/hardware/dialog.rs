@@ -69,9 +69,9 @@ impl WalletRoot {
             }
         }
 
-        let password = match self.hardware_profile_device_auth_password.take() {
+        let password = match self.hardware_profile.device_auth_password.take() {
             Some(password) => password,
-            None => Self::read_and_clear_input(&self.hardware_profile_password_input, window, cx),
+            None => Self::read_and_clear_input(&self.hardware_profile.password_input, window, cx),
         };
         if password.trim().is_empty() {
             self.hardware_profile_unlock.error =
@@ -131,9 +131,9 @@ impl WalletRoot {
 
     #[cfg(feature = "hardware")]
     pub(in crate::root::vault) const fn next_hardware_profile_action_generation(&mut self) -> u64 {
-        self.hardware_wallet_creation_generation =
-            self.hardware_wallet_creation_generation.wrapping_add(1);
-        self.hardware_wallet_creation_generation
+        self.hardware_wallet_creation.generation =
+            self.hardware_wallet_creation.generation.wrapping_add(1);
+        self.hardware_wallet_creation.generation
     }
 
     #[cfg(feature = "hardware")]
@@ -142,7 +142,7 @@ impl WalletRoot {
         generation: u64,
     ) -> bool {
         hardware_wallet_creation_result_is_current(
-            self.hardware_wallet_creation_generation,
+            self.hardware_wallet_creation.generation,
             generation,
         )
     }
@@ -186,7 +186,8 @@ impl WalletRoot {
             {
                 self.hardware_profile_unlock.trezor_passphrase_mode =
                     TrezorPassphraseMode::NoPassphrase;
-                self.trezor_app_passphrase_input
+                self.hardware_profile
+                    .trezor_app_passphrase_input
                     .update(cx, |input, cx| input.set_value("", window, cx));
             }
         }
@@ -296,11 +297,16 @@ impl WalletRoot {
                 .trezor_passphrase_always_on_device
                 .unwrap_or(false)
         {
-            self.trezor_app_passphrase_input
+            self.hardware_profile
+                .trezor_app_passphrase_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
             return None;
         }
-        let passphrase = Self::read_and_clear_input(&self.trezor_app_passphrase_input, window, cx);
+        let passphrase = Self::read_and_clear_input(
+            &self.hardware_profile.trezor_app_passphrase_input,
+            window,
+            cx,
+        );
         (!passphrase.is_empty()).then_some(passphrase)
     }
 
@@ -426,11 +432,16 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) -> Option<Zeroizing<String>> {
         if !session.uses_trezor_app_passphrase() {
-            self.trezor_app_passphrase_input
+            self.hardware_profile
+                .trezor_app_passphrase_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
             return None;
         }
-        let passphrase = Self::read_and_clear_input(&self.trezor_app_passphrase_input, window, cx);
+        let passphrase = Self::read_and_clear_input(
+            &self.hardware_profile.trezor_app_passphrase_input,
+            window,
+            cx,
+        );
         (!passphrase.is_empty()).then_some(passphrase)
     }
 
@@ -646,14 +657,17 @@ impl WalletRoot {
         let lease = Rc::new(Cell::new(true));
         self.hardware_profile_unlock.dialog_lease = Rc::downgrade(&lease);
         self.clear_hardware_profile_sensitive_inputs(window, cx);
-        self.hardware_profile_label_input.update(cx, |input, cx| {
+        self.hardware_profile.label_input.update(cx, |input, cx| {
             input.set_value(default_hardware_profile_label(device_kind), window, cx);
         });
-        self.hardware_profile_recovery_start_input
+        self.hardware_profile
+            .recovery_start_input
             .update(cx, |input, cx| input.set_value("0", window, cx));
-        self.hardware_profile_recovery_count_input
+        self.hardware_profile
+            .recovery_count_input
             .update(cx, |input, cx| input.set_value("1", window, cx));
-        self.hardware_profile_exact_index_input
+        self.hardware_profile
+            .exact_index_input
             .update(cx, |input, cx| input.set_value("0", window, cx));
         let root = cx.entity();
         let device_label = hardware_device_label(device_kind);
@@ -698,7 +712,8 @@ impl WalletRoot {
                     && !root.hardware_profile_unlock.in_progress
                     && root.hardware_profile_unlock_requires_password()
                 {
-                    root.hardware_profile_password_input
+                    root.hardware_profile
+                        .password_input
                         .read(cx)
                         .focus_handle(cx)
                         .focus(window, cx);
@@ -720,7 +735,9 @@ impl WalletRoot {
                     && root.hardware_profile_unlock.session.is_none()
                     && !root.hardware_profile_unlock.in_progress
                 {
-                    root.trezor_passphrase_mode_focus.focus(window, cx);
+                    root.hardware_profile
+                        .trezor_passphrase_mode_focus
+                        .focus(window, cx);
                 }
             });
         }
@@ -758,9 +775,12 @@ impl WalletRoot {
         self.hardware_profile_unlock.trezor_passphrase_mode = mode;
         self.hardware_profile_unlock.error = None;
         if mode != TrezorPassphraseMode::EnterInApp {
-            self.trezor_app_passphrase_input
+            self.hardware_profile
+                .trezor_app_passphrase_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
-            self.trezor_passphrase_mode_focus.focus(window, cx);
+            self.hardware_profile
+                .trezor_passphrase_mode_focus
+                .focus(window, cx);
         }
         cx.notify();
         if mode == TrezorPassphraseMode::EnterInApp {
@@ -771,7 +791,8 @@ impl WalletRoot {
                     && root.hardware_profile_unlock.session.is_none()
                     && !root.hardware_profile_unlock.in_progress
                 {
-                    root.trezor_app_passphrase_input
+                    root.hardware_profile
+                        .trezor_app_passphrase_input
                         .read(cx)
                         .focus_handle(cx)
                         .focus(window, cx);
@@ -866,8 +887,9 @@ mod tests {
                 root.choose_hardware_wallet(HardwareDeviceKind::Ledger, window, cx);
                 let store = root.vault_store.clone().unwrap();
                 // Completion must replace this stale cache with the fixture's actual status.
-                root.touch_id_status = DeviceAuthStatus::NeedsReenrollment;
-                root.hardware_profile_password_input
+                root.device_auth.touch_id_status = DeviceAuthStatus::NeedsReenrollment;
+                root.hardware_profile
+                    .password_input
                     .update(cx, |input, cx| {
                         input.set_value("public list test password", window, cx);
                     });
@@ -880,7 +902,7 @@ mod tests {
         });
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while root.read_with(cx, |root, _| root.touch_id_status)
+        while root.read_with(cx, |root, _| root.device_auth.touch_id_status)
             == DeviceAuthStatus::NeedsReenrollment
         {
             assert!(
@@ -894,7 +916,7 @@ mod tests {
         }
         root.read_with(cx, |root, _| {
             assert_eq!(
-                root.touch_id_status,
+                root.device_auth.touch_id_status,
                 root.vault_store
                     .as_ref()
                     .unwrap()

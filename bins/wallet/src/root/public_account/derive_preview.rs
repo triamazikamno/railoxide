@@ -1384,7 +1384,7 @@ impl WalletRoot {
                     this.child(trezor_app_passphrase_panel(
                         input_enter_scope(!state.authorizing, show.clone()).child(
                             ui::controls::app_masked_input(
-                                &self.trezor_app_passphrase_input,
+                                &self.hardware_profile.trezor_app_passphrase_input,
                                 state.authorizing,
                             ),
                         ),
@@ -1433,7 +1433,7 @@ impl WalletRoot {
                     error,
                 );
             }
-            let busy = state.authorizing || self.device_auth_in_progress;
+            let busy = state.authorizing || self.device_auth.in_progress;
             return div()
                 .w(content_width)
                 .flex()

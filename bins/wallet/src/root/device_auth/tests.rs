@@ -63,7 +63,7 @@ fn vault_device_auth_ignores_results_after_password_unlock_and_relock(cx: &mut T
         let generation = cx.update(|window, cx| {
             root.update(cx, |root, cx| {
                 root.lock_vault(window, cx);
-                root.device_auth_in_progress = true;
+                root.device_auth.in_progress = true;
                 let generation = root.active_wallet_generation;
                 // The gateway uses this password path while Touch ID is pending.
                 root.unlock_vault_with_password(Zeroizing::new(PASSWORD.into()), None, window, cx);
@@ -77,7 +77,7 @@ fn vault_device_auth_ignores_results_after_password_unlock_and_relock(cx: &mut T
                 root.vault_error = Some(Arc::from("current unlock error"));
                 root.focus_vault_input_on_render = false;
                 root.finish_vault_device_auth_unlock(generation, outcome, window, cx);
-                assert!(!root.device_auth_in_progress);
+                assert!(!root.device_auth.in_progress);
                 assert!(
                     !root.unlock_in_progress,
                     "stale result restarted vault unlock"
@@ -97,7 +97,7 @@ fn vault_device_auth_ignores_results_after_password_unlock_and_relock(cx: &mut T
 
     cx.update(|window, cx| {
         root.update(cx, |root, cx| {
-            root.device_auth_in_progress = true;
+            root.device_auth.in_progress = true;
             root.finish_vault_device_auth_unlock(
                 root.active_wallet_generation,
                 DeviceAuthPassword::Password(Zeroizing::new(PASSWORD.into())),
@@ -150,10 +150,10 @@ fn hardware_device_auth_ignores_results_after_dialog_replacement(cx: &mut TestAp
             cx.run_until_parked();
             cx.update(|window, cx| window.draw(cx).clear(cx));
             let (lease, generation) = root.update(cx, |root, _| {
-                root.device_auth_in_progress = true;
+                root.device_auth.in_progress = true;
                 (
                     root.hardware_profile_unlock.dialog_lease.clone(),
-                    root.hardware_wallet_creation_generation,
+                    root.hardware_wallet_creation.generation,
                 )
             });
             if replacement == "hardware" {
@@ -172,7 +172,8 @@ fn hardware_device_auth_ignores_results_after_dialog_replacement(cx: &mut TestAp
             cx.run_until_parked();
             cx.update(|window, cx| {
                 root.update(cx, |root, cx| {
-                    root.hardware_profile_password_input
+                    root.hardware_profile
+                        .password_input
                         .update(cx, |input, cx| {
                             input.set_value("replacement typed password", window, cx);
                         });
@@ -180,7 +181,7 @@ fn hardware_device_auth_ignores_results_after_dialog_replacement(cx: &mut TestAp
                     root.finish_hardware_profile_device_auth_unlock(
                         &lease, generation, outcome, window, cx,
                     );
-                    assert!(!root.device_auth_in_progress);
+                    assert!(!root.device_auth.in_progress);
                     assert!(!root.hardware_profile_unlock.in_progress);
                     assert!(root.hardware_profile_unlock.vault_view_unlock.is_none());
                     assert!(root.vault_view_unlock.is_none());
@@ -189,7 +190,7 @@ fn hardware_device_auth_ignores_results_after_dialog_replacement(cx: &mut TestAp
                         Some("replacement error")
                     );
                     assert_eq!(
-                        root.hardware_profile_password_input.read(cx).value(),
+                        root.hardware_profile.password_input.read(cx).value(),
                         "replacement typed password"
                     );
                     assert!(window.has_active_dialog(cx));
@@ -202,11 +203,11 @@ fn hardware_device_auth_ignores_results_after_dialog_replacement(cx: &mut TestAp
     cx.update(|window, cx| {
         root.update(cx, |root, cx| {
             root.choose_hardware_wallet(HardwareDeviceKind::Ledger, window, cx);
-            root.device_auth_in_progress = true;
+            root.device_auth.in_progress = true;
             let lease = root.hardware_profile_unlock.dialog_lease.clone();
             root.finish_hardware_profile_device_auth_unlock(
                 &lease,
-                root.hardware_wallet_creation_generation,
+                root.hardware_wallet_creation.generation,
                 DeviceAuthPassword::Failed(Arc::from("current prompt failure")),
                 window,
                 cx,
@@ -260,7 +261,7 @@ fn add_wallet_device_auth_ignores_results_after_dismissal_reopening_or_wallet_ch
             cx.run_until_parked();
             cx.update(|window, cx| window.draw(cx).clear(cx));
             let (lease, generation) = root.update(cx, |root, _| {
-                root.device_auth_in_progress = true;
+                root.device_auth.in_progress = true;
                 (
                     root.add_wallet_dialog_lease.clone(),
                     root.active_wallet_generation,
@@ -281,25 +282,27 @@ fn add_wallet_device_auth_ignores_results_after_dismissal_reopening_or_wallet_ch
             }
             cx.update(|window, cx| {
                 root.update(cx, |root, cx| {
-                    root.add_wallet_password_input.update(cx, |input, cx| {
-                        input.set_value("current typed password", window, cx);
-                    });
+                    root.vault_inputs
+                        .add_wallet_password_input
+                        .update(cx, |input, cx| {
+                            input.set_value("current typed password", window, cx);
+                        });
                     root.vault_error = Some(Arc::from("current form error"));
-                    root.touch_id_status = DeviceAuthStatus::Enabled;
+                    root.device_auth.touch_id_status = DeviceAuthStatus::Enabled;
                     root.finish_add_wallet_device_auth(&lease, generation, outcome, window, cx);
-                    assert!(!root.device_auth_in_progress);
+                    assert!(!root.device_auth.in_progress);
                     assert!(
                         root.add_wallet_device_auth_password.is_none(),
                         "stale result authorized the current form"
                     );
                     assert_eq!(
-                        root.add_wallet_password_input.read(cx).value(),
+                        root.vault_inputs.add_wallet_password_input.read(cx).value(),
                         "current typed password"
                     );
                     assert_eq!(root.vault_error.as_deref(), Some("current form error"));
                     if failed {
                         assert_eq!(
-                            root.touch_id_status,
+                            root.device_auth.touch_id_status,
                             root.vault_store
                                 .as_ref()
                                 .unwrap()
@@ -321,7 +324,7 @@ fn add_wallet_device_auth_ignores_results_after_dismissal_reopening_or_wallet_ch
     cx.update(|window, cx| {
         root.update(cx, |root, cx| {
             let lease = root.add_wallet_dialog_lease.clone();
-            root.device_auth_in_progress = true;
+            root.device_auth.in_progress = true;
             root.finish_add_wallet_device_auth(
                 &lease,
                 root.active_wallet_generation,
@@ -334,7 +337,7 @@ fn add_wallet_device_auth_ignores_results_after_dismissal_reopening_or_wallet_ch
                     .as_ref()
                     .is_some_and(|password| password.as_str() == "current authentication")
             );
-            assert!(!root.device_auth_in_progress);
+            assert!(!root.device_auth.in_progress);
             window.close_all_dialogs(cx);
         });
     });
@@ -434,7 +437,7 @@ fn device_auth_enrollment_refreshes_root_without_closing_or_focusing_a_newer_dia
         let dialog = cx.update(|window, cx| {
             root.update(cx, |root, cx| {
                 // Deliberately stale cache: completion must reread the disabled test vault.
-                root.touch_id_status = DeviceAuthStatus::Enabled;
+                root.device_auth.touch_id_status = DeviceAuthStatus::Enabled;
                 EnableDeviceAuthDialogContent::open(DeviceAuthMethod::TouchId, window, cx)
             })
         });
@@ -461,7 +464,7 @@ fn device_auth_enrollment_refreshes_root_without_closing_or_focusing_a_newer_dia
         send.send(result).unwrap();
         cx.run_until_parked();
         assert_eq!(
-            root.read_with(cx, |root, _| root.touch_id_status),
+            root.read_with(cx, |root, _| root.device_auth.touch_id_status),
             DeviceAuthStatus::Disabled
         );
         cx.update(|window, cx| {
@@ -509,10 +512,10 @@ fn device_auth_settings_preserve_drafts_and_follow_enrollment(cx: &mut TestAppCo
             cx,
         );
         wallet.update(cx, |root, _| {
-            root.touch_id_supported = true;
-            root.apple_watch_supported = true;
-            root.touch_id_available = false;
-            root.apple_watch_available = false;
+            root.device_auth.touch_id_supported = true;
+            root.device_auth.apple_watch_supported = true;
+            root.device_auth.touch_id_available = false;
+            root.device_auth.apple_watch_available = false;
         });
         let editor = wallet.read(cx).settings_editor.clone().unwrap();
         editor.update(cx, |editor, cx| {
@@ -556,8 +559,8 @@ fn device_auth_settings_preserve_drafts_and_follow_enrollment(cx: &mut TestAppCo
             assert_eq!(editor.read(cx).draft, draft);
             root.update(cx, |root, cx| {
                 match method {
-                    DeviceAuthMethod::TouchId => root.touch_id_available = true,
-                    DeviceAuthMethod::AppleWatch => root.apple_watch_available = true,
+                    DeviceAuthMethod::TouchId => root.device_auth.touch_id_available = true,
+                    DeviceAuthMethod::AppleWatch => root.device_auth.apple_watch_available = true,
                 }
                 cx.notify();
             });
@@ -609,13 +612,13 @@ fn device_auth_settings_preserve_drafts_and_follow_enrollment(cx: &mut TestAppCo
     ] {
         cx.update(|_, cx| {
             root.update(cx, |root, cx| {
-                root.touch_id_status = status;
-                root.apple_watch_status = status;
+                root.device_auth.touch_id_status = status;
+                root.device_auth.apple_watch_status = status;
                 // Saved settings remain visible while either device is unavailable.
-                root.touch_id_supported = false;
-                root.apple_watch_supported = false;
-                root.touch_id_available = false;
-                root.apple_watch_available = false;
+                root.device_auth.touch_id_supported = false;
+                root.device_auth.apple_watch_supported = false;
+                root.device_auth.touch_id_available = false;
+                root.device_auth.apple_watch_available = false;
                 cx.notify();
             });
         });
@@ -642,7 +645,10 @@ fn device_auth_settings_preserve_drafts_and_follow_enrollment(cx: &mut TestAppCo
         );
         window.click("wallet-settings-touch-id", cx);
         assert!(!window.has_active_dialog(cx));
-        assert_eq!(root.read(cx).touch_id_status, DeviceAuthStatus::Disabled);
+        assert_eq!(
+            root.read(cx).device_auth.touch_id_status,
+            DeviceAuthStatus::Disabled
+        );
         assert!(!editor.read(cx).is_dirty());
         window.remove_window();
     });

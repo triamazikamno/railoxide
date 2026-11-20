@@ -30,6 +30,10 @@ const TOR_ACTIVITY_INTERVAL_LIMIT: usize = 8;
 /// that can't stop within it fails the rotation and keeps the current Tor session.
 const TOR_ROTATION_WAKU_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
+mod status_ui;
+
+pub(super) use status_ui::NetworkStatusUi;
+
 /// The root's pending explicit Tor rotation.
 pub(super) struct TorRotation {
     id: u64,
@@ -327,9 +331,9 @@ impl WalletRoot {
     pub(super) fn gateway_network_view(&self) -> GatewayNetworkView {
         let mut view = GatewayNetworkView::new(
             self.network_context_revision(),
-            &self.network_health,
-            self.tor_bridge_activity.as_ref(),
-            self.tor_download_rate,
+            &self.network_status.network_health,
+            self.network_status.tor_bridge_activity.as_ref(),
+            self.network_status.tor_download_rate,
         );
         view.direct_rpc_endpoints = self.effective_chain_configs.direct_rpc_endpoint_count();
         view.rotation = self.tor_rotation_presentation();
@@ -337,7 +341,10 @@ impl WalletRoot {
     }
 
     pub(super) fn network_status_presentation(&self) -> NetworkStatus {
-        let kind = match (self.network_health.mode, self.network_health.state) {
+        let kind = match (
+            self.network_status.network_health.mode,
+            self.network_status.network_health.state,
+        ) {
             (WalletNetworkMode::Tor, WalletNetworkHealthState::Ready) => {
                 NetworkStatusKind::TorReady
             }
@@ -352,9 +359,9 @@ impl WalletRoot {
         };
         NetworkStatus::new(
             kind,
-            self.network_health.detail.to_string(),
+            self.network_status.network_health.detail.to_string(),
             matches!(
-                self.network_health.cause,
+                self.network_status.network_health.cause,
                 WalletNetworkHealthCause::TorRuntimeSlow
                     | WalletNetworkHealthCause::TorRuntimeUnreliable
             ),
@@ -363,19 +370,22 @@ impl WalletRoot {
     }
 
     pub(super) fn network_activity_presentation(&self) -> Option<NetworkActivity> {
-        self.tor_bridge_activity.as_ref().map(|snapshot| {
-            let mut activity = NetworkActivity::default();
-            activity.generation = snapshot.generation;
-            activity.session_duration = snapshot.session_duration;
-            activity.downloaded_bytes = snapshot.downloaded_bytes;
-            activity.recent_connection_sample_count = snapshot.recent_connection_sample_count;
-            activity.recent_successful_sample_count = snapshot.recent_successful_sample_count;
-            activity.successful_connections = snapshot.successful_connections;
-            activity.failed_connections = snapshot.failed_connections;
-            activity.median_setup_duration = snapshot.median_setup_duration;
-            activity.last_activity_age = snapshot.last_activity_age;
-            activity
-        })
+        self.network_status
+            .tor_bridge_activity
+            .as_ref()
+            .map(|snapshot| {
+                let mut activity = NetworkActivity::default();
+                activity.generation = snapshot.generation;
+                activity.session_duration = snapshot.session_duration;
+                activity.downloaded_bytes = snapshot.downloaded_bytes;
+                activity.recent_connection_sample_count = snapshot.recent_connection_sample_count;
+                activity.recent_successful_sample_count = snapshot.recent_successful_sample_count;
+                activity.successful_connections = snapshot.successful_connections;
+                activity.failed_connections = snapshot.failed_connections;
+                activity.median_setup_duration = snapshot.median_setup_duration;
+                activity.last_activity_age = snapshot.last_activity_age;
+                activity
+            })
     }
 
     pub(super) fn network_status_intent(
@@ -383,7 +393,7 @@ impl WalletRoot {
         intent: NetworkStatusIntent,
         cx: &mut Context<'_, Self>,
     ) {
-        if !self.network_status_popover_open {
+        if !self.network_status.popover_open {
             return;
         }
         match intent {
@@ -482,9 +492,11 @@ impl WalletRoot {
                         }) {
                             return;
                         }
-                        if root.tor_bridge_activity != snapshot || root.tor_download_rate != rate {
-                            root.tor_bridge_activity = snapshot;
-                            root.tor_download_rate = rate;
+                        if root.network_status.tor_bridge_activity != snapshot
+                            || root.network_status.tor_download_rate != rate
+                        {
+                            root.network_status.tor_bridge_activity = snapshot;
+                            root.network_status.tor_download_rate = rate;
                             root.publish_gateway_network_state();
                             cx.notify();
                         }
@@ -499,8 +511,8 @@ impl WalletRoot {
     }
 
     fn set_network_health(&mut self, health: WalletNetworkHealth, cx: &mut Context<'_, Self>) {
-        if self.network_health != health {
-            self.network_health = health;
+        if self.network_status.network_health != health {
+            self.network_status.network_health = health;
             self.publish_gateway_network_state();
             cx.notify();
         }
@@ -512,12 +524,12 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         if !open {
-            self.network_status_error = None;
+            self.network_status.error = None;
             self.invalidate_tor_exit_ip_query();
-            self.tor_state_reset_confirming = false;
+            self.network_status.tor_state_reset_confirming = false;
         }
-        if self.network_status_popover_open != open {
-            self.network_status_popover_open = open;
+        if self.network_status.popover_open != open {
+            self.network_status.popover_open = open;
             cx.notify();
         } else if !open {
             cx.notify();
@@ -530,7 +542,7 @@ impl WalletRoot {
         }
         // The next render opens the popover, which remembers the focused field, or closes it and
         // returns focus there.
-        self.set_network_status_popover_open(!self.network_status_popover_open, cx);
+        self.set_network_status_popover_open(!self.network_status.popover_open, cx);
     }
 
     /// Starts the explicit Tor rotation, or joins `request` to the pending one. Native and
@@ -546,11 +558,11 @@ impl WalletRoot {
         }
         // Outside Tor mode the commit fails before any Waku change.
         let retiring = waku_to_retire(
-            self.waku_runtime.as_ref(),
-            self.waku_stopping_generation.as_ref(),
+            self.waku.runtime.as_ref(),
+            self.waku.stopping_generation.as_ref(),
         )
         .filter(|_| self.http.network_mode() == WalletNetworkMode::Tor);
-        let id = self.tor_rotation_id.wrapping_add(1);
+        let id = self.network_status.tor_rotation_id.wrapping_add(1);
         let rotation = TorRotation {
             id,
             retired_generation: retiring.as_ref().and_then(|(replaced, ..)| *replaced),
@@ -561,17 +573,19 @@ impl WalletRoot {
             requests: request.into_iter().collect(),
             restart_deferred: false,
         };
-        if !join_or_begin_tor_rotation(&mut self.tor_rotation, rotation) {
+        if !join_or_begin_tor_rotation(&mut self.network_status.tor_rotation, rotation) {
             return;
         }
-        self.tor_rotation_id = id;
-        self.tor_rotation_failure = None;
-        self.network_status_error = None;
+        self.network_status.tor_rotation_id = id;
+        self.network_status.tor_rotation_failure = None;
+        self.network_status.error = None;
         if let Some(waku_failed) = super::private_swap::ui_fixture_tor_rotation() {
-            if waku_failed && let Some(rotation) = take_tor_rotation(&mut self.tor_rotation, id) {
+            if waku_failed
+                && let Some(rotation) = take_tor_rotation(&mut self.network_status.tor_rotation, id)
+            {
                 let error = GatewayNetworkError::WakuUnavailable;
-                self.tor_rotation_failure = Some(error);
-                self.network_status_error = Some(Arc::from(error.message()));
+                self.network_status.tor_rotation_failure = Some(error);
+                self.network_status.error = Some(Arc::from(error.message()));
                 self.complete_gateway_network_requests(
                     rotation.requests,
                     &GatewayNetworkOutcome::Failed { error },
@@ -610,12 +624,12 @@ impl WalletRoot {
         retired: Result<(), String>,
         cx: &mut Context<'_, Self>,
     ) {
-        let Some(rotation) = take_tor_rotation(&mut self.tor_rotation, id) else {
+        let Some(rotation) = take_tor_rotation(&mut self.network_status.tor_rotation, id) else {
             return;
         };
         if let Some(generation) = rotation.retired_generation {
             super::release_retired_waku_generation(
-                &mut self.waku_stopping_generation,
+                &mut self.waku.stopping_generation,
                 generation,
                 &self.monitor_state,
                 &self.monitor_event_tx,
@@ -630,13 +644,14 @@ impl WalletRoot {
             |(root, cx)| root.commit_tor_session(cx),
             |(root, cx)| {
                 root.ensure_waku_started(cx);
-                root.waku_runtime.is_some()
+                root.waku.runtime.is_some()
             },
         );
         let failure = match completed {
             Ok(((generation, walletconnect_refreshed), failure)) => {
                 let waku_peer_id = self
-                    .waku_runtime
+                    .waku
+                    .runtime
                     .as_ref()
                     .and_then(|runtime| runtime.client.local_peer_id())
                     .map(|peer_id| peer_id.to_string());
@@ -651,9 +666,9 @@ impl WalletRoot {
             }
             Err(failure) => Some(failure),
         };
-        self.tor_rotation_failure = failure;
+        self.network_status.tor_rotation_failure = failure;
         if let Some(error) = failure {
-            self.network_status_error = Some(Arc::from(error.message()));
+            self.network_status.error = Some(Arc::from(error.message()));
         }
         self.complete_gateway_network_requests(
             rotation.requests,
@@ -669,11 +684,11 @@ impl WalletRoot {
     /// how many `WalletConnect` relay workers restart.
     fn commit_tor_session(&mut self, cx: &mut Context<'_, Self>) -> eyre::Result<(u64, usize)> {
         let generation = self.http.start_new_tor_session()?;
-        self.network_health = self.http.network_health();
-        self.tor_bridge_activity = self.http.tor_bridge_activity_snapshot();
-        self.tor_download_rate = None;
+        self.network_status.network_health = self.http.network_health();
+        self.network_status.tor_bridge_activity = self.http.tor_bridge_activity_snapshot();
+        self.network_status.tor_download_rate = None;
         self.invalidate_tor_exit_ip_query();
-        self.tor_state_reset_confirming = false;
+        self.network_status.tor_state_reset_confirming = false;
         let walletconnect_refreshed =
             self.restart_walletconnect_relay_workers_for_network_session(cx);
         self.publish_gateway_network_state();
@@ -683,41 +698,45 @@ impl WalletRoot {
     /// Retires an uncommitted rotation and its presentation on lock and root replacement. A
     /// dropped root's continuation can't reach it at all.
     pub(super) fn cancel_tor_rotation(&mut self) {
-        self.tor_rotation = None;
-        self.tor_rotation_failure = None;
+        self.network_status.tor_rotation = None;
+        self.network_status.tor_rotation_failure = None;
     }
 
     fn tor_rotation_presentation(&self) -> Option<GatewayTorRotation> {
-        if self.tor_rotation.is_some() {
+        if self.network_status.tor_rotation.is_some() {
             Some(GatewayTorRotation::InProgress)
         } else {
-            self.tor_rotation_failure
+            self.network_status
+                .tor_rotation_failure
                 .map(|error| GatewayTorRotation::Failed { error })
         }
     }
 
     fn invalidate_tor_exit_ip_query(&mut self) {
-        self.tor_exit_ip_query_generation =
-            next_tor_exit_ip_query_generation(self.tor_exit_ip_query_generation);
-        self.tor_exit_ip_query = TorExitIpQueryState::Idle;
+        self.network_status.tor_exit_ip_query_generation =
+            next_tor_exit_ip_query_generation(self.network_status.tor_exit_ip_query_generation);
+        self.network_status.tor_exit_ip_query = TorExitIpQueryState::Idle;
     }
 
     fn query_tor_exit_ip(&mut self, cx: &mut Context<'_, Self>) {
         if self.http.network_mode() != WalletNetworkMode::Tor
-            || matches!(self.tor_exit_ip_query, TorExitIpQueryState::Querying)
+            || matches!(
+                self.network_status.tor_exit_ip_query,
+                TorExitIpQueryState::Querying
+            )
         {
             return;
         }
 
-        self.network_status_error = None;
-        self.tor_exit_ip_query_generation =
-            next_tor_exit_ip_query_generation(self.tor_exit_ip_query_generation);
-        let query_generation = self.tor_exit_ip_query_generation;
-        self.tor_exit_ip_query = TorExitIpQueryState::Querying;
+        self.network_status.error = None;
+        self.network_status.tor_exit_ip_query_generation =
+            next_tor_exit_ip_query_generation(self.network_status.tor_exit_ip_query_generation);
+        let query_generation = self.network_status.tor_exit_ip_query_generation;
+        self.network_status.tor_exit_ip_query = TorExitIpQueryState::Querying;
         cx.notify();
 
         let Some(proxy_url) = self.http.proxy_url.clone() else {
-            self.tor_exit_ip_query = TorExitIpQueryState::Error(Arc::from(
+            self.network_status.tor_exit_ip_query = TorExitIpQueryState::Error(Arc::from(
                 "Exit IP query requires the built-in Tor SOCKS bridge",
             ));
             cx.notify();
@@ -735,11 +754,11 @@ impl WalletRoot {
             };
             let _ = this.update(cx, |root, cx| {
                 if tor_exit_ip_query_completion_is_current(
-                    root.tor_exit_ip_query_generation,
+                    root.network_status.tor_exit_ip_query_generation,
                     query_generation,
-                    &root.tor_exit_ip_query,
+                    &root.network_status.tor_exit_ip_query,
                 ) {
-                    root.tor_exit_ip_query = state;
+                    root.network_status.tor_exit_ip_query = state;
                     cx.notify();
                 }
             });
@@ -748,24 +767,24 @@ impl WalletRoot {
     }
 
     fn begin_tor_state_reset_confirmation(&mut self, cx: &mut Context<'_, Self>) {
-        self.network_status_error = None;
+        self.network_status.error = None;
         self.invalidate_tor_exit_ip_query();
-        self.tor_state_reset_confirming = true;
+        self.network_status.tor_state_reset_confirming = true;
         cx.notify();
     }
 
     fn cancel_tor_state_reset_confirmation(&mut self, cx: &mut Context<'_, Self>) {
-        self.tor_state_reset_confirming = false;
+        self.network_status.tor_state_reset_confirming = false;
         cx.notify();
     }
 
     fn quit_and_reset_tor_state(&mut self, cx: &mut Context<'_, Self>) {
-        if !self.tor_state_reset_confirming {
+        if !self.network_status.tor_state_reset_confirming {
             return;
         }
         if reset_tor_state_and_quit(&self.options.db_path, || cx.quit()).is_err() {
-            self.network_status_error = Some(Arc::from(GatewayNetworkError::ResetFailed.message()));
-            self.tor_state_reset_confirming = false;
+            self.network_status.error = Some(Arc::from(GatewayNetworkError::ResetFailed.message()));
+            self.network_status.tor_state_reset_confirming = false;
             cx.notify();
         }
     }

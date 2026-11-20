@@ -52,6 +52,51 @@ pub(in crate::root) const DEVICE_AUTH_REASON_ADD_WALLET: &str = "add a wallet";
 pub(in crate::root) const DEVICE_AUTH_REASON_PUBLIC_ACCOUNT: &str = "add a public account";
 pub(in crate::root) const DEVICE_AUTH_REASON_PASSPHRASE_WALLET: &str = "open a passphrase wallet";
 
+pub(super) struct DeviceAuthStartup {
+    pub(super) touch_id_supported: bool,
+    pub(super) touch_id_status: DeviceAuthStatus,
+    pub(super) apple_watch_supported: bool,
+    pub(super) apple_watch_status: DeviceAuthStatus,
+    pub(super) touch_id_unlock_on_render: bool,
+}
+
+pub(super) struct DeviceAuthUi {
+    /// Whether this Mac has usable Touch ID, independent of the vault setting.
+    pub(super) touch_id_supported: bool,
+    pub(super) touch_id_available: bool,
+    pub(super) touch_id_status: DeviceAuthStatus,
+    pub(super) apple_watch_supported: bool,
+    pub(super) apple_watch_available: bool,
+    pub(super) apple_watch_status: DeviceAuthStatus,
+    pub(super) in_progress: bool,
+    pub(super) touch_id_unlock_on_render: bool,
+    pub(super) enable_device_auth_on_create: bool,
+}
+
+impl DeviceAuthUi {
+    pub(super) fn new(
+        DeviceAuthStartup {
+            touch_id_supported,
+            touch_id_status,
+            apple_watch_supported,
+            apple_watch_status,
+            touch_id_unlock_on_render,
+        }: DeviceAuthStartup,
+    ) -> Self {
+        Self {
+            touch_id_supported,
+            touch_id_available: device_auth_available(DeviceAuthMethod::TouchId),
+            touch_id_status,
+            apple_watch_supported,
+            apple_watch_available: device_auth_available(DeviceAuthMethod::AppleWatch),
+            apple_watch_status,
+            in_progress: false,
+            touch_id_unlock_on_render,
+            enable_device_auth_on_create: true,
+        }
+    }
+}
+
 /// Reads the sealed vault password using one explicitly selected method.
 #[derive(Clone)]
 pub(in crate::root) struct DeviceAuthPrompt {
@@ -211,10 +256,12 @@ pub(in crate::root) fn masked_input_with_device_auth(
 
 impl WalletRoot {
     pub(in crate::root) fn refresh_device_auth_status(&mut self) {
-        self.touch_id_supported = device_auth_supported(DeviceAuthMethod::TouchId);
-        self.apple_watch_supported = device_auth_supported(DeviceAuthMethod::AppleWatch);
-        self.touch_id_available = device_auth_available(DeviceAuthMethod::TouchId);
-        self.apple_watch_available = device_auth_available(DeviceAuthMethod::AppleWatch);
+        self.device_auth.touch_id_supported = device_auth_supported(DeviceAuthMethod::TouchId);
+        self.device_auth.apple_watch_supported =
+            device_auth_supported(DeviceAuthMethod::AppleWatch);
+        self.device_auth.touch_id_available = device_auth_available(DeviceAuthMethod::TouchId);
+        self.device_auth.apple_watch_available =
+            device_auth_available(DeviceAuthMethod::AppleWatch);
         for method in DeviceAuthMethod::ALL {
             let status = self.vault_store.as_ref().and_then(|store| {
                 store.device_auth_status(method)
@@ -222,8 +269,8 @@ impl WalletRoot {
                     .ok()
             }).unwrap_or(DeviceAuthStatus::Disabled);
             match method {
-                DeviceAuthMethod::TouchId => self.touch_id_status = status,
-                DeviceAuthMethod::AppleWatch => self.apple_watch_status = status,
+                DeviceAuthMethod::TouchId => self.device_auth.touch_id_status = status,
+                DeviceAuthMethod::AppleWatch => self.device_auth.apple_watch_status = status,
             }
         }
     }
@@ -256,23 +303,23 @@ impl WalletRoot {
         method: DeviceAuthMethod,
     ) -> DeviceAuthStatus {
         match method {
-            DeviceAuthMethod::TouchId => self.touch_id_status,
-            DeviceAuthMethod::AppleWatch => self.apple_watch_status,
+            DeviceAuthMethod::TouchId => self.device_auth.touch_id_status,
+            DeviceAuthMethod::AppleWatch => self.device_auth.apple_watch_status,
         }
     }
 
     const fn device_auth_supported(&self, method: DeviceAuthMethod) -> bool {
         match method {
-            DeviceAuthMethod::TouchId => self.touch_id_supported,
-            DeviceAuthMethod::AppleWatch => self.apple_watch_supported,
+            DeviceAuthMethod::TouchId => self.device_auth.touch_id_supported,
+            DeviceAuthMethod::AppleWatch => self.device_auth.apple_watch_supported,
         }
     }
 
     /// Snapshot for Settings presentation; enrollment rechecks with macOS.
     pub(in crate::root) const fn device_auth_available(&self, method: DeviceAuthMethod) -> bool {
         match method {
-            DeviceAuthMethod::TouchId => self.touch_id_available,
-            DeviceAuthMethod::AppleWatch => self.apple_watch_available,
+            DeviceAuthMethod::TouchId => self.device_auth.touch_id_available,
+            DeviceAuthMethod::AppleWatch => self.device_auth.apple_watch_available,
         }
     }
 
@@ -305,7 +352,7 @@ impl WalletRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if std::mem::take(&mut self.touch_id_unlock_on_render)
+        if std::mem::take(&mut self.device_auth.touch_id_unlock_on_render)
             && matches!(self.vault_state, VaultState::UnlockVault)
         {
             cx.defer_in(window, |root, window, cx| {
@@ -322,14 +369,14 @@ impl WalletRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.unlock_in_progress || self.device_auth_in_progress {
+        if self.unlock_in_progress || self.device_auth.in_progress {
             return;
         }
         let Some(prompt) = self.device_auth_prompt() else {
             cx.notify();
             return;
         };
-        self.device_auth_in_progress = true;
+        self.device_auth.in_progress = true;
         self.vault_error = None;
         let generation = self.active_wallet_generation;
         cx.notify();
@@ -351,7 +398,7 @@ impl WalletRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.device_auth_in_progress = false;
+        self.device_auth.in_progress = false;
         if matches!(&outcome, DeviceAuthPassword::Failed(_)) {
             self.refresh_device_auth_status();
         }
@@ -383,7 +430,7 @@ impl WalletRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.device_auth_in_progress
+        if self.device_auth.in_progress
             || !self
                 .add_wallet_dialog_lease
                 .upgrade()
@@ -395,7 +442,7 @@ impl WalletRoot {
             cx.notify();
             return;
         };
-        self.device_auth_in_progress = true;
+        self.device_auth.in_progress = true;
         self.vault_error = None;
         let lease = self.add_wallet_dialog_lease.clone();
         let generation = self.active_wallet_generation;
@@ -419,7 +466,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.device_auth_in_progress = false;
+        self.device_auth.in_progress = false;
         if matches!(&outcome, DeviceAuthPassword::Failed(_)) {
             self.refresh_device_auth_status();
         }
@@ -432,7 +479,8 @@ impl WalletRoot {
         }
         match outcome {
             DeviceAuthPassword::Password(password) => {
-                self.add_wallet_password_input
+                self.vault_inputs
+                    .add_wallet_password_input
                     .update(cx, |input, cx| input.set_value("", window, cx));
                 self.add_wallet_device_auth_password = Some(password);
             }
@@ -450,7 +498,7 @@ impl WalletRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.device_auth_in_progress
+        if self.device_auth.in_progress
             || self.hardware_profile_unlock.in_progress
             || !self
                 .hardware_profile_unlock
@@ -464,9 +512,9 @@ impl WalletRoot {
             cx.notify();
             return;
         };
-        self.device_auth_in_progress = true;
+        self.device_auth.in_progress = true;
         self.hardware_profile_unlock.error = None;
-        let generation = self.hardware_wallet_creation_generation;
+        let generation = self.hardware_wallet_creation.generation;
         let lease = self.hardware_profile_unlock.dialog_lease.clone();
         cx.notify();
         prompt.run(
@@ -491,13 +539,13 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.device_auth_in_progress = false;
+        self.device_auth.in_progress = false;
         if matches!(&outcome, DeviceAuthPassword::Failed(_)) {
             self.refresh_device_auth_status();
         }
         cx.notify();
         if !lease.upgrade().is_some_and(|open| open.get())
-            || self.hardware_wallet_creation_generation != generation
+            || self.hardware_wallet_creation.generation != generation
         {
             return;
         }
@@ -506,9 +554,9 @@ impl WalletRoot {
                 if self.hardware_profile_unlock_requires_password()
                     && !self.hardware_profile_unlock.in_progress
                 {
-                    self.hardware_profile_device_auth_password = Some(password);
+                    self.hardware_profile.device_auth_password = Some(password);
                     self.unlock_hardware_profile_from_dialog(window, cx);
-                    self.hardware_profile_device_auth_password = None;
+                    self.hardware_profile.device_auth_password = None;
                 }
             }
             DeviceAuthPassword::Cancelled => {}
@@ -524,7 +572,8 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         self.add_wallet_device_auth_password = None;
-        self.add_wallet_password_input
+        self.vault_inputs
+            .add_wallet_password_input
             .update(cx, |input, cx| input.set_value("", window, cx));
     }
 
@@ -571,12 +620,12 @@ impl WalletRoot {
                 );
         }
         masked_input_with_device_auth(
-            &self.add_wallet_password_input,
-            disabled || self.device_auth_in_progress,
+            &self.vault_inputs.add_wallet_password_input,
+            disabled || self.device_auth.in_progress,
             device_auth_buttons(
                 self.device_auth_prompt_cached().as_ref(),
                 "add-wallet-touch-id",
-                self.device_auth_in_progress,
+                self.device_auth.in_progress,
                 disabled,
                 move |method, window, cx| {
                     root.update(cx, |root, cx| {
@@ -640,7 +689,7 @@ impl WalletRoot {
         window: &Window,
         cx: &Context<'_, Self>,
     ) {
-        if !self.enable_device_auth_on_create {
+        if !self.device_auth.enable_device_auth_on_create {
             return;
         }
         let Some(method) = self.vault_creation_device_auth_method() else {
@@ -686,7 +735,7 @@ impl WalletRoot {
         enabled: bool,
         cx: &mut Context<'_, Self>,
     ) {
-        self.enable_device_auth_on_create = enabled;
+        self.device_auth.enable_device_auth_on_create = enabled;
         cx.notify();
     }
 }

@@ -816,7 +816,7 @@ impl WalletRoot {
                 )
                 .child(masked_input_with_device_auth(
                     &self.public_form.add_password_input,
-                    self.device_auth_in_progress || busy,
+                    self.device_auth.in_progress || busy,
                     self.public_account_device_auth_buttons(
                         root.clone(),
                         PublicAccountDialogKind::Derive,
@@ -839,7 +839,10 @@ impl WalletRoot {
                     #[cfg(feature = "hardware")]
                     {
                         this.child(super::derive_preview::trezor_app_passphrase_panel(
-                            ui::controls::app_masked_input(&self.trezor_app_passphrase_input, busy),
+                            ui::controls::app_masked_input(
+                                &self.hardware_profile.trezor_app_passphrase_input,
+                                busy,
+                            ),
                         ))
                     }
                     #[cfg(not(feature = "hardware"))]
@@ -865,7 +868,7 @@ impl WalletRoot {
                 .primary()
                 .small()
                 .loading(busy)
-                .disabled(busy || self.device_auth_in_progress)
+                .disabled(busy || self.device_auth.in_progress)
                 .on_click(move |_event, window, cx| {
                     root.update(cx, |root, cx| {
                         root.add_public_derived_account_from_input(window, cx);

@@ -197,7 +197,7 @@ impl WalletRoot {
                         .flex_col()
                         .gap_3()
                         .child(
-                            app_input(&state.hardware_profile_label_input)
+                            app_input(&state.hardware_profile.label_input)
                                 .disabled(state.hardware_profile_unlock.in_progress),
                         )
                         .child(
@@ -212,7 +212,8 @@ impl WalletRoot {
                 )
         });
         cx.defer_in(window, |root, window, cx| {
-            root.hardware_profile_label_input
+            root.hardware_profile
+                .label_input
                 .read(cx)
                 .focus_handle(cx)
                 .focus(window, cx);
@@ -227,7 +228,7 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         if let Some(profile) = self.hardware_profile_unlock.profile.as_ref() {
-            self.hardware_profile_label_input.update(cx, |input, cx| {
+            self.hardware_profile.label_input.update(cx, |input, cx| {
                 input.set_value(profile.label.clone(), window, cx);
             });
         }
@@ -255,7 +256,8 @@ impl WalletRoot {
             return false;
         };
         let label = self
-            .hardware_profile_label_input
+            .hardware_profile
+            .label_input
             .read(cx)
             .value()
             .trim()
@@ -266,7 +268,7 @@ impl WalletRoot {
             label
         };
         profile.label.clone_from(&label);
-        self.hardware_profile_label_input.update(cx, |input, cx| {
+        self.hardware_profile.label_input.update(cx, |input, cx| {
             input.set_value(label.clone(), window, cx);
         });
 
@@ -282,7 +284,7 @@ impl WalletRoot {
         }
 
         self.hardware_profile_unlock.profile = Some(profile);
-        self.active_hardware_profile = self.hardware_profile_unlock.profile.clone();
+        self.hardware_profile.active = self.hardware_profile_unlock.profile.clone();
         self.hardware_profile_unlock.error = None;
         cx.notify();
         true
@@ -360,12 +362,13 @@ impl WalletRoot {
             && trezor_mode == TrezorPassphraseMode::EnterInApp
         {
             Some(Self::read_and_clear_input(
-                &self.trezor_app_passphrase_input,
+                &self.hardware_profile.trezor_app_passphrase_input,
                 window,
                 cx,
             ))
         } else {
-            self.trezor_app_passphrase_input
+            self.hardware_profile
+                .trezor_app_passphrase_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
             None
         };
@@ -461,10 +464,10 @@ impl WalletRoot {
             self.hardware_profile_unlock.purpose,
             self.hardware_profile_unlock.target_wallet_id.as_deref(),
         );
-        self.hardware_profile_label_input.update(cx, |input, cx| {
+        self.hardware_profile.label_input.update(cx, |input, cx| {
             input.set_value(profile.label.clone(), window, cx);
         });
-        self.active_hardware_profile = Some(profile.clone());
+        self.hardware_profile.active = Some(profile.clone());
         self.hardware_profile_unlock.vault_view_unlock = Some(vault_view_unlock);
         self.hardware_profile_unlock.session = Some(session);
         self.hardware_profile_unlock.profile = Some(profile);
@@ -687,7 +690,8 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let value = self
-            .hardware_profile_exact_index_input
+            .hardware_profile
+            .exact_index_input
             .read(cx)
             .value()
             .to_string();
@@ -712,12 +716,14 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let start = self
-            .hardware_profile_recovery_start_input
+            .hardware_profile
+            .recovery_start_input
             .read(cx)
             .value()
             .to_string();
         let count = self
-            .hardware_profile_recovery_count_input
+            .hardware_profile
+            .recovery_count_input
             .read(cx)
             .value()
             .to_string();
@@ -776,7 +782,8 @@ impl WalletRoot {
             return;
         }
         let label_prefix = self
-            .hardware_profile_label_input
+            .hardware_profile
+            .label_input
             .read(cx)
             .value()
             .to_string();

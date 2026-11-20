@@ -87,7 +87,7 @@ fn idle_waku(
     cx: &gpui::VisualTestContext,
 ) -> wallet_ops::PublicBroadcasterWaku {
     root.read_with(cx, |root, _| {
-        let mut config = root.waku_config.clone();
+        let mut config = root.waku.config.clone();
         config.network.mode = broadcaster_monitor_waku::RelayNetworkMode::Proxy;
         wallet_ops::PublicBroadcasterWaku::new(
             config.build_client().unwrap(),

@@ -82,7 +82,7 @@ pub(in crate::root) use hardware::{
 #[allow(unused_imports)]
 pub(in crate::root) use hardware::{
     HardwareAccountPickerRow, HardwareProfileApprovalPrompt, HardwareProfilePickerView,
-    HardwareProfileStep, HardwareProfileStepState, HardwareProfileStepStatus,
+    HardwareProfileStep, HardwareProfileStepState, HardwareProfileStepStatus, HardwareProfileUi,
     HardwareProfileUnlockPurpose, HardwareProfileUnlockState, TrezorPinMatrixPromptState,
     dismiss_hardware_profile_unlock_state, hardware_account_picker_rows,
     hardware_profile_approval_prompt_for_account, hardware_profile_auto_open_wallet_id,
@@ -93,7 +93,10 @@ pub(in crate::root) use hardware::{
     hardware_profile_should_reconnect_after_error, hardware_setup_error_preserves_password,
     trezor_session_stale_error_message,
 };
-pub(in crate::root) use hardware::{default_hardware_wallet_setup_intent, hardware_device_label};
+pub(in crate::root) use hardware::{
+    HardwareWalletCreation, default_hardware_wallet_setup_intent, hardware_device_label,
+};
+pub(in crate::root) use inputs::VaultInputs;
 #[cfg(test)]
 pub(in crate::root) use inputs::should_focus_vault_input;
 #[cfg(test)]

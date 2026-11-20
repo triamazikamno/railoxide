@@ -1,4 +1,9 @@
 #[cfg(feature = "hardware")]
+use gpui::{Entity, FocusHandle};
+#[cfg(feature = "hardware")]
+use gpui_component::input::InputState;
+
+#[cfg(feature = "hardware")]
 use super::{
     Arc, DesktopViewSession, HardwareDerivationError, HardwareDeviceKind, HardwareProfileMetadata,
     HardwareProfileSession, HardwareRailgunAccountMetadata, TrezorPassphraseMode,
@@ -105,6 +110,20 @@ pub(in crate::root) struct HardwareAccountPickerRow {
 pub(in crate::root) enum HardwareProfileApprovalPrompt {
     EvmAddress(Arc<str>),
     TrezorCipherKeyValue(Arc<str>),
+}
+
+#[cfg(feature = "hardware")]
+pub(in crate::root) struct HardwareProfileUi {
+    pub(in crate::root) active: Option<HardwareProfileMetadata>,
+    pub(in crate::root) password_input: Entity<InputState>,
+    pub(in crate::root) label_input: Entity<InputState>,
+    pub(in crate::root) recovery_start_input: Entity<InputState>,
+    pub(in crate::root) recovery_count_input: Entity<InputState>,
+    pub(in crate::root) exact_index_input: Entity<InputState>,
+    pub(in crate::root) trezor_app_passphrase_input: Entity<InputState>,
+    pub(in crate::root) trezor_passphrase_mode_focus: FocusHandle,
+    /// The vault password device authentication supplied for the hardware profile dialog.
+    pub(in crate::root) device_auth_password: Option<Zeroizing<String>>,
 }
 
 #[cfg(feature = "hardware")]

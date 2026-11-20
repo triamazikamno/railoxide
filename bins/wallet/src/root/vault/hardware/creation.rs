@@ -1,6 +1,10 @@
 #[cfg(feature = "hardware")]
 use std::collections::BTreeSet;
 
+use gpui::Entity;
+use gpui_component::input::InputState;
+
+use super::HardwareWalletSyncIntent;
 #[cfg(not(feature = "hardware"))]
 use super::WalletRoot;
 #[cfg(feature = "hardware")]
@@ -11,12 +15,11 @@ use super::{
     HardwareProfileSession, HardwareProfileStep, HardwareProfileStepStatus,
     HardwareRailgunAccountMetadata, HardwareSetupErrorFocus, HardwareViewAccessKey,
     HardwareWalletCreationError, HardwareWalletCreationResult, HardwareWalletProfile,
-    HardwareWalletSyncIntent, LedgerHardwareDerivationClient, SyntheticRailgunEntropy,
-    TrezorHardwareDerivationClient, TrezorPassphraseMode, VaultError, VaultState, ViewUnlock,
-    WalletMetadataBundle, WalletRoot, WalletSetupMode, Window, Zeroizing,
-    default_hardware_profile_label, effective_trezor_passphrase_mode, generate_opaque_id,
-    hardware_approval_error, hardware_profile_approval_prompt_for_descriptor,
-    hardware_profile_detection_should_retry,
+    LedgerHardwareDerivationClient, SyntheticRailgunEntropy, TrezorHardwareDerivationClient,
+    TrezorPassphraseMode, VaultError, VaultState, ViewUnlock, WalletMetadataBundle, WalletRoot,
+    WalletSetupMode, Window, Zeroizing, default_hardware_profile_label,
+    effective_trezor_passphrase_mode, generate_opaque_id, hardware_approval_error,
+    hardware_profile_approval_prompt_for_descriptor, hardware_profile_detection_should_retry,
     hardware_profile_detection_should_suppress_initial_ledger_progress,
     hardware_profile_detection_should_suppress_initial_trezor_progress,
     hardware_setup_error_preserves_password, hardware_setup_vault_error_focus,
@@ -26,6 +29,14 @@ use super::{
     send_hardware_profile_readiness_progress, send_trezor_passphrase_policy_progress, sleep,
     synthetic_entropy_from_hardware_output, trezor_pin_matrix_provider, vault_error_kind,
 };
+
+pub(in crate::root) struct HardwareWalletCreation {
+    pub(in crate::root) in_progress: bool,
+    pub(in crate::root) generation: u64,
+    pub(in crate::root) intent: Option<HardwareWalletSyncIntent>,
+    pub(in crate::root) restore_account_index_input: Entity<InputState>,
+    pub(in crate::root) restore_account_index_set: bool,
+}
 
 #[cfg(any(feature = "hardware", test))]
 pub(in crate::root) const fn hardware_wallet_creation_result_is_current(
@@ -44,10 +55,10 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.hardware_wallet_creation_in_progress {
+        if self.hardware_wallet_creation.in_progress {
             return;
         }
-        self.hardware_wallet_creation_intent = Some(sync_intent);
+        self.hardware_wallet_creation.intent = Some(sync_intent);
         let Some(explicit_account_index) = self.hardware_wallet_restore_account_index(cx) else {
             return;
         };
@@ -84,10 +95,10 @@ impl WalletRoot {
 
         window.blur(cx);
         self.focus_vault_input_on_render = false;
-        self.hardware_wallet_creation_in_progress = true;
-        self.hardware_wallet_creation_generation =
-            self.hardware_wallet_creation_generation.wrapping_add(1);
-        let creation_generation = self.hardware_wallet_creation_generation;
+        self.hardware_wallet_creation.in_progress = true;
+        self.hardware_wallet_creation.generation =
+            self.hardware_wallet_creation.generation.wrapping_add(1);
+        let creation_generation = self.hardware_wallet_creation.generation;
         self.vault_error = None;
         cx.notify();
 
@@ -105,12 +116,12 @@ impl WalletRoot {
             let result = join.await;
             let _ = this.update_in(cx, |root, window, cx| {
                 if !hardware_wallet_creation_result_is_current(
-                    root.hardware_wallet_creation_generation,
+                    root.hardware_wallet_creation.generation,
                     creation_generation,
                 ) {
                     return;
                 }
-                root.hardware_wallet_creation_in_progress = false;
+                root.hardware_wallet_creation.in_progress = false;
                 match result {
                     Ok(Ok((session, metadata))) => {
                         if sync_intent == HardwareWalletSyncIntent::CreateNew {
@@ -192,15 +203,17 @@ impl WalletRoot {
         cx.defer_in(window, move |root, window, cx| {
             if matches!(root.vault_state, VaultState::ViewUnlocked)
                 && matches!(root.wallet_setup_mode, WalletSetupMode::Hardware(_))
-                && !root.hardware_wallet_creation_in_progress
+                && !root.hardware_wallet_creation.in_progress
             {
                 match focus {
                     HardwareSetupErrorFocus::WalletName => root
+                        .vault_inputs
                         .wallet_name_input
                         .read(cx)
                         .focus_handle(cx)
                         .focus(window, cx),
                     HardwareSetupErrorFocus::VaultPassword => root
+                        .vault_inputs
                         .add_wallet_password_input
                         .read(cx)
                         .focus_handle(cx)

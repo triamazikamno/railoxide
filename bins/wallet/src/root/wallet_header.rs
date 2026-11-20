@@ -448,7 +448,8 @@ impl WalletRoot {
             .as_ref()
             .filter(|profile| profile.profile_id == account.profile_id)
             .or_else(|| {
-                self.active_hardware_profile
+                self.hardware_profile
+                    .active
                     .as_ref()
                     .filter(|profile| profile.profile_id == account.profile_id)
             })

@@ -217,7 +217,8 @@ impl WalletRoot {
                         lease.set(false);
                     }
                     close_root.update(cx, |root, cx| {
-                        root.import_mnemonic_input
+                        root.vault_inputs
+                            .import_mnemonic_input
                             .update(cx, |input, cx| input.set_value("", window, cx));
                     });
                 })
@@ -230,7 +231,8 @@ impl WalletRoot {
         cx.defer_in(window, move |root, window, cx| {
             root.set_wallet_name_input(&label, window, cx);
             root.clear_add_wallet_password(window, cx);
-            root.import_mnemonic_input
+            root.vault_inputs
+                .import_mnemonic_input
                 .update(cx, |input, cx| input.set_value("", window, cx));
         });
     }
@@ -520,7 +522,8 @@ impl WalletRoot {
             .filter(|profile| profile.profile_id == account.profile_id)
             .cloned()
             .or_else(|| {
-                self.active_hardware_profile
+                self.hardware_profile
+                    .active
                     .as_ref()
                     .filter(|profile| profile.profile_id == account.profile_id)
                     .cloned()
@@ -616,14 +619,14 @@ impl WalletRoot {
         self.clear_key_export_dialog_state(window, cx);
         #[cfg(feature = "hardware")]
         {
-            self.active_hardware_profile = None;
+            self.hardware_profile.active = None;
             self.hardware_profile_unlock = HardwareProfileUnlockState::default();
             self.clear_hardware_profile_sensitive_inputs(window, cx);
         }
-        self.hardware_wallet_creation_in_progress = false;
-        self.hardware_wallet_creation_generation =
-            self.hardware_wallet_creation_generation.wrapping_add(1);
-        self.hardware_wallet_creation_intent = None;
+        self.hardware_wallet_creation.in_progress = false;
+        self.hardware_wallet_creation.generation =
+            self.hardware_wallet_creation.generation.wrapping_add(1);
+        self.hardware_wallet_creation.intent = None;
         self.clear_hardware_wallet_restore_account_index(window, cx);
         self.vault_error = None;
         self.reset_wallet_scoped_state(cx);
@@ -831,7 +834,7 @@ impl WalletRoot {
         self.save_ui_state();
         #[cfg(feature = "hardware")]
         {
-            self.active_hardware_profile = if selected_metadata
+            self.hardware_profile.active = if selected_metadata
                 .is_some_and(|metadata| metadata.source.is_hardware_derived())
                 || session.hardware_profile_session().is_some()
             {
@@ -863,13 +866,14 @@ impl WalletRoot {
             self.hardware_profile_unlock = HardwareProfileUnlockState::default();
             self.clear_hardware_profile_sensitive_inputs(window, cx);
         }
-        self.hardware_wallet_creation_in_progress = false;
-        self.hardware_wallet_creation_generation =
-            self.hardware_wallet_creation_generation.wrapping_add(1);
-        self.hardware_wallet_creation_intent = None;
+        self.hardware_wallet_creation.in_progress = false;
+        self.hardware_wallet_creation.generation =
+            self.hardware_wallet_creation.generation.wrapping_add(1);
+        self.hardware_wallet_creation.intent = None;
         self.clear_hardware_wallet_restore_account_index(window, cx);
         self.clear_add_wallet_password(window, cx);
-        self.import_mnemonic_input
+        self.vault_inputs
+            .import_mnemonic_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.clear_key_export_dialog_state(window, cx);
         self.vault_error = None;
@@ -918,7 +922,7 @@ impl WalletRoot {
         self.clear_key_export_dialog_state(window, cx);
         #[cfg(feature = "hardware")]
         {
-            self.active_hardware_profile = None;
+            self.hardware_profile.active = None;
             self.hardware_profile_unlock = HardwareProfileUnlockState::default();
             self.clear_hardware_profile_sensitive_inputs(window, cx);
         }
@@ -1067,14 +1071,14 @@ impl WalletRoot {
         self.clear_key_export_dialog_state(window, cx);
         #[cfg(feature = "hardware")]
         {
-            self.active_hardware_profile = None;
+            self.hardware_profile.active = None;
             self.hardware_profile_unlock = HardwareProfileUnlockState::default();
             self.clear_hardware_profile_sensitive_inputs(window, cx);
         }
-        self.hardware_wallet_creation_in_progress = false;
-        self.hardware_wallet_creation_generation =
-            self.hardware_wallet_creation_generation.wrapping_add(1);
-        self.hardware_wallet_creation_intent = None;
+        self.hardware_wallet_creation.in_progress = false;
+        self.hardware_wallet_creation.generation =
+            self.hardware_wallet_creation.generation.wrapping_add(1);
+        self.hardware_wallet_creation.intent = None;
         self.clear_hardware_wallet_restore_account_index(window, cx);
         self.vault_error = None;
         self.vault_state = VaultState::ViewUnlocked;
@@ -1116,7 +1120,7 @@ impl WalletRoot {
         self.vault_view_unlock = None;
         self.clear_address_books();
         self.set_broadcaster_preferences(wallet_ops::vault::BroadcasterPreferences::default(), cx);
-        self.broadcaster_preference_error = None;
+        self.broadcaster_preferences.error = None;
         self.reset_wallet_scoped_state(cx);
         self.sync_wallet_select(window, cx);
         self.setup_password = None;
@@ -1213,7 +1217,7 @@ impl WalletRoot {
         self.vault_view_unlock = None;
         self.clear_address_books();
         self.set_broadcaster_preferences(wallet_ops::vault::BroadcasterPreferences::default(), cx);
-        self.broadcaster_preference_error = None;
+        self.broadcaster_preferences.error = None;
         self.reset_wallet_scoped_state(cx);
         self.sync_wallet_select(window, cx);
         self.vault_state = VaultState::UnlockVault;
@@ -1266,19 +1270,22 @@ impl WalletRoot {
         );
         self.clear_address_books();
         self.set_broadcaster_preferences(wallet_ops::vault::BroadcasterPreferences::default(), cx);
-        self.broadcaster_preference_error = None;
-        self.logs_search
+        self.broadcaster_preferences.error = None;
+        self.logs_panel
+            .logs_search
             .update(cx, crate::root::search_field::SearchField::end_session);
         self.address_book.search_query = Arc::from("");
         self.address_book
             .search_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.address_book.clear_dialog_state(window, cx);
-        self.favorite_broadcaster_input
+        self.broadcaster_preferences
+            .favorite_broadcaster_input
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.banned_broadcaster_input
+        self.broadcaster_preferences
+            .banned_broadcaster_input
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.active_broadcaster_tab = BroadcasterActivityTab::default();
+        self.broadcaster_preferences.active_tab = BroadcasterActivityTab::default();
         self.address_book_save_error = None;
         self.advance_active_wallet_generation();
         self.sync_wallet_select(window, cx);
@@ -1293,19 +1300,20 @@ impl WalletRoot {
         self.vault_view_unlock = None;
         self.auto_lock.disarm();
         self.generated_seed = None;
-        self.import_mnemonic_input
+        self.vault_inputs
+            .import_mnemonic_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.clear_key_export_dialog_state(window, cx);
         #[cfg(feature = "hardware")]
         {
-            self.active_hardware_profile = None;
+            self.hardware_profile.active = None;
             self.hardware_profile_unlock = HardwareProfileUnlockState::default();
             self.clear_hardware_profile_sensitive_inputs(window, cx);
         }
-        self.hardware_wallet_creation_in_progress = false;
-        self.hardware_wallet_creation_generation =
-            self.hardware_wallet_creation_generation.wrapping_add(1);
-        self.hardware_wallet_creation_intent = None;
+        self.hardware_wallet_creation.in_progress = false;
+        self.hardware_wallet_creation.generation =
+            self.hardware_wallet_creation.generation.wrapping_add(1);
+        self.hardware_wallet_creation.intent = None;
         self.clear_hardware_wallet_restore_account_index(window, cx);
         self.vault_error = None;
         self.repair_cache_error = None;

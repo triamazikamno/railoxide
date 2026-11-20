@@ -188,8 +188,10 @@ impl WalletRoot {
             self.set_vault_error("Wallet vault storage is unavailable", cx);
             return;
         };
-        let password = Self::read_and_clear_input(&self.new_password_input, window, cx);
-        let confirm = Self::read_and_clear_input(&self.confirm_password_input, window, cx);
+        let password =
+            Self::read_and_clear_input(&self.vault_inputs.new_password_input, window, cx);
+        let confirm =
+            Self::read_and_clear_input(&self.vault_inputs.confirm_password_input, window, cx);
 
         if password.trim().is_empty() {
             self.set_vault_error("Enter a vault password to continue", cx);
@@ -226,7 +228,8 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let password = Self::read_and_clear_input(&self.unlock_password_input, window, cx);
+        let password =
+            Self::read_and_clear_input(&self.vault_inputs.unlock_password_input, window, cx);
         self.unlock_vault_with_password(password, None, window, cx);
     }
 
@@ -426,7 +429,8 @@ impl WalletRoot {
         cx.notify();
         cx.defer_in(window, move |root, window, cx| {
             if root.wallet_setup_mode == WalletSetupMode::Import {
-                root.import_mnemonic_input
+                root.vault_inputs
+                    .import_mnemonic_input
                     .read(cx)
                     .focus_handle(cx)
                     .focus(window, cx);
@@ -459,14 +463,15 @@ impl WalletRoot {
         self.generated_seed = None;
         self.vault_error = None;
         self.wallet_setup_mode = WalletSetupMode::Hardware(device_kind);
-        self.hardware_wallet_creation_intent = None;
+        self.hardware_wallet_creation.intent = None;
         self.clear_hardware_wallet_restore_account_index(window, cx);
         cx.notify();
         cx.defer_in(window, move |root, window, cx| {
             if matches!(root.vault_state, VaultState::ViewUnlocked)
                 && root.wallet_setup_mode == WalletSetupMode::Hardware(device_kind)
             {
-                root.add_wallet_password_input
+                root.vault_inputs
+                    .add_wallet_password_input
                     .read(cx)
                     .focus_handle(cx)
                     .focus(window, cx);
@@ -485,8 +490,8 @@ impl WalletRoot {
         self.store_hardware_derived_wallet(
             device_kind,
             default_hardware_wallet_setup_intent(
-                self.hardware_wallet_creation_intent,
-                self.hardware_wallet_restore_account_index_set,
+                self.hardware_wallet_creation.intent,
+                self.hardware_wallet_creation.restore_account_index_set,
             ),
             window,
             cx,
@@ -499,11 +504,12 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         self.generated_seed = None;
-        self.import_mnemonic_input
+        self.vault_inputs
+            .import_mnemonic_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.vault_error = None;
         self.wallet_setup_mode = WalletSetupMode::Choose;
-        self.hardware_wallet_creation_intent = None;
+        self.hardware_wallet_creation.intent = None;
         self.clear_hardware_wallet_restore_account_index(window, cx);
         cx.notify();
     }
@@ -517,7 +523,11 @@ impl WalletRoot {
             if let Some(password) = self.add_wallet_device_auth_password.take() {
                 return Some(password);
             }
-            let password = Self::read_and_clear_input(&self.add_wallet_password_input, window, cx);
+            let password = Self::read_and_clear_input(
+                &self.vault_inputs.add_wallet_password_input,
+                window,
+                cx,
+            );
             if password.trim().is_empty() {
                 self.set_vault_error("Enter the vault password to add a wallet", cx);
                 return None;
@@ -541,8 +551,13 @@ impl WalletRoot {
             if let Some(password) = self.add_wallet_device_auth_password.clone() {
                 return Some(password);
             }
-            let password =
-                Zeroizing::new(self.add_wallet_password_input.read(cx).value().to_string());
+            let password = Zeroizing::new(
+                self.vault_inputs
+                    .add_wallet_password_input
+                    .read(cx)
+                    .value()
+                    .to_string(),
+            );
             if password.trim().is_empty() {
                 self.set_vault_error("Enter the vault password to add a wallet", cx);
                 return None;
@@ -563,7 +578,8 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) -> Option<Option<u32>> {
         let value = self
-            .hardware_wallet_restore_account_index_input
+            .hardware_wallet_creation
+            .restore_account_index_input
             .read(cx)
             .value()
             .to_string();
@@ -577,7 +593,11 @@ impl WalletRoot {
     }
 
     pub(super) fn wallet_name_from_input(&self, cx: &Context<'_, Self>) -> String {
-        self.wallet_name_input.read(cx).value().to_string()
+        self.vault_inputs
+            .wallet_name_input
+            .read(cx)
+            .value()
+            .to_string()
     }
 
     pub(in crate::root) fn store_generated_wallet(
@@ -647,8 +667,15 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        let mnemonic = Zeroizing::new(self.import_mnemonic_input.read(cx).value().to_string());
-        self.import_mnemonic_input
+        let mnemonic = Zeroizing::new(
+            self.vault_inputs
+                .import_mnemonic_input
+                .read(cx)
+                .value()
+                .to_string(),
+        );
+        self.vault_inputs
+            .import_mnemonic_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         if mnemonic.trim().is_empty() {
             self.set_vault_error("Paste a recovery phrase to import", cx);
@@ -712,7 +739,7 @@ impl WalletRoot {
         _window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.hardware_wallet_creation_intent = Some(sync_intent);
+        self.hardware_wallet_creation.intent = Some(sync_intent);
         self.set_vault_error(
             "Hardware wallet support is not enabled in this build. Rebuild the wallet with the hardware feature to use Ledger-derived or Trezor-derived wallets.",
             cx,

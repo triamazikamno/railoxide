@@ -682,7 +682,7 @@ impl WalletRoot {
                             root.save_ui_state();
                             #[cfg(feature = "hardware")]
                             {
-                                root.active_hardware_profile = None;
+                                root.hardware_profile.active = None;
                             }
                             root.sync_wallet_select(window, cx);
                         }

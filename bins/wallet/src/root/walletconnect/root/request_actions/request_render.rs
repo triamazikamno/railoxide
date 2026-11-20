@@ -241,7 +241,7 @@ impl WalletRoot {
             {
                 if self.current_session_needs_trezor_app_passphrase() {
                     content = content.child(walletconnect_trezor_app_passphrase_input(
-                        &self.trezor_app_passphrase_input,
+                        &self.hardware_profile.trezor_app_passphrase_input,
                         self.walletconnect
                             .request_actions
                             .contains(request.key.as_str()),

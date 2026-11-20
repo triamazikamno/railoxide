@@ -41,18 +41,20 @@ impl WalletRoot {
 
     pub(super) fn subscribe_logs(&self, window: &Window, cx: &mut Context<'_, Self>) {
         cx.subscribe(
-            &self.logs_search,
+            &self.logs_panel.logs_search,
             |root, search, _: &SearchFieldEvent, cx| {
                 let filter = logs_search::log_filter(search.read(cx).filter());
-                root.logs.update(cx, |logs, cx| logs.set_filter(filter, cx));
+                root.logs_panel
+                    .logs
+                    .update(cx, |logs, cx| logs.set_filter(filter, cx));
             },
         )
         .detach();
-        cx.subscribe_in(&self.logs, window, Self::logs_pane_event)
+        cx.subscribe_in(&self.logs_panel.logs, window, Self::logs_pane_event)
             .detach();
         // The open panel's title bar shows the pane's line counts.
-        cx.observe(&self.logs, |root, _, cx| {
-            if root.logs_open {
+        cx.observe(&self.logs_panel.logs, |root, _, cx| {
+            if root.logs_panel.open {
                 cx.notify();
             }
         })
@@ -209,11 +211,15 @@ impl WalletRoot {
         }
         for (input, kind) in [
             (
-                self.favorite_broadcaster_input.clone(),
+                self.broadcaster_preferences
+                    .favorite_broadcaster_input
+                    .clone(),
                 BroadcasterPreferenceListKind::Favorite,
             ),
             (
-                self.banned_broadcaster_input.clone(),
+                self.broadcaster_preferences
+                    .banned_broadcaster_input
+                    .clone(),
                 BroadcasterPreferenceListKind::Banned,
             ),
         ] {
@@ -225,7 +231,7 @@ impl WalletRoot {
                         this.add_broadcaster_preference_from_input(kind, window, cx);
                     }
                     InputEvent::Change => {
-                        this.broadcaster_preference_error = None;
+                        this.broadcaster_preferences.error = None;
                         cx.notify();
                     }
                     _ => {}
@@ -321,7 +327,7 @@ impl WalletRoot {
 
     pub(super) fn subscribe_vault_inputs(&self, window: &Window, cx: &mut Context<'_, Self>) {
         cx.subscribe_in(
-            &self.unlock_password_input,
+            &self.vault_inputs.unlock_password_input,
             window,
             |this, _input, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -331,7 +337,7 @@ impl WalletRoot {
         )
         .detach();
         cx.subscribe_in(
-            &self.new_password_input,
+            &self.vault_inputs.new_password_input,
             window,
             |this, input, event: &InputEvent, window, cx| {
                 if !matches!(event, InputEvent::PressEnter { .. }) {
@@ -339,13 +345,15 @@ impl WalletRoot {
                 }
                 let password_entered = !input.read(cx).value().trim().is_empty();
                 let confirm_empty = this
+                    .vault_inputs
                     .confirm_password_input
                     .read(cx)
                     .value()
                     .trim()
                     .is_empty();
                 if password_entered && confirm_empty {
-                    this.confirm_password_input
+                    this.vault_inputs
+                        .confirm_password_input
                         .read(cx)
                         .focus_handle(cx)
                         .focus(window, cx);
@@ -356,7 +364,7 @@ impl WalletRoot {
         )
         .detach();
         cx.subscribe_in(
-            &self.confirm_password_input,
+            &self.vault_inputs.confirm_password_input,
             window,
             |this, _input, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -366,7 +374,7 @@ impl WalletRoot {
         )
         .detach();
         cx.subscribe_in(
-            &self.wallet_name_input,
+            &self.vault_inputs.wallet_name_input,
             window,
             |this, _input, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -376,7 +384,7 @@ impl WalletRoot {
         )
         .detach();
         cx.subscribe_in(
-            &self.add_wallet_password_input,
+            &self.vault_inputs.add_wallet_password_input,
             window,
             |this, _input, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
@@ -393,14 +401,14 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         cx.subscribe_in(
-            &self.hardware_wallet_restore_account_index_input,
+            &self.hardware_wallet_creation.restore_account_index_input,
             window,
             |this, input, event: &InputEvent, window, cx| match event {
                 InputEvent::PressEnter { .. } => {
                     this.submit_default_hardware_wallet_setup(window, cx);
                 }
                 InputEvent::Change => {
-                    this.hardware_wallet_restore_account_index_set =
+                    this.hardware_wallet_creation.restore_account_index_set =
                         !input.read(cx).value().trim().is_empty();
                     this.vault_error = None;
                     cx.notify();
@@ -412,7 +420,7 @@ impl WalletRoot {
         #[cfg(feature = "hardware")]
         {
             cx.subscribe_in(
-                &self.hardware_profile_password_input,
+                &self.hardware_profile.password_input,
                 window,
                 |this, _input, event: &InputEvent, window, cx| {
                     if matches!(event, InputEvent::PressEnter { .. }) {
@@ -422,10 +430,10 @@ impl WalletRoot {
             )
             .detach();
             for input in [
-                self.hardware_profile_label_input.clone(),
-                self.hardware_profile_recovery_start_input.clone(),
-                self.hardware_profile_recovery_count_input.clone(),
-                self.hardware_profile_exact_index_input.clone(),
+                self.hardware_profile.label_input.clone(),
+                self.hardware_profile.recovery_start_input.clone(),
+                self.hardware_profile.recovery_count_input.clone(),
+                self.hardware_profile.exact_index_input.clone(),
             ] {
                 cx.subscribe(&input, |this, _input, event: &InputEvent, cx| {
                     if matches!(event, InputEvent::Change) {
@@ -436,7 +444,7 @@ impl WalletRoot {
                 .detach();
             }
             cx.subscribe_in(
-                &self.trezor_app_passphrase_input,
+                &self.hardware_profile.trezor_app_passphrase_input,
                 window,
                 |this, _input, event: &InputEvent, window, cx| match event {
                     InputEvent::PressEnter { .. } => {

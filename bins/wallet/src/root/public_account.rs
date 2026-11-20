@@ -684,7 +684,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.device_auth_in_progress {
+        if self.device_auth.in_progress {
             return;
         }
         self.add_public_derived_account(None, window, cx);
@@ -722,7 +722,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.device_auth_in_progress {
+        if self.device_auth.in_progress {
             return;
         }
         self.import_public_account(None, window, cx);
@@ -1152,7 +1152,7 @@ impl WalletRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.device_auth_in_progress
+        if self.device_auth.in_progress
             || self.public_form.importing_account
             || self.public_form.derive_preview.authorizing
             || !lease.upgrade().is_some_and(|open| open.get())
@@ -1192,7 +1192,7 @@ impl WalletRoot {
             cx.notify();
             return;
         };
-        self.device_auth_in_progress = true;
+        self.device_auth.in_progress = true;
         self.public_form.error = None;
         let generation = self.active_wallet_generation;
         cx.notify();
@@ -1218,7 +1218,7 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.device_auth_in_progress = false;
+        self.device_auth.in_progress = false;
         cx.notify();
         if !lease.upgrade().is_some_and(|open| open.get())
             || self.active_wallet_generation != generation
@@ -1254,7 +1254,7 @@ impl WalletRoot {
         device_auth_buttons(
             self.device_auth_prompt_cached().as_ref(),
             id,
-            self.device_auth_in_progress,
+            self.device_auth.in_progress,
             busy,
             move |method, window, cx| {
                 root.update(cx, |root, cx| {
@@ -1288,7 +1288,7 @@ impl WalletRoot {
                 let import_root = root.clone();
                 let global_root = root.clone();
                 let network_root = root;
-                let busy = self.public_form.importing_account || self.device_auth_in_progress;
+                let busy = self.public_form.importing_account || self.device_auth.in_progress;
                 let tron = self.public_form.import_tron;
                 div()
                     .w(content_width)
@@ -1340,15 +1340,15 @@ impl WalletRoot {
                     }))
                     .child(
                         app_input(&self.public_form.import_label_input)
-                            .disabled(self.device_auth_in_progress),
+                            .disabled(self.device_auth.in_progress),
                     )
                     .child(app_masked_input(
                         &self.public_form.import_private_key_input,
-                        self.device_auth_in_progress,
+                        self.device_auth.in_progress,
                     ))
                     .child(masked_input_with_device_auth(
                         &self.public_form.import_password_input,
-                        self.device_auth_in_progress,
+                        self.device_auth.in_progress,
                         self.public_account_device_auth_buttons(
                             import_root.clone(),
                             PublicAccountDialogKind::Import,
@@ -1362,7 +1362,7 @@ impl WalletRoot {
                             .label("Global account")
                             .checked(self.public_form.import_global)
                             .small()
-                            .disabled(self.device_auth_in_progress)
+                            .disabled(self.device_auth.in_progress)
                             .on_click(move |checked, _window, cx| {
                                 let checked = *checked;
                                 global_root.update(cx, |root, cx| {
@@ -1387,7 +1387,7 @@ impl WalletRoot {
                         .small()
                         .loading(self.public_form.importing_account)
                         .disabled(
-                            self.public_form.importing_account || self.device_auth_in_progress,
+                            self.public_form.importing_account || self.device_auth.in_progress,
                         )
                         .on_click(move |_event, window, cx| {
                             import_root.update(cx, |root, cx| {

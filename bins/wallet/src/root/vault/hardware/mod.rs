@@ -27,6 +27,7 @@ pub(super) mod picker;
 pub(super) mod progress;
 pub(super) mod types;
 
+pub(in crate::root) use creation::HardwareWalletCreation;
 #[cfg(any(feature = "hardware", test))]
 pub(in crate::root) use creation::hardware_wallet_creation_result_is_current;
 #[cfg(feature = "hardware")]
@@ -72,7 +73,7 @@ pub(in crate::root) use progress::{
 #[cfg(feature = "hardware")]
 pub(in crate::root) use types::{
     HardwareAccountPickerRow, HardwareProfileApprovalPrompt, HardwareProfilePickerView,
-    HardwareProfileStep, HardwareProfileStepState, HardwareProfileStepStatus,
+    HardwareProfileStep, HardwareProfileStepState, HardwareProfileStepStatus, HardwareProfileUi,
     HardwareProfileUnlockPurpose, HardwareProfileUnlockState, TrezorPinMatrixPromptState,
     dismiss_hardware_profile_unlock_state,
 };

@@ -2,14 +2,30 @@ use std::future::Future;
 use std::sync::Arc;
 
 use broadcaster_monitor::{EventTx, Shared, publish_revision};
-#[cfg(test)]
-use broadcaster_monitor_waku::WakuMonitorConfig;
-use broadcaster_monitor_waku::{RelayNetworkMode, spawn_workers_until_shutdown};
+use broadcaster_monitor_waku::{RelayNetworkMode, WakuMonitorConfig, spawn_workers_until_shutdown};
 use gpui::Context;
 use tokio::sync::watch;
 use wallet_ops::{PublicBroadcasterWaku, SubmissionNodeScope, WakuDeliveryClient};
 
 use super::{DeliveryMode, WalletRoot, format_report_chain, network};
+
+pub(super) struct WakuState {
+    pub(super) config: WakuMonitorConfig,
+    pub(super) runtime: Option<WalletWakuRuntime>,
+    pub(super) session_generation: u64,
+    pub(super) stopping_generation: Option<WakuStoppingState>,
+}
+
+impl WakuState {
+    pub(super) const fn new(config: WakuMonitorConfig) -> Self {
+        Self {
+            config,
+            runtime: None,
+            session_generation: 0,
+            stopping_generation: None,
+        }
+    }
+}
 
 pub(super) struct WalletWakuRuntime {
     pub(super) client: Arc<WakuDeliveryClient>,
@@ -250,10 +266,10 @@ pub(super) fn release_retired_waku_generation(
 impl WalletRoot {
     /// Public broadcaster delivery over the active runtime, which supplies only seed peers.
     pub(super) fn public_broadcaster_waku(&self) -> Option<PublicBroadcasterWaku> {
-        active_waku_client(self.waku_runtime.as_ref()).map(|root| {
+        active_waku_client(self.waku.runtime.as_ref()).map(|root| {
             PublicBroadcasterWaku::new(
                 root,
-                self.waku_config.to_waku_config(),
+                self.waku.config.to_waku_config(),
                 self.http.clone(),
                 self.submission_scope.clone(),
             )
@@ -268,13 +284,13 @@ impl WalletRoot {
         if should_start_waku_for_delivery(
             delivery_mode,
             self.vault_view_unlock.is_some(),
-            self.waku_runtime.is_some(),
+            self.waku.runtime.is_some(),
             waku_start_blocked(
-                self.waku_stopping_generation.as_ref(),
-                self.tor_rotation.as_ref(),
+                self.waku.stopping_generation.as_ref(),
+                self.network_status.tor_rotation.as_ref(),
             ),
             self.wallet_sync_lifecycle_shutdown_started,
-            self.waku_config.network.mode,
+            self.waku.config.network.mode,
         ) {
             self.ensure_waku_started(cx);
         }
@@ -283,21 +299,21 @@ impl WalletRoot {
     pub(super) fn ensure_waku_started(&mut self, cx: &mut Context<'_, Self>) {
         let should_start = should_start_waku_runtime(
             self.vault_view_unlock.is_some(),
-            self.waku_runtime.is_some(),
+            self.waku.runtime.is_some(),
             waku_start_blocked(
-                self.waku_stopping_generation.as_ref(),
-                self.tor_rotation.as_ref(),
+                self.waku.stopping_generation.as_ref(),
+                self.network_status.tor_rotation.as_ref(),
             ),
             self.wallet_sync_lifecycle_shutdown_started,
-            self.waku_config.network.mode,
+            self.waku.config.network.mode,
         );
         let client =
-            match build_waku_client_if_needed(should_start, || self.waku_config.build_client()) {
+            match build_waku_client_if_needed(should_start, || self.waku.config.build_client()) {
                 Ok(Some(client)) => client,
                 Ok(None) => return,
                 Err(error) => {
                     tracing::error!(%error, "wallet Waku delivery runtime failed to start");
-                    self.network_status_error = Some(Arc::from(format!(
+                    self.network_status.error = Some(Arc::from(format!(
                         "Waku delivery network is unavailable: {}",
                         format_report_chain(&error)
                     )));
@@ -305,12 +321,12 @@ impl WalletRoot {
                     return;
                 }
             };
-        self.waku_session_generation = self.waku_session_generation.wrapping_add(1);
-        let generation = self.waku_session_generation;
+        self.waku.session_generation = self.waku.session_generation.wrapping_add(1);
+        let generation = self.waku.session_generation;
         let (worker_shutdown, shutdown_rx) = watch::channel(false);
         let (quiesced_tx, quiesced_rx) = watch::channel(false);
         let completion = WakuWorkerCompletionToken { quiesced_rx };
-        let config = self.waku_config.clone();
+        let config = self.waku.config.clone();
         let worker_client = Arc::clone(&client);
         let worker_monitor_state = self.monitor_state.clone();
         let worker_event_tx = self.monitor_event_tx.clone();
@@ -328,13 +344,13 @@ impl WalletRoot {
             )
             .await
         });
-        self.waku_runtime = Some(WalletWakuRuntime {
+        self.waku.runtime = Some(WalletWakuRuntime {
             client,
             worker_shutdown,
             completion,
             generation,
         });
-        self.network_status_error = None;
+        self.network_status.error = None;
 
         cx.spawn(async move |this, cx| {
             let result = worker.await;
@@ -345,8 +361,8 @@ impl WalletRoot {
             };
             let _ = this.update(cx, |root, cx| {
                 let action = complete_waku_worker_generation(
-                    root.waku_runtime.as_ref().map(|runtime| runtime.generation),
-                    &mut root.waku_stopping_generation,
+                    root.waku.runtime.as_ref().map(|runtime| runtime.generation),
+                    &mut root.waku.stopping_generation,
                     generation,
                     completion,
                     root.vault_view_unlock.is_some(),
@@ -370,7 +386,7 @@ impl WalletRoot {
                         }
                         if restart
                             && network::restart_now_or_defer_to_rotation(
-                                root.tor_rotation.as_mut(),
+                                root.network_status.tor_rotation.as_mut(),
                                 generation,
                             )
                         {
@@ -381,9 +397,9 @@ impl WalletRoot {
                     }
                     (WakuWorkerCompletionAction::HandleActiveFailure, Ok(Err(error))) => {
                         root.stop_waku();
-                        root.waku_stopping_generation = None;
+                        root.waku.stopping_generation = None;
                         tracing::error!(%error, "wallet Waku delivery monitor workers failed to start");
-                        root.network_status_error = Some(Arc::from(format!(
+                        root.network_status.error = Some(Arc::from(format!(
                             "Waku delivery network is unavailable: {}",
                             format_report_chain(&error)
                         )));
@@ -391,9 +407,9 @@ impl WalletRoot {
                     }
                     (WakuWorkerCompletionAction::HandleActiveFailure, Err(error)) => {
                         root.stop_waku();
-                        root.waku_stopping_generation = None;
+                        root.waku.stopping_generation = None;
                         tracing::error!(%error, "wallet Waku delivery monitor task failed");
-                        root.network_status_error = Some(Arc::from(format!(
+                        root.network_status.error = Some(Arc::from(format!(
                             "Waku delivery network monitor failed: {error}"
                         )));
                         cx.notify();
@@ -410,10 +426,10 @@ impl WalletRoot {
     }
 
     pub(super) fn stop_waku(&mut self) -> bool {
-        let stopping = take_waku_runtime_for_stop(&mut self.waku_runtime);
+        let stopping = take_waku_runtime_for_stop(&mut self.waku.runtime);
         let stopped = stopping.is_some();
         if stopped {
-            self.waku_stopping_generation = stopping;
+            self.waku.stopping_generation = stopping;
             if !self.wallet_sync_lifecycle_shutdown_started
                 && let Some(rev) = self.monitor_state.write().clear()
             {
@@ -424,10 +440,11 @@ impl WalletRoot {
     }
 
     pub(super) fn stop_waku_for_root_replacement(&mut self) -> Option<WakuWorkerCompletionToken> {
-        if let Some(stopping) = take_waku_runtime_for_stop(&mut self.waku_runtime) {
-            self.waku_stopping_generation = Some(stopping);
+        if let Some(stopping) = take_waku_runtime_for_stop(&mut self.waku.runtime) {
+            self.waku.stopping_generation = Some(stopping);
         }
-        self.waku_stopping_generation
+        self.waku
+            .stopping_generation
             .as_ref()
             .map(|stopping| stopping.completion.clone())
     }

@@ -267,39 +267,45 @@ impl WalletRoot {
         }
 
         let device_auth_root = root.clone();
-        body.child(app_masked_input(&self.new_password_input, false))
-            .child(app_masked_input(&self.confirm_password_input, false))
-            .when_some(self.vault_creation_device_auth_method(), |this, method| {
-                this.child(
-                    Checkbox::new("create-wallet-vault-device-auth")
-                        .label(format!("Also unlock with {} on this Mac", method.label()))
-                        .checked(self.enable_device_auth_on_create)
-                        .small()
-                        .on_click(move |checked, _window, cx| {
-                            let checked = *checked;
-                            device_auth_root.update(cx, |root, cx| {
-                                root.set_enable_device_auth_on_create(checked, cx);
-                            });
-                        }),
-                )
-            })
-            .child(
-                app_button("create-wallet-vault", "Create vault")
-                    .primary()
-                    .w_full()
-                    .on_click(move |_event, window, cx| {
-                        submit_root.update(cx, |root, cx| {
-                            root.create_vault_from_inputs(window, cx);
+        body.child(app_masked_input(
+            &self.vault_inputs.new_password_input,
+            false,
+        ))
+        .child(app_masked_input(
+            &self.vault_inputs.confirm_password_input,
+            false,
+        ))
+        .when_some(self.vault_creation_device_auth_method(), |this, method| {
+            this.child(
+                Checkbox::new("create-wallet-vault-device-auth")
+                    .label(format!("Also unlock with {} on this Mac", method.label()))
+                    .checked(self.device_auth.enable_device_auth_on_create)
+                    .small()
+                    .on_click(move |checked, _window, cx| {
+                        let checked = *checked;
+                        device_auth_root.update(cx, |root, cx| {
+                            root.set_enable_device_auth_on_create(checked, cx);
                         });
                     }),
             )
-            .child(self.render_create_vault_cache_offer(root))
+        })
+        .child(
+            app_button("create-wallet-vault", "Create vault")
+                .primary()
+                .w_full()
+                .on_click(move |_event, window, cx| {
+                    submit_root.update(cx, |root, cx| {
+                        root.create_vault_from_inputs(window, cx);
+                    });
+                }),
+        )
+        .child(self.render_create_vault_cache_offer(root))
     }
 
     fn render_create_vault_cache_offer(&self, root: Entity<Self>) -> gpui::Div {
         let start_root = root;
-        let progress = self.prover_cache_build_progress.clone();
-        let completed = self.prover_cache_build_completed;
+        let progress = self.prover_cache_build.progress.clone();
+        let completed = self.prover_cache_build.completed;
         let percent = progress
             .as_ref()
             .map_or(0, wallet_ops::ProverCacheBuildProgress::percent);
@@ -385,7 +391,7 @@ impl WalletRoot {
         let submit_root = root.clone();
         let device_auth_root = root;
         let device_auth = self.device_auth_prompt_cached().is_some();
-        let busy = self.unlock_in_progress || self.device_auth_in_progress;
+        let busy = self.unlock_in_progress || self.device_auth.in_progress;
         let mut body = vault_dialog_body(if device_auth {
             "Use an enabled device or enter the vault password to view wallet balances and history."
         } else {
@@ -396,12 +402,12 @@ impl WalletRoot {
         }
 
         let password = masked_input_with_device_auth(
-            &self.unlock_password_input,
+            &self.vault_inputs.unlock_password_input,
             busy,
             device_auth_buttons(
                 self.device_auth_prompt_cached().as_ref(),
                 "unlock-wallet-vault-touch-id",
-                self.device_auth_in_progress,
+                self.device_auth.in_progress,
                 self.unlock_in_progress,
                 move |method, window, cx| {
                     device_auth_root.update(cx, |root, cx| {
@@ -533,7 +539,7 @@ impl WalletRoot {
             body = body.child(error);
         }
 
-        body = body.child(app_input(&self.wallet_name_input));
+        body = body.child(app_input(&self.vault_inputs.wallet_name_input));
         if matches!(self.vault_state, VaultState::ViewUnlocked) {
             body = body.child(self.render_add_wallet_password(password_root, false));
         }
@@ -631,13 +637,13 @@ impl WalletRoot {
             body = body.child(error);
         }
 
-        body.child(app_input(&self.wallet_name_input))
+        body.child(app_input(&self.vault_inputs.wallet_name_input))
             .when(
                 matches!(self.vault_state, VaultState::ViewUnlocked),
                 |this| this.child(self.render_add_wallet_password(password_root, false)),
             )
             .child(
-                gpui_component::input::Textarea::new(&self.import_mnemonic_input)
+                gpui_component::input::Textarea::new(&self.vault_inputs.import_mnemonic_input)
                     .bg(rgb(theme::SURFACE))
                     .w_full()
                     .px(px(8.0)),
@@ -677,12 +683,12 @@ impl WalletRoot {
         let device_label = hardware_device_label(device_kind);
         let create_button_id = hardware_create_button_id(device_kind);
         let recover_button_id = hardware_recover_button_id(device_kind);
-        let create_active = self.hardware_wallet_creation_in_progress
-            && self.hardware_wallet_creation_intent == Some(HardwareWalletSyncIntent::CreateNew);
-        let recover_active = self.hardware_wallet_creation_in_progress
-            && self.hardware_wallet_creation_intent
+        let create_active = self.hardware_wallet_creation.in_progress
+            && self.hardware_wallet_creation.intent == Some(HardwareWalletSyncIntent::CreateNew);
+        let recover_active = self.hardware_wallet_creation.in_progress
+            && self.hardware_wallet_creation.intent
                 == Some(HardwareWalletSyncIntent::RecoverExisting);
-        let restore_index_set = self.hardware_wallet_restore_account_index_set;
+        let restore_index_set = self.hardware_wallet_creation.restore_account_index_set;
         let mut body = vault_dialog_body(format!(
             "Choose whether this {device_label}-derived Railgun wallet is new or already has private history. The choice only changes the first sync baseline."
         ));
@@ -691,21 +697,21 @@ impl WalletRoot {
         }
 
         body.child(
-            app_input(&self.wallet_name_input).disabled(self.hardware_wallet_creation_in_progress),
+            app_input(&self.vault_inputs.wallet_name_input).disabled(self.hardware_wallet_creation.in_progress),
         )
         .when(
             matches!(self.vault_state, VaultState::ViewUnlocked),
             |this| {
                 this.child(self.render_add_wallet_password(
                     password_root,
-                    self.hardware_wallet_creation_in_progress,
+                    self.hardware_wallet_creation.in_progress,
                 ))
             },
         )
         .child(labeled_field(
             "Restore Railgun account index (optional)",
-            app_input(&self.hardware_wallet_restore_account_index_input)
-                .disabled(self.hardware_wallet_creation_in_progress),
+            app_input(&self.hardware_wallet_creation.restore_account_index_input)
+                .disabled(self.hardware_wallet_creation.in_progress),
         ))
         .child(
             app_muted_text(
@@ -714,7 +720,7 @@ impl WalletRoot {
             .whitespace_normal(),
         )
         .child(hardware_setup_notice(device_kind))
-        .when(self.hardware_wallet_creation_in_progress, |this| {
+        .when(self.hardware_wallet_creation.in_progress, |this| {
             this.child(hardware_setup_progress(device_kind))
         })
         .child(
@@ -725,7 +731,7 @@ impl WalletRoot {
             .primary()
             .w_full()
             .loading(create_active)
-            .disabled(self.hardware_wallet_creation_in_progress || restore_index_set)
+            .disabled(self.hardware_wallet_creation.in_progress || restore_index_set)
             .on_click(move |_event, window, cx| {
                 create_root.update(cx, |root, cx| {
                     root.store_hardware_derived_wallet(
@@ -745,7 +751,7 @@ impl WalletRoot {
             .outline()
             .w_full()
             .loading(recover_active)
-            .disabled(self.hardware_wallet_creation_in_progress)
+            .disabled(self.hardware_wallet_creation.in_progress)
             .on_click(move |_event, window, cx| {
                 recover_root.update(cx, |root, cx| {
                     root.store_hardware_derived_wallet(
@@ -761,7 +767,7 @@ impl WalletRoot {
             app_button("back-hardware-wallet", "Back")
                 .ghost()
                 .w_full()
-                .disabled(self.hardware_wallet_creation_in_progress)
+                .disabled(self.hardware_wallet_creation.in_progress)
                 .on_click(move |_event, window, cx| {
                     back_root.update(cx, |root, cx| {
                         root.back_to_wallet_setup_choice(window, cx);
@@ -843,9 +849,9 @@ impl WalletRoot {
             .when(requires_password, |this| {
                 let device_auth_root = root.clone();
                 this.child(masked_input_with_device_auth(
-                    &self.hardware_profile_password_input,
-                    self.hardware_profile_unlock.in_progress || self.device_auth_in_progress,
-                    device_auth_buttons(self.device_auth_prompt_cached().as_ref(), "hardware-profile-unlock-touch-id", self.device_auth_in_progress, self.hardware_profile_unlock.in_progress,
+                    &self.hardware_profile.password_input,
+                    self.hardware_profile_unlock.in_progress || self.device_auth.in_progress,
+                    device_auth_buttons(self.device_auth_prompt_cached().as_ref(), "hardware-profile-unlock-touch-id", self.device_auth.in_progress, self.hardware_profile_unlock.in_progress,
                     move |method, window, cx| {
                         device_auth_root.update(cx, |root, cx| root.unlock_hardware_profile_with_device_auth(method, window, cx));
                     }),
@@ -853,7 +859,7 @@ impl WalletRoot {
             })
             .when(device_kind == HardwareDeviceKind::Trezor, |this| {
                 let mode = self.hardware_profile_unlock.trezor_passphrase_mode;
-                let passphrase_mode_focus = self.trezor_passphrase_mode_focus.clone();
+                let passphrase_mode_focus = self.hardware_profile.trezor_passphrase_mode_focus.clone();
                 let passphrase_mode_keyboard_root = trezor_mode_root.clone();
                 let enter_in_app_disabled = self.hardware_profile_unlock.in_progress
                     || self
@@ -935,7 +941,7 @@ impl WalletRoot {
                         .when(mode == TrezorPassphraseMode::EnterInApp, |this| {
                             this.child(
                                 app_masked_input(
-                                    &self.trezor_app_passphrase_input,
+                                    &self.hardware_profile.trezor_app_passphrase_input,
                                     self.hardware_profile_unlock.in_progress,
                                 ),
                             )
@@ -1333,7 +1339,7 @@ impl WalletRoot {
                                 ).whitespace_normal())
                                 .child(
                                     app_masked_input(
-                                        &self.trezor_app_passphrase_input,
+                                        &self.hardware_profile.trezor_app_passphrase_input,
                                         self.hardware_profile_unlock.in_progress,
                                     ),
                                 ),
@@ -1357,7 +1363,7 @@ impl WalletRoot {
                                     });
                                 }
                             },
-                        ).child(app_input(&self.hardware_profile_exact_index_input)
+                        ).child(app_input(&self.hardware_profile.exact_index_input)
                             .disabled(self.hardware_profile_unlock.in_progress)),
                     ))
                     .child(
@@ -1398,7 +1404,7 @@ impl WalletRoot {
                                     });
                                 }
                             },
-                        ).child(app_input(&self.hardware_profile_recovery_start_input)
+                        ).child(app_input(&self.hardware_profile.recovery_start_input)
                                             .disabled(self.hardware_profile_unlock.in_progress)),
                                     )),
                             )
@@ -1419,7 +1425,7 @@ impl WalletRoot {
                                     });
                                 }
                             },
-                        ).child(app_input(&self.hardware_profile_recovery_count_input)
+                        ).child(app_input(&self.hardware_profile.recovery_count_input)
                                             .disabled(self.hardware_profile_unlock.in_progress)),
                                     )),
                             ),

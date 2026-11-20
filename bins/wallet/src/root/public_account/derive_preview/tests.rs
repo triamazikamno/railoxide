@@ -121,7 +121,7 @@ fn derive_dialog_stays_in_authorize_on_failure(cx: &mut TestAppContext) {
     ] {
         cx.update(|window, cx| {
             root.update(cx, |root, cx| {
-                root.device_auth_in_progress = true;
+                root.device_auth.in_progress = true;
                 let generation = root.active_wallet_generation;
                 root.finish_public_account_device_auth(
                     PublicAccountDialogKind::Derive,

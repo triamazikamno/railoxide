@@ -1,8 +1,8 @@
 use gpui::{
-    Anchor, AnyElement, App, AppContext as _, Context, DragMoveEvent, Entity, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, deferred, div, img, prelude::FluentBuilder as _,
-    px, relative, rgb,
+    Anchor, AnyElement, App, AppContext as _, Context, DragMoveEvent, Entity, FocusHandle,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Render,
+    SharedString, StatefulInteractiveElement, Styled, Window, deferred, div, img,
+    prelude::FluentBuilder as _, px, relative, rgb,
 };
 use gpui_component::{
     Disableable as _, FocusTrapElement as _, Icon, IconName, Selectable as _, Sizable,
@@ -28,8 +28,9 @@ use wallet_ops::ProverCacheBuildProgress;
 use crate::assets::{RailgunActionIcon, RailgunSidebarIcon};
 
 use super::actions::LOGS_PANEL_KEY_CONTEXT;
-use super::logs_search::{self, line_count};
-use super::{LOGS_DRAWER_MAX_HEIGHT, LOGS_DRAWER_MIN_HEIGHT, WalletRoot};
+use super::logs_search::{self, LogsSearchSource, line_count};
+use super::search_field::SearchField;
+use super::{LOGS_DRAWER_HEIGHT, LOGS_DRAWER_MAX_HEIGHT, LOGS_DRAWER_MIN_HEIGHT, WalletRoot};
 
 /// Fits the network chip's two text lines. A dialog at maximum height ends 16px above the window
 /// bottom with its footer inside a 16px bottom padding, so a bar over 32px would cover its footer
@@ -42,6 +43,38 @@ const LOGS_PANEL_RESIZE_HANDLE_HEIGHT: Pixels = px(5.0);
 const LOGS_TITLE_BAR_HEIGHT: Pixels = px(40.0);
 /// Narrower windows show a search's count as "N lines" without "of M".
 const LOGS_TOTAL_COUNT_MIN_WIDTH: Pixels = px(960.0);
+
+pub(super) struct LogsPanelState {
+    pub(super) logs: Entity<LogsPane>,
+    pub(super) logs_search: Entity<SearchField<LogsSearchSource>>,
+    /// Tracks focus within the logs panel.
+    pub(super) focus: FocusHandle,
+    /// Holds the logs panel's focus trap while a dialog is open.
+    pub(super) trap: FocusHandle,
+    /// Where focus was before the logs panel took it above a dialog, given back by Escape
+    /// or closing the panel.
+    pub(super) return_focus: Option<FocusHandle>,
+    pub(super) open: bool,
+    pub(super) height: Pixels,
+}
+
+impl LogsPanelState {
+    pub(super) fn new(
+        logs: Entity<LogsPane>,
+        logs_search: Entity<SearchField<LogsSearchSource>>,
+        cx: &App,
+    ) -> Self {
+        Self {
+            logs,
+            logs_search,
+            focus: cx.focus_handle(),
+            trap: cx.focus_handle(),
+            return_focus: None,
+            open: false,
+            height: LOGS_DRAWER_HEIGHT,
+        }
+    }
+}
 
 /// Drag payload and drag view of the logs panel's top-edge resize handle.
 struct LogsPanelResize;
@@ -71,7 +104,7 @@ impl WalletRoot {
             .w_full()
             .flex()
             .flex_col()
-            .when(self.logs_open, |this| {
+            .when(self.logs_panel.open, |this| {
                 this.child(self.render_logs_panel(root, dialog_open, window, cx))
             })
             .child(self.render_status_bar(root, dialog_open));
@@ -99,7 +132,7 @@ impl WalletRoot {
             .left(item(
                 self.render_network_status_control(root).into_any_element(),
             ))
-            .when_some(self.prover_cache_build_progress.clone(), |bar, progress| {
+            .when_some(self.prover_cache_build.progress.clone(), |bar, progress| {
                 bar.left(item(self.render_prover_cache_build_indicator(
                     root,
                     progress,
@@ -129,8 +162,8 @@ impl WalletRoot {
             .tooltip("Logs")
             // A child icon keeps the shared size; `.icon()` would size it from the button.
             .child(Icon::new(RailgunSidebarIcon::Logs).size(theme::STATUS_BAR_ICON_SIZE))
-            .selected(self.logs_open)
-            .toggled(self.logs_open)
+            .selected(self.logs_panel.open)
+            .toggled(self.logs_panel.open)
             .debug_selector(|| "wallet-status-bar-logs".into())
             // Above a dialog a press must not take focus from the dialog.
             .when(dialog_open, |this| {
@@ -138,10 +171,10 @@ impl WalletRoot {
             })
             .on_click(move |_event, window, cx| {
                 root.update(cx, |root, cx| {
-                    if root.logs_open {
+                    if root.logs_panel.open {
                         root.close_logs_panel(window, cx);
                     } else {
-                        root.logs_open = true;
+                        root.logs_panel.open = true;
                         cx.notify();
                     }
                 });
@@ -156,40 +189,42 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.logs_search.update(cx, |search, cx| match event {
-            LogsPaneEvent::FocusSearch => search.focus(window, cx),
-            LogsPaneEvent::ShowOnlyTarget(target) => {
-                search.edit_chips(|chips| logs_search::show_only(chips, target), cx);
-            }
-            LogsPaneEvent::HideTarget(target) => {
-                search.edit_chips(|chips| logs_search::hide(chips, target), cx);
-            }
-            LogsPaneEvent::ClearSearch => {
-                search.clear(cx);
-                // `clear` opens the suggestions for a focused field; this field may not be.
-                search.dismiss_suggestions(cx);
-            }
-        });
+        self.logs_panel
+            .logs_search
+            .update(cx, |search, cx| match event {
+                LogsPaneEvent::FocusSearch => search.focus(window, cx),
+                LogsPaneEvent::ShowOnlyTarget(target) => {
+                    search.edit_chips(|chips| logs_search::show_only(chips, target), cx);
+                }
+                LogsPaneEvent::HideTarget(target) => {
+                    search.edit_chips(|chips| logs_search::hide(chips, target), cx);
+                }
+                LogsPaneEvent::ClearSearch => {
+                    search.clear(cx);
+                    // `clear` opens the suggestions for a focused field; this field may not be.
+                    search.dismiss_suggestions(cx);
+                }
+            });
     }
 
     fn close_logs_panel(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        self.logs_open = false;
+        self.logs_panel.open = false;
         self.restore_logs_focus(window, cx);
         cx.notify();
     }
 
     /// Before a press in the panel above a dialog takes focus, remembers where focus is.
     fn remember_logs_focus(&mut self, window: &Window, cx: &App) {
-        if !self.logs_panel_focus.contains_focused(window, cx) {
-            self.logs_return_focus = window.focused(cx);
+        if !self.logs_panel.focus.contains_focused(window, cx) {
+            self.logs_panel.return_focus = window.focused(cx);
         }
     }
 
     /// Gives focus back to where it was before the panel took it, while the panel still holds
     /// it, and forgets it either way.
     fn restore_logs_focus(&mut self, window: &mut Window, cx: &mut App) {
-        if let Some(focus) = self.logs_return_focus.take()
-            && self.logs_panel_focus.contains_focused(window, cx)
+        if let Some(focus) = self.logs_panel.return_focus.take()
+            && self.logs_panel.focus.contains_focused(window, cx)
         {
             focus.focus(window, cx);
         }
@@ -198,14 +233,14 @@ impl WalletRoot {
     /// Escape that nothing inside the panel took: the search field's suggestions and the
     /// selection come first. Clears the search text, keeping its chips, then gives focus back.
     fn logs_panel_escape(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
-        let search = self.logs_search.read(cx);
+        let search = self.logs_panel.logs_search.read(cx);
         if search.text().is_empty() {
             self.restore_logs_focus(window, cx);
             return;
         }
         let input = search.input().clone();
         input.update(cx, |input, cx| input.set_value("", window, cx));
-        self.logs_search.update(cx, |search, cx| {
+        self.logs_panel.logs_search.update(cx, |search, cx| {
             search.set_query("", cx);
             search.dismiss_suggestions(cx);
         });
@@ -222,7 +257,8 @@ impl WalletRoot {
     ) -> AnyElement {
         let viewport = window.viewport_size();
         let height = self
-            .logs_panel_height
+            .logs_panel
+            .height
             .min(viewport.height - STATUS_BAR_HEIGHT - WORKSPACE_MIN_HEIGHT)
             .max(LOGS_DRAWER_MIN_HEIGHT);
         let resize_root = root.clone();
@@ -267,14 +303,14 @@ impl WalletRoot {
                             .min(LOGS_DRAWER_MAX_HEIGHT);
                         cx.stop_propagation();
                         resize_root.update(cx, |root, cx| {
-                            if root.logs_panel_height != height {
-                                root.logs_panel_height = height;
+                            if root.logs_panel.height != height {
+                                root.logs_panel.height = height;
                                 cx.notify();
                             }
                         });
                     }),
             );
-        let panel = panel.track_focus(&self.logs_panel_focus);
+        let panel = panel.track_focus(&self.logs_panel.focus);
         if dialog_open {
             // GPUI applies the dialog's trap only while focus is inside it. gpui-base keeps a
             // trap registered while its handle lives, so the trap gets a handle of its own
@@ -283,7 +319,7 @@ impl WalletRoot {
                 .flex_none()
                 .w_full()
                 .child(panel)
-                .focus_trap("wallet-logs-panel-trap", &self.logs_panel_trap)
+                .focus_trap("wallet-logs-panel-trap", &self.logs_panel.trap)
                 .into_any_element()
         } else {
             panel.into_any_element()
@@ -299,7 +335,7 @@ impl WalletRoot {
         viewport_width: Pixels,
         cx: &App,
     ) -> impl IntoElement {
-        let pane = self.logs.read(cx);
+        let pane = self.logs_panel.logs.read(cx);
         let (shown, retained, selected) = (
             pane.shown_count(),
             pane.retained_count(),
@@ -317,8 +353,8 @@ impl WalletRoot {
                 root.update(cx, |root, cx| root.remember_logs_focus(window, cx));
             }
         };
-        let copy_pane = self.logs.clone();
-        let clear_pane = self.logs.clone();
+        let copy_pane = self.logs_panel.logs.clone();
+        let clear_pane = self.logs_panel.logs.clone();
         let close_root = root.clone();
         div()
             .size_full()
@@ -363,7 +399,7 @@ impl WalletRoot {
                             .when(dialog_open, |this| {
                                 this.capture_any_mouse_down(remember(root))
                             })
-                            .child(self.logs_search.clone()),
+                            .child(self.logs_panel.logs_search.clone()),
                     )
                     .child(app_muted_text(counts).flex_none().whitespace_nowrap())
                     .when(selected > 0, |this| {
@@ -418,24 +454,24 @@ impl WalletRoot {
                     .when(dialog_open, |this| {
                         this.capture_any_mouse_down(remember(root))
                     })
-                    .child(self.logs.clone()),
+                    .child(self.logs_panel.logs.clone()),
             )
     }
 
     fn render_network_status_control(&self, root: &Entity<Self>) -> impl IntoElement {
         let status = self.network_status_presentation();
         let activity = self.network_activity_presentation();
-        let download_rate = self.tor_download_rate;
+        let download_rate = self.network_status.tor_download_rate;
         let popover_root = root.clone();
         let content_root = root.clone();
-        let popover_focus = self.network_status_popover_focus.clone();
+        let popover_focus = self.network_status.popover_focus.clone();
         let network_status_error = super::network::native_network_status_error(
-            self.network_status_error.as_ref(),
-            self.tor_rotation_failure,
+            self.network_status.error.as_ref(),
+            self.network_status.tor_rotation_failure,
         );
-        let tor_exit_ip_query = self.tor_exit_ip_query.clone();
-        let tor_state_reset_confirming = self.tor_state_reset_confirming;
-        let tor_rotation_in_progress = self.tor_rotation.is_some();
+        let tor_exit_ip_query = self.network_status.tor_exit_ip_query.clone();
+        let tor_state_reset_confirming = self.network_status.tor_state_reset_confirming;
+        let tor_rotation_in_progress = self.network_status.tor_rotation.is_some();
 
         let trigger = network_status_pill(
             "wallet-network-status-pill-trigger",
@@ -451,7 +487,7 @@ impl WalletRoot {
         Popover::new("wallet-network-status-popover")
             .p_0()
             .anchor(Anchor::BottomLeft)
-            .open(self.network_status_popover_open)
+            .open(self.network_status.popover_open)
             .overlay_closable(false)
             .track_focus(&popover_focus)
             .on_open_change(move |open, _window, cx| {
@@ -461,7 +497,7 @@ impl WalletRoot {
             })
             .trigger(NetworkStatusTrigger::new(
                 trigger,
-                &self.network_status_focus,
+                &self.network_status.focus,
                 &status,
             ))
             .content(move |_state, window, _cx| {
@@ -533,7 +569,7 @@ impl WalletRoot {
         }
 
         Popover::new("wallet-prover-cache-build-popover")
-            .open(self.prover_cache_build_popover_open)
+            .open(self.prover_cache_build.popover_open)
             .on_open_change(move |open, _window, cx| {
                 popover_root.update(cx, |root, cx| {
                     root.set_prover_cache_build_popover_open(*open, cx);

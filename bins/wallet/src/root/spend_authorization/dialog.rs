@@ -849,7 +849,9 @@ impl gpui::Render for HardwareSpendAuthorizationDialogContent {
             .read(cx)
             .current_session_needs_trezor_app_passphrase();
         #[cfg(feature = "hardware")]
-        let trezor_app_passphrase_input = self.root.read(cx).trezor_app_passphrase_input.clone();
+        let hardware_profile = &self.root.read(cx).hardware_profile;
+        #[cfg(feature = "hardware")]
+        let trezor_app_passphrase_input = hardware_profile.trezor_app_passphrase_input.clone();
         #[cfg(feature = "hardware")]
         let trezor_pin_matrix_prompt = self.render_trezor_pin_matrix_prompt(cx);
         #[cfg(not(feature = "hardware"))]

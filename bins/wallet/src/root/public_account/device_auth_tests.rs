@@ -56,7 +56,7 @@ fn device_auth_public_account_ignores_results_after_dismissal_replacement_or_wal
                         window,
                         cx,
                     );
-                    root.device_auth_in_progress = true;
+                    root.device_auth.in_progress = true;
                     (lease, root.active_wallet_generation)
                 })
             });
@@ -92,7 +92,7 @@ fn device_auth_public_account_ignores_results_after_dismissal_replacement_or_wal
                         window,
                         cx,
                     );
-                    assert!(!root.device_auth_in_progress);
+                    assert!(!root.device_auth.in_progress);
                     assert_eq!(
                         account_count(root),
                         before,
@@ -157,7 +157,7 @@ fn device_auth_public_account_blocks_typed_submission_then_creates_one_account(
                 root.public_form
                     .import_private_key_input
                     .update(cx, |input, cx| input.set_value("11".repeat(32), window, cx));
-                root.device_auth_in_progress = true;
+                root.device_auth.in_progress = true;
                 // These are also the entry points used by the input Enter subscriptions.
                 match kind {
                     PublicAccountDialogKind::Derive => {
@@ -180,7 +180,7 @@ fn device_auth_public_account_blocks_typed_submission_then_creates_one_account(
                     window,
                     cx,
                 );
-                assert!(!root.device_auth_in_progress);
+                assert!(!root.device_auth.in_progress);
                 if matches!(kind, PublicAccountDialogKind::Derive) {
                     // A software wallet's password authorizes the address preview instead.
                     assert!(root.public_form.derive_preview.authorizing);

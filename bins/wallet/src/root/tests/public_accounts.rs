@@ -1277,9 +1277,9 @@ fn network_status_stays_reachable_above_dialogs(cx: &mut TestAppContext) {
     // Two stacked dialogs with entered text; the second input has focus.
     let inputs = cx.update(|window, cx| {
         root.update(cx, |root, cx| {
-            root.network_health.mode = wallet_ops::WalletNetworkMode::Tor;
-            root.network_health.state = wallet_ops::WalletNetworkHealthState::Ready;
-            root.logs = cx.new(|cx| ui::logs::LogsPane::new(logs, window, cx));
+            root.network_status.network_health.mode = wallet_ops::WalletNetworkMode::Tor;
+            root.network_status.network_health.state = wallet_ops::WalletNetworkHealthState::Ready;
+            root.logs_panel.logs = cx.new(|cx| ui::logs::LogsPane::new(logs, window, cx));
             cx.notify();
         });
         let inputs = ["first draft", "second draft"]
@@ -1315,8 +1315,9 @@ fn network_status_stays_reachable_above_dialogs(cx: &mut TestAppContext) {
         cx.update(|window, cx| {
             let root = root.read(cx);
             (
-                root.network_status_popover_open,
-                root.network_status_popover_focus
+                root.network_status.popover_open,
+                root.network_status
+                    .popover_focus
                     .contains_focused(window, cx),
                 dialogs,
                 inputs[1].read(cx).focus_handle(cx).is_focused(window),
@@ -1351,7 +1352,7 @@ fn network_status_stays_reachable_above_dialogs(cx: &mut TestAppContext) {
         "recovery keeps everything open"
     );
     cx.update(|_, cx| {
-        assert!(root.read(cx).network_status_error.is_some(), "recovery ran");
+        assert!(root.read(cx).network_status.error.is_some(), "recovery ran");
         assert_eq!(
             inputs
                 .each_ref()
@@ -1401,7 +1402,7 @@ fn network_status_stays_reachable_above_dialogs(cx: &mut TestAppContext) {
     // (logs open, panel rendered)
     let logs_state = |cx: &mut gpui::VisualTestContext| {
         let panel = cx.debug_bounds("wallet-logs-panel").is_some();
-        (cx.update(|_, cx| root.read(cx).logs_open), panel)
+        (cx.update(|_, cx| root.read(cx).logs_panel.open), panel)
     };
     let logs_toggle = cx
         .debug_bounds("wallet-status-bar-logs")
@@ -1413,7 +1414,7 @@ fn network_status_stays_reachable_above_dialogs(cx: &mut TestAppContext) {
     let panel = cx
         .debug_bounds("wallet-logs-panel")
         .expect("logs panel is rendered");
-    let pane = cx.update(|_, cx| root.read(cx).logs.clone());
+    let pane = cx.update(|_, cx| root.read(cx).logs_panel.logs.clone());
     let pane_notified = std::rc::Rc::new(std::cell::Cell::new(false));
     let _pane_observer = cx.update(|_, cx| {
         let pane_notified = pane_notified.clone();
@@ -1468,7 +1469,7 @@ fn network_status_stays_reachable_above_dialogs(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         root.update(cx, |root, cx| {
-            root.prover_cache_build_progress =
+            root.prover_cache_build.progress =
                 Some(wallet_ops::ProverCacheBuildProgress::preparing());
             cx.notify();
         });
@@ -1478,7 +1479,7 @@ fn network_status_stays_reachable_above_dialogs(cx: &mut TestAppContext) {
         .debug_bounds("wallet-prover-cache-build-pill")
         .expect("prover cache indicator is rendered");
     click(cx, prover.center());
-    assert!(cx.update(|_, cx| !root.read(cx).prover_cache_build_popover_open));
+    assert!(cx.update(|_, cx| !root.read(cx).prover_cache_build.popover_open));
     assert!(
         dialogs_intact(cx),
         "prover cache indicator is inert above dialogs"
@@ -1508,10 +1509,10 @@ fn network_status_stays_reachable_above_dialogs(cx: &mut TestAppContext) {
     cx.update(|window, cx| {
         root.update(cx, |root, cx| {
             root.lock_vault(window, cx);
-            assert!(!root.network_status_popover_open, "lock closes popover");
+            assert!(!root.network_status.popover_open, "lock closes popover");
             root.toggle_network_status_from_shortcut(cx);
             assert!(
-                !root.network_status_popover_open,
+                !root.network_status.popover_open,
                 "shortcut ignored while locked"
             );
         });

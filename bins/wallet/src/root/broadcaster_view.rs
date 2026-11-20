@@ -12,6 +12,7 @@ use gpui_component::{
 };
 use ui::controls::{app_button, app_button_base, app_input, app_muted_text, app_strong_text};
 use ui::theme::{self, APP_MONO_FONT_FAMILY, APP_TEXT_SIZE};
+use wallet_ops::vault::BroadcasterPreferenceEntry;
 
 use crate::assets::{RailgunActionIcon, RailgunSidebarIcon};
 
@@ -70,8 +71,15 @@ impl BroadcasterPreferenceListKind {
 
     const fn input(self, root: &WalletRoot) -> &Entity<InputState> {
         match self {
-            Self::Favorite => &root.favorite_broadcaster_input,
-            Self::Banned => &root.banned_broadcaster_input,
+            Self::Favorite => &root.broadcaster_preferences.favorite_broadcaster_input,
+            Self::Banned => &root.broadcaster_preferences.banned_broadcaster_input,
+        }
+    }
+
+    const fn entries(self, root: &WalletRoot) -> &Vec<BroadcasterPreferenceEntry> {
+        match self {
+            Self::Favorite => &root.broadcaster_preferences.saved.favorites,
+            Self::Banned => &root.broadcaster_preferences.saved.banned,
         }
     }
 }
@@ -87,13 +95,13 @@ impl WalletRoot {
             .bg(rgb(theme::SURFACE_ELEVATED))
             .child(Self::render_broadcaster_header())
             .child(self.render_broadcaster_tabs(root))
-            .children(self.broadcaster_preference_error.as_ref().map(|message| {
+            .children(self.broadcaster_preferences.error.as_ref().map(|message| {
                 div().flex_none().px(px(14.0)).pt(px(10.0)).child(
                     Alert::error("wallet-broadcaster-preference-error", message.to_string())
                         .small(),
                 )
             }))
-            .child(match self.active_broadcaster_tab {
+            .child(match self.broadcaster_preferences.active_tab {
                 BroadcasterActivityTab::Monitor => div()
                     .flex_1()
                     .min_w(px(0.0))
@@ -133,7 +141,7 @@ impl WalletRoot {
     fn render_broadcaster_tabs(&self, root: &Entity<Self>) -> impl IntoElement {
         let selected_index = BroadcasterActivityTab::ALL
             .iter()
-            .position(|tab| *tab == self.active_broadcaster_tab)
+            .position(|tab| *tab == self.broadcaster_preferences.active_tab)
             .unwrap_or(0);
         let tab_root = root.clone();
 
@@ -148,8 +156,8 @@ impl WalletRoot {
                     return;
                 };
                 tab_root.update(cx, |root, cx| {
-                    root.active_broadcaster_tab = tab;
-                    root.broadcaster_preference_error = None;
+                    root.broadcaster_preferences.active_tab = tab;
+                    root.broadcaster_preferences.error = None;
                     cx.notify();
                 });
             })
@@ -167,10 +175,7 @@ impl WalletRoot {
     ) -> gpui::AnyElement {
         let input = kind.input(self);
         let add_root = root.clone();
-        let entries = match kind {
-            BroadcasterPreferenceListKind::Favorite => &self.broadcaster_preferences.favorites,
-            BroadcasterPreferenceListKind::Banned => &self.broadcaster_preferences.banned,
-        };
+        let entries = kind.entries(self);
 
         let mut list = div().w_full().flex().flex_col().gap_2();
         if entries.is_empty() {
@@ -309,7 +314,7 @@ impl WalletRoot {
             BroadcasterPreferenceListKind::Banned => self.add_banned_broadcaster(&address, cx),
         };
         if saved {
-            self.active_broadcaster_tab = kind.tab();
+            self.broadcaster_preferences.active_tab = kind.tab();
             input.update(cx, |input, cx| input.set_value("", window, cx));
             cx.notify();
         }

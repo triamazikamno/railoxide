@@ -58,8 +58,8 @@ fn open_logs<'a>(
     cx.update(|window, cx| {
         root.update(cx, |root, cx| {
             // The pane reads the store when made; the fixture's own holds no lines.
-            root.logs = cx.new(|cx| LogsPane::new(store, window, cx));
-            root.logs_open = true;
+            root.logs_panel.logs = cx.new(|cx| LogsPane::new(store, window, cx));
+            root.logs_panel.open = true;
             cx.notify();
         });
         window.draw(cx).clear(cx);
@@ -87,7 +87,7 @@ fn logs_keyboard_selects_and_copies_shown_lines(cx: &mut TestAppContext) {
         .unwrap();
     let _entered = runtime.enter();
     let (host, root, lines, cx) = open_logs(cx, &path, &runtime);
-    let pane = cx.update(|_, cx| root.read(cx).logs.clone());
+    let pane = cx.update(|_, cx| root.read(cx).logs_panel.logs.clone());
     cx.update(|window, cx| pane.read(cx).focus_handle().focus(window, cx));
     draw(cx);
     let selected = |cx: &mut VisualTestContext| cx.update(|_, cx| pane.read(cx).selected_count());
@@ -133,10 +133,17 @@ fn logs_panel_holds_focus_above_a_dialog(cx: &mut TestAppContext) {
         cx.update(|window, cx| input.read(cx).focus_handle(cx).is_focused(window))
     };
     let in_panel = |cx: &mut VisualTestContext| {
-        cx.update(|window, cx| root.read(cx).logs_panel_focus.contains_focused(window, cx))
+        cx.update(|window, cx| root.read(cx).logs_panel.focus.contains_focused(window, cx))
     };
     let search_text = |cx: &mut VisualTestContext| {
-        cx.update(|_, cx| root.read(cx).logs_search.read(cx).text().to_owned())
+        cx.update(|_, cx| {
+            root.read(cx)
+                .logs_panel
+                .logs_search
+                .read(cx)
+                .text()
+                .to_owned()
+        })
     };
     let press = |cx: &mut VisualTestContext, position| {
         cx.simulate_click(position, Modifiers::default());
@@ -175,7 +182,7 @@ fn logs_panel_holds_focus_above_a_dialog(cx: &mut TestAppContext) {
 
     // A row press selects it; Escape clears the selection, then gives focus back.
     press(cx, point(panel.center().x, panel.bottom() - px(10.)));
-    let pane = cx.update(|_, cx| root.read(cx).logs.clone());
+    let pane = cx.update(|_, cx| root.read(cx).logs_panel.logs.clone());
     assert_eq!(cx.update(|_, cx| pane.read(cx).selected_count()), 1);
     escape(cx);
     assert!(in_panel(cx));
@@ -211,12 +218,12 @@ fn logs_panel_holds_focus_above_a_dialog(cx: &mut TestAppContext) {
     cx.update(gpui_component::WindowExt::close_all_dialogs);
     cx.update(|window, cx| {
         root.update(cx, |root, cx| {
-            root.network_health.mode = wallet_ops::WalletNetworkMode::Tor;
-            root.network_health.state = wallet_ops::WalletNetworkHealthState::Ready;
+            root.network_status.network_health.mode = wallet_ops::WalletNetworkMode::Tor;
+            root.network_status.network_health.state = wallet_ops::WalletNetworkHealthState::Ready;
             cx.notify();
         });
         window.draw(cx).clear(cx);
-        let search = root.read(cx).logs_search.clone();
+        let search = root.read(cx).logs_panel.logs_search.clone();
         search.update(cx, |search, cx| search.focus(window, cx));
     });
     draw(cx);
@@ -245,7 +252,7 @@ fn logs_search_suggestions_open_above_the_field_without_room_below(cx: &mut Test
     // enough modules to fill the suggestions.
     cx.update(|window, cx| {
         root.update(cx, |root, cx| {
-            let store = root.logs.read(cx).store().clone();
+            let store = root.logs_panel.logs.read(cx).store().clone();
             for module in ["a", "b", "c", "d", "e"] {
                 store.push(LogEntry {
                     seq: 0,
@@ -255,7 +262,7 @@ fn logs_search_suggestions_open_above_the_field_without_room_below(cx: &mut Test
                     message: "line".into(),
                 });
             }
-            root.logs_search = cx.new(|cx| {
+            root.logs_panel.logs_search = cx.new(|cx| {
                 crate::root::search_field::SearchField::new(
                     crate::root::logs_search::LogsSearchSource { store },
                     window,
@@ -301,7 +308,7 @@ fn locking_the_vault_forgets_the_logs_search(cx: &mut TestAppContext) {
         .unwrap();
     let _entered = runtime.enter();
     let (host, root, _, cx) = open_logs(cx, &path, &runtime);
-    let search = cx.update(|_, cx| root.read(cx).logs_search.clone());
+    let search = cx.update(|_, cx| root.read(cx).logs_panel.logs_search.clone());
     cx.update(|window, cx| {
         let input = search.read(cx).input().clone();
         input.update(cx, |input, cx| input.set_value("rpc", window, cx));

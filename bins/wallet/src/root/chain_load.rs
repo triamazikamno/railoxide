@@ -521,8 +521,8 @@ impl WalletRoot {
         self.send_forms.clear();
         self.unshield_forms.clear();
         self.set_broadcaster_preferences(wallet_ops::vault::BroadcasterPreferences::default(), cx);
-        self.broadcaster_preference_error = None;
-        self.active_broadcaster_tab = BroadcasterActivityTab::default();
+        self.broadcaster_preferences.error = None;
+        self.broadcaster_preferences.active_tab = BroadcasterActivityTab::default();
         self.clear_public_wallet_runtime_state(cx);
         self.private_action_form = None;
         self.clear_private_broadcaster_progress_state();

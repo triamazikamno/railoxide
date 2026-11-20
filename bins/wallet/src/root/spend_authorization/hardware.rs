@@ -188,7 +188,7 @@ impl WalletRoot {
                 .read(cx)
                 .current_session_needs_trezor_app_passphrase();
             #[cfg(feature = "hardware")]
-            let trezor_app_passphrase_input = root.read(cx).trezor_app_passphrase_input.clone();
+            let trezor_app_passphrase_input = root.read(cx).hardware_profile.trezor_app_passphrase_input.clone();
             dialog
                 .w(dialog_width)
                 .max_h(dialog_max_height(window))

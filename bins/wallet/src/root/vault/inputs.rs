@@ -1,7 +1,18 @@
+use gpui_component::input::TextareaState;
+
 use super::{
     Context, Entity, Focusable, InputState, PRIMARY_WALLET_LABEL, VaultState, WalletRoot,
     WalletSetupMode, Window, Zeroizing,
 };
+
+pub(in crate::root) struct VaultInputs {
+    pub(in crate::root) unlock_password_input: Entity<InputState>,
+    pub(in crate::root) new_password_input: Entity<InputState>,
+    pub(in crate::root) confirm_password_input: Entity<InputState>,
+    pub(in crate::root) wallet_name_input: Entity<InputState>,
+    pub(in crate::root) add_wallet_password_input: Entity<InputState>,
+    pub(in crate::root) import_mnemonic_input: Entity<TextareaState>,
+}
 
 pub(in crate::root) const fn should_focus_vault_input(
     vault_state: &VaultState,
@@ -24,7 +35,8 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         let value = value.to_owned();
-        self.wallet_name_input
+        self.vault_inputs
+            .wallet_name_input
             .update(cx, |input, cx| input.set_value(&value, window, cx));
     }
 
@@ -57,9 +69,10 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.hardware_wallet_restore_account_index_input
+        self.hardware_wallet_creation
+            .restore_account_index_input
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.hardware_wallet_restore_account_index_set = false;
+        self.hardware_wallet_creation.restore_account_index_set = false;
     }
 
     #[cfg(feature = "hardware")]
@@ -68,7 +81,8 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.hardware_profile_password_input
+        self.hardware_profile
+            .password_input
             .update(cx, |input, cx| input.set_value("", window, cx));
         self.clear_trezor_app_passphrase_input(window, cx);
     }
@@ -79,7 +93,8 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        self.trezor_app_passphrase_input
+        self.hardware_profile
+            .trezor_app_passphrase_input
             .update(cx, |input, cx| input.set_value("", window, cx));
     }
 
@@ -106,16 +121,19 @@ impl WalletRoot {
 
         match self.vault_state {
             VaultState::CreateVault => self
+                .vault_inputs
                 .new_password_input
                 .read(cx)
                 .focus_handle(cx)
                 .focus(window, cx),
             VaultState::UnlockVault => self
+                .vault_inputs
                 .unlock_password_input
                 .read(cx)
                 .focus_handle(cx)
                 .focus(window, cx),
             VaultState::SetupWallet if self.wallet_setup_mode == WalletSetupMode::Import => self
+                .vault_inputs
                 .import_mnemonic_input
                 .read(cx)
                 .focus_handle(cx)

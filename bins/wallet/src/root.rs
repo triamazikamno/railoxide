@@ -5,6 +5,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use broadcaster_monitor::{EventRx, EventTx, Shared};
+#[cfg(test)]
 use broadcaster_monitor_waku::WakuMonitorConfig;
 #[cfg(test)]
 use gpui::Focusable;
@@ -12,7 +13,7 @@ use gpui::{AppContext, Context, Entity, FocusHandle, Pixels, SharedString, Windo
 #[cfg(test)]
 use gpui_component::WindowExt;
 use gpui_component::{
-    input::{InputState, TextareaState},
+    input::InputState,
     select::{SearchableVec, SelectState},
     table::TableState,
 };
@@ -25,10 +26,8 @@ use ui::logs::LogsPane;
 use ui::theme::APP_TEXT_SIZE;
 use wallet_ops::{
     BlockedShieldRescueUtxoId, BroadcasterFeePolicy, HttpContext, PoiArtifactCacheProgress,
-    PoiReadSource, ProverCacheBuildProgress, PublicBalanceCache, PublicBalanceSnapshot,
-    SponsoredSelfBroadcastCommand, SubmissionNodeScope, TokenAnchorRateCache,
-    TokenAnchorRefreshHandle, WalletNetworkHealth,
-    hardware::HardwareWalletSyncIntent,
+    PoiReadSource, PublicBalanceCache, PublicBalanceSnapshot, SponsoredSelfBroadcastCommand,
+    SubmissionNodeScope, TokenAnchorRateCache, TokenAnchorRefreshHandle,
     settings::{
         EffectiveChainRegistry, EffectiveTokenRegistry, WalletUiState, load_wallet_settings,
         save_wallet_ui_state,
@@ -118,24 +117,25 @@ use auto_lock::{
     AutoLockState, InitialCatchUpFingerprint, InitialSyncActivity, InitialSyncObservation,
 };
 use broadcaster_picker::BroadcasterPickerState;
-use broadcaster_preferences::install_broadcaster_preference_hooks;
+use broadcaster_preferences::{BroadcasterPreferencesUi, install_broadcaster_preference_hooks};
 use broadcaster_view::BroadcasterActivityTab;
 use chain_load::{
     ChainUtxoState, WalletSyncLifecycle, WalletSyncLifecycleCleanupTask, chain_load_overrides,
 };
+use device_auth::{DeviceAuthStartup, DeviceAuthUi};
 use gas_fee::Eip1559GasFeeEditorState;
 use governance::GovernanceState;
 use key_export::KeyExportState;
-use logs_search::LogsSearchSource;
 use maintenance::WalletMaintenanceController;
 use manage_wallets::ManageWalletsState;
-use network::TorExitIpQueryState;
+use network::NetworkStatusUi;
 use private_action::{
     DeliveryFormKind, DeliveryMode, PrivateActionFormState, SendFormState, UnshieldAsset,
     UnshieldAssetKey, UnshieldFormState,
 };
 use private_broadcaster::PrivateBroadcasterProgressState;
 use proposals::ProposalsState;
+use prover_cache_monitor::ProverCacheBuildUi;
 use public_account::{PublicAccountFormState, TronPublicState, TronSendState};
 use public_action::PublicActionMode;
 #[cfg(test)]
@@ -152,7 +152,6 @@ use public_broadcaster::{
     unshield_form_max_entered_amount, unshield_max_entered_amount_for_mode,
     unshield_max_fill_amount,
 };
-use search_field::SearchField;
 use settings::WalletSettingsEditor;
 use shell::{PoiArtifactCacheRetryAttempts, WalletTab};
 #[cfg(test)]
@@ -160,6 +159,7 @@ use shell::{ppoi_hover_detail, ppoi_hover_heading};
 use sidebar::Activity;
 use spend_authorization::{SpendAuthorizationCache, SpendAuthorizationLifetime};
 use startup::{WalletStartupReady, WalletStartupRoot};
+use status_bar::LogsPanelState;
 use tokens::{
     format_exact_token_amount_for_display, format_native_token_amount_ceiling_for_display,
     format_native_token_amount_for_display, format_native_top_up_recipient_suffix,
@@ -181,7 +181,7 @@ use vault::{
     vault_error_kind,
 };
 use waku_runtime::{
-    WakuStoppingState, WakuWorkerCompletionToken, WalletWakuRuntime,
+    WakuState, WakuStoppingState, WakuWorkerCompletionToken, WalletWakuRuntime,
     release_retired_waku_generation, renew_submission_scope,
 };
 use wallet_header::WalletSelectItem;
@@ -413,77 +413,31 @@ pub(crate) struct WalletRoot {
     view_session: Option<Arc<DesktopViewSession>>,
     generated_seed: Option<GeneratedSeedMaterial>,
     generated_seed_revealed: bool,
-    hardware_wallet_creation_in_progress: bool,
-    hardware_wallet_creation_generation: u64,
-    hardware_wallet_creation_intent: Option<HardwareWalletSyncIntent>,
-    hardware_wallet_restore_account_index_input: Entity<InputState>,
-    hardware_wallet_restore_account_index_set: bool,
+    hardware_wallet_creation: vault::HardwareWalletCreation,
     #[cfg(feature = "hardware")]
     hardware_profile_unlock: vault::HardwareProfileUnlockState,
     #[cfg(feature = "hardware")]
-    active_hardware_profile: Option<wallet_ops::vault::HardwareProfileMetadata>,
-    #[cfg(feature = "hardware")]
-    hardware_profile_password_input: Entity<InputState>,
-    #[cfg(feature = "hardware")]
-    hardware_profile_label_input: Entity<InputState>,
-    #[cfg(feature = "hardware")]
-    hardware_profile_recovery_start_input: Entity<InputState>,
-    #[cfg(feature = "hardware")]
-    hardware_profile_recovery_count_input: Entity<InputState>,
-    #[cfg(feature = "hardware")]
-    hardware_profile_exact_index_input: Entity<InputState>,
-    #[cfg(feature = "hardware")]
-    trezor_app_passphrase_input: Entity<InputState>,
-    #[cfg(feature = "hardware")]
-    trezor_passphrase_mode_focus: FocusHandle,
+    hardware_profile: vault::HardwareProfileUi,
     http: HttpContext,
     /// Identity warmup for the installed routes on `http`; replaced with the settings and
     /// cleared before the network context is handed off.
     rpc_identity_warmup: Option<wallet_ops::RpcIdentityWarmup>,
     active_rpc_chains: BTreeSet<u64>,
     network_context_id: String,
-    network_health: WalletNetworkHealth,
-    tor_bridge_activity: Option<wallet_ops::TorBridgeActivitySnapshot>,
-    tor_download_rate: Option<u64>,
+    network_status: NetworkStatusUi,
     root_shutdown: watch::Sender<bool>,
     gateway: gateway::GatewayUi,
-    network_status_popover_open: bool,
-    network_status_focus: gpui::FocusHandle,
-    network_status_popover_focus: gpui::FocusHandle,
-    network_status_error: Option<Arc<str>>,
-    tor_exit_ip_query: TorExitIpQueryState,
-    tor_exit_ip_query_generation: u64,
-    tor_state_reset_confirming: bool,
-    /// The one pending explicit Tor rotation, which later activations join.
-    tor_rotation: Option<network::TorRotation>,
-    tor_rotation_id: u64,
-    /// The last rotation's failure, shown until the next rotation, lock or root retirement.
-    tor_rotation_failure: Option<wallet_ops::gateway::GatewayNetworkError>,
-    prover_cache_build_progress: Option<ProverCacheBuildProgress>,
-    prover_cache_build_popover_open: bool,
-    prover_cache_build_monitor_active: bool,
-    prover_cache_build_completed: bool,
+    prover_cache_build: ProverCacheBuildUi,
     runtime: Handle,
     monitor_state: Shared,
     monitor_event_tx: EventTx,
-    waku_config: WakuMonitorConfig,
-    waku_runtime: Option<WalletWakuRuntime>,
-    waku_session_generation: u64,
-    waku_stopping_generation: Option<WakuStoppingState>,
+    waku: WakuState,
     /// Ends public broadcaster submission nodes on lock and root shutdown.
     submission_scope: SubmissionNodeScope,
     public_broadcaster_anchor_cache: Arc<TokenAnchorRateCache>,
     public_broadcaster_anchor_refresh: TokenAnchorRefreshHandle,
     monitor: Entity<broadcaster_monitor_gpui::BroadcasterMonitorPane>,
-    logs: Entity<LogsPane>,
-    logs_search: Entity<SearchField<LogsSearchSource>>,
-    /// Tracks focus within the logs panel.
-    logs_panel_focus: FocusHandle,
-    /// Holds the logs panel's focus trap while a dialog is open.
-    logs_panel_trap: FocusHandle,
-    /// Where focus was before the logs panel took it above a dialog, given back by Escape
-    /// or closing the panel.
-    logs_return_focus: Option<FocusHandle>,
+    logs_panel: LogsPanelState,
     settings_editor: Option<Entity<WalletSettingsEditor>>,
     maintenance_controller: Entity<WalletMaintenanceController>,
     settings_error: Option<Arc<str>>,
@@ -527,12 +481,7 @@ pub(crate) struct WalletRoot {
     wallet_sync_lifecycle_shutdown_started: bool,
     public_sync_cache_resetting: bool,
     merkle_forest_cache_resetting: bool,
-    unlock_password_input: Entity<InputState>,
-    new_password_input: Entity<InputState>,
-    confirm_password_input: Entity<InputState>,
-    wallet_name_input: Entity<InputState>,
-    add_wallet_password_input: Entity<InputState>,
-    import_mnemonic_input: Entity<TextareaState>,
+    vault_inputs: vault::VaultInputs,
     public_accounts: Vec<PublicAccountMetadata>,
     address_book: AddressBookState,
     governance: GovernanceState,
@@ -541,12 +490,7 @@ pub(crate) struct WalletRoot {
     private_address_book: Vec<PrivateAddressBookEntry>,
     public_address_book: Vec<PublicAddressBookEntry>,
     non_evm_address_book: Vec<NonEvmAddressBookEntry>,
-    broadcaster_preferences: BroadcasterPreferences,
-    broadcaster_preference_snapshot: Arc<RwLock<BroadcasterPreferences>>,
-    broadcaster_preference_error: Option<Arc<str>>,
-    active_broadcaster_tab: BroadcasterActivityTab,
-    favorite_broadcaster_input: Entity<InputState>,
-    banned_broadcaster_input: Entity<InputState>,
+    broadcaster_preferences: BroadcasterPreferencesUi,
     address_book_label_input: Entity<InputState>,
     address_book_save_error: Option<Arc<str>>,
     public_form: PublicAccountFormState,
@@ -591,28 +535,14 @@ pub(crate) struct WalletRoot {
     executor_locked_note_count: usize,
     utxo_table: Entity<TableState<UtxoDelegate>>,
     focus_vault_input_on_render: bool,
-    /// Whether this Mac has usable Touch ID, independent of the vault setting.
-    touch_id_supported: bool,
-    touch_id_available: bool,
-    touch_id_status: DeviceAuthStatus,
-    apple_watch_supported: bool,
-    apple_watch_available: bool,
-    apple_watch_status: DeviceAuthStatus,
-    device_auth_in_progress: bool,
-    touch_id_unlock_on_render: bool,
-    enable_device_auth_on_create: bool,
+    device_auth: DeviceAuthUi,
     /// Weak identity of the active add-wallet dialog; its builder owns the lease.
     add_wallet_dialog_lease: std::rc::Weak<Cell<bool>>,
     /// The vault password device authentication supplied for the add-wallet form, if any.
     add_wallet_device_auth_password: Option<Zeroizing<String>>,
-    /// The vault password device authentication supplied for the hardware profile dialog.
-    #[cfg(feature = "hardware")]
-    hardware_profile_device_auth_password: Option<Zeroizing<String>>,
     focus_utxo_table_on_render: bool,
     focus_public_account_search_on_render: bool,
     wallet_focus: FocusHandle,
-    logs_open: bool,
-    logs_panel_height: Pixels,
 }
 
 impl Drop for WalletRoot {
@@ -852,69 +782,28 @@ impl WalletRoot {
             view_session: None,
             generated_seed: None,
             generated_seed_revealed: false,
-            hardware_wallet_creation_in_progress: false,
-            hardware_wallet_creation_generation: 0,
-            hardware_wallet_creation_intent: None,
-            hardware_wallet_restore_account_index_input: widgets
-                .hardware_wallet_restore_account_index_input,
-            hardware_wallet_restore_account_index_set: false,
+            hardware_wallet_creation: widgets.hardware_wallet_creation,
             #[cfg(feature = "hardware")]
             hardware_profile_unlock: vault::HardwareProfileUnlockState::default(),
             #[cfg(feature = "hardware")]
-            active_hardware_profile: None,
-            #[cfg(feature = "hardware")]
-            hardware_profile_password_input: widgets.hardware_profile_password_input,
-            #[cfg(feature = "hardware")]
-            hardware_profile_label_input: widgets.hardware_profile_label_input,
-            #[cfg(feature = "hardware")]
-            hardware_profile_recovery_start_input: widgets.hardware_profile_recovery_start_input,
-            #[cfg(feature = "hardware")]
-            hardware_profile_recovery_count_input: widgets.hardware_profile_recovery_count_input,
-            #[cfg(feature = "hardware")]
-            hardware_profile_exact_index_input: widgets.hardware_profile_exact_index_input,
-            #[cfg(feature = "hardware")]
-            trezor_app_passphrase_input: widgets.trezor_app_passphrase_input,
-            #[cfg(feature = "hardware")]
-            trezor_passphrase_mode_focus: widgets.trezor_passphrase_mode_focus,
+            hardware_profile: widgets.hardware_profile,
             http,
             rpc_identity_warmup: None,
             active_rpc_chains: BTreeSet::new(),
             network_context_id: format!("{:032x}", rand::random::<u128>()),
-            network_health,
-            tor_bridge_activity,
-            tor_download_rate: None,
+            network_status: NetworkStatusUi::new(network_health, tor_bridge_activity, cx),
             root_shutdown,
             gateway,
-            network_status_popover_open: false,
-            network_status_focus: cx.focus_handle(),
-            network_status_popover_focus: cx.focus_handle(),
-            network_status_error: None,
-            tor_exit_ip_query: TorExitIpQueryState::Idle,
-            tor_exit_ip_query_generation: 0,
-            tor_state_reset_confirming: false,
-            tor_rotation: None,
-            tor_rotation_id: 0,
-            tor_rotation_failure: None,
-            prover_cache_build_progress: None,
-            prover_cache_build_popover_open: false,
-            prover_cache_build_monitor_active: false,
-            prover_cache_build_completed: false,
+            prover_cache_build: ProverCacheBuildUi::default(),
             runtime,
             monitor_state,
             monitor_event_tx,
-            waku_config,
-            waku_runtime: None,
-            waku_session_generation: 0,
-            waku_stopping_generation: None,
+            waku: WakuState::new(waku_config),
             submission_scope: SubmissionNodeScope::new(),
             public_broadcaster_anchor_cache,
             public_broadcaster_anchor_refresh,
             monitor,
-            logs,
-            logs_search: widgets.logs_search,
-            logs_panel_focus: cx.focus_handle(),
-            logs_panel_trap: cx.focus_handle(),
-            logs_return_focus: None,
+            logs_panel: LogsPanelState::new(logs, widgets.logs_search, cx),
             settings_editor,
             maintenance_controller: maintenance_controller.clone(),
             settings_error,
@@ -952,12 +841,7 @@ impl WalletRoot {
             wallet_sync_lifecycle_shutdown_started: false,
             public_sync_cache_resetting,
             merkle_forest_cache_resetting,
-            unlock_password_input: widgets.unlock_password_input,
-            new_password_input: widgets.new_password_input,
-            confirm_password_input: widgets.confirm_password_input,
-            wallet_name_input: widgets.wallet_name_input,
-            add_wallet_password_input: widgets.add_wallet_password_input,
-            import_mnemonic_input: widgets.import_mnemonic_input,
+            vault_inputs: widgets.vault_inputs,
             public_accounts: Vec::new(),
             address_book: widgets.address_book,
             governance: GovernanceState::new(
@@ -971,12 +855,11 @@ impl WalletRoot {
             private_address_book: Vec::new(),
             public_address_book: Vec::new(),
             non_evm_address_book: Vec::new(),
-            broadcaster_preferences: BroadcasterPreferences::default(),
-            broadcaster_preference_snapshot,
-            broadcaster_preference_error: None,
-            active_broadcaster_tab: BroadcasterActivityTab::default(),
-            favorite_broadcaster_input: widgets.favorite_broadcaster_input,
-            banned_broadcaster_input: widgets.banned_broadcaster_input,
+            broadcaster_preferences: BroadcasterPreferencesUi::new(
+                broadcaster_preference_snapshot,
+                widgets.favorite_broadcaster_input,
+                widgets.banned_broadcaster_input,
+            ),
             address_book_label_input: widgets.address_book_label_input,
             address_book_save_error: None,
             public_form: widgets.public_form,
@@ -1018,28 +901,12 @@ impl WalletRoot {
             executor_locked_note_count: 0,
             utxo_table,
             focus_vault_input_on_render: vault_startup.focus_input_on_render,
-            touch_id_supported: vault_startup.touch_id_supported,
-            touch_id_available: wallet_ops::device_auth::device_auth_available(
-                wallet_ops::device_auth::DeviceAuthMethod::TouchId,
-            ),
-            touch_id_status: vault_startup.touch_id_status,
-            apple_watch_supported: vault_startup.apple_watch_supported,
-            apple_watch_available: wallet_ops::device_auth::device_auth_available(
-                wallet_ops::device_auth::DeviceAuthMethod::AppleWatch,
-            ),
-            apple_watch_status: vault_startup.apple_watch_status,
-            device_auth_in_progress: false,
-            touch_id_unlock_on_render: vault_startup.touch_id_unlock_on_render,
-            enable_device_auth_on_create: true,
+            device_auth: DeviceAuthUi::new(vault_startup.device_auth),
             add_wallet_dialog_lease: std::rc::Weak::new(),
             add_wallet_device_auth_password: None,
-            #[cfg(feature = "hardware")]
-            hardware_profile_device_auth_password: None,
             focus_utxo_table_on_render: false,
             focus_public_account_search_on_render: false,
             wallet_focus: cx.focus_handle(),
-            logs_open: false,
-            logs_panel_height: LOGS_DRAWER_HEIGHT,
         };
         Self::start_auto_lock_monitor(window, cx);
         Self::observe_window_focus(window, cx);
@@ -1105,11 +972,7 @@ struct VaultStartup {
     state: VaultState,
     error: Option<Arc<str>>,
     focus_input_on_render: bool,
-    touch_id_supported: bool,
-    touch_id_status: DeviceAuthStatus,
-    apple_watch_supported: bool,
-    apple_watch_status: DeviceAuthStatus,
-    touch_id_unlock_on_render: bool,
+    device_auth: DeviceAuthStartup,
 }
 
 impl VaultStartup {
@@ -1143,11 +1006,13 @@ impl VaultStartup {
             state,
             error,
             focus_input_on_render,
-            touch_id_supported,
-            touch_id_status,
-            apple_watch_supported,
-            apple_watch_status,
-            touch_id_unlock_on_render,
+            device_auth: DeviceAuthStartup {
+                touch_id_supported,
+                touch_id_status,
+                apple_watch_supported,
+                apple_watch_status,
+                touch_id_unlock_on_render,
+            },
         }
     }
 }

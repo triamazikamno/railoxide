@@ -1,7 +1,5 @@
 //! The input and pane state `WalletRoot::new` creates before it assembles the root.
 
-#[cfg(feature = "hardware")]
-use gpui::FocusHandle;
 use gpui::{AppContext, Context, Entity, Window};
 use gpui_component::input::{InputState, TextareaState};
 use gpui_component::select::SearchableVec;
@@ -12,31 +10,17 @@ use super::governance::{self, ParticipantPickerState};
 use super::logs_search::LogsSearchSource;
 use super::public_account::PublicAccountFormState;
 use super::search_field::SearchField;
+#[cfg(feature = "hardware")]
+use super::vault::HardwareProfileUi;
+use super::vault::{HardwareWalletCreation, VaultInputs};
 use super::{WalletRoot, new_masked_input, new_text_input, wallet_activity};
 
 pub(super) struct WalletRootWidgets {
-    pub(super) unlock_password_input: Entity<InputState>,
-    pub(super) new_password_input: Entity<InputState>,
-    pub(super) confirm_password_input: Entity<InputState>,
-    pub(super) wallet_name_input: Entity<InputState>,
+    pub(super) vault_inputs: VaultInputs,
     pub(super) manage_wallet_label_input: Entity<InputState>,
-    pub(super) add_wallet_password_input: Entity<InputState>,
-    pub(super) hardware_wallet_restore_account_index_input: Entity<InputState>,
+    pub(super) hardware_wallet_creation: HardwareWalletCreation,
     #[cfg(feature = "hardware")]
-    pub(super) hardware_profile_password_input: Entity<InputState>,
-    #[cfg(feature = "hardware")]
-    pub(super) hardware_profile_label_input: Entity<InputState>,
-    #[cfg(feature = "hardware")]
-    pub(super) hardware_profile_recovery_start_input: Entity<InputState>,
-    #[cfg(feature = "hardware")]
-    pub(super) hardware_profile_recovery_count_input: Entity<InputState>,
-    #[cfg(feature = "hardware")]
-    pub(super) hardware_profile_exact_index_input: Entity<InputState>,
-    #[cfg(feature = "hardware")]
-    pub(super) trezor_app_passphrase_input: Entity<InputState>,
-    #[cfg(feature = "hardware")]
-    pub(super) trezor_passphrase_mode_focus: FocusHandle,
-    pub(super) import_mnemonic_input: Entity<TextareaState>,
+    pub(super) hardware_profile: HardwareProfileUi,
     pub(super) wallet_activity: wallet_activity::WalletActivityState,
     pub(super) logs_search: Entity<SearchField<LogsSearchSource>>,
     pub(super) governance_participant_picker: Entity<ParticipantPickerState>,
@@ -120,28 +104,34 @@ impl WalletRootWidgets {
         let repair_cache_block_input = new_text_input(window, cx, "0 = deployment block");
         let tx_search_input = new_text_input(window, cx, "search tx hash");
         Self {
-            unlock_password_input,
-            new_password_input,
-            confirm_password_input,
-            wallet_name_input,
+            vault_inputs: VaultInputs {
+                unlock_password_input,
+                new_password_input,
+                confirm_password_input,
+                wallet_name_input,
+                add_wallet_password_input,
+                import_mnemonic_input,
+            },
             manage_wallet_label_input,
-            add_wallet_password_input,
-            hardware_wallet_restore_account_index_input,
+            hardware_wallet_creation: HardwareWalletCreation {
+                in_progress: false,
+                generation: 0,
+                intent: None,
+                restore_account_index_input: hardware_wallet_restore_account_index_input,
+                restore_account_index_set: false,
+            },
             #[cfg(feature = "hardware")]
-            hardware_profile_password_input,
-            #[cfg(feature = "hardware")]
-            hardware_profile_label_input,
-            #[cfg(feature = "hardware")]
-            hardware_profile_recovery_start_input,
-            #[cfg(feature = "hardware")]
-            hardware_profile_recovery_count_input,
-            #[cfg(feature = "hardware")]
-            hardware_profile_exact_index_input,
-            #[cfg(feature = "hardware")]
-            trezor_app_passphrase_input,
-            #[cfg(feature = "hardware")]
-            trezor_passphrase_mode_focus,
-            import_mnemonic_input,
+            hardware_profile: HardwareProfileUi {
+                active: None,
+                password_input: hardware_profile_password_input,
+                label_input: hardware_profile_label_input,
+                recovery_start_input: hardware_profile_recovery_start_input,
+                recovery_count_input: hardware_profile_recovery_count_input,
+                exact_index_input: hardware_profile_exact_index_input,
+                trezor_app_passphrase_input,
+                trezor_passphrase_mode_focus,
+                device_auth_password: None,
+            },
             wallet_activity,
             logs_search,
             governance_participant_picker,

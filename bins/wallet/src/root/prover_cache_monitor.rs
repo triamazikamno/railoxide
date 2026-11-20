@@ -7,19 +7,27 @@ use super::WalletRoot;
 
 const PROVER_CACHE_BUILD_DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
 
+#[derive(Default)]
+pub(super) struct ProverCacheBuildUi {
+    pub(super) progress: Option<ProverCacheBuildProgress>,
+    pub(super) popover_open: bool,
+    pub(super) monitor_active: bool,
+    pub(super) completed: bool,
+}
+
 impl WalletRoot {
     pub(super) const fn is_prover_cache_building(&self) -> bool {
-        self.prover_cache_build_progress.is_some()
+        self.prover_cache_build.progress.is_some()
     }
 
     pub(super) fn ensure_prover_cache_build_monitor(&mut self, cx: &Context<'_, Self>) {
-        if self.prover_cache_build_monitor_active {
+        if self.prover_cache_build.monitor_active {
             return;
         }
         let Some(db_path) = self.wallet_db_root_dir() else {
             return;
         };
-        self.prover_cache_build_monitor_active = true;
+        self.prover_cache_build.monitor_active = true;
         cx.spawn(async move |this, cx| {
             loop {
                 if let Some(mut progress_rx) = subscribe_prover_cache_build(&db_path) {
@@ -69,9 +77,9 @@ impl WalletRoot {
         progress: Option<ProverCacheBuildProgress>,
         cx: &mut Context<'_, Self>,
     ) {
-        self.prover_cache_build_progress = progress;
-        if self.prover_cache_build_progress.is_none() {
-            self.prover_cache_build_popover_open = false;
+        self.prover_cache_build.progress = progress;
+        if self.prover_cache_build.progress.is_none() {
+            self.prover_cache_build.popover_open = false;
         }
         cx.notify();
     }
@@ -81,13 +89,13 @@ impl WalletRoot {
         progress: ProverCacheBuildProgress,
         cx: &mut Context<'_, Self>,
     ) {
-        self.prover_cache_build_progress = Some(progress);
+        self.prover_cache_build.progress = Some(progress);
         cx.notify();
     }
 
     pub(super) fn finish_prover_cache_build_progress(&mut self, cx: &mut Context<'_, Self>) {
-        self.prover_cache_build_progress = None;
-        self.prover_cache_build_popover_open = false;
+        self.prover_cache_build.progress = None;
+        self.prover_cache_build.popover_open = false;
         cx.notify();
     }
 
@@ -96,8 +104,8 @@ impl WalletRoot {
         open: bool,
         cx: &mut Context<'_, Self>,
     ) {
-        if self.prover_cache_build_popover_open != open {
-            self.prover_cache_build_popover_open = open;
+        if self.prover_cache_build.popover_open != open {
+            self.prover_cache_build.popover_open = open;
             cx.notify();
         }
     }

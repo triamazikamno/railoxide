@@ -476,7 +476,7 @@ fn a_prepared_swap_is_listed_resumed_and_cancelled_after_a_restart(cx: &mut Test
             // This review never sends a setup. A disabled client supplies the reviewed action's
             // transport handle without starting networking or duplicating proof fixtures.
             let waku = root.read_with(cx, |root, _| {
-                let mut config = root.waku_config.clone();
+                let mut config = root.waku.config.clone();
                 config.network.mode = broadcaster_monitor_waku::RelayNetworkMode::Proxy;
                 wallet_ops::PublicBroadcasterWaku::new(
                     config.build_client().unwrap(),
