@@ -81,7 +81,9 @@ pub(super) fn blocked_shield_rescue_utxo_id_from_output(
 pub(super) fn active_blocked_shield_rescue_utxo_id_from_output(
     row: &UtxoOutput,
 ) -> Option<BlockedShieldRescueUtxoId> {
-    if row.is_spent || row.pending_new || row.pending_spent || row.local_pending_spent {
+    let pending_or_spent =
+        row.is_spent || row.pending_new || row.pending_spent || row.local_pending_spent;
+    if pending_or_spent {
         return None;
     }
     blocked_shield_rescue_utxo_id_from_output(row)

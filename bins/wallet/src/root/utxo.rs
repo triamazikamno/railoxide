@@ -238,7 +238,8 @@ impl UtxoFinalityContext {
         let head = self.head_block?;
         let safe_head = self.safe_head_block?;
         let depth = self.finality_depth?;
-        if block == 0 || depth == 0 || safe_head > head || head < block {
+        let finality_unavailable = block == 0 || depth == 0 || safe_head > head || head < block;
+        if finality_unavailable {
             return None;
         }
         if safe_head >= block {

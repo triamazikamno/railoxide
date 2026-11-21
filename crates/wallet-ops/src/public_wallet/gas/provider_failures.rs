@@ -130,9 +130,8 @@ pub(super) fn friendly_revert_data(data: &[u8]) -> String {
     let Some(selector) = data.get(..4) else {
         return "Execution reverted".to_owned();
     };
-    if (selector == Revert::SELECTOR || selector == Panic::SELECTOR)
-        && let Some(reason) = decode_revert_reason(data)
-    {
+    let standard_selector = selector == Revert::SELECTOR || selector == Panic::SELECTOR;
+    if standard_selector && let Some(reason) = decode_revert_reason(data) {
         let reason = safe_provider_message(reason.strip_prefix("revert: ").unwrap_or(&reason));
         return if reason.is_empty() {
             "Execution reverted".to_owned()

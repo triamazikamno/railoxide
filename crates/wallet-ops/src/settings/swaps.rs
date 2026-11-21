@@ -618,7 +618,7 @@ impl EffectiveChainConfig {
     /// this doesn't require an executor profile.
     #[must_use]
     pub const fn public_swap_profile(&self) -> Option<PublicSwapProfile> {
-        if !self.built_in || !self.enabled || self.bridge_origin_profile().is_none() {
+        if !self.enabled || self.bridge_origin_profile().is_none() {
             return None;
         }
         built_in_public_swap_profile(self.chain_id)

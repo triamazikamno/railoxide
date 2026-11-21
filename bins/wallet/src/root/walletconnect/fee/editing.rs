@@ -9,14 +9,17 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
-        if !self.walletconnect.request_dialog_open
-            || self.walletconnect.request_dialog_key.as_deref() != Some(request_key.as_ref())
-            || self
-                .walletconnect
-                .walletconnect_fee_state
-                .as_ref()
-                .is_none_or(|state| state.request_key.as_ref() != request_key.as_ref())
-        {
+        let owns_dialog = self.walletconnect.request_dialog_open
+            && self.walletconnect.request_dialog_key.as_deref() == Some(request_key.as_ref());
+        if !owns_dialog {
+            return;
+        }
+        let owns_fee_state = self
+            .walletconnect
+            .walletconnect_fee_state
+            .as_ref()
+            .is_some_and(|state| state.request_key.as_ref() == request_key.as_ref());
+        if !owns_fee_state {
             return;
         }
         if self.walletconnect.walletconnect_gas_fee.mode == mode {

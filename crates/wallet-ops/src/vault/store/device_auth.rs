@@ -175,10 +175,10 @@ impl DesktopVaultStore {
         method: DeviceAuthMethod,
         record: &StoredDeviceAuth,
     ) -> Result<bool, VaultError> {
-        if record.stale
-            || record.version != BIOMETRIC_UNLOCK_VERSION
-            || record.vault_salt != self.metadata()?.salt
-        {
+        if record.stale || record.version != BIOMETRIC_UNLOCK_VERSION {
+            return Ok(false);
+        }
+        if record.vault_salt != self.metadata()?.salt {
             return Ok(false);
         }
         // Skip a prompt after fingerprint or paired-Watch enrollment changed.

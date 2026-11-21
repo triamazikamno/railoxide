@@ -181,7 +181,8 @@ pub(super) fn public_balance_tile_amount(amount: &PublicBalanceAmount, decimals:
     };
     let full = format_scaled_amount(*amount, decimals);
     let (whole, fraction) = full.split_once('.').unwrap_or((&full, ""));
-    if !amount.is_zero() && whole == "0" && fraction.starts_with("0000") {
+    let below_display_precision = !amount.is_zero() && whole == "0" && fraction.starts_with("0000");
+    if below_display_precision {
         return "<0.0001".to_owned();
     }
     // Keep up to four decimal places, reducing precision before abbreviating large integers.

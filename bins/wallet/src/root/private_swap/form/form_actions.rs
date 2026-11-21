@@ -39,12 +39,13 @@ impl PrivateSwapsView {
         let Some(form) = self.form.as_ref() else {
             return;
         };
-        if self.form_mode(form) == FormMode::Order
-            && (matches!(form.quote, QuoteState::Idle | QuoteState::Failed(_))
-                || matches!(&form.quote, QuoteState::Ready(review)
-                    if review.plan().swap_executor().requires_setup()))
-            && form.quote_task.is_none()
-        {
+        if self.form_mode(form) != FormMode::Order {
+            return;
+        }
+        let quote_needs_refresh = matches!(form.quote, QuoteState::Idle | QuoteState::Failed(_))
+            || matches!(&form.quote, QuoteState::Ready(review)
+                if review.plan().swap_executor().requires_setup());
+        if quote_needs_refresh && form.quote_task.is_none() {
             self.schedule_quote(window, cx);
         }
     }

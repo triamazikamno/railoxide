@@ -121,10 +121,10 @@ impl SetupProgress {
         step: &PrivateBroadcasterProgressStepState,
         now: Instant,
     ) -> Option<String> {
-        if step.stage != TransactionGenerationStage::WaitingForBroadcasterResponse
-            || step.status != PublicActionStepStatus::Pending
-            || self.stage()? != step.stage
-        {
+        let waits_for_broadcaster = step.stage
+            == TransactionGenerationStage::WaitingForBroadcasterResponse
+            && step.status == PublicActionStepStatus::Pending;
+        if !waits_for_broadcaster || self.stage()? != step.stage {
             return None;
         }
         Some(broadcaster_wait_detail(

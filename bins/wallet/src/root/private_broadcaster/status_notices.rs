@@ -116,10 +116,10 @@ fn private_submission_active_status_detail(
 
 fn private_submission_error_summary(message: &str) -> String {
     let normalized = message.to_ascii_lowercase();
-    if normalized.contains("cancel")
+    let signing_cancelled = normalized.contains("cancel")
         || normalized.contains("rejected")
-        || normalized.contains("denied")
-    {
+        || normalized.contains("denied");
+    if signing_cancelled {
         return "Signing was cancelled.".to_string();
     }
     message.to_string()

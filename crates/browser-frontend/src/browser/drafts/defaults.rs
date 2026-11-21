@@ -7,7 +7,9 @@ pub(super) fn select_private_output(
     default_unwrap_asset: Option<&str>,
 ) {
     // Reopening the same selection must preserve an explicit output choice.
-    if input["kind"] != kind || input["asset"] != asset || input.get("unwrap").is_none() {
+    let reset_defaults =
+        input["kind"] != kind || input["asset"] != asset || input.get("unwrap").is_none();
+    if reset_defaults {
         input["unwrap"] = (kind == "unshield" && default_unwrap_asset == Some(asset)).into();
         input["native_top_up"] = false.into();
     }
