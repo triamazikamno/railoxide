@@ -158,6 +158,9 @@ impl WalletRoot {
         self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
         self.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
+        // Debug UI fixture: a `delivery:` mode holds the form at its state.
+        #[cfg(debug_assertions)]
+        self.apply_ui_fixture_delivery(DeliveryFormKind::Unshield, key);
         Self::open_private_action_dialog(DeliveryFormKind::Unshield, key, "Unshield", window, cx);
         cx.defer_in(window, move |root, window, cx| {
             if root

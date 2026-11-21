@@ -54,6 +54,9 @@ impl WalletRoot {
         });
         self.refresh_public_broadcaster_anchor(DeliveryFormKind::Send, key, cx);
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Send, key, cx);
+        // Debug UI fixture: a `delivery:` mode holds the form at its state.
+        #[cfg(debug_assertions)]
+        self.apply_ui_fixture_delivery(DeliveryFormKind::Send, key);
         Self::open_private_action_dialog(DeliveryFormKind::Send, key, "Send", window, cx);
         cx.defer_in(window, move |root, window, cx| {
             if root

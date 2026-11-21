@@ -414,6 +414,15 @@ impl WalletRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
+        // Debug UI fixture: a `delivery:` mode's spend must stop before the executor account is
+        // prepared, which writes executor records.
+        #[cfg(debug_assertions)]
+        {
+            if crate::root::private_swap::ui_fixture_holds_delivery() {
+                self.set_unshield_form_error(key, "The UI fixture's form sends nothing.", cx);
+                return;
+            }
+        }
         let preparation_started = Instant::now();
         tracing::info!(target: "executor_preparation", step = "review_preparation", "started");
         let Some(draft) = self.unshield_spend_draft(key, cx) else {

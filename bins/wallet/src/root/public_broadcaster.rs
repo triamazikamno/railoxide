@@ -114,6 +114,13 @@ impl WalletRoot {
         else {
             return Vec::new();
         };
+        // Debug UI fixture: `delivery:estimate` and `pin-conflict` offer the stand-in fee token.
+        #[cfg(debug_assertions)]
+        {
+            if let Some(options) = Self::ui_fixture_fee_token_options(chain_id) {
+                return options;
+            }
+        }
         let fee_rows = self.monitor_fee_rows();
         public_broadcaster_fee_token_options_from_snapshot(
             snapshot,

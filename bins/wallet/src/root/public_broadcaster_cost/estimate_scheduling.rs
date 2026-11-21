@@ -52,6 +52,9 @@ impl WalletRoot {
         cx: &mut Context<'_, Self>,
     ) {
         if !self.can_schedule_public_broadcaster_cost_estimate(kind, key) {
+            // Debug UI fixture: in a `delivery:` mode, the refusal drops the stand-in quote.
+            #[cfg(debug_assertions)]
+            self.drop_ui_fixture_delivery_estimate(kind, key, retain_shown, cx);
             return;
         }
 
@@ -178,6 +181,13 @@ impl WalletRoot {
         kind: DeliveryFormKind,
         key: UnshieldAssetKey,
     ) -> bool {
+        // Debug UI fixture: a `delivery:` mode's form holds a stand-in state.
+        #[cfg(debug_assertions)]
+        {
+            if crate::root::private_swap::ui_fixture_holds_delivery() {
+                return false;
+            }
+        }
         match kind {
             DeliveryFormKind::Send => self.send_forms.get(&key).is_some_and(|form| {
                 !form.generating && form.delivery_mode == DeliveryMode::PublicBroadcaster

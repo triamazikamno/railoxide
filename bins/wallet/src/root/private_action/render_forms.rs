@@ -2,16 +2,16 @@ use super::generation::{
     broadcaster_estimate_allows_submission, broadcaster_input_pin_conflict_awaits_choice,
 };
 use super::{
-    Alert, ButtonVariants, DeliveryFormKind, DeliveryMode, Disableable, Entity, ParentElement,
-    Pixels, PublicBroadcasterResultKind, SendResult, Sizable, SponsoredSelfBroadcastSessionOutcome,
-    Styled, UnshieldAssetKey, UnshieldResult, WalletRoot, app_button, app_muted_text,
-    app_strong_text, delivery_element_id, div, effective_self_broadcast_funding_mode,
-    fee_policy_eligible_public_broadcasters, format_form_error_for_asset,
-    is_effective_wrapped_native_token, labeled_field, private_action_amount_input,
-    private_action_metric_display_amount, private_broadcaster_closed_active_progress,
-    public_broadcaster_cost_status, public_broadcaster_fee_token_warning,
-    public_broadcaster_submit_disabled_for_fee_token_options, px, render_delivery_selector,
-    render_fee_mode_toggle, render_private_action_amount_field,
+    Alert, ButtonVariants, DeliveryFormKind, DeliveryMode, Disableable, Entity, InteractiveElement,
+    ParentElement, Pixels, PublicBroadcasterResultKind, SendResult, Sizable,
+    SponsoredSelfBroadcastSessionOutcome, Styled, UnshieldAssetKey, UnshieldResult, WalletRoot,
+    app_button, app_muted_text, app_strong_text, delivery_element_id, div,
+    effective_self_broadcast_funding_mode, fee_policy_eligible_public_broadcasters,
+    format_form_error_for_asset, is_effective_wrapped_native_token, labeled_field,
+    private_action_amount_input, private_action_metric_display_amount,
+    private_broadcaster_closed_active_progress, public_broadcaster_cost_status,
+    public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
+    px, render_delivery_selector, render_fee_mode_toggle, render_private_action_amount_field,
     render_private_broadcaster_status_notice, render_private_self_broadcast_status_notice,
     render_private_submission_active_status_notice, render_public_broadcaster_cost_estimate,
     render_public_broadcaster_cost_status, render_public_broadcaster_settings,
@@ -303,6 +303,7 @@ impl WalletRoot {
                         "Generate calldata"
                     },
                 )
+                .debug_selector(|| "send-generate".into())
                 .primary()
                 .loading(form.generating)
                 .disabled(submit_disabled)
@@ -421,6 +422,7 @@ impl WalletRoot {
                 && !pin_conflict_awaits_choice)
                 .then(|| {
                     app_button(send_element_id(key, "estimate-retry"), "Retry")
+                        .debug_selector(|| "send-estimate-retry".into())
                         .outline()
                         .small()
                         .flex_none()
@@ -808,6 +810,7 @@ impl WalletRoot {
                         "Generate calldata"
                     },
                 )
+                .debug_selector(|| "unshield-generate".into())
                 .primary()
                 .loading(form.generating)
                 .disabled(submit_disabled)
@@ -926,6 +929,7 @@ impl WalletRoot {
                 && !pin_conflict_awaits_choice)
                 .then(|| {
                     app_button(unshield_element_id(key, "estimate-retry"), "Retry")
+                        .debug_selector(|| "unshield-estimate-retry".into())
                         .outline()
                         .small()
                         .flex_none()

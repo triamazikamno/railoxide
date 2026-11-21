@@ -326,11 +326,46 @@
 //!   `broadcaster-progress:`. The network's private session must be started and synced. Send
 //!   then opens the review of a private Send via broadcaster in place of the form: 0.5 of the
 //!   token to the wallet's own address, over a stand-in broadcaster's quote of two plain
-//!   transactions with a fee of 1.25 USDC (Ethereum's USDC where the network lists none). The
-//!   review is the wallet's own, so it shows the notice that a broadcaster could unbundle the
-//!   batch, with its sentence about paying the fee in the payment's token. The quote is never
-//!   estimated again. Approving the review takes the vault password and ends with nothing
-//!   proved or sent, and no record is written.
+//!   transactions with a fee of 1.25 USDC (Ethereum's USDC, in raw units, where the network
+//!   lists none). The review is the wallet's own, so it shows the notice that a broadcaster
+//!   could unbundle the batch, with its sentence about paying the fee in the payment's token.
+//!   The quote is never estimated again. Approving the review takes the vault password and ends
+//!   with nothing proved or sent, and no record is written.
+//! - `delivery:<state>` lets the Private tab's Send and Unshield offer a stand-in 1.0 of the
+//!   network's wrapped native token, with its icon, when the wallet holds nothing it can send
+//!   or unshield. The network's private session must be started. Each form then opens held at
+//!   the state, with its recipient and amount empty; a real asset's form is held too. Unshield
+//!   opens as a plain withdrawal, with unwrap off. `estimate` shows a stand-in broadcaster
+//!   estimate of two plain transactions with a fee of 1.25 USDC, and `refreshing` that estimate
+//!   while it refreshes. `custom-fee` has no estimate and a custom fee of 1.25 USDC, with its edit
+//!   button. `retry` shows a failed estimate with
+//!   its Retry, and `pin-conflict` that failure on a form whose pinned notes can't make the
+//!   attempt, where Retry is hidden and Submit opens the pinned-notes prompt. `estimate` and
+//!   `pin-conflict` offer the fee's USDC as a fee token with one eligible broadcaster, so their
+//!   Submit is enabled; the other broadcaster states keep the wallet's own fee tokens, so on an
+//!   unfunded wallet their Submit stays disabled and the fee-token warning shows. In `estimate` and
+//!   `pin-conflict` a paired Gateway client's private broadcaster drafts get the same stand-in USDC
+//!   option, 1,000 spendable with one eligible broadcaster, in place of the wallet's own fee
+//!   tokens. The fee is paid in the network's USDC, or Ethereum's where the network lists none,
+//!   which then shows in raw units. Both forms show the same Send-shaped estimate, with no public
+//!   output and no Unshield protocol fee, so the withdrawal fee row isn't covered. `sponsored` is
+//!   Self-broadcast funded by private sponsorship, on a network that offers it (Ethereum by
+//!   default), whose estimate card shows too little private wrapped native token for its fees:
+//!   0 available, 0.01 required. No gas quote is requested on open, so Max fee and Max tip
+//!   initially read unavailable. Refresh requests a live gas quote. `submitted` is the stand-in
+//!   estimate accepted by a broadcaster, whose button reads Submitted and is disabled. In both
+//!   forms, View status does nothing because this fixture does not create submission progress.
+//!   The forms' scheduled broadcaster and sponsorship estimates don't run, and sync snapshots
+//!   leave the forms alone, so Retry changes nothing.
+//!   Editing an input still clears the estimate, error, result or sponsored card, as on any form,
+//!   and Max, the broadcaster filters, Random or Specific, favoriting or blocking a broadcaster and
+//!   the estimate's refresh or F5 drop the stand-in estimate too, with nothing in its place;
+//!   reopening the form restores the state. Other estimates stay live: the broadcaster picker and
+//!   the fee editor can estimate on a Ready chain with a live broadcaster for the fee token, and
+//!   show the result only in that picker or editor. A paired Gateway client's draft estimates and
+//!   Self-broadcast gas quotes remain live. Whatever asset the form holds, an approved Send or
+//!   Unshield stops with the fixture's error before executor account preparation, proof
+//!   generation or submission, so no record of that action is written.
 //! - `hardware-derive` shows the Derive from private dialog, from Public's Add account, as a
 //!   hardware wallet's: its authorize state with Show addresses, its preview and the progress
 //!   of an add. Whatever wallet is selected, the dialog treats it as Ledger-derived and asks a
@@ -481,9 +516,9 @@ use swap_records::*;
 
 pub(in crate::root) use activity_stand_in::activity;
 pub(in crate::root) use wallet_stand_ins::{
-    fill_logs, hardware_derive, holds_send_review, send_asset, setup_swap_token, shows_utxos,
-    tor_rotation, tron, unshield_asset, update_check, utxo_finality_context, utxo_rows,
-    walletconnect_request,
+    fill_logs, hardware_derive, holds_delivery, holds_send_review, send_asset, setup_swap_token,
+    shows_utxos, tor_rotation, tron, unshield_asset, update_check, utxo_finality_context,
+    utxo_rows, walletconnect_request,
 };
 pub(super) use wallet_stand_ins::{locked_sell_value, max_asset};
 
@@ -529,6 +564,7 @@ enum Mode {
     Cancelled(Cancelled),
     BroadcasterProgress(BroadcasterProgress),
     BroadcasterReview,
+    Delivery(Delivery),
     HardwareDerive,
     NonEvm(NonEvm, NonEvmNetwork),
     Tron(Tron),
@@ -593,6 +629,25 @@ enum BroadcasterProgress {
     Refused,
     /// Waiting in direct network mode, with no route of its own.
     Direct,
+}
+
+/// What a `delivery:` mode holds on a Send or Unshield form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Delivery {
+    /// A stand-in broadcaster estimate.
+    Estimate,
+    /// That estimate while it is refreshed.
+    Refreshing,
+    /// A custom broadcaster fee and no estimate.
+    CustomFee,
+    /// A failed estimate with its Retry.
+    Retry,
+    /// That failure once the estimate found the form's pinned notes can't make the attempt.
+    PinConflict,
+    /// Self-broadcast funded by private sponsorship, short of wrapped native token.
+    Sponsored,
+    /// The broadcaster accepted the submission.
+    Submitted,
 }
 
 /// Whether a `max:` mode's stand-in Sell asset has locked notes.

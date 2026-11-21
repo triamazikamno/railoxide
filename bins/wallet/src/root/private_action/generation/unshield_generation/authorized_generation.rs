@@ -31,6 +31,15 @@ impl WalletRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
+        // Debug UI fixture: a `delivery:` mode's form is held, so approving must prove and send
+        // nothing.
+        #[cfg(debug_assertions)]
+        {
+            if crate::root::private_swap::ui_fixture_holds_delivery() {
+                self.set_unshield_form_error(key, "The UI fixture's form sends nothing.", cx);
+                return;
+            }
+        }
         let Ok(resolved_chain) = self.effective_chain_configs.railgun(key.chain_id).cloned() else {
             return;
         };

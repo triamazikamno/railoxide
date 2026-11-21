@@ -408,12 +408,14 @@ impl WalletRoot {
         window: &Window,
         cx: &mut Context<'_, Self>,
     ) {
-        // Debug UI fixture: the `broadcaster-review` mode's quote is a stand-in, so approving
-        // its review must prove and send nothing.
+        // Debug UI fixture: the `broadcaster-review` mode's quote is a stand-in and a
+        // `delivery:` mode's form is held, so approving must prove and send nothing.
         #[cfg(debug_assertions)]
         {
-            if crate::root::private_swap::ui_fixture_holds_send_review() {
-                self.set_send_form_error(key, "The UI fixture's review sends nothing.", cx);
+            if crate::root::private_swap::ui_fixture_holds_send_review()
+                || crate::root::private_swap::ui_fixture_holds_delivery()
+            {
+                self.set_send_form_error(key, "The UI fixture's form sends nothing.", cx);
                 return;
             }
         }

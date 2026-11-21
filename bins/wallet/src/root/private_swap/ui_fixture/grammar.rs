@@ -35,6 +35,7 @@ fn parse_family(family: &str, state: &str) -> Option<Mode> {
         "update-check" => update_check_state(state).map(Mode::UpdateCheck),
         "max" => max_state(state).map(Mode::Max),
         "broadcaster-progress" => broadcaster_progress_state(state).map(Mode::BroadcasterProgress),
+        "delivery" => delivery_state(state).map(Mode::Delivery),
         "rotation" => rotation_waku_failed(state).map(|waku_failed| Mode::Rotation { waku_failed }),
         "speed-up" => speed_up_state(state).map(Mode::SpeedUp),
         "split" => split_stage(state).map(Mode::Split),
@@ -78,6 +79,19 @@ fn broadcaster_progress_state(state: &str) -> Option<BroadcasterProgress> {
         "timeout" => BroadcasterProgress::Timeout,
         "refused" => BroadcasterProgress::Refused,
         "direct" => BroadcasterProgress::Direct,
+        _ => return None,
+    })
+}
+
+fn delivery_state(state: &str) -> Option<Delivery> {
+    Some(match state {
+        "estimate" => Delivery::Estimate,
+        "refreshing" => Delivery::Refreshing,
+        "custom-fee" => Delivery::CustomFee,
+        "retry" => Delivery::Retry,
+        "pin-conflict" => Delivery::PinConflict,
+        "sponsored" => Delivery::Sponsored,
+        "submitted" => Delivery::Submitted,
         _ => return None,
     })
 }

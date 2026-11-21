@@ -181,48 +181,7 @@ impl WalletRoot {
             .as_ref()
             .and_then(|session| session.receive_address().ok())
             .unwrap_or_default();
-        let fee_token = [asset.chain_id, 1]
-            .into_iter()
-            .find_map(|chain| known_tokens_for_chain(chain).find(|token| token.symbol == "USDC"))
-            .map_or(Address::ZERO, |token| token.token);
-        let entered_amount =
-            U256::from(10).pow(U256::from(asset.decimals.unwrap_or(18))) / U256::from(2);
-        let gas_limit = 2_351_228;
-        let min_gas_price = 58_798_000;
-        let estimate = wallet_ops::PublicBroadcasterCostEstimate {
-            broadcaster: wallet_ops::PublicBroadcasterCandidate {
-                token: fee_token,
-                fee: U256::from(1_000_000_000_u64),
-                fee_expiration: std::time::SystemTime::now() + Duration::from_mins(1),
-                ..crate::root::private_swap::setup_progress::stand_in_setup_broadcaster(
-                    asset.chain_id,
-                    None,
-                )
-            },
-            action_token: asset.token,
-            fee_token,
-            entered_amount,
-            receiver_amount: entered_amount,
-            recipient_amount: entered_amount,
-            total_private_spend: entered_amount,
-            // 1.25 USDC.
-            fee_amount: U256::from(1_250_000_u64),
-            protocol_fee_amount: U256::ZERO,
-            protocol_fee_bps: U256::ZERO,
-            fee_mode: wallet_ops::FeeHandlingMode::AddToAmount,
-            max_receiver_amount: asset.max_batched,
-            max_entered_amount: asset.max_batched,
-            gas_limit,
-            min_gas_price,
-            native_gas_cost: U256::from(gas_limit) * U256::from(min_gas_price),
-            transaction_count: 2,
-            input_count: 2,
-            private_output_count: 2,
-            public_output_count: 0,
-            relay_call_count: 0,
-            uses_relay_adapt: false,
-            native_top_up: None,
-        };
+        let (fee_token, estimate) = stand_in_cost_estimate(asset);
         let key = crate::root::UnshieldAssetKey::from_asset(asset);
         self.initialize_send_form(asset.clone(), window, cx);
         let Some(form) = self.send_forms.get_mut(&key) else {
@@ -239,4 +198,265 @@ impl WalletRoot {
         form.cost_estimate = Some(estimate);
         self.generate_send_calldata_from_form(key, window, cx);
     }
+
+    /// In a `delivery:` mode, set the `kind` form of `key`, just opened, to the mode's state.
+    /// No scheduled form estimate runs in the mode to replace it.
+    pub(in crate::root) fn apply_ui_fixture_delivery(
+        &mut self,
+        kind: crate::root::DeliveryFormKind,
+        key: crate::root::UnshieldAssetKey,
+    ) {
+        use crate::root::private_action::{SelfBroadcastFundingMode, SendResult, UnshieldResult};
+        use crate::root::{DeliveryFormKind, DeliveryMode};
+        let Some(Mode::Delivery(state)) = mode() else {
+            return;
+        };
+        let Some(asset) = self.private_action_dialog_asset(kind, key).cloned() else {
+            return;
+        };
+        let (fee_token, estimate) = stand_in_cost_estimate(&asset);
+        let fee_mode = estimate.fee_mode;
+        // The custom fee is the stand-in fee, 1.25 of its token.
+        let custom_fee = (state == Delivery::CustomFee).then_some(estimate.fee_amount);
+        let result = (state == Delivery::Submitted).then(|| stand_in_submission(&estimate));
+        let estimate = matches!(
+            state,
+            Delivery::Estimate | Delivery::Refreshing | Delivery::Submitted
+        )
+        .then_some(estimate);
+        let sponsored = state == Delivery::Sponsored;
+        let wrapped_native = self
+            .effective_chain_configs
+            .get(key.chain_id)
+            .and_then(|chain| chain.wrapped_native_token);
+        let sponsored_estimate =
+            sponsored.then(|| stand_in_sponsored_estimate(key.chain_id, wrapped_native));
+        let failed = matches!(state, Delivery::Retry | Delivery::PinConflict);
+        let pin_conflict = state == Delivery::PinConflict;
+        // The two forms name these fields alike; only their result types differ.
+        macro_rules! hold {
+            ($form:ident, $result:path) => {{
+                if sponsored {
+                    $form.delivery_mode = DeliveryMode::SelfBroadcast;
+                    $form.self_broadcast_funding = SelfBroadcastFundingMode::PrivateSponsorship;
+                    $form.sponsored_funding_estimate = sponsored_estimate;
+                } else {
+                    $form.delivery_mode = DeliveryMode::PublicBroadcaster;
+                    $form.selected_fee_token = fee_token;
+                    $form.fee_mode = fee_mode;
+                }
+                $form.cost_estimate = estimate;
+                $form.estimating_cost = state == Delivery::Refreshing;
+                $form.custom_fee_amount = custom_fee;
+                $form.error = failed.then(|| "The UI fixture's stand-in estimate failed.".into());
+                $form.input_pin = pin_conflict.then(stand_in_input_pin);
+                $form.input_pin_conflict = pin_conflict;
+                $form.result = result.map($result);
+            }};
+        }
+        match kind {
+            DeliveryFormKind::Send => {
+                if let Some(form) = self.send_forms.get_mut(&key) {
+                    hold!(form, SendResult::PublicBroadcaster);
+                }
+            }
+            DeliveryFormKind::Unshield => {
+                if let Some(form) = self.unshield_forms.get_mut(&key) {
+                    // Keep unwrap off in held Unshield forms regardless of the saved default.
+                    form.unwrap = false;
+                    hold!(form, UnshieldResult::PublicBroadcaster);
+                }
+            }
+        }
+    }
+
+    /// In a `delivery:` mode, drop the stand-in estimate of the `kind` form of `key` unless
+    /// `retain_shown`. The fixture refuses every estimate, so an edit that would restart one
+    /// drops the stand-in quote instead.
+    pub(in crate::root) fn drop_ui_fixture_delivery_estimate(
+        &mut self,
+        kind: crate::root::DeliveryFormKind,
+        key: crate::root::UnshieldAssetKey,
+        retain_shown: bool,
+        cx: &mut Context<'_, Self>,
+    ) {
+        use crate::root::DeliveryFormKind;
+        if retain_shown || !holds_delivery() {
+            return;
+        }
+        let estimate = match kind {
+            DeliveryFormKind::Send => self
+                .send_forms
+                .get_mut(&key)
+                .map(|form| &mut form.cost_estimate),
+            DeliveryFormKind::Unshield => self
+                .unshield_forms
+                .get_mut(&key)
+                .map(|form| &mut form.cost_estimate),
+        };
+        if let Some(estimate) = estimate
+            && estimate.take().is_some()
+        {
+            cx.notify();
+        }
+    }
+
+    /// The fee tokens Send and Unshield offer on `chain_id` in a `delivery:estimate` or
+    /// `delivery:pin-conflict` mode: only the stand-in estimate's, 1000 of it spendable, with one
+    /// eligible broadcaster, so the form's Submit is enabled. A paired Gateway client's private
+    /// broadcaster drafts get the same option in place of the wallet's own fee tokens. `None` in
+    /// every other mode.
+    pub(in crate::root) fn ui_fixture_fee_token_options(
+        chain_id: u64,
+    ) -> Option<Vec<crate::root::public_broadcaster::PublicBroadcasterFeeTokenOption>> {
+        if !matches!(
+            mode(),
+            Some(Mode::Delivery(Delivery::Estimate | Delivery::PinConflict))
+        ) {
+            return None;
+        }
+        let fee_token = stand_in_fee_token(chain_id);
+        Some(vec![
+            crate::root::public_broadcaster::PublicBroadcasterFeeTokenOption {
+                token: fee_token.token,
+                label: fee_token.symbol.to_owned(),
+                decimals: Some(fee_token.decimals),
+                max_spendable: U256::from(1000)
+                    * U256::from(10).pow(U256::from(fee_token.decimals)),
+                eligible_broadcaster_count: 1,
+                icon_path: token_icon_asset_path(fee_token.chain_id, &fee_token.token)
+                    .map(WalletIconSource::embedded),
+            },
+        ])
+    }
+}
+
+/// `estimate` accepted by its broadcaster, as a `delivery:submitted` form holds it.
+fn stand_in_submission(
+    estimate: &wallet_ops::PublicBroadcasterCostEstimate,
+) -> Box<wallet_ops::PublicBroadcasterSubmissionResult> {
+    Box::new(wallet_ops::PublicBroadcasterSubmissionResult {
+        broadcaster: estimate.broadcaster.clone(),
+        action_token: estimate.action_token,
+        fee_token: estimate.fee_token,
+        entered_amount: estimate.entered_amount,
+        receiver_amount: estimate.receiver_amount,
+        recipient_amount: estimate.recipient_amount,
+        total_private_spend: estimate.total_private_spend,
+        fee_amount: estimate.fee_amount,
+        protocol_fee_amount: estimate.protocol_fee_amount,
+        protocol_fee_bps: estimate.protocol_fee_bps,
+        fee_mode: estimate.fee_mode,
+        gas_limit: estimate.gas_limit,
+        min_gas_price: estimate.min_gas_price,
+        transaction_count: estimate.transaction_count,
+        input_count: estimate.input_count,
+        private_output_count: estimate.private_output_count,
+        public_output_count: estimate.public_output_count,
+        relay_call_count: estimate.relay_call_count,
+        uses_relay_adapt: estimate.uses_relay_adapt,
+        result: PublicBroadcasterResultKind::Submitted {
+            tx_hash: alloy::hex::encode_prefixed(B256::repeat_byte(0x5d)),
+        },
+        native_top_up: None,
+        payload_inputs: None,
+    })
+}
+
+/// The sponsored estimate of a `delivery:sponsored` form on `chain_id`: too little private
+/// `wrapped_native` for its fees, 0 available and 0.01 required.
+fn stand_in_sponsored_estimate(
+    chain_id: u64,
+    wrapped_native: Option<Address>,
+) -> crate::root::private_action::SponsoredFundingEstimateState {
+    crate::root::private_action::SponsoredFundingEstimateState::InsufficientWrappedNative {
+        chain_id,
+        token: wrapped_native,
+        available: U256::ZERO,
+        required: U256::from(10_000_000_000_000_000_u64),
+    }
+}
+
+/// The pinned notes of a `delivery:pin-conflict` form.
+fn stand_in_input_pin() -> wallet_ops::PublicBroadcasterInputPin {
+    wallet_ops::PublicBroadcasterInputPin {
+        inputs: vec![wallet_ops::SelectedInputIdentity {
+            tree: 0,
+            position: 7,
+        }],
+        overridden: false,
+    }
+}
+
+/// The fee token of the stand-in estimate on `chain_id`: its network's USDC, or Ethereum's
+/// where it lists none. A zero-address USDC of 6 decimals where neither is known.
+fn stand_in_fee_token(chain_id: u64) -> KnownTokenInfo {
+    [chain_id, 1]
+        .into_iter()
+        .find_map(|chain| known_tokens_for_chain(chain).find(|token| token.symbol == "USDC"))
+        .unwrap_or(KnownTokenInfo {
+            chain_id,
+            token: Address::ZERO,
+            symbol: "USDC",
+            decimals: 6,
+            anchor_sources: &[],
+        })
+}
+
+/// The stand-in broadcaster estimate of a Send or Unshield of 0.5 of `asset`: two plain
+/// transactions whose fee is 1.25 of the USDC of `asset`'s network, or of Ethereum's where it
+/// lists none, which then shows in raw units. Both forms use this Send-shaped estimate, with no
+/// public output and no Unshield protocol fee. Also returns that fee token.
+fn stand_in_cost_estimate(
+    asset: &crate::root::UnshieldAsset,
+) -> (Address, wallet_ops::PublicBroadcasterCostEstimate) {
+    let fee = stand_in_fee_token(asset.chain_id);
+    let fee_token = fee.token;
+    let entered_amount =
+        U256::from(10).pow(U256::from(asset.decimals.unwrap_or(18))) / U256::from(2);
+    // 1.25 of the fee token.
+    let fee_amount =
+        U256::from(125) * U256::from(10).pow(U256::from(fee.decimals)) / U256::from(100);
+    // With AddToAmount, a fee in the payment token increases its total private spend.
+    let total_private_spend = if asset.token == fee_token {
+        entered_amount + fee_amount
+    } else {
+        entered_amount
+    };
+    let gas_limit = 2_351_228;
+    let min_gas_price = 58_798_000;
+    let estimate = wallet_ops::PublicBroadcasterCostEstimate {
+        broadcaster: wallet_ops::PublicBroadcasterCandidate {
+            token: fee_token,
+            fee: U256::from(1_000_000_000_u64),
+            fee_expiration: std::time::SystemTime::now() + Duration::from_mins(1),
+            ..crate::root::private_swap::setup_progress::stand_in_setup_broadcaster(
+                asset.chain_id,
+                None,
+            )
+        },
+        action_token: asset.token,
+        fee_token,
+        entered_amount,
+        receiver_amount: entered_amount,
+        recipient_amount: entered_amount,
+        total_private_spend,
+        fee_amount,
+        protocol_fee_amount: U256::ZERO,
+        protocol_fee_bps: U256::ZERO,
+        fee_mode: wallet_ops::FeeHandlingMode::AddToAmount,
+        max_receiver_amount: asset.max_batched,
+        max_entered_amount: asset.max_batched,
+        gas_limit,
+        min_gas_price,
+        native_gas_cost: U256::from(gas_limit) * U256::from(min_gas_price),
+        transaction_count: 2,
+        input_count: 2,
+        private_output_count: 2,
+        public_output_count: 0,
+        relay_call_count: 0,
+        uses_relay_adapt: false,
+        native_top_up: None,
+    };
+    (fee_token, estimate)
 }

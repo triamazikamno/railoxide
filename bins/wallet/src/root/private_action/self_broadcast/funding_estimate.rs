@@ -185,6 +185,17 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         cx: &mut Context<'_, Self>,
     ) {
+        // Debug UI fixture: a `delivery:` mode's form keeps its stand-in card on background
+        // refreshes, which a refused schedule would clear (`clears_current(false)` clears in
+        // Retain mode too). Still notify because the gas quote success callback relies on
+        // revalidation to redraw.
+        #[cfg(debug_assertions)]
+        {
+            if crate::root::private_swap::ui_fixture_holds_delivery() {
+                cx.notify();
+                return;
+            }
+        }
         self.schedule_sponsored_funding_estimate(
             kind,
             key,
@@ -253,6 +264,15 @@ impl WalletRoot {
         kind: DeliveryFormKind,
         key: UnshieldAssetKey,
     ) -> bool {
+        // Debug UI fixture: a `delivery:` mode's forms schedule no sponsored estimate.
+        // Refusing clears the held card on an edit, as on any form, while
+        // `revalidate_sponsored_funding_estimate` returns first so background refreshes keep it.
+        #[cfg(debug_assertions)]
+        {
+            if crate::root::private_swap::ui_fixture_holds_delivery() {
+                return false;
+            }
+        }
         let (delivery_mode, generating) = match kind {
             DeliveryFormKind::Send => self
                 .send_forms

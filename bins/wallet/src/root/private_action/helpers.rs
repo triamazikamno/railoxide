@@ -368,6 +368,13 @@ impl WalletRoot {
         snapshot: &ListUtxosOutput,
         cx: &mut Context<'_, Self>,
     ) {
+        // Debug UI fixture: a `delivery:` mode's stand-in asset is not in any snapshot.
+        #[cfg(debug_assertions)]
+        {
+            if crate::root::private_swap::ui_fixture_holds_delivery() {
+                return;
+            }
+        }
         let mut reschedule_estimates = Vec::new();
         let mut reschedule_sponsored_estimates = Vec::new();
         let mut refresh_native_top_up = Vec::new();

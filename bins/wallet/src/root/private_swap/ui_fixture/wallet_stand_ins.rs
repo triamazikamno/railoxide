@@ -47,18 +47,21 @@ pub(in crate::root::private_swap) fn locked_sell_value(
         .then_some(U256::from(500_000_000_000_000_000_u64))
 }
 
-/// The stand-in asset of the `unshield` or a `max:` mode. `None` in every other mode.
+/// The stand-in asset of the `unshield`, a `max:` or a `delivery:` mode, the last two with
+/// their token's icon. `None` in every other mode.
 pub(in crate::root) fn unshield_asset(
     chain_id: u64,
     wrapped_native: Address,
 ) -> Option<crate::root::UnshieldAsset> {
-    max_asset(chain_id, wrapped_native).or_else(|| {
-        matches!(mode(), Some(Mode::Unshield)).then(|| stand_in_asset(chain_id, wrapped_native))
+    max_asset(chain_id, wrapped_native).or_else(|| match mode()? {
+        Mode::Unshield => Some(stand_in_asset(chain_id, wrapped_native)),
+        Mode::Delivery(_) => send_asset(chain_id, wrapped_native),
+        _ => None,
     })
 }
 
-/// The stand-in asset Send offers in a `broadcaster-progress:`, `broadcaster-review` or `max:`
-/// mode, with its token's icon. `None` in every other mode.
+/// The stand-in asset Send offers in a `broadcaster-progress:`, `broadcaster-review`, `max:` or
+/// `delivery:` mode, with its token's icon. `None` in every other mode.
 pub(in crate::root) fn send_asset(
     chain_id: u64,
     wrapped_native: Address,
@@ -66,7 +69,7 @@ pub(in crate::root) fn send_asset(
     max_asset(chain_id, wrapped_native).or_else(|| {
         matches!(
             mode(),
-            Some(Mode::BroadcasterProgress(_) | Mode::BroadcasterReview)
+            Some(Mode::BroadcasterProgress(_) | Mode::BroadcasterReview | Mode::Delivery(_))
         )
         .then(|| crate::root::UnshieldAsset {
             icon_path: token_icon_asset_path(chain_id, &wrapped_native)
@@ -79,6 +82,14 @@ pub(in crate::root) fn send_asset(
 /// Whether the `broadcaster-review` mode is active, whose Send reviews prove and send nothing.
 pub(in crate::root) fn holds_send_review() -> bool {
     matches!(mode(), Some(Mode::BroadcasterReview))
+}
+
+/// Whether a `delivery:` mode is active, whose Send and Unshield forms hold their stand-in
+/// state: the forms' scheduled broadcaster and sponsorship estimates don't run, sync snapshots
+/// leave the forms alone, and an approved Send or Unshield stops before executor account
+/// preparation, proof generation or submission.
+pub(in crate::root) fn holds_delivery() -> bool {
+    matches!(mode(), Some(Mode::Delivery(_)))
 }
 
 /// The token the Private tab's Swap offers in a `setup:`, `retry-review`, `native-buy` or `max:`
