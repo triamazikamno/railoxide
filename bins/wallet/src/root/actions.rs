@@ -143,8 +143,8 @@ fn secondary_key_binding<A: Action>(
         .expect("valid secondary keystroke")
 }
 
-pub(crate) fn install_wallet_action_bindings(app: &mut App) {
-    app.bind_keys([
+fn device_auth_key_bindings() -> [KeyBinding; 2] {
+    [
         // Let the focused icon activate natively instead of a parent dialog or form command.
         KeyBinding::new(
             "enter",
@@ -156,6 +156,11 @@ pub(crate) fn install_wallet_action_bindings(app: &mut App) {
             gpui::NoAction,
             Some(DEVICE_AUTH_BUTTON_KEY_CONTEXT),
         ),
+    ]
+}
+
+fn public_account_key_bindings(app: &App) -> [KeyBinding; 12] {
+    [
         KeyBinding::new(
             "enter",
             gpui_kit::base::actions::Confirm { secondary: false },
@@ -217,6 +222,12 @@ pub(crate) fn install_wallet_action_bindings(app: &mut App) {
             Some(PUBLIC_ACCOUNT_LIST_KEY_CONTEXT),
             app,
         ),
+    ]
+}
+
+/// Global shortcuts, the broadcaster estimate refresh and workspace navigation.
+fn wallet_command_key_bindings(app: &App) -> [KeyBinding; 8] {
+    [
         secondary_key_binding("secondary-,", OpenSettings, None, app),
         secondary_key_binding("secondary-l", LockVault, None, app),
         secondary_key_binding("secondary-shift-t", ToggleNetworkStatus, None, app),
@@ -247,6 +258,11 @@ pub(crate) fn install_wallet_action_bindings(app: &mut App) {
             OpenChainSelector,
             Some(WALLET_WORKSPACE_KEY_CONTEXT),
         ),
+    ]
+}
+
+fn logs_key_bindings(app: &App) -> [KeyBinding; 9] {
+    [
         KeyBinding::new("up", SelectPreviousLine, Some(LOGS_PANE_KEY_CONTEXT)),
         KeyBinding::new("down", SelectNextLine, Some(LOGS_PANE_KEY_CONTEXT)),
         KeyBinding::new("shift-up", ExtendSelectionUp, Some(LOGS_PANE_KEY_CONTEXT)),
@@ -276,7 +292,18 @@ pub(crate) fn install_wallet_action_bindings(app: &mut App) {
             Some(LOGS_PANE_KEY_CONTEXT),
             app,
         ),
-    ]);
+    ]
+}
+
+pub(crate) fn install_wallet_action_bindings(app: &mut App) {
+    // Keep this order: later bindings can take precedence over earlier ones.
+    app.bind_keys(
+        device_auth_key_bindings()
+            .into_iter()
+            .chain(public_account_key_bindings(app))
+            .chain(wallet_command_key_bindings(app))
+            .chain(logs_key_bindings(app)),
+    );
     app.on_action(|_: &OpenSettings, cx| {
         dispatch_wallet_shortcut(WalletShortcutAction::OpenSettings, cx);
     });

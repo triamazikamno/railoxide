@@ -3,7 +3,8 @@ use gpui_component::{
     Disableable, Icon, Selectable, Sizable,
     button::{Button, ButtonGroup},
     checkbox::Checkbox,
-    list::List,
+    input::InputState,
+    list::{List, ListState},
 };
 use ui::controls::app_input;
 use ui::theme;
@@ -14,7 +15,8 @@ use super::WalletRoot;
 use super::broadcaster_picker::{
     BROADCASTER_PICKER_LIST_BOTTOM_PADDING, BROADCASTER_PICKER_LIST_HORIZONTAL_PADDING,
     BROADCASTER_PICKER_LIST_TOP_PADDING, BROADCASTER_PICKER_MIN_LIST_HEIGHT,
-    BroadcasterPickerContent, BroadcasterPickerDialogSnapshot, BroadcasterPickerViewMode,
+    BroadcasterPickerContent, BroadcasterPickerDelegate, BroadcasterPickerDialogSnapshot,
+    BroadcasterPickerScrollIndicator, BroadcasterPickerTarget, BroadcasterPickerViewMode,
     render_broadcaster_picker_header,
 };
 
@@ -78,8 +80,6 @@ pub(super) fn render_broadcaster_picker_dialog_content(
         }
     });
 
-    let toggle_root = root.clone();
-    let view_root = root.clone();
     div()
         .w_full()
         .h(content_height)
@@ -87,73 +87,14 @@ pub(super) fn render_broadcaster_picker_dialog_content(
         .flex()
         .flex_col()
         .gap_2()
-        .child(
-            div().flex().items_center().gap_3().child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(app_input(&query_input).small().disabled(generating)),
-            ),
-        )
-        .child(
-            div()
-                .w_full()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    Checkbox::new(target.element_id("show-all-broadcasters"))
-                        .label("Allow out-of-range fees")
-                        .checked(show_all_broadcasters)
-                        .xsmall()
-                        .disabled(generating)
-                        .on_click(move |checked, _window, cx| {
-                            let checked = *checked;
-                            toggle_root.update(cx, |root, cx| {
-                                root.set_broadcaster_picker_allow_out_of_range(checked, cx);
-                            });
-                        }),
-                )
-                .child(
-                    ButtonGroup::new(target.element_id("broadcaster-picker-view-mode"))
-                        .child(
-                            Button::new(target.element_id("broadcaster-picker-view-grouped"))
-                                .icon(Icon::empty().path(GROUP_ICON_PATH))
-                                .selected(view_mode == BroadcasterPickerViewMode::Grouped)
-                                .accessibility_label("Grouped view")
-                                .tooltip("Grouped view"),
-                        )
-                        .child(
-                            Button::new(target.element_id("broadcaster-picker-view-list"))
-                                .icon(Icon::empty().path(LIST_ICON_PATH))
-                                .selected(view_mode == BroadcasterPickerViewMode::List)
-                                .accessibility_label("List view")
-                                .tooltip("List view"),
-                        )
-                        .compact()
-                        .outline()
-                        .small()
-                        .disabled(generating)
-                        .on_click(move |selected, _window, cx| {
-                            let Some(index) = selected.first() else {
-                                return;
-                            };
-                            let view_mode = if *index == 0 {
-                                BroadcasterPickerViewMode::Grouped
-                            } else {
-                                BroadcasterPickerViewMode::List
-                            };
-                            view_root.update(cx, |root, cx| {
-                                root.set_broadcaster_picker_view_mode(view_mode, cx);
-                            });
-                        }),
-                ),
-        )
+        .child(render_broadcaster_picker_search(&query_input, generating))
+        .child(render_broadcaster_picker_controls(
+            root,
+            &target,
+            show_all_broadcasters,
+            view_mode,
+            generating,
+        ))
         .child(render_broadcaster_picker_header(
             root,
             &query_input,
@@ -161,22 +102,116 @@ pub(super) fn render_broadcaster_picker_dialog_content(
             total_count,
             fee_status_popover_open,
         ))
-        .child(
-            div()
-                .relative()
-                .flex_1()
-                .min_h(BROADCASTER_PICKER_MIN_LIST_HEIGHT)
-                .min_w(px(0.0))
-                .w_full()
-                .child(
-                    List::new(&list)
-                        .px(BROADCASTER_PICKER_LIST_HORIZONTAL_PADDING)
-                        .pt(BROADCASTER_PICKER_LIST_TOP_PADDING)
-                        .pb(BROADCASTER_PICKER_LIST_BOTTOM_PADDING)
-                        .size_full()
-                        .bg(rgb(theme::SURFACE)),
-                )
-                .child(scroll_indicator),
-        )
+        .child(render_broadcaster_picker_list(&list, scroll_indicator))
         .into_any_element()
+}
+
+fn render_broadcaster_picker_search(
+    query_input: &Entity<InputState>,
+    generating: bool,
+) -> gpui::Div {
+    div().flex().items_center().gap_3().child(
+        div()
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(app_input(query_input).small().disabled(generating)),
+    )
+}
+
+fn render_broadcaster_picker_controls(
+    root: &Entity<WalletRoot>,
+    target: &BroadcasterPickerTarget,
+    show_all_broadcasters: bool,
+    view_mode: BroadcasterPickerViewMode,
+    generating: bool,
+) -> gpui::Div {
+    let toggle_root = root.clone();
+    div()
+        .w_full()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(
+            Checkbox::new(target.element_id("show-all-broadcasters"))
+                .label("Allow out-of-range fees")
+                .checked(show_all_broadcasters)
+                .xsmall()
+                .disabled(generating)
+                .on_click(move |checked, _window, cx| {
+                    let checked = *checked;
+                    toggle_root.update(cx, |root, cx| {
+                        root.set_broadcaster_picker_allow_out_of_range(checked, cx);
+                    });
+                }),
+        )
+        .child(render_broadcaster_picker_view_mode_buttons(
+            root, target, view_mode, generating,
+        ))
+}
+
+fn render_broadcaster_picker_view_mode_buttons(
+    root: &Entity<WalletRoot>,
+    target: &BroadcasterPickerTarget,
+    view_mode: BroadcasterPickerViewMode,
+    generating: bool,
+) -> ButtonGroup {
+    let view_root = root.clone();
+    ButtonGroup::new(target.element_id("broadcaster-picker-view-mode"))
+        .child(
+            Button::new(target.element_id("broadcaster-picker-view-grouped"))
+                .icon(Icon::empty().path(GROUP_ICON_PATH))
+                .selected(view_mode == BroadcasterPickerViewMode::Grouped)
+                .accessibility_label("Grouped view")
+                .tooltip("Grouped view"),
+        )
+        .child(
+            Button::new(target.element_id("broadcaster-picker-view-list"))
+                .icon(Icon::empty().path(LIST_ICON_PATH))
+                .selected(view_mode == BroadcasterPickerViewMode::List)
+                .accessibility_label("List view")
+                .tooltip("List view"),
+        )
+        .compact()
+        .outline()
+        .small()
+        .disabled(generating)
+        .on_click(move |selected, _window, cx| {
+            let Some(index) = selected.first() else {
+                return;
+            };
+            let view_mode = if *index == 0 {
+                BroadcasterPickerViewMode::Grouped
+            } else {
+                BroadcasterPickerViewMode::List
+            };
+            view_root.update(cx, |root, cx| {
+                root.set_broadcaster_picker_view_mode(view_mode, cx);
+            });
+        })
+}
+
+fn render_broadcaster_picker_list(
+    list: &Entity<ListState<BroadcasterPickerDelegate>>,
+    scroll_indicator: Entity<BroadcasterPickerScrollIndicator>,
+) -> gpui::Div {
+    div()
+        .relative()
+        .flex_1()
+        .min_h(BROADCASTER_PICKER_MIN_LIST_HEIGHT)
+        .min_w(px(0.0))
+        .w_full()
+        .child(
+            List::new(list)
+                .px(BROADCASTER_PICKER_LIST_HORIZONTAL_PADDING)
+                .pt(BROADCASTER_PICKER_LIST_TOP_PADDING)
+                .pb(BROADCASTER_PICKER_LIST_BOTTOM_PADDING)
+                .size_full()
+                .bg(rgb(theme::SURFACE)),
+        )
+        .child(scroll_indicator)
 }

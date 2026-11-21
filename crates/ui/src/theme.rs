@@ -1,4 +1,5 @@
-use gpui::{App, Hsla, Pixels, px, rgb};
+use gpui::{App, Hsla, Pixels, px};
+use gpui_component::ThemeColor;
 
 pub const APP_FONT_FAMILY: &str = ".SystemUIFont";
 #[cfg(target_os = "macos")]
@@ -73,62 +74,88 @@ pub fn apply_zenburn_component_theme(cx: &mut App) {
     theme.shadow = false;
     theme.focus_ring = false;
 
-    let rgb = |value: u32| -> Hsla { rgb(value).into() };
     let colors = &mut theme.colors;
+    apply_surface_colors(colors);
+    apply_action_colors(colors);
+    apply_component_colors(colors);
+    apply_chart_and_hue_colors(colors);
+    apply_button_colors(colors);
+
+    // Components paint token backgrounds; Base also owns scrollbar and resize styles.
+    theme.tokens = theme.colors.into();
+    gpui_component::Theme::sync_base(cx);
+}
+
+fn rgb(value: u32) -> Hsla {
+    gpui::rgb(value).into()
+}
+
+fn apply_surface_colors(colors: &mut ThemeColor) {
     colors.accent = rgb(SURFACE_HOVER);
     colors.accent_foreground = rgb(TEXT);
-    colors.accordion = rgb(SURFACE);
     colors.background = rgb(SURFACE);
     colors.border = rgb(BORDER);
-    colors.group_box = rgb(SURFACE_ELEVATED);
-    colors.group_box_foreground = rgb(TEXT);
     colors.caret = rgb(TEXT);
-    colors.chart_1 = rgb(PRIMARY);
-    colors.chart_2 = rgb(SUCCESS);
-    colors.chart_3 = rgb(WARNING);
-    colors.chart_4 = rgb(DANGER);
-    colors.chart_5 = rgb(PURPLE);
+    colors.drag_border = rgb(PRIMARY);
+    colors.drop_target = rgb(SELECTED_SURFACE);
+    colors.foreground = rgb(TEXT);
+    colors.input = rgb(BORDER);
+    colors.muted = rgb(SURFACE_HOVER_SUBTLE);
+    colors.muted_foreground = rgb(TEXT_PLACEHOLDER);
+    colors.popover = rgb(POPOVER_BG);
+    colors.popover_foreground = rgb(TEXT);
+    colors.ring = rgb(PRIMARY);
+    colors.selection = rgb(SELECTED_SURFACE).alpha(0.45);
+    colors.overlay = rgb(OVERLAY);
+    colors.window_border = rgb(BORDER);
+}
+
+fn apply_action_colors(colors: &mut ThemeColor) {
     colors.danger = rgb(DANGER);
     colors.danger_active = rgb(DANGER_BG);
     colors.danger_foreground = rgb(PRIMARY_FOREGROUND);
     colors.danger_hover = rgb(0xdca3a3);
-    colors.description_list_label = rgb(SURFACE_HOVER_SUBTLE);
-    colors.description_list_label_foreground = rgb(TEXT_MUTED);
-    colors.drag_border = rgb(PRIMARY);
-    colors.drop_target = rgb(SELECTED_SURFACE);
-    colors.foreground = rgb(TEXT);
     colors.info = rgb(INFO);
     colors.info_active = rgb(PRIMARY_ACTIVE);
     colors.info_foreground = rgb(PRIMARY_FOREGROUND);
     colors.info_hover = rgb(PRIMARY_HOVER);
-    colors.input = rgb(BORDER);
     colors.link = rgb(PRIMARY);
     colors.link_active = rgb(INFO);
     colors.link_hover = rgb(PRIMARY_HOVER);
+    colors.primary = rgb(PRIMARY);
+    colors.primary_active = rgb(PRIMARY_ACTIVE);
+    colors.primary_foreground = rgb(PRIMARY_FOREGROUND);
+    colors.primary_hover = rgb(PRIMARY_HOVER);
+    colors.secondary = rgb(SURFACE_ELEVATED);
+    colors.secondary_active = rgb(SURFACE_ELEVATED_ALT);
+    colors.secondary_foreground = rgb(TEXT);
+    colors.secondary_hover = rgb(SURFACE_HOVER);
+    colors.success = rgb(SUCCESS);
+    colors.success_foreground = rgb(PRIMARY_FOREGROUND);
+    colors.success_hover = rgb(0x8fb28f);
+    colors.success_active = rgb(0x5f7f5f);
+    colors.warning = rgb(WARNING);
+    colors.warning_active = rgb(0xccb98f);
+    colors.warning_hover = rgb(0xffefbf);
+    colors.warning_foreground = rgb(PRIMARY_FOREGROUND);
+}
+
+fn apply_component_colors(colors: &mut ThemeColor) {
+    colors.accordion = rgb(SURFACE);
+    colors.group_box = rgb(SURFACE_ELEVATED);
+    colors.group_box_foreground = rgb(TEXT);
+    colors.description_list_label = rgb(SURFACE_HOVER_SUBTLE);
+    colors.description_list_label_foreground = rgb(TEXT_MUTED);
     colors.list = rgb(BACKGROUND);
     colors.list_active = rgb(SURFACE_HOVER).alpha(0.2);
     colors.list_active_border = rgb(PRIMARY);
     colors.list_even = rgb(SURFACE);
     colors.list_head = rgb(SURFACE_ELEVATED);
     colors.list_hover = rgb(SURFACE_HOVER_SUBTLE);
-    colors.muted = rgb(SURFACE_HOVER_SUBTLE);
-    colors.muted_foreground = rgb(TEXT_PLACEHOLDER);
-    colors.popover = rgb(POPOVER_BG);
-    colors.popover_foreground = rgb(TEXT);
-    colors.primary = rgb(PRIMARY);
-    colors.primary_active = rgb(PRIMARY_ACTIVE);
-    colors.primary_foreground = rgb(PRIMARY_FOREGROUND);
-    colors.primary_hover = rgb(PRIMARY_HOVER);
     colors.progress_bar = rgb(PRIMARY);
-    colors.ring = rgb(PRIMARY);
     colors.scrollbar = rgb(SURFACE).alpha(0.0);
     colors.scrollbar_thumb = rgb(BORDER);
     colors.scrollbar_thumb_hover = rgb(BORDER_STRONG);
-    colors.secondary = rgb(SURFACE_ELEVATED);
-    colors.secondary_active = rgb(SURFACE_ELEVATED_ALT);
-    colors.secondary_foreground = rgb(TEXT);
-    colors.secondary_hover = rgb(SURFACE_HOVER);
-    colors.selection = rgb(SELECTED_SURFACE).alpha(0.45);
     colors.sidebar = rgb(SURFACE);
     colors.sidebar_accent = rgb(SURFACE_HOVER);
     colors.sidebar_accent_foreground = rgb(TEXT);
@@ -139,12 +166,6 @@ pub fn apply_zenburn_component_theme(cx: &mut App) {
     colors.skeleton = rgb(SURFACE_HOVER_SUBTLE);
     colors.slider_bar = rgb(SURFACE_HOVER);
     colors.slider_thumb = rgb(TEXT_MUTED);
-    colors.success = rgb(SUCCESS);
-    colors.success_foreground = rgb(PRIMARY_FOREGROUND);
-    colors.success_hover = rgb(0x8fb28f);
-    colors.success_active = rgb(0x5f7f5f);
-    colors.chart_bullish = rgb(SUCCESS);
-    colors.chart_bearish = rgb(DANGER);
     colors.switch = rgb(SURFACE_HOVER);
     colors.switch_thumb = rgb(SURFACE);
     colors.tab = rgb(SURFACE);
@@ -163,12 +184,16 @@ pub fn apply_zenburn_component_theme(cx: &mut App) {
     colors.table_row_border = rgb(BORDER_SUBTLE);
     colors.title_bar = rgb(SURFACE);
     colors.title_bar_border = rgb(BORDER_SUBTLE);
-    colors.warning = rgb(WARNING);
-    colors.warning_active = rgb(0xccb98f);
-    colors.warning_hover = rgb(0xffefbf);
-    colors.warning_foreground = rgb(PRIMARY_FOREGROUND);
-    colors.overlay = rgb(OVERLAY);
-    colors.window_border = rgb(BORDER);
+}
+
+fn apply_chart_and_hue_colors(colors: &mut ThemeColor) {
+    colors.chart_1 = rgb(PRIMARY);
+    colors.chart_2 = rgb(SUCCESS);
+    colors.chart_3 = rgb(WARNING);
+    colors.chart_4 = rgb(DANGER);
+    colors.chart_5 = rgb(PURPLE);
+    colors.chart_bullish = rgb(SUCCESS);
+    colors.chart_bearish = rgb(DANGER);
 
     colors.red = rgb(DANGER);
     colors.red_light = rgb(0xdca3a3);
@@ -182,7 +207,10 @@ pub fn apply_zenburn_component_theme(cx: &mut App) {
     colors.magenta_light = rgb(0xec93d3);
     colors.cyan = rgb(PRIMARY);
     colors.cyan_light = rgb(INFO);
+}
 
+/// Copies the action colors, so it must run after [`apply_action_colors`].
+const fn apply_button_colors(colors: &mut ThemeColor) {
     // Buttons now have independent colors instead of inheriting the generic palette.
     colors.button = colors.secondary;
     colors.button_active = colors.secondary_active;
@@ -212,8 +240,4 @@ pub fn apply_zenburn_component_theme(cx: &mut App) {
     colors.button_warning_active = colors.warning_active;
     colors.button_warning_foreground = colors.warning_foreground;
     colors.button_warning_hover = colors.warning_hover;
-
-    // Components paint token backgrounds; Base also owns scrollbar and resize styles.
-    theme.tokens = theme.colors.into();
-    gpui_component::Theme::sync_base(cx);
 }
