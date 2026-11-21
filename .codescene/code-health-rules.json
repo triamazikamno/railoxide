@@ -1,0 +1,12 @@
+{
+  "rule_sets" : [ {
+    "matching_content_path" : "**/*",
+    "thresholds" : [ {
+      "name" : "function_max_arguments",
+      "value" : 7
+    }, {
+      "name" : "constructor_max_arguments",
+      "value" : 8
+    } ]
+  } ]
+}
