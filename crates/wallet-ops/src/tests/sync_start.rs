@@ -445,6 +445,7 @@ fn chain_config_threads_indexed_artifact_source() {
         max_manifest_age: Some(Duration::from_mins(10)),
         concurrency: 5,
         max_in_flight_bytes: 8 * 1024 * 1024,
+        amount_statistics_ipns_name: None,
     });
 
     let cfg = crate::chain_config(&effective, &http, None).expect("chain config");

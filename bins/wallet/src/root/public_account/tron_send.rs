@@ -282,7 +282,10 @@ fn tron_send_authorization_summary(
             "Amount",
             format!(
                 "{} {}",
-                format_send_amount_input(review_amount(review), Some(intent.decimals)),
+                railgun_ui::group_thousands(&format_send_amount_input(
+                    review_amount(review),
+                    Some(intent.decimals)
+                )),
                 intent.symbol
             ),
         )
@@ -1103,7 +1106,7 @@ impl WalletRoot {
             TronSendOutcome::Complete { amount, .. } => {
                 self.tron_public.send.completed = Some(Arc::from(format!(
                     "Sent {} {symbol} to {}.",
-                    format_send_amount_input(amount, Some(decimals)),
+                    railgun_ui::group_thousands(&format_send_amount_input(amount, Some(decimals))),
                     railgun_ui::short_non_evm(&encode_tron_address(receiver)),
                 )));
                 return;

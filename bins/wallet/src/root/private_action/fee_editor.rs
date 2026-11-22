@@ -46,7 +46,7 @@ pub(in crate::root) fn custom_fee_label(
         || format!("raw units of {}", token.to_checksum(None)),
         |token| token.symbol,
     );
-    format!("{value} {symbol}")
+    format!("{} {symbol}", railgun_ui::group_thousands(&value))
 }
 
 pub(in crate::root) fn fee_edit_button(
@@ -219,7 +219,10 @@ impl WalletRoot {
             (
                 format!(
                     "{} {token_label}",
-                    format_send_amount_input(retry.fee_amount, decimals)
+                    railgun_ui::group_thousands(&format_send_amount_input(
+                        retry.fee_amount,
+                        decimals
+                    ))
                 ),
                 crate::root::broadcaster_picker::broadcaster_candidate_label(&retry.broadcaster),
             )
@@ -259,9 +262,9 @@ impl WalletRoot {
                     let result = join.await;
                     let _ = this.update(cx, |this, cx| {
                         this.automatic_estimate = match result {
-                            Ok(Ok(estimate)) => {
-                                format_send_amount_input(estimate.fee_amount, this.decimals)
-                            }
+                            Ok(Ok(estimate)) => railgun_ui::group_thousands(
+                                &format_send_amount_input(estimate.fee_amount, this.decimals),
+                            ),
                             _ => "Unavailable. Use automatic estimation to retry.".into(),
                         };
                         cx.notify();

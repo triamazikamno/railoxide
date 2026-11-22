@@ -113,7 +113,8 @@ impl WalletRoot {
             summary.with_notice(AppNoticeTone::Warning, disclosure)
         } else {
             summary
-        };
+        }
+        .with_privacy_hints(self.unshield_privacy_presentation(key));
         self.request_spend_authorization(intent, summary, window, cx);
     }
 
@@ -307,7 +308,10 @@ impl WalletRoot {
                 key,
                 format!(
                     "Amount exceeds max POI-verified batched transaction: {}",
-                    format_unshield_amount_input(max_entered_amount, asset.decimals)
+                    railgun_ui::group_thousands(&format_unshield_amount_input(
+                        max_entered_amount,
+                        asset.decimals
+                    ))
                 ),
                 cx,
             );

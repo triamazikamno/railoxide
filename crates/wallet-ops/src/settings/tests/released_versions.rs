@@ -526,3 +526,23 @@ fn released_v10_protocol_overrides_are_dropped_and_other_settings_kept() {
     drop(store);
     fs::remove_dir_all(root_dir).unwrap();
 }
+
+/// Released versions store this section without `amount_statistics_ipns_name` and reject unknown
+/// fields, so an unset name must load from and save back to the released shape.
+#[test]
+fn released_indexed_artifact_settings_round_trip_without_amount_statistics_name() {
+    let released = json!({
+        "source_mode": "custom",
+        "publisher_pubkey": format!("0x{}", "11".repeat(32)),
+        "manifest_source": { "type": "ipns-name", "value": OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME },
+        "gateway_urls": OFFICIAL_INDEXED_ARTIFACT_GATEWAYS,
+        "max_manifest_age_secs": 3_600,
+        "concurrency": 5,
+        "max_in_flight_bytes": null,
+    });
+
+    let loaded: crate::settings::IndexedArtifactSettings =
+        serde_json::from_value(released.clone()).expect("released indexed artifact settings");
+    assert_eq!(loaded.amount_statistics_ipns_name, None);
+    assert_eq!(serde_json::to_value(&loaded).unwrap(), released);
+}

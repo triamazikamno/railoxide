@@ -177,6 +177,7 @@ impl WalletSettingsEditor {
                         .keywords(["indexed artifacts", "ipfs", "manifest", "custom"])
                         .layout(Axis::Vertical),
                 )
+                .item(self.indexed_artifact_amount_statistics_item(editor))
                 .item(
                     SettingItem::new("Chunk concurrency", indexed_concurrency).keywords([
                         "indexed artifacts",
@@ -220,6 +221,38 @@ impl WalletSettingsEditor {
                 );
         }
         indexed_artifact_group
+    }
+
+    /// The custom source's amount statistics IPNS name, described by its help or by why it is
+    /// invalid.
+    fn indexed_artifact_amount_statistics_item(&self, editor: &Entity<Self>) -> SettingItem {
+        let ipns_name = Self::shared_string_field(
+            "indexed-artifact-amount-statistics-ipns-name",
+            editor.clone(),
+            |settings| {
+                settings
+                    .indexed_artifacts
+                    .amount_statistics_ipns_name
+                    .clone()
+                    .unwrap_or_default()
+            },
+            |settings, value| {
+                settings.indexed_artifacts.amount_statistics_ipns_name = non_empty_setting(&value);
+            },
+        );
+        SettingItem::new("Amount statistics IPNS name", ipns_name)
+            .description(indexed_artifact_amount_statistics_help(
+                &self.draft,
+                self.validation_error.as_deref(),
+            ))
+            .keywords([
+                "indexed artifacts",
+                "amount statistics",
+                "privacy hints",
+                "ipns",
+                "custom",
+            ])
+            .layout(Axis::Vertical)
     }
 
     fn poi_group(&self, editor: &Entity<Self>) -> SettingGroup {

@@ -47,7 +47,7 @@ use super::summary_view::{
 };
 use super::{
     SPEND_AUTHORIZATION_DETAILS_TOGGLE, SPEND_AUTHORIZATION_DIALOG_WIDTH,
-    SPEND_AUTHORIZATION_ROW_GROUP_TOGGLE,
+    SPEND_AUTHORIZATION_ROW_GROUP_TOGGLE, spend_authorization_dialog_body,
 };
 
 #[derive(Clone)]
@@ -423,7 +423,11 @@ impl WalletRoot {
                         root.clear_trezor_pin_matrix_prompt(cx);
                     });
                 })
-                .child(div().w(content_width).child(content.clone()))
+                .child(spend_authorization_dialog_body(
+                    content.clone(),
+                    content_width,
+                    window,
+                ))
                 // The footer stays in view while the content scrolls.
                 .footer(content.read(cx).render_footer(&content).w(content_width))
         });
@@ -661,6 +665,8 @@ impl WalletRoot {
             return;
         };
         draft.sponsored_authorization_limit = authorization_limit;
+        let summary = super::super::private_action::private_unshield_authorization_summary(&draft)
+            .with_privacy_hints(self.unshield_privacy_presentation(key));
         self.open_hardware_spend_authorization_dialog(
             HardwareSpendAuthorizationCompletion::PrivateUnshieldSelfBroadcast {
                 key,
@@ -668,7 +674,7 @@ impl WalletRoot {
                 authorization_limit,
                 execution,
             },
-            super::super::private_action::private_unshield_authorization_summary(&draft),
+            summary,
             window,
             cx,
         );

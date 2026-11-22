@@ -63,13 +63,7 @@ impl WalletRoot {
         #[cfg(debug_assertions)]
         if Self::public_shield_error_ui_fixture_active() {
             let root = root.clone();
-            let label = match crate::root::public_action::public_shield_ui_fixture() {
-                Some(
-                    crate::root::public_action::PublicShieldUiFixture::EstimateError
-                    | crate::root::public_action::PublicShieldUiFixture::FundingError,
-                ) => "Preview Shield failure…",
-                _ => "Preview native shield…",
-            };
+            let label = Self::public_shield_ui_fixture_label();
             return app_button("wallet-public-preview-shield-error", label)
                 .small()
                 .on_click(move |_, window, cx| {
@@ -79,7 +73,8 @@ impl WalletRoot {
                             .selected_account_uuid
                             .clone()
                             .unwrap_or_else(|| Arc::from("ui-fixture"));
-                        root.open_public_action_dialog(account, PublicAssetId::Native, window, cx);
+                        let asset = root.public_shield_ui_fixture_asset();
+                        root.open_public_action_dialog(account, asset, window, cx);
                     });
                 })
                 .into_any_element();
@@ -123,6 +118,21 @@ impl WalletRoot {
                     ))
             })
             .into_any_element()
+    }
+
+    /// The label of the debug button that opens the active Shield UI fixture.
+    #[cfg(debug_assertions)]
+    fn public_shield_ui_fixture_label() -> &'static str {
+        match crate::root::public_action::public_shield_ui_fixture() {
+            Some(
+                crate::root::public_action::PublicShieldUiFixture::EstimateError
+                | crate::root::public_action::PublicShieldUiFixture::FundingError,
+            ) => "Preview Shield failure…",
+            Some(crate::root::public_action::PublicShieldUiFixture::Hints) => {
+                "Preview Shield hints…"
+            }
+            _ => "Preview native shield…",
+        }
     }
 
     pub(in crate::root) fn render_public_account_dialog_content(

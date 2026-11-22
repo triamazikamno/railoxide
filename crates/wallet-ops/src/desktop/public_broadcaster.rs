@@ -312,6 +312,9 @@ pub struct PublicBroadcasterCostEstimate {
     pub relay_call_count: usize,
     pub uses_relay_adapt: bool,
     pub native_top_up: Option<DesktopNativeTopUpPlan>,
+    /// The unshields of the estimate's final selection, with their notes resolved, for the
+    /// amount privacy hints. `None` for a send, a native top-up, or notes that didn't resolve.
+    pub planned_unshields: Option<Vec<crate::ResolvedPlannedUnshield>>,
 }
 
 /// Reviewed spending limits, separate from the fee placed in the transaction.

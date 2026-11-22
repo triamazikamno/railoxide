@@ -169,7 +169,9 @@ pub(super) fn render_staking_action_form(
                                     .compact()
                                     .child(format!(
                                         "Max: {} RAIL",
-                                        format_send_amount_input(balance, decimals)
+                                        railgun_ui::group_thousands(&format_send_amount_input(
+                                            balance, decimals
+                                        ))
                                     ))
                                     .on_click(move |_event, window, cx| {
                                         max_input.update(cx, |input, cx| {

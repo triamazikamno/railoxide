@@ -254,6 +254,29 @@ pub(in crate::root) const fn should_show_indexed_artifact_custom_settings(
     matches!(mode, IndexedArtifactSourceModeSetting::Custom)
 }
 
+/// The path settings validation names the amount-statistics IPNS name by.
+const AMOUNT_STATISTICS_IPNS_NAME_FIELD: &str = "indexed_artifacts.amount_statistics_ipns_name";
+
+/// The help under a custom source's amount-statistics IPNS name. `validation_error` is the
+/// page's, which names the field while its value is invalid.
+pub(in crate::root) fn indexed_artifact_amount_statistics_help(
+    settings: &WalletSettings,
+    validation_error: Option<&str>,
+) -> &'static str {
+    if validation_error.is_some_and(|error| error.contains(AMOUNT_STATISTICS_IPNS_NAME_FIELD)) {
+        "This isn't a valid IPNS name. Leave it empty to fetch no amount statistics."
+    } else if settings
+        .indexed_artifacts
+        .amount_statistics_ipns_name
+        .as_deref()
+        .is_none_or(|name| name.trim().is_empty())
+    {
+        "No amount statistics are fetched for this source. Shield and Unshield show only the privacy factors that need none."
+    } else {
+        "Shield and Unshield read amount statistics for their privacy hints from this IPNS name."
+    }
+}
+
 pub(in crate::root) const fn network_mode_value(mode: NetworkModeSetting) -> &'static str {
     match mode {
         NetworkModeSetting::Tor => "tor",

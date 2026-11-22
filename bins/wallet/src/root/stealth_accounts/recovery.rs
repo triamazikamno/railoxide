@@ -741,7 +741,9 @@ impl StealthAccountsView {
     ) -> String {
         self.asset_decimals(asset, cx).map_or_else(
             || format!("{amount} smallest token units"),
-            |decimals| railgun_ui::format_scaled_amount(amount, decimals),
+            |decimals| {
+                railgun_ui::group_thousands(&railgun_ui::format_scaled_amount(amount, decimals))
+            },
         )
     }
 

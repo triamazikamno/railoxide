@@ -163,26 +163,7 @@ pub fn build_effective_chain_configs(
         sync.indexed_artifact_source = settings
             .indexed_artifacts
             .source_config(&settings.poi.artifact.gateway_urls)
-            .map(|source| sync_service::IndexedArtifactSourceConfig {
-                trusted_publisher_pubkey: source.trusted_publisher_pubkey,
-                manifest_source: match source.manifest_source {
-                    super::IndexedArtifactManifestSource::Url(url) => {
-                        sync_service::IndexedArtifactManifestSource::Url(url)
-                    }
-                    super::IndexedArtifactManifestSource::Cid(cid) => {
-                        sync_service::IndexedArtifactManifestSource::Cid(cid)
-                    }
-                    super::IndexedArtifactManifestSource::IpnsName(name) => {
-                        sync_service::IndexedArtifactManifestSource::IpnsName(name)
-                    }
-                },
-                gateway_urls: source.gateway_urls,
-                gateway_pool: None,
-                manifest_reuse: sync_service::IndexedArtifactManifestReuse::default(),
-                max_manifest_age: source.max_manifest_age,
-                concurrency: source.concurrency,
-                max_in_flight_bytes: source.max_in_flight_bytes,
-            });
+            .map(sync_indexed_artifact_source);
         config.railgun = Some(super::EffectiveRailgunConfig {
             deployment,
             sync,
@@ -253,6 +234,32 @@ pub fn build_effective_chain_configs(
         );
     }
     Ok(EffectiveChainRegistry { chains: configs })
+}
+
+fn sync_indexed_artifact_source(
+    source: super::IndexedArtifactSourceConfig,
+) -> sync_service::IndexedArtifactSourceConfig {
+    sync_service::IndexedArtifactSourceConfig {
+        trusted_publisher_pubkey: source.trusted_publisher_pubkey,
+        manifest_source: match source.manifest_source {
+            super::IndexedArtifactManifestSource::Url(url) => {
+                sync_service::IndexedArtifactManifestSource::Url(url)
+            }
+            super::IndexedArtifactManifestSource::Cid(cid) => {
+                sync_service::IndexedArtifactManifestSource::Cid(cid)
+            }
+            super::IndexedArtifactManifestSource::IpnsName(name) => {
+                sync_service::IndexedArtifactManifestSource::IpnsName(name)
+            }
+        },
+        gateway_urls: source.gateway_urls,
+        gateway_pool: None,
+        manifest_reuse: sync_service::IndexedArtifactManifestReuse::default(),
+        max_manifest_age: source.max_manifest_age,
+        concurrency: source.concurrency,
+        max_in_flight_bytes: source.max_in_flight_bytes,
+        amount_statistics_ipns_name: source.amount_statistics_ipns_name,
+    }
 }
 
 /// Shared resolution for every built-in preset. Railgun capability is layered on afterwards.

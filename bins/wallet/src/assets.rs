@@ -55,6 +55,7 @@ const KEY_ROUND_ICON_PATH: &str = "railgun/icons/key-round.svg";
 const WATCH_ICON_PATH: &str = "railgun/icons/watch.svg";
 const FINGERPRINT_ICON_PATH: &str = "railgun/icons/fingerprint.svg";
 const HAT_GLASSES_ICON_PATH: &str = "railgun/icons/hat-glasses.svg";
+const CHART_NO_AXES_COLUMN_ICON_PATH: &str = "railgun/icons/chart-no-axes-column.svg";
 const LIST_SORT_DESCENDING_ICON_PATH: &str = "railgun/icons/list-sort-descending.svg";
 const WRENCH_ICON_PATH: &str = "railgun/icons/wrench.svg";
 const FILE_PEN_LINE_ICON_PATH: &str = "railgun/icons/file-pen-line.svg";
@@ -110,6 +111,7 @@ const RAILGUN_ASSET_PATHS: &[&str] = &[
     FINGERPRINT_ICON_PATH,
     WATCH_ICON_PATH,
     HAT_GLASSES_ICON_PATH,
+    CHART_NO_AXES_COLUMN_ICON_PATH,
     LIST_SORT_DESCENDING_ICON_PATH,
     WRENCH_ICON_PATH,
     FILE_PEN_LINE_ICON_PATH,
@@ -170,6 +172,8 @@ const KEY_ROUND_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/key-round.sv
 const WATCH_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/watch.svg");
 const FINGERPRINT_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/fingerprint.svg");
 const HAT_GLASSES_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/hat-glasses.svg");
+const CHART_NO_AXES_COLUMN_ICON_BYTES: &[u8] =
+    include_bytes!("../assets/icons/chart-no-axes-column.svg");
 const LIST_SORT_DESCENDING_ICON_BYTES: &[u8] =
     include_bytes!("../assets/icons/list-sort-descending.svg");
 const WRENCH_ICON_BYTES: &[u8] = include_bytes!("../assets/icons/wrench.svg");
@@ -363,6 +367,7 @@ pub(crate) enum RailgunActionIcon {
     Fingerprint,
     Watch,
     HatGlasses,
+    ChartNoAxesColumn,
     ListSortDescending,
     Wrench,
     FilePenLine,
@@ -388,6 +393,7 @@ impl IconNamed for RailgunActionIcon {
             Self::Fingerprint => FINGERPRINT_ICON_PATH,
             Self::Watch => WATCH_ICON_PATH,
             Self::HatGlasses => HAT_GLASSES_ICON_PATH,
+            Self::ChartNoAxesColumn => CHART_NO_AXES_COLUMN_ICON_PATH,
             Self::ListSortDescending => LIST_SORT_DESCENDING_ICON_PATH,
             Self::Wrench => WRENCH_ICON_PATH,
             Self::FilePenLine => FILE_PEN_LINE_ICON_PATH,
@@ -479,6 +485,7 @@ fn railgun_asset(path: &str) -> Option<&'static [u8]> {
         FINGERPRINT_ICON_PATH => Some(FINGERPRINT_ICON_BYTES),
         WATCH_ICON_PATH => Some(WATCH_ICON_BYTES),
         HAT_GLASSES_ICON_PATH => Some(HAT_GLASSES_ICON_BYTES),
+        CHART_NO_AXES_COLUMN_ICON_PATH => Some(CHART_NO_AXES_COLUMN_ICON_BYTES),
         LIST_SORT_DESCENDING_ICON_PATH => Some(LIST_SORT_DESCENDING_ICON_BYTES),
         WRENCH_ICON_PATH => Some(WRENCH_ICON_BYTES),
         FILE_PEN_LINE_ICON_PATH => Some(FILE_PEN_LINE_ICON_BYTES),

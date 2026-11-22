@@ -8,6 +8,7 @@ use super::auto_lock::AutoLockTimestamp;
 use gpui::{AppContext, Context, Entity, ParentElement, SharedString, Styled, Window, div, px};
 use gpui_component::{
     WindowExt,
+    scroll::ScrollableElement as _,
     select::{SearchableVec, SelectItem, SelectState},
 };
 use ui::dialog::WalletDialogExt as _;
@@ -51,6 +52,25 @@ pub(super) use summary_view::{
 const SPEND_AUTHORIZATION_DIALOG_WIDTH: gpui::Pixels = px(560.0);
 const SPEND_AUTHORIZATION_ROW_GROUP_TOGGLE: &str = "wallet-spend-auth-row-group-toggle";
 const SPEND_AUTHORIZATION_DETAILS_TOGGLE: &str = "wallet-spend-auth-details-toggle";
+/// A review dialog's title, footer, padding and gaps, with room for the network chip to wrap
+/// under the title, plus a few pixels so the dialog clears the status bar.
+const SPEND_AUTHORIZATION_DIALOG_CHROME_HEIGHT: gpui::Pixels = px(150.0);
+
+/// A review dialog's content, scrolling within a height that keeps the dialog inside
+/// `dialog_max_height`, clear of the status bar drawn above dialogs. The dialog itself stops
+/// only at the window's edges, whatever `max_h` it is given. The scroll area spans the body, so
+/// its scrollbar sits beside the content rather than over it.
+fn spend_authorization_dialog_body(
+    content: impl gpui::IntoElement,
+    content_width: gpui::Pixels,
+    window: &Window,
+) -> impl gpui::IntoElement {
+    div()
+        .w_full()
+        .max_h(dialog_max_height(window) - SPEND_AUTHORIZATION_DIALOG_CHROME_HEIGHT)
+        .overflow_y_scrollbar()
+        .child(div().w(content_width).child(content))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SpendAuthorizationLifetime {

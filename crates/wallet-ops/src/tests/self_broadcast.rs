@@ -355,6 +355,43 @@ fn direct_self_broadcast_estimates_private_send_and_unshield_costs() {
 }
 
 #[test]
+fn self_broadcast_unshield_plan_selects_the_fee_mode_amount_and_resolves_note_kinds() {
+    let token = address(0x42);
+    // A 600 deposit in tree 0 and a 600 private transfer in tree 1.
+    let utxos = [
+        utxo_with_kind(token, 600, 0, 0, UtxoCommitmentKind::Shield).utxo,
+        utxo(token, 600, 1, 0).utxo,
+    ];
+    let plan = |entered: u64, fee_mode| {
+        crate::desktop_unshield_self_broadcast_plan(&utxos, token, U256::from(entered), fee_mode)
+            .map(|plan| {
+                plan.into_iter()
+                    .map(|unshield| {
+                        let shields: Vec<_> = unshield
+                            .inputs
+                            .iter()
+                            .map(|input| input.is_shield)
+                            .collect();
+                        let value = unshield.value.to::<u64>();
+                        (unshield.tree, value, unshield.change.to::<u64>(), shields)
+                    })
+                    .collect::<Vec<_>>()
+            })
+    };
+
+    assert_eq!(
+        plan(1_000, FeeHandlingMode::DeductFromAmount),
+        Some(vec![(0, 600, 0, vec![true]), (1, 400, 200, vec![false])])
+    );
+    // Adding the fee selects 1,002, which leaves 1,000 after the 0.25% unshield fee.
+    assert_eq!(
+        plan(1_000, FeeHandlingMode::AddToAmount),
+        Some(vec![(0, 600, 0, vec![true]), (1, 402, 198, vec![false])])
+    );
+    assert_eq!(plan(1_300, FeeHandlingMode::DeductFromAmount), None);
+}
+
+#[test]
 fn self_broadcast_estimate_includes_each_native_top_up_protocol_fee() {
     let token = address(0x42);
     let wrapped_native = address(0x43);

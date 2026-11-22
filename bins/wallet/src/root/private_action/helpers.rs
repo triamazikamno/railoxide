@@ -1,5 +1,7 @@
 use super::*;
 
+const SELF_BROADCAST_PLAN_DEBOUNCE: Duration = Duration::from_millis(200);
+
 pub(in crate::root) fn private_action_input(state: &Entity<InputState>) -> Input {
     Input::new(state)
         .px(px(12.0))
@@ -149,7 +151,7 @@ pub(in crate::root) fn format_exact_asset_amount_for_display(
         |decimals| {
             format!(
                 "{} {}",
-                format_send_amount_input(amount, Some(decimals)),
+                railgun_ui::group_thousands(&format_send_amount_input(amount, Some(decimals))),
                 asset.label
             )
         },
@@ -198,7 +200,10 @@ pub(in crate::root) fn private_action_amount_input_error(
         Ok(amount) if amount.is_zero() => Some("Enter an amount greater than zero".to_string()),
         Ok(amount) if amount > asset.max_batched => Some(format!(
             "Amount exceeds max POI-verified batched transaction: {}",
-            format_send_amount_input(asset.max_batched, asset.decimals)
+            railgun_ui::group_thousands(&format_send_amount_input(
+                asset.max_batched,
+                asset.decimals
+            ))
         )),
         Ok(_) => None,
         Err(error) => Some(error.to_string()),
@@ -517,6 +522,137 @@ impl WalletRoot {
         if should_reschedule {
             self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
         }
+        // After the top-up normalization above, which can make the form eligible.
+        self.refresh_unshield_self_broadcast_plan(key, cx);
+    }
+
+    /// Selects, off the UI thread and after a debounce, the notes a self-broadcast or
+    /// calldata-only Unshield of the entered amount would spend, as its generation selects
+    /// them, for the amount privacy hints. A broadcaster form's estimate carries its own plan.
+    /// The shown plan stays while a recomputation for the same inputs runs.
+    pub(in crate::root) fn refresh_unshield_self_broadcast_plan(
+        &mut self,
+        key: UnshieldAssetKey,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let inputs = self.unshield_self_broadcast_plan_inputs(key, cx);
+        self.cost_estimate_seq = self.cost_estimate_seq.wrapping_add(1);
+        let plan_id = self.cost_estimate_seq;
+        let Some(form) = self.unshield_forms.get_mut(&key) else {
+            return;
+        };
+        // A new id also drops a pending selection when the form is no longer eligible.
+        form.self_broadcast_plan_id = plan_id;
+        if form.self_broadcast_plan_inputs != inputs {
+            form.self_broadcast_plan_inputs = None;
+            if form.self_broadcast_plan.take().is_some() {
+                cx.notify();
+            }
+        }
+        let Some(inputs) = inputs else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            tokio::time::sleep(SELF_BROADCAST_PLAN_DEBOUNCE).await;
+            let _ = this.update(cx, |root, cx| {
+                root.start_unshield_self_broadcast_plan(key, plan_id, inputs, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn start_unshield_self_broadcast_plan(
+        &self,
+        key: UnshieldAssetKey,
+        plan_id: u64,
+        inputs: (Address, U256, FeeHandlingMode),
+        cx: &Context<'_, Self>,
+    ) {
+        if !self.unshield_self_broadcast_plan_current(key, plan_id, inputs, cx) {
+            return;
+        }
+        let Some(ChainUtxoState::Ready { session, .. }) = self.chain_states.get(&key.chain_id)
+        else {
+            return;
+        };
+        let session = Arc::clone(session);
+        let (token, amount, fee_mode) = inputs;
+        // `unspent_utxos` decrypts the wallet's executor records from the vault.
+        let join = self.runtime.spawn_blocking(move || {
+            wallet_ops::desktop_unshield_self_broadcast_plan(
+                &session.unspent_utxos(),
+                token,
+                amount,
+                fee_mode,
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let plan = join.await.ok().flatten();
+            let _ = this.update(cx, |root, cx| {
+                if !root.unshield_self_broadcast_plan_current(key, plan_id, inputs, cx) {
+                    return;
+                }
+                let Some(form) = root.unshield_forms.get_mut(&key) else {
+                    return;
+                };
+                form.self_broadcast_plan_inputs = Some(inputs);
+                if form.self_broadcast_plan != plan {
+                    form.self_broadcast_plan = plan;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Whether `plan_id` is still the form's latest plan request and the form still selects a
+    /// plan for `inputs`.
+    fn unshield_self_broadcast_plan_current(
+        &self,
+        key: UnshieldAssetKey,
+        plan_id: u64,
+        inputs: (Address, U256, FeeHandlingMode),
+        cx: &App,
+    ) -> bool {
+        self.unshield_forms
+            .get(&key)
+            .is_some_and(|form| form.self_broadcast_plan_id == plan_id)
+            && self.unshield_self_broadcast_plan_inputs(key, cx) == Some(inputs)
+    }
+
+    /// The token, amount and fee mode the form's plan is selected for, or `None` when the
+    /// hints don't use a self-broadcast plan: the same conditions as
+    /// `unshield_privacy_presentation`, plus synced notes and a non-zero amount.
+    fn unshield_self_broadcast_plan_inputs(
+        &self,
+        key: UnshieldAssetKey,
+        cx: &App,
+    ) -> Option<(Address, U256, FeeHandlingMode)> {
+        let form = self.unshield_forms.get(&key)?;
+        let funding = effective_delivery_funding_mode(
+            form.delivery_mode,
+            self.effective_chain_configs.get(form.asset.chain_id),
+            form.self_broadcast_funding,
+        );
+        let eligible = matches!(
+            form.delivery_mode,
+            DeliveryMode::SelfBroadcast | DeliveryMode::ManualCalldata
+        ) && !form.native_top_up_enabled
+            && funding == SelfBroadcastFundingMode::PublicBalance
+            && matches!(
+                self.chain_states.get(&key.chain_id),
+                Some(ChainUtxoState::Ready { .. })
+            );
+        if !eligible {
+            return None;
+        }
+        let amount = parse_unshield_amount(
+            form.amount_input.read(cx).value().as_ref(),
+            form.asset.decimals,
+        )
+        .ok()
+        .filter(|amount| !amount.is_zero())?;
+        Some((form.asset.token, amount, form.fee_mode))
     }
 
     pub(in crate::root) fn unshield_native_top_up_state(
@@ -579,6 +715,7 @@ impl WalletRoot {
             self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
         }
         self.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
+        self.refresh_unshield_self_broadcast_plan(key, cx);
     }
 
     /// The visible Public account an unshield to `recipient` pays out to, if any.

@@ -43,6 +43,7 @@ use zeroize::Zeroizing;
 
 mod actions;
 mod address_book;
+mod amount_privacy;
 mod auto_lock;
 mod broadcaster_picker;
 mod broadcaster_preferences;

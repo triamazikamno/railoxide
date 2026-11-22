@@ -210,6 +210,64 @@ impl WalletSession {
             handle: self.handle.clone(),
         })
     }
+
+    /// This chain's amount statistics at `now`, or why they are unavailable. Makes no request.
+    #[must_use]
+    pub fn amount_statistics_status(
+        &self,
+        chains: &settings::EffectiveChainRegistry,
+        now: SystemTime,
+    ) -> AmountStatisticsStatus {
+        amount_statistics_status_for_chain(chains.get(self.chain_id), || {
+            self.sync_manager
+                .amount_statistics_status(&self.chain_key, now)
+        })
+    }
+
+    /// The wallet's own deposits of `token`: its notes received from a shield, spent or not.
+    /// Makes no request.
+    #[must_use]
+    pub fn own_shield_deposits(&self, token: Address) -> Vec<crate::OwnDeposit> {
+        self.handle
+            .current_snapshot()
+            .map_or_else(Vec::new, |snapshot| {
+                crate::own_shield_deposits(&snapshot.utxos, token)
+            })
+    }
+
+    /// The highest commitment tree in the chain's Merkle forest, the one new deposits enter
+    /// once the forest is synced. `None` while the chain isn't running or its forest is being
+    /// written. Makes no request.
+    #[must_use]
+    pub fn merkle_forest_tip_tree(&self) -> Option<u32> {
+        // `chain_handle` only reads a std mutex, so it is ready when first polled.
+        let chain = futures_util::FutureExt::now_or_never(
+            self.sync_manager.chain_handle(&self.chain_key),
+        )??;
+        let forest = chain.forest.try_read().ok()?;
+        forest
+            .computed_roots()
+            .last_key_value()
+            .map(|(tree, _)| *tree)
+    }
+}
+
+/// Settings decide first, so a chain without a statistics source never asks the sync manager.
+/// `running_chain_status` is `None` while the chain has no session.
+#[must_use]
+pub fn amount_statistics_status_for_chain(
+    chain: Option<&settings::EffectiveChainConfig>,
+    running_chain_status: impl FnOnce() -> Option<AmountStatisticsStatus>,
+) -> AmountStatisticsStatus {
+    let configured = chain
+        .and_then(|chain| chain.railgun.as_ref())
+        .and_then(|private| private.sync.indexed_artifact_source.as_ref())
+        .is_some_and(|source| source.amount_statistics_ipns_name.is_some());
+    if !configured {
+        return AmountStatisticsStatus::NotConfigured;
+    }
+    // A chain that is not running yet holds no accepted snapshot.
+    running_chain_status().unwrap_or(AmountStatisticsStatus::NotYetAvailable)
 }
 
 impl Drop for WalletSession {
@@ -277,7 +335,8 @@ impl From<PersistedPublicSyncCacheResetError> for PersistedPoiDataResetError {
             PersistedPublicSyncCacheKind::PoiCorpus => "verified PPOI data",
             PersistedPublicSyncCacheKind::PoiArtifactCheckpointChunks => "downloaded PPOI chunks",
             PersistedPublicSyncCacheKind::Txid
-            | PersistedPublicSyncCacheKind::WalletScanArtifactChunks => "PPOI data",
+            | PersistedPublicSyncCacheKind::WalletScanArtifactChunks
+            | PersistedPublicSyncCacheKind::AmountStatistics => "PPOI data",
         };
         Self {
             kind: error.kind,

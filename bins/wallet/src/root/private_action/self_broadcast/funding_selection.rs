@@ -26,6 +26,7 @@ impl WalletRoot {
                     form.error = None;
                     form.result = None;
                 }
+                self.refresh_unshield_self_broadcast_plan(key, cx);
             }
         }
         self.debounce_sponsored_funding_estimate(kind, key, cx);

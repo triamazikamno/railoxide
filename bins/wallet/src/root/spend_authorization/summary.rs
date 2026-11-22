@@ -4,6 +4,7 @@ use alloy::primitives::U256;
 use ui::controls::AppNoticeTone;
 
 use crate::assets::WalletIconSource;
+use crate::root::amount_privacy::AmountPrivacyPresentation;
 use crate::root::ui_helpers::network_name;
 
 use super::summary_view::spend_authorization_recipient_display;
@@ -26,6 +27,7 @@ pub(in crate::root) struct SpendAuthorizationSummary {
     pub(super) row_group: Option<SpendAuthorizationDetails>,
     pub(super) details: Option<SpendAuthorizationDetails>,
     pub(super) disclosure: Option<SpendAuthorizationDisclosure>,
+    pub(super) privacy_hints: Option<AmountPrivacyPresentation>,
 }
 
 impl SpendAuthorizationSummary {
@@ -51,6 +53,7 @@ impl SpendAuthorizationSummary {
             row_group: None,
             details: None,
             disclosure: None,
+            privacy_hints: None,
         }
     }
 
@@ -100,6 +103,16 @@ impl SpendAuthorizationSummary {
             summary: summary.into(),
             hint,
         });
+        self
+    }
+
+    /// The form's privacy factors and statistics notice, under the rows. They inform only: a
+    /// remembered spend authorization still skips the review, whatever their levels.
+    pub(in crate::root) fn with_privacy_hints(
+        mut self,
+        hints: Option<AmountPrivacyPresentation>,
+    ) -> Self {
+        self.privacy_hints = hints.map(AmountPrivacyPresentation::factors_only);
         self
     }
 
@@ -268,6 +281,14 @@ impl SpendAuthorizationSummary {
                 )
             })
             .collect()
+    }
+
+    /// What the review shows of the privacy hints.
+    #[cfg(test)]
+    pub(in crate::root) const fn privacy_hints_for_test(
+        &self,
+    ) -> Option<&AmountPrivacyPresentation> {
+        self.privacy_hints.as_ref()
     }
 
     #[cfg(test)]

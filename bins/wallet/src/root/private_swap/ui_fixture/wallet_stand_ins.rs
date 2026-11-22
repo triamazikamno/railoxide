@@ -47,14 +47,14 @@ pub(in crate::root::private_swap) fn locked_sell_value(
         .then_some(U256::from(500_000_000_000_000_000_u64))
 }
 
-/// The stand-in asset of the `unshield`, a `max:` or a `delivery:` mode, the last two with
-/// their token's icon. `None` in every other mode.
+/// The stand-in asset of the `unshield`, a `max:`, a `delivery:` or a `hints:` mode, a `max:`
+/// or `delivery:` one with its token's icon. `None` in every other mode.
 pub(in crate::root) fn unshield_asset(
     chain_id: u64,
     wrapped_native: Address,
 ) -> Option<crate::root::UnshieldAsset> {
     max_asset(chain_id, wrapped_native).or_else(|| match mode()? {
-        Mode::Unshield => Some(stand_in_asset(chain_id, wrapped_native)),
+        Mode::Unshield | Mode::Hints(_) => Some(stand_in_asset(chain_id, wrapped_native)),
         Mode::Delivery(_) => send_asset(chain_id, wrapped_native),
         _ => None,
     })
@@ -84,12 +84,12 @@ pub(in crate::root) fn holds_send_review() -> bool {
     matches!(mode(), Some(Mode::BroadcasterReview))
 }
 
-/// Whether a `delivery:` mode is active, whose Send and Unshield forms hold their stand-in
-/// state: the forms' scheduled broadcaster and sponsorship estimates don't run, sync snapshots
-/// leave the forms alone, and an approved Send or Unshield stops before executor account
-/// preparation, proof generation or submission.
+/// Whether a `delivery:` or `hints:` mode is active, whose Send and Unshield forms hold their
+/// stand-in state: the forms' scheduled broadcaster and sponsorship estimates don't run, sync
+/// snapshots leave the forms alone, and an approved Send or Unshield stops before executor
+/// account preparation, proof generation or submission.
 pub(in crate::root) fn holds_delivery() -> bool {
-    matches!(mode(), Some(Mode::Delivery(_)))
+    matches!(mode(), Some(Mode::Delivery(_) | Mode::Hints(_)))
 }
 
 /// The token the Private tab's Swap offers in a `setup:`, `retry-review`, `native-buy` or `max:`
@@ -435,7 +435,10 @@ pub(in crate::root) fn utxo_rows(chain_id: u64) -> Option<Vec<UtxoDisplayRow>> {
         // Every decimal of an 18-decimal amount, under a long symbol.
         UtxoDisplayRow {
             token: "stkWETH-USDC-LPv2".to_owned(),
-            amount: format_scaled_amount(U256::from(LONG_AMOUNT), weth.decimals),
+            amount: group_thousands(&format_scaled_amount(
+                U256::from(LONG_AMOUNT),
+                weth.decimals,
+            )),
             activity_classification: private(),
             ..utxo_row(weth, LONG_AMOUNT, 65_014, UTXO_HEAD - 21_600, ago(3 * DAY))
         },

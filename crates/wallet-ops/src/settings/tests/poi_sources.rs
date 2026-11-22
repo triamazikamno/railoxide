@@ -12,6 +12,7 @@ fn indexed_artifact_official_source_ignores_stored_custom_fields() {
     settings.indexed_artifacts.max_manifest_age_secs = Some(0);
     settings.indexed_artifacts.concurrency = Some(0);
     settings.indexed_artifacts.max_in_flight_bytes = Some(1024 * 1024 * 1024 + 1);
+    settings.indexed_artifacts.amount_statistics_ipns_name = Some("not-an-ipns-name".to_string());
 
     settings
         .validate()
@@ -53,6 +54,10 @@ fn indexed_artifact_official_source_ignores_stored_custom_fields() {
         DEFAULT_INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES
     );
     assert_eq!(source.max_manifest_age, None);
+    assert_eq!(
+        source.amount_statistics_ipns_name.as_deref(),
+        Some(crate::settings::OFFICIAL_AMOUNT_STATISTICS_IPNS_NAME)
+    );
 }
 
 #[test]
@@ -68,6 +73,8 @@ fn indexed_artifact_custom_source_builds_effective_config() {
     settings.indexed_artifacts.concurrency = Some(5);
     settings.indexed_artifacts.max_in_flight_bytes = Some(8 * 1024 * 1024);
     settings.indexed_artifacts.max_manifest_age_secs = Some(3_600);
+    let statistics_name = "k51qzi5uqu5dicmabkge4lkunc4bkd198u9xicp5espmw5zdzbafkez7hyh5ft";
+    settings.indexed_artifacts.amount_statistics_ipns_name = Some(statistics_name.to_string());
 
     let configs = build_effective_chain_configs(&settings).expect("build effective configs");
     let ethereum = configs.get(1).expect("ethereum config");
@@ -104,6 +111,10 @@ fn indexed_artifact_custom_source_builds_effective_config() {
     assert_eq!(
         source.max_manifest_age,
         Some(std::time::Duration::from_hours(1))
+    );
+    assert_eq!(
+        source.amount_statistics_ipns_name.as_deref(),
+        Some(statistics_name)
     );
 }
 
@@ -145,6 +156,7 @@ fn indexed_artifact_defaults_apply_to_custom_source_limits() {
         IndexedArtifactManifestSourceSetting::IpnsName("k51qzi5uqu5custom".to_string()),
     );
     settings.indexed_artifacts.gateway_urls = vec!["https://gateway.example".to_string()];
+    settings.indexed_artifacts.amount_statistics_ipns_name = Some("  ".to_string());
 
     let configs = build_effective_chain_configs(&settings).expect("build effective configs");
     let source = configs
@@ -162,6 +174,8 @@ fn indexed_artifact_defaults_apply_to_custom_source_limits() {
         source.max_in_flight_bytes,
         DEFAULT_INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES
     );
+    // An empty name is accepted and leaves no name, so sync-service makes no statistics request.
+    assert_eq!(source.amount_statistics_ipns_name, None);
 }
 
 #[test]
@@ -179,6 +193,7 @@ fn indexed_artifact_custom_source_validation_rejects_missing_source() {
         .push("ftp://gateway.example".to_string());
     settings.indexed_artifacts.concurrency = Some(0);
     settings.indexed_artifacts.max_in_flight_bytes = Some(1024 * 1024 * 1024 + 1);
+    settings.indexed_artifacts.amount_statistics_ipns_name = Some("not-an-ipns-name".to_string());
 
     let err = settings
         .validate()
@@ -206,6 +221,11 @@ fn indexed_artifact_custom_source_validation_rejects_missing_source() {
         err.messages
             .iter()
             .any(|message| message.contains("indexed_artifacts.max_in_flight_bytes"))
+    );
+    assert!(
+        err.messages
+            .iter()
+            .any(|message| message.contains("indexed_artifacts.amount_statistics_ipns_name"))
     );
 }
 

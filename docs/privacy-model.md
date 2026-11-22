@@ -61,6 +61,21 @@ Public broadcasters help submit private transactions without using your own publ
 
 RailOxide also monitors public broadcaster availability through Waku. In proxy mode, embedded Waku libp2p transports are disabled to prevent proxy bypass.
 
+## Amount Privacy Hints
+
+The Shield and Unshield forms show how many past deposits and exits used the same amount, how many deposits of the token sit in the relevant commitment tree, and a list of good and bad privacy factors.
+
+The counts come from an amount-statistics snapshot that the indexed artifact source publishes for each chain. The wallet resolves the source's amount-statistics IPNS name and downloads the whole snapshot through the artifact gateways when a chain session starts and then once an hour. Every wallet syncing a chain from the same source downloads the same snapshot. No request depends on the selected token, an entered amount, your balances or history, or which form is open, and nothing is fetched before first-start setup finishes. The requests use the active network mode, like other artifact downloads.
+
+The wallet checks the publisher's signature on the manifest that names the snapshot, the chain, and the snapshot's hash and size before using it, and keeps it in the public cache outside the encrypted vault. The stored snapshot holds no wallet data. A custom indexed artifact source without an amount-statistics IPNS name, or disabled indexed artifacts, means nothing is fetched. The forms then show only the factors that need no statistics: who sends the transaction, whether the recipient deposited before, how old the spent deposit is, and the network mode.
+
+Matching against your amount, notes and history happens on your device. The hints never block an action or add a confirmation, and they never call an amount or transaction safe. They describe past public activity as the indexer reports it:
+
+- Counts lag the chain by the indexer's confirmation depth and publish interval, plus up to an hour between wallet refreshes. A snapshot whose block is more than six hours old is shown as out of date and its counts are hidden.
+- Each shield counts once. The statistics do not count distinct depositors.
+- The number of deposits large enough to fund an exit is a lower bound.
+- A good factor does not make a transaction unlinkable. Observers can also use timing, the gas payer, recipient history and other signals the hints do not cover.
+
 ## Wallet Storage
 
 The encrypted wallet vault protects wallet secrets and decrypted-wallet cache material. Wallet UTXO payloads, pending-output POI contexts, and output POI recovery records are encrypted with wallet view capability before they enter the local database. Their workflow-row keys are opaque, domain-separated HMAC identifiers rather than transaction hashes, commitments, NPKs, or output roles. Authentication binds each encrypted payload to its record kind, wallet-chain namespace, and opaque row ID.

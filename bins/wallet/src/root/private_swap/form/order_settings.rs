@@ -250,7 +250,7 @@ impl PrivateSwapsView {
         let input = form.gas_minimum_input.clone();
         // At the display precision of the card's amounts; the share, not this text, sets the order.
         let text = (!input.read(cx).focus_handle(cx).is_focused(window)).then(|| match decimals {
-            Some(decimals) => railgun_ui::format_token_amount(minimum, decimals),
+            Some(decimals) => railgun_ui::format_token_amount_ungrouped(minimum, decimals),
             None => format_unshield_amount_input(minimum, None),
         });
         form.gas_slider.update(cx, |slider, cx| {

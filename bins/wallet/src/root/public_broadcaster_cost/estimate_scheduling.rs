@@ -75,9 +75,11 @@ impl WalletRoot {
             DeliveryFormKind::Unshield => {
                 if let Some(form) = self.unshield_forms.get_mut(&key) {
                     form.estimate_id = estimate_id;
-                    if !retain_shown {
-                        form.cost_estimate = None;
-                    }
+                    form.replaced_estimate = if retain_shown {
+                        None
+                    } else {
+                        form.cost_estimate.take()
+                    };
                     form.cost_estimate_pending = false;
                     form.estimating_cost = false;
                     form.error = None;
@@ -141,6 +143,7 @@ impl WalletRoot {
                 if let Some(form) = self.unshield_forms.get_mut(&key) {
                     form.estimate_id = estimate_id;
                     form.cost_estimate = None;
+                    form.replaced_estimate = None;
                     form.cost_estimate_pending = true;
                     form.estimating_cost = false;
                     form.error = None;

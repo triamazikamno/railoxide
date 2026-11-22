@@ -808,6 +808,7 @@ fn pow10(exp: u8) -> U256 {
     uint!(10_U256).pow(U256::from(exp))
 }
 
+/// The exact amount without thousands separators, as amount inputs and parsers take it.
 #[must_use]
 pub fn format_scaled_amount(amount: U256, decimals: u8) -> String {
     if decimals == 0 {
@@ -867,12 +868,34 @@ fn format_token_amount_with_precision(amount: U256, decimals: u8, precision: u8)
     format_scaled_amount(rounded, precision)
 }
 
+/// Insert thousands separators into the whole-number part of an unsigned decimal string, so
+/// `1234567.5` becomes `1,234,567.5`. Display only: inputs and parsers take ungrouped text.
+#[must_use]
+pub fn group_thousands(amount: &str) -> String {
+    let (whole, fraction) = amount.split_at(amount.find('.').unwrap_or(amount.len()));
+    let mut grouped = String::with_capacity(amount.len() + whole.len() / 3);
+    for (index, digit) in whole.chars().enumerate() {
+        if index > 0 && (whole.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped.push_str(fraction);
+    grouped
+}
+
+/// `format_token_amount` without thousands separators, for text written into an amount input.
+#[must_use]
+pub fn format_token_amount_ungrouped(amount: U256, decimals: u8) -> String {
+    format_token_amount_with_precision(amount, decimals, display_precision(amount, decimals))
+}
+
 /// Format a raw integer amount as a decimal string scaled by `decimals`,
 /// using coarse precision for large values and finer precision for small
-/// values so fee cells stay readable.
+/// values so fee cells stay readable. The whole-number part is grouped in thousands.
 #[must_use]
 pub fn format_token_amount(amount: U256, decimals: u8) -> String {
-    format_token_amount_with_precision(amount, decimals, display_precision(amount, decimals))
+    group_thousands(&format_token_amount_ungrouped(amount, decimals))
 }
 
 /// Format an upper-bound token amount without rendering below the raw value.
@@ -880,14 +903,14 @@ pub fn format_token_amount(amount: U256, decimals: u8) -> String {
 pub fn format_token_amount_ceiling(amount: U256, decimals: u8) -> String {
     let precision = display_precision(amount, decimals);
     if precision == decimals {
-        return format_scaled_amount(amount, decimals);
+        return group_thousands(&format_scaled_amount(amount, decimals));
     }
     let rounding_divisor = pow10(decimals - precision);
     let mut rounded = amount / rounding_divisor;
     if amount % rounding_divisor != U256::ZERO {
         rounded += uint!(1_U256);
     }
-    format_scaled_amount(rounded, precision)
+    group_thousands(&format_scaled_amount(rounded, precision))
 }
 
 #[must_use]
@@ -953,24 +976,9 @@ pub fn format_usd_micro_value(value: U256) -> String {
     if value % USD_MICRO_PER_CENT >= USD_MICRO_PER_CENT / uint!(2_U256) {
         rounded_cents = rounded_cents.saturating_add(U256::ONE);
     }
-    let dollars = format_usd_dollars(rounded_cents / CENTS_PER_DOLLAR);
+    let dollars = group_thousands(&(rounded_cents / CENTS_PER_DOLLAR).to_string());
     let cents = (rounded_cents % CENTS_PER_DOLLAR).to_string();
     format!("${dollars}.{cents:0>2}")
-}
-
-fn format_usd_dollars(dollars: U256) -> String {
-    let digits = dollars.to_string();
-    if digits.len() <= 3 {
-        return digits;
-    }
-    let mut formatted = String::with_capacity(digits.len() + (digits.len() - 1) / 3);
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index).is_multiple_of(3) {
-            formatted.push(',');
-        }
-        formatted.push(digit);
-    }
-    formatted
 }
 
 /// Shorten an address for the fallback display on unknown tokens.

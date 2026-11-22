@@ -21,6 +21,7 @@ use ui::controls::{app_amount_text, app_button_base, app_muted_text, app_strong_
 use ui::hint::hint_card;
 use ui::theme::{self, APP_MONO_FONT_FAMILY};
 
+use crate::root::amount_privacy::{AmountPrivacyPresentation, render_amount_privacy_hints};
 use crate::root::ui_helpers::{network_mention, network_token_icon};
 
 use super::summary::{
@@ -168,6 +169,17 @@ pub(super) fn render_spend_authorization_summary(
         .when_some(summary.disclosure.as_ref(), |this, disclosure| {
             this.child(render_spend_authorization_disclosure(disclosure))
         })
+        .when_some(summary.privacy_hints.as_ref(), |this, hints| {
+            this.child(render_spend_authorization_privacy_hints(hints, cx))
+        })
+}
+
+/// The amount privacy factors the review repeats, without the common amounts.
+fn render_spend_authorization_privacy_hints(
+    hints: &AmountPrivacyPresentation,
+    cx: &App,
+) -> gpui::Div {
+    render_amount_privacy_hints("wallet-spend-auth-privacy", hints, None, cx)
 }
 
 /// A change's text at the small size: in the danger colour when adverse, else the success

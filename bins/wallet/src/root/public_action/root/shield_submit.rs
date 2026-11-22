@@ -19,7 +19,8 @@ impl WalletRoot {
         let Some(draft) = self.public_shield_draft(cx) else {
             return;
         };
-        let summary = public_shield_authorization_summary(&draft);
+        let summary = public_shield_authorization_summary(&draft)
+            .with_privacy_hints(self.shield_privacy_presentation(cx));
         let hardware_derived = draft.public_account_source == PublicAccountSource::HardwareDerived;
         let intent = SpendAuthorizationIntent::PublicShield(Box::new(draft));
         if hardware_derived {

@@ -22,6 +22,8 @@ pub(in crate::root) enum PublicShieldUiFixture {
     NativePending,
     Fallback,
     FallbackPending,
+    /// Any `hints:` mode: an ERC-20 Shield form showing the mode's privacy hints.
+    Hints,
 }
 
 #[cfg(debug_assertions)]
@@ -49,6 +51,9 @@ pub(in crate::root) fn public_shield_ui_fixture() -> Option<PublicShieldUiFixtur
             "shield:native-pending" => Some(PublicShieldUiFixture::NativePending),
             "shield:fallback" => Some(PublicShieldUiFixture::Fallback),
             "shield:fallback-pending" => Some(PublicShieldUiFixture::FallbackPending),
+            _ if crate::root::private_swap::ui_fixture_hints_active() => {
+                Some(PublicShieldUiFixture::Hints)
+            }
             _ => None,
         },
     )
@@ -502,6 +507,30 @@ impl WalletRoot {
 
 #[cfg(debug_assertions)]
 impl WalletRoot {
+    /// The asset Add account's preview opens: the network's USDC in a `hints:` mode, which no
+    /// native shield preparation hides, and the native token in the other `shield:` modes.
+    pub(in crate::root) fn public_shield_ui_fixture_asset(&self) -> PublicAssetId {
+        if public_shield_ui_fixture() == Some(PublicShieldUiFixture::Hints) {
+            PublicAssetId::Erc20(crate::root::private_swap::ui_fixture_hints_shield_token(
+                self.last_evm_chain,
+            ))
+        } else {
+            PublicAssetId::Native
+        }
+    }
+
+    /// A `hints:` mode's Shield form: 1,370 of the token, which the mode's statistics count no
+    /// deposit of, beside a common amount the stand-in balance covers. Nothing is sent.
+    pub(in crate::root) fn stage_shield_hints_ui_fixture(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.public_form
+            .shield_amount_input
+            .update(cx, |input, cx| input.set_value("1370", window, cx));
+    }
+
     /// `shield:mimic-prepared`, `shield:native-prepared`, `shield:mimic-unavailable` and
     /// `shield:fallback` stage the native Shield form with synthesized state. Nothing is
     /// prepared or sent.

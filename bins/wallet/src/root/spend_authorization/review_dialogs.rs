@@ -98,7 +98,11 @@ impl WalletRoot {
                     }
                     close_content.update(cx, SpendAuthorizationDialogContent::cancel);
                 })
-                .child(div().w(content_width).child(dialog_content.clone()))
+                .child(spend_authorization_dialog_body(
+                    dialog_content.clone(),
+                    content_width,
+                    window,
+                ))
                 // The footer stays in view while the content scrolls.
                 .footer(
                     dialog_content

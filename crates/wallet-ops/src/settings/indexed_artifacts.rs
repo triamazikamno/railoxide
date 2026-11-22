@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use super::{
-    Deserialize, FixedBytes, MAX_INTERVAL_SECS, Serialize, Url, parse_fixed_hex_32,
-    validate_optional_range, validate_range, validate_url_scheme,
+    Deserialize, FixedBytes, MAX_INTERVAL_SECS, Serialize, Url, is_valid_ipns_name,
+    parse_fixed_hex_32, validate_optional_range, validate_range, validate_url_scheme,
 };
 
 pub const DEFAULT_INDEXED_ARTIFACT_CONCURRENCY: usize = 6;
@@ -11,6 +11,8 @@ pub const OFFICIAL_INDEXED_ARTIFACT_PUBLISHER_PUBKEY: &str =
     "0x053fc2967addee3cec8d637f6de25401a170faaf16e42585952cb1c50abd85fe";
 pub const OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME: &str =
     "k51qzi5uqu5dgbarnyr67fxkcmuyb5aumtsi2p86acs8fxpg3q3r0947ne9726";
+pub const OFFICIAL_AMOUNT_STATISTICS_IPNS_NAME: &str =
+    "k51qzi5uqu5di2q52bhxc670mbew0ahf7ip06bh02flwcdpyuh9bv0xs9twarb";
 /// Frozen released-settings compatibility data; runtime defaults use the POI gateway list.
 pub const OFFICIAL_INDEXED_ARTIFACT_GATEWAYS: &[&str] = &[
     "https://ipfs.io",
@@ -42,6 +44,10 @@ pub struct IndexedArtifactSettings {
     pub max_manifest_age_secs: Option<u64>,
     pub concurrency: Option<usize>,
     pub max_in_flight_bytes: Option<u64>,
+    /// Used only by a custom source; empty means no amount statistics are fetched. Written only
+    /// when set, because released versions reject unknown fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount_statistics_ipns_name: Option<String>,
 }
 
 impl Default for IndexedArtifactSettings {
@@ -66,6 +72,7 @@ impl IndexedArtifactSettings {
             max_manifest_age_secs: None,
             concurrency: None,
             max_in_flight_bytes: None,
+            amount_statistics_ipns_name: None,
         }
     }
 
@@ -84,6 +91,24 @@ impl IndexedArtifactSettings {
             max_manifest_age_secs: None,
             concurrency: None,
             max_in_flight_bytes: None,
+            amount_statistics_ipns_name: None,
+        }
+    }
+
+    /// The amount-statistics IPNS name of the selected source, or `None` when it fetches no
+    /// amount statistics.
+    #[must_use]
+    pub fn effective_amount_statistics_ipns_name(&self) -> Option<&str> {
+        match self.source_mode {
+            IndexedArtifactSourceModeSetting::Disabled => None,
+            IndexedArtifactSourceModeSetting::Official => {
+                Some(OFFICIAL_AMOUNT_STATISTICS_IPNS_NAME)
+            }
+            IndexedArtifactSourceModeSetting::Custom => self
+                .amount_statistics_ipns_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty()),
         }
     }
 
@@ -118,6 +143,7 @@ impl IndexedArtifactSettings {
             max_manifest_age: None,
             concurrency: DEFAULT_INDEXED_ARTIFACT_CONCURRENCY,
             max_in_flight_bytes: DEFAULT_INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES,
+            amount_statistics_ipns_name: Some(OFFICIAL_AMOUNT_STATISTICS_IPNS_NAME.to_string()),
         }
     }
 
@@ -145,6 +171,9 @@ impl IndexedArtifactSettings {
             max_in_flight_bytes: self
                 .max_in_flight_bytes
                 .unwrap_or(DEFAULT_INDEXED_ARTIFACT_MAX_IN_FLIGHT_BYTES),
+            amount_statistics_ipns_name: self
+                .effective_amount_statistics_ipns_name()
+                .map(ToString::to_string),
         }
     }
 
@@ -177,6 +206,15 @@ impl IndexedArtifactSettings {
             MAX_INDEXED_ARTIFACT_IN_FLIGHT_BYTES,
             errors,
         );
+        if self
+            .effective_amount_statistics_ipns_name()
+            .is_some_and(|name| !is_valid_ipns_name(name))
+        {
+            errors.push(
+                "indexed_artifacts.amount_statistics_ipns_name must be a valid IPNS name"
+                    .to_string(),
+            );
+        }
     }
 
     fn validate_required_source(&self, errors: &mut Vec<String>) {
@@ -244,6 +282,7 @@ pub struct IndexedArtifactSourceConfig {
     pub max_manifest_age: Option<Duration>,
     pub concurrency: usize,
     pub max_in_flight_bytes: u64,
+    pub amount_statistics_ipns_name: Option<String>,
 }
 
 fn validate_optional_usize_range(

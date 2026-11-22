@@ -89,6 +89,13 @@ pub(super) use ui_fixture::utxo_rows as ui_fixture_utxo_rows;
 pub(super) use ui_fixture::walletconnect_request as ui_fixture_walletconnect_request;
 #[cfg(debug_assertions)]
 pub(super) use ui_fixture::{Tron as UiFixtureTron, tron as ui_fixture_tron};
+#[cfg(debug_assertions)]
+pub(super) use ui_fixture::{
+    amount_statistics as ui_fixture_amount_statistics, hints_active as ui_fixture_hints_active,
+    hints_shield_token as ui_fixture_hints_shield_token,
+    own_deposit_stand_ins as ui_fixture_own_deposit_stand_ins,
+    shield_hint_stand_ins as ui_fixture_shield_hint_stand_ins,
+};
 /// The debug UI fixture's queries in a release build, which has no fixture.
 #[cfg(not(debug_assertions))]
 mod ui_fixture {

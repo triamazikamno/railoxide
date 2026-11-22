@@ -172,6 +172,7 @@ pub(crate) fn approximate_public_broadcaster_cost(
                 relay_call_count: shape.relay_call_count,
                 uses_relay_adapt: shape.uses_relay_adapt,
                 native_top_up: None,
+                planned_unshields: None,
             });
         }
         fee_amount = custom_fee_amount.map_or_else(
@@ -216,6 +217,7 @@ pub(crate) fn approximate_public_broadcaster_cost(
         relay_call_count: shape.relay_call_count,
         uses_relay_adapt: shape.uses_relay_adapt,
         native_top_up: None,
+        planned_unshields: None,
     })
 }
 

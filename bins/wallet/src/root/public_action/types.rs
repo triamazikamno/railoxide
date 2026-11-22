@@ -467,7 +467,10 @@ pub(in crate::root) fn public_send_authorization_summary(
                 "Native value",
                 format!(
                     "{} {}",
-                    format_send_amount_input(metadata.value, draft.asset_decimals),
+                    railgun_ui::group_thousands(&format_send_amount_input(
+                        metadata.value,
+                        draft.asset_decimals
+                    )),
                     draft.asset_label
                 ),
             )
@@ -689,7 +692,10 @@ pub(in crate::root) const fn public_shield_authorization_detail(
 pub(in crate::root) fn public_action_amount_label(draft: &PublicSendDraft) -> String {
     format!(
         "{} {}",
-        format_send_amount_input(draft.amount, draft.asset_decimals),
+        railgun_ui::group_thousands(&format_send_amount_input(
+            draft.amount,
+            draft.asset_decimals
+        )),
         draft.asset_label
     )
 }
@@ -697,7 +703,10 @@ pub(in crate::root) fn public_action_amount_label(draft: &PublicSendDraft) -> St
 pub(in crate::root) fn public_shield_amount_label(draft: &PublicShieldDraft) -> String {
     format!(
         "{} {}",
-        format_send_amount_input(draft.amount, draft.asset_decimals),
+        railgun_ui::group_thousands(&format_send_amount_input(
+            draft.amount,
+            draft.asset_decimals
+        )),
         draft.asset_label
     )
 }

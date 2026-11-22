@@ -1,8 +1,9 @@
 //! A debug-only fixture for looking at the Public account swap screens, at a private swap's
 //! retry review, failed quote, speed-up, split outcome, reported fill, setup progress,
 //! cancelled preparation and delivery to a non-EVM network, at the Stealth accounts inspector, at the refund dialog of a blocked
-//! Shield, at a private Send's broadcaster progress and review, at the rows of the UTXO table
-//! and at a hardware wallet's Derive from private dialog without a device: it opens
+//! Shield, at a private Send's broadcaster progress and review, at the rows of the UTXO table,
+//! at the privacy hints of Shield and Unshield and at a hardware wallet's Derive from private
+//! dialog without a device: it opens
 //! them on a scratch wallet without private
 //! funds and holds a chosen state on screen. It is compiled only with `debug_assertions`, and
 //! does nothing unless `RAILOXIDE_UI_FIXTURE` is set.
@@ -366,6 +367,39 @@
 //!   Self-broadcast gas quotes remain live. Whatever asset the form holds, an approved Send or
 //!   Unshield stops with the fixture's error before executor account preparation, proof
 //!   generation or submission, so no record of that action is written.
+//! - `hints:<state>` replaces the amount statistics of Shield's and Unshield's privacy hints with
+//!   a stand-in snapshot: fresh in `fresh`, `direct-exit` and `no-repeat`, out of date in
+//!   `out-of-date`. Nothing is fetched or stored. Public's Add account button becomes Preview
+//!   Shield hints…, which opens a Shield form of the network's USDC, or Ethereum's in raw units
+//!   where the network lists none, with 1,370 entered, a stand-in balance of 1,500 and tree 2 as
+//!   the current tree, as in the `shield:` modes, whose Shield does nothing. The snapshot counts
+//!   no deposit of 1,370, 32 of 1,200 and 7 in tree 2, with 2,350,000 in the pool. The Show
+//!   common amounts button under the amount factor opens the common amounts, any of which fills
+//!   in the amount: the five nearest below 1,370, from 250 to 1,200 with 1,204 of 1,000, then
+//!   1,370 itself, then 2,000 dimmed because it is above the balance. The snapshot's 100 is a
+//!   sixth below.
+//!   `no-repeat` lists no repeated amount, so the form says none was used twice and offers no
+//!   common amounts, and `out-of-date` shows its notice and the network factor alone. The
+//!   Private tab's Unshield offers a stand-in 1.0 of the network's wrapped native token when the
+//!   wallet holds nothing it can unshield, held as `delivery:estimate` holds it but with fees
+//!   deducted from the amount, and filled with 0.5 to the first Public account, or to
+//!   0x1111…1111 without one, over a stand-in estimate that plans one unshield of 0.5 from
+//!   tree 0.
+//!   In `direct-exit` it spends a 0.5 deposit made two days ago in full, with 1 other deposit of
+//!   that value in tree 0, 12 deposits there above its value bucket and 9 exits of the token in
+//!   30 days. In `out-of-date` it spends half of a deposit made 20 minutes ago, and in `fresh`
+//!   and `no-repeat` half of a note received in a private transfer. In `fresh` the wallet has a
+//!   stand-in deposit of 0.51 in tree 0, so the exit is within 5% of it, with the 1,201 deposits
+//!   of 0.5 in that range, and the Show common exit amounts button at the end of the hints lists
+//!   the amounts at least 5 exits used in 30 days, any of which fills in the amount: 0.1, 0.25
+//!   and 0.3, then 0.5 itself with 90, then 0.75 and 1, then 2 dimmed because it is above the
+//!   form's maximum of 1.0. On a started and synced private session, Submit opens the review,
+//!   which repeats the factors, and approving it stops with the fixture's error as in
+//!   `delivery:`. Editing the Unshield form, or choosing a common exit amount, drops the
+//!   stand-in estimate and its plan, as in `delivery:`; reopening the form restores them.
+//!   Switching the form to Add on top makes the common exit amounts browse-only, but here the
+//!   switch is such an edit: it drops the plan, and the list with it, so the fixture can't show
+//!   the browse-only list. Reopening the form restores Deduct and the estimate.
 //! - `hardware-derive` shows the Derive from private dialog, from Public's Add account, as a
 //!   hardware wallet's: its authorize state with Show addresses, its preview and the progress
 //!   of an add. Whatever wallet is selected, the dialog treats it as Ledger-derived and asks a
@@ -446,8 +480,8 @@ use alloy::eips::BlockNumHash;
 use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256};
 use gpui::{App, Context, Window};
 use railgun_ui::{
-    KnownTokenInfo, format_scaled_amount, format_token_amount, known_tokens_for_chain,
-    token_icon_asset_path,
+    KnownTokenInfo, format_scaled_amount, format_token_amount, group_thousands,
+    known_tokens_for_chain, token_icon_asset_path,
 };
 use wallet_ops::bridge::{NearAssets, NonEvmBridgeDestination, NonEvmNetwork};
 use wallet_ops::cow::{CowOrderStatusHint, CowOrderStatusReport, OrderLimitError, OrderUid};
@@ -494,6 +528,7 @@ use crate::root::utxo::{BlockedShieldRefundDialogState, UtxoDisplayRow, UtxoFina
 use crate::root::wallet_activity::{ActivityData, ActivityRowId, ActivityStandIn};
 
 mod activity_stand_in;
+mod amount_hints;
 mod swap_screens;
 mod wallet_screens;
 mod wallet_stand_ins;
@@ -515,6 +550,10 @@ pub(super) use setup_records::*;
 use swap_records::*;
 
 pub(in crate::root) use activity_stand_in::activity;
+pub(in crate::root) use amount_hints::{
+    amount_statistics, hints_active, hints_shield_token, own_deposit_stand_ins,
+    shield_hint_stand_ins,
+};
 pub(in crate::root) use wallet_stand_ins::{
     fill_logs, hardware_derive, holds_delivery, holds_send_review, send_asset, setup_swap_token,
     shows_utxos, tor_rotation, tron, unshield_asset, update_check, utxo_finality_context,
@@ -565,6 +604,7 @@ enum Mode {
     BroadcasterProgress(BroadcasterProgress),
     BroadcasterReview,
     Delivery(Delivery),
+    Hints(Hints),
     HardwareDerive,
     NonEvm(NonEvm, NonEvmNetwork),
     Tron(Tron),
@@ -648,6 +688,19 @@ enum Delivery {
     Sponsored,
     /// The broadcaster accepted the submission.
     Submitted,
+}
+
+/// The amount statistics and plan a `hints:` mode shows on Shield and Unshield.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hints {
+    /// A fresh snapshot and an exit that doesn't spend a deposit directly.
+    Fresh,
+    /// An out-of-date snapshot and an exit soon after a deposit.
+    OutOfDate,
+    /// A fresh snapshot and an exit that spends a deposit directly.
+    DirectExit,
+    /// A fresh snapshot in which no amount of either token repeats.
+    NoRepeat,
 }
 
 /// Whether a `max:` mode's stand-in Sell asset has locked notes.

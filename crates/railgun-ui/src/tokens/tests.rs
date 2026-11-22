@@ -25,7 +25,35 @@ fn format_trims_trailing_zeros_after_rounding() {
 fn format_rounds_large_values_to_whole_numbers() {
     assert_eq!(
         format_token_amount(uint!(19_232_527_572_893_U256), 9),
-        "19233"
+        "19,233"
+    );
+}
+
+/// Display amounts group their whole part in thousands, while the exact and rounded input
+/// formatters stay ungrouped because amount parsers reject separators.
+#[test]
+fn display_amounts_group_thousands_and_input_amounts_do_not() {
+    assert_eq!(group_thousands("1234567.891"), "1,234,567.891");
+    assert_eq!(group_thousands("999.5"), "999.5");
+    assert_eq!(
+        format_token_amount(uint!(402_118_977_U256), 0),
+        "402,118,977"
+    );
+    assert_eq!(
+        format_token_amount(uint!(1_234_567_891_000_U256), 6),
+        "1,234,568"
+    );
+    assert_eq!(
+        format_token_amount_ceiling(uint!(1_000_004_U256), 3),
+        "1,001"
+    );
+    assert_eq!(
+        format_token_amount_ungrouped(uint!(1_234_567_891_000_U256), 6),
+        "1234568"
+    );
+    assert_eq!(
+        format_scaled_amount(uint!(1_000_500_001_U256), 6),
+        "1000.500001"
     );
 }
 

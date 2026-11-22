@@ -1,7 +1,7 @@
 use alloy::primitives::{Address, U256};
 use railgun_ui::{
-    format_scaled_amount, format_token_amount, format_usd_micro_value, lookup_token,
-    non_redundant_usd_micro_value, short_address, token_icon_asset_path,
+    format_scaled_amount, format_token_amount, format_usd_micro_value, group_thousands,
+    lookup_token, non_redundant_usd_micro_value, short_address, token_icon_asset_path,
 };
 use wallet_ops::settings::{EffectiveChainRegistry, EffectiveTokenInfo, EffectiveTokenRegistry};
 
@@ -74,7 +74,7 @@ pub(super) fn format_exact_token_amount_for_display(
         |info| {
             format!(
                 "{} {}",
-                format_send_amount_input(amount, Some(info.decimals)),
+                group_thousands(&format_send_amount_input(amount, Some(info.decimals))),
                 info.symbol
             )
         },

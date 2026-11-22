@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use super::generation::{
     broadcaster_estimate_allows_submission, broadcaster_input_pin_conflict_awaits_choice,
 };
@@ -29,6 +31,7 @@ use super::{
     sponsored_funding_enabled, sponsored_self_broadcast_availability_reason, unshield_element_id,
     unshield_form_max_entered_amount, unshield_form_submitted,
 };
+use crate::root::amount_privacy::{UseAmount, render_amount_privacy_hints};
 
 /// One Send or Unshield form, as the shared form sections read it.
 struct DeliveryFormView<'a> {
@@ -189,6 +192,7 @@ impl WalletRoot {
         root: Entity<Self>,
         key: UnshieldAssetKey,
         content_width: Pixels,
+        cx: &App,
     ) -> gpui::Div {
         let Some(form) = self.unshield_forms.get(&key) else {
             return div();
@@ -218,7 +222,7 @@ impl WalletRoot {
             );
         }
 
-        let (card, submit_disabled) = self.render_unshield_inputs(&view, form, card);
+        let (card, submit_disabled) = self.render_unshield_inputs(&view, form, card, cx);
         let card = self.render_submit_section(&view, card, submit_disabled);
         let mut card = self.render_delivery_status(&view, card);
 
@@ -274,13 +278,14 @@ impl WalletRoot {
         (card, submit_disabled)
     }
 
-    /// Delivery controls, then Unshield's fee-mode toggle, recipient, output and amount row, gas
-    /// top-up and executor reason. Also returns whether submit is disabled.
+    /// Delivery controls, then Unshield's fee-mode toggle, recipient, output and amount row,
+    /// privacy hints, gas top-up and executor reason. Also returns whether submit is disabled.
     fn render_unshield_inputs(
         &self,
         view: &DeliveryFormView<'_>,
         form: &UnshieldFormState,
         card: gpui::Div,
+        cx: &App,
     ) -> (gpui::Div, bool) {
         let unwrap_supported = is_effective_wrapped_native_token(
             &self.effective_chain_configs,
@@ -328,6 +333,7 @@ impl WalletRoot {
                         submit_disabled,
                     )),
             )
+            .children(self.render_unshield_privacy_hints(view, cx))
             .child(render_unshield_native_top_up_control(
                 view.root.clone(),
                 view.key,
@@ -338,6 +344,31 @@ impl WalletRoot {
             ))
             .children(executor_reason);
         (card, submit_disabled)
+    }
+
+    /// The Unshield form's privacy hints, `None` without a form for its key, whose common exit
+    /// amounts are offered until generation starts. With fees added on top the list is
+    /// browse-only.
+    fn render_unshield_privacy_hints(
+        &self,
+        view: &DeliveryFormView<'_>,
+        cx: &App,
+    ) -> Option<gpui::Div> {
+        let key = view.key;
+        self.unshield_privacy_presentation(key).map(|presentation| {
+            let root = view.root.clone();
+            let use_amount: UseAmount = Rc::new(move |amount, window, cx| {
+                root.update(cx, |root, cx| {
+                    root.use_unshield_amount(key, amount, window, cx);
+                });
+            });
+            render_amount_privacy_hints(
+                &unshield_element_id(key, "privacy"),
+                &presentation,
+                (!view.generating).then_some(use_amount),
+                cx,
+            )
+        })
     }
 
     /// Delivery selector, then the selected mode's settings. Also returns whether submit is

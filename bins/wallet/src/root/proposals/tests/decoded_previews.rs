@@ -195,7 +195,7 @@ fn common_governance_decoded_previews_show_parties_tokens_and_rates() {
     assert_eq!(mint.verb, "Mint governance tokens");
     assert_eq!(
         mint.hero.as_ref().map(|hero| hero.rounded.as_str()),
-        Some("10000 RAIL")
+        Some("10,000 RAIL")
     );
     assert!(matches!(
         &mint.details[0],
@@ -513,7 +513,7 @@ fn proposal_decoded_preview_uses_typed_token_and_party_presentation() {
         Some(&[]),
     );
     let hero = transfer.hero.as_ref().expect("known token hero");
-    assert_eq!(hero.rounded, "15109 TEST");
+    assert_eq!(hero.rounded, "15,109 TEST");
     assert!(hero.icon.is_none(), "custom icon-less symbols have no slot");
     assert!(hero.amount_copy_value.is_none());
     assert!(hero.context_copy_value.is_none());

@@ -158,6 +158,8 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
         },
     )?;
 
+    // The estimate is built from the last selection, so its planned unshields are the plan's.
+    let mut planned_unshields = None;
     let mut estimate = approximate_public_broadcaster_cost(
         broadcaster,
         chain.gas.gas_limit_buffer,
@@ -198,12 +200,15 @@ pub async fn estimate_desktop_unshield_public_broadcaster_cost(
                     RAILGUN_PROTOCOL_FEE_BPS,
                 )
             })?;
-            Ok(
+            let shape =
                 unshield_approximate_shape(&selection, selection.max_spendable, request.unwrap)
-                    .with_executor(uses_executor),
-            )
+                    .with_executor(uses_executor);
+            planned_unshields = Some(selection.planned_unshields);
+            Ok(shape)
         },
     )?;
+    estimate.planned_unshields =
+        planned_unshields.and_then(|planned| crate::resolve_planned_unshields(&planned, &utxos));
     require_pinned_estimate(pinned.is_some(), &estimate)?;
     let reported_amounts = public_broadcaster_reported_amounts(
         request.token,
@@ -330,6 +335,22 @@ pub fn estimate_desktop_unshield_self_broadcast_cost(
         max_priority_fee_per_gas,
         protocol_fees,
     ))
+}
+
+/// The unshields a self-broadcast or calldata-only Unshield of `entered_amount` would send
+/// without a native top-up, selected from `utxos` as its generation selects them, with their
+/// notes resolved for the amount privacy hints. `None` when the notes don't cover the amount.
+/// Makes no request.
+#[must_use]
+pub fn desktop_unshield_self_broadcast_plan(
+    utxos: &[Utxo],
+    token: Address,
+    entered_amount: U256,
+    fee_mode: FeeHandlingMode,
+) -> Option<Vec<crate::ResolvedPlannedUnshield>> {
+    let receiver_amount = unshield_receiver_amount_for_fee_mode(entered_amount, fee_mode).ok()?;
+    let selection = unshield_selection_info(utxos, token, receiver_amount, false).ok()?;
+    crate::resolve_planned_unshields(&selection.planned_unshields, utxos)
 }
 
 fn desktop_self_broadcast_cost_estimate(

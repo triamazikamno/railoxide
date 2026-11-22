@@ -1,4 +1,15 @@
+use cid::Cid;
+use libp2p::PeerId;
+
 use super::{Address, FromStr, Url, WakuDirectPeerSetting, hex, parse_multiaddr, parse_peer_id};
+
+const LIBP2P_KEY_CODEC: u64 = 0x72;
+
+pub(super) fn is_valid_ipns_name(name: &str) -> bool {
+    Cid::try_from(name.trim()).is_ok_and(|cid| {
+        cid.codec() == LIBP2P_KEY_CODEC && PeerId::from_bytes(&cid.hash().to_bytes()).is_ok()
+    })
+}
 
 pub(super) fn validate_address(field: &str, value: &str, errors: &mut Vec<String>) {
     if Address::from_str(value).is_err() {

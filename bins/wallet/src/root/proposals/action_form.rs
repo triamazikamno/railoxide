@@ -213,7 +213,9 @@ pub(super) fn render_proposal_action_form(
                                     .disabled(sponsor_lockout_until.is_some())
                                     .child(format!(
                                         "Max: {} RAIL",
-                                        format_send_amount_input(maximum, decimals)
+                                        railgun_ui::group_thousands(&format_send_amount_input(
+                                            maximum, decimals
+                                        ))
                                     ))
                                     .on_click(move |_event, window, cx| {
                                         if let Some(value) = &max_value {

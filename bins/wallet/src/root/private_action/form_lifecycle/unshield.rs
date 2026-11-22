@@ -158,9 +158,12 @@ impl WalletRoot {
         self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);
         self.schedule_public_broadcaster_cost_estimate(DeliveryFormKind::Unshield, key, cx);
         self.debounce_sponsored_funding_estimate(DeliveryFormKind::Unshield, key, cx);
-        // Debug UI fixture: a `delivery:` mode holds the form at its state.
+        // Debug UI fixture: a `delivery:` mode holds the form at its state, and a `hints:` mode
+        // also fills it so its review can open.
         #[cfg(debug_assertions)]
         self.apply_ui_fixture_delivery(DeliveryFormKind::Unshield, key);
+        #[cfg(debug_assertions)]
+        self.stage_ui_fixture_hints_unshield_inputs(key, window, cx);
         Self::open_private_action_dialog(DeliveryFormKind::Unshield, key, "Unshield", window, cx);
         cx.defer_in(window, move |root, window, cx| {
             if root
@@ -396,6 +399,9 @@ impl WalletRoot {
                 sponsored_estimate_id: 0,
                 sponsored_estimate_pending: false,
                 self_broadcast_estimated_native_gas_cost: None,
+                self_broadcast_plan: None,
+                self_broadcast_plan_inputs: None,
+                self_broadcast_plan_id: 0,
                 selected_fee_token,
                 broadcaster_choice: BroadcasterChoice::Random,
                 fee_mode: FeeHandlingMode::DeductFromAmount,
@@ -406,6 +412,7 @@ impl WalletRoot {
                 cost_estimate_pending: false,
                 estimating_cost: false,
                 cost_estimate: None,
+                replaced_estimate: None,
                 shown_broadcaster: None,
                 refused_broadcasters: Vec::new(),
                 input_pin: None,
@@ -632,6 +639,8 @@ impl WalletRoot {
         cx.notify();
         if amount_adjusted {
             self.refresh_unshield_native_top_up_state(key, cx);
+        } else {
+            self.refresh_unshield_self_broadcast_plan(key, cx);
         }
         if mode == DeliveryMode::PublicBroadcaster {
             self.refresh_public_broadcaster_anchor(DeliveryFormKind::Unshield, key, cx);

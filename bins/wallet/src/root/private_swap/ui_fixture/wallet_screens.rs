@@ -199,7 +199,38 @@ impl WalletRoot {
         self.generate_send_calldata_from_form(key, window, cx);
     }
 
-    /// In a `delivery:` mode, set the `kind` form of `key`, just opened, to the mode's state.
+    /// In a `hints:` mode, fill the Unshield form of `key`, just opened, with 0.5 to the first
+    /// Public account's address, or to 0x1111…1111 without one, so Submit opens its review over
+    /// the stand-in estimate.
+    pub(in crate::root) fn stage_ui_fixture_hints_unshield_inputs(
+        &mut self,
+        key: crate::root::UnshieldAssetKey,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        const STAND_IN_RECIPIENT: Address = Address::repeat_byte(0x11);
+        if !hints_active() {
+            return;
+        }
+        let recipient = self
+            .public_accounts
+            .first()
+            .map_or(STAND_IN_RECIPIENT, |account| account.address)
+            .to_checksum(None);
+        let Some(form) = self.unshield_forms.get_mut(&key) else {
+            return;
+        };
+        // `set_value` emits no change, so nothing drops the stand-in estimate.
+        form.recipient_input.update(cx, |input, cx| {
+            input.set_value(recipient.clone(), window, cx);
+        });
+        form.amount_input
+            .update(cx, |input, cx| input.set_value("0.5", window, cx));
+        form.recipient_value = recipient.into();
+    }
+
+    /// In a `delivery:` mode, set the `kind` form of `key`, just opened, to the mode's state. A
+    /// `hints:` mode holds the `estimate` state, whose Unshield estimate carries the mode's plan.
     /// No scheduled form estimate runs in the mode to replace it.
     pub(in crate::root) fn apply_ui_fixture_delivery(
         &mut self,
@@ -208,13 +239,15 @@ impl WalletRoot {
     ) {
         use crate::root::private_action::{SelfBroadcastFundingMode, SendResult, UnshieldResult};
         use crate::root::{DeliveryFormKind, DeliveryMode};
-        let Some(Mode::Delivery(state)) = mode() else {
-            return;
+        let state = match mode() {
+            Some(Mode::Delivery(state)) => state,
+            Some(Mode::Hints(_)) => Delivery::Estimate,
+            _ => return,
         };
         let Some(asset) = self.private_action_dialog_asset(kind, key).cloned() else {
             return;
         };
-        let (fee_token, estimate) = stand_in_cost_estimate(&asset);
+        let (fee_token, estimate) = stand_in_form_cost_estimate(kind, &asset);
         let fee_mode = estimate.fee_mode;
         // The custom fee is the stand-in fee, 1.25 of its token.
         let custom_fee = (state == Delivery::CustomFee).then_some(estimate.fee_amount);
@@ -301,17 +334,17 @@ impl WalletRoot {
         }
     }
 
-    /// The fee tokens Send and Unshield offer on `chain_id` in a `delivery:estimate` or
-    /// `delivery:pin-conflict` mode: only the stand-in estimate's, 1000 of it spendable, with one
-    /// eligible broadcaster, so the form's Submit is enabled. A paired Gateway client's private
-    /// broadcaster drafts get the same option in place of the wallet's own fee tokens. `None` in
-    /// every other mode.
+    /// The fee tokens Send and Unshield offer on `chain_id` in a `delivery:estimate`,
+    /// `delivery:pin-conflict` or `hints:` mode: only the stand-in estimate's, 1000 of it
+    /// spendable, with one eligible broadcaster, so the form's Submit is enabled. A paired Gateway
+    /// client's private broadcaster drafts get the same option in place of the wallet's own fee
+    /// tokens. `None` in every other mode.
     pub(in crate::root) fn ui_fixture_fee_token_options(
         chain_id: u64,
     ) -> Option<Vec<crate::root::public_broadcaster::PublicBroadcasterFeeTokenOption>> {
         if !matches!(
             mode(),
-            Some(Mode::Delivery(Delivery::Estimate | Delivery::PinConflict))
+            Some(Mode::Delivery(Delivery::Estimate | Delivery::PinConflict) | Mode::Hints(_))
         ) {
             return None;
         }
@@ -389,8 +422,9 @@ fn stand_in_input_pin() -> wallet_ops::PublicBroadcasterInputPin {
 }
 
 /// The fee token of the stand-in estimate on `chain_id`: its network's USDC, or Ethereum's
-/// where it lists none. A zero-address USDC of 6 decimals where neither is known.
-fn stand_in_fee_token(chain_id: u64) -> KnownTokenInfo {
+/// where it lists none. A zero-address USDC of 6 decimals where neither is known. A `hints:`
+/// mode shields it too.
+pub(super) fn stand_in_fee_token(chain_id: u64) -> KnownTokenInfo {
     [chain_id, 1]
         .into_iter()
         .find_map(|chain| known_tokens_for_chain(chain).find(|token| token.symbol == "USDC"))
@@ -457,6 +491,24 @@ fn stand_in_cost_estimate(
         relay_call_count: 0,
         uses_relay_adapt: false,
         native_top_up: None,
+        planned_unshields: None,
     };
+    (fee_token, estimate)
+}
+
+/// The stand-in estimate of the `kind` form, whose Unshield estimate carries a `hints:` mode's
+/// plan and, in that mode, deducts fees from the amount. Also returns its fee token.
+fn stand_in_form_cost_estimate(
+    kind: crate::root::DeliveryFormKind,
+    asset: &crate::root::UnshieldAsset,
+) -> (Address, wallet_ops::PublicBroadcasterCostEstimate) {
+    let (fee_token, mut estimate) = stand_in_cost_estimate(asset);
+    if matches!(kind, crate::root::DeliveryFormKind::Unshield) {
+        estimate.planned_unshields = super::amount_hints::stand_in_planned_unshields(asset);
+        // The form copies this mode, in which its common exit amounts can be chosen.
+        if hints_active() {
+            estimate.fee_mode = wallet_ops::FeeHandlingMode::DeductFromAmount;
+        }
+    }
     (fee_token, estimate)
 }

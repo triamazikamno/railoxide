@@ -64,21 +64,21 @@ pub use sync_service::types::{
     WalletObservation, WalletPpoiWorkflowStatus, WalletReadiness, WalletReadinessError,
     WalletReadinessWaitError,
 };
+pub use sync_service::{
+    AmountStatisticsStatus, ChainPublicSyncCacheReset, ChainPublicSyncCacheResetResult,
+    GlobalPoiPolicy as PoiReadSource, PersistedPublicSyncCacheKind,
+    PersistedPublicSyncCacheResetError, PersistedPublicSyncCacheResetReport,
+    PoiArtifactCacheAttemptId, PoiArtifactCacheFailureKind, PoiArtifactCacheGraphProgress,
+    PoiArtifactCacheListProgress, PoiArtifactCachePhase, PoiArtifactCacheProgress,
+    PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiProxyFallback, PublicScanSource,
+    PublicSyncCachesResetReport, SyncProgressStage, SyncProgressUnit, SyncProgressUpdate,
+    WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus, reset_persisted_public_sync_caches,
+};
 use sync_service::{
     ChainConfig, ChainKey, LocalPoiMerkleProofSource, PendingOutputPoiContextIntent,
     PoiArtifactCacheRetry as CorePoiArtifactCacheRetry, PublicDataPlaneHandle, SyncManager,
     SyncProgressSender, WalletConfig, WalletHandle, WalletPendingOverlay, WalletPendingSpent,
     WalletPendingSpentMarkOutcome, WalletViewState,
-};
-pub use sync_service::{
-    ChainPublicSyncCacheReset, ChainPublicSyncCacheResetResult, GlobalPoiPolicy as PoiReadSource,
-    PersistedPublicSyncCacheKind, PersistedPublicSyncCacheResetError,
-    PersistedPublicSyncCacheResetReport, PoiArtifactCacheAttemptId, PoiArtifactCacheFailureKind,
-    PoiArtifactCacheGraphProgress, PoiArtifactCacheListProgress, PoiArtifactCachePhase,
-    PoiArtifactCacheProgress, PoiArtifactManifestSource, PoiArtifactSourceConfig, PoiProxyFallback,
-    PublicScanSource, PublicSyncCachesResetReport, SyncProgressStage, SyncProgressUnit,
-    SyncProgressUpdate, WalletIndexedCatchUpSource, WalletIndexedCatchUpStatus,
-    reset_persisted_public_sync_caches,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -93,6 +93,7 @@ static ACTIVE_PROVER_CACHE_BUILDS: LazyLock<
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 mod activity;
+mod amount_privacy;
 mod amounts;
 mod anchors;
 mod app_tables;
@@ -132,6 +133,13 @@ pub use activity::{
     ActivityConfirmation, ActivityStatus, ReceivedKind, ReceivedRow, StatusInputs, SwapRow,
     SwapRowRecipient, entry_status, has_unread_received, is_in_flight, owned_hashes, received_rows,
     resolve_counterparty, swap_rows,
+};
+pub use amount_privacy::{
+    CommonAmount, NetworkRoute, OwnDeposit, PlannedUnshieldLines, PoolShare, PrivacyFactor,
+    PrivacyFactorKind, PrivacyLevel, ResolvedPlannedInput, ResolvedPlannedUnshield,
+    ShieldHintInput, ShieldHints, ShieldLines, StatisticsNotice, TreeDeposits, UnshieldHintInput,
+    UnshieldHints, UnshieldLines, UnshieldSender, evaluate_shield_hints, evaluate_unshield_hints,
+    own_shield_deposits, recipient_deposited, resolve_planned_unshields,
 };
 pub use amounts::{
     is_wrapped_native_token, parse_railgun_recipient, parse_send_amount, parse_unshield_amount,

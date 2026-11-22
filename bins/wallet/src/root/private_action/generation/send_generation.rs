@@ -255,7 +255,10 @@ impl WalletRoot {
                 key,
                 format!(
                     "Amount exceeds max POI-verified batched transaction: {}",
-                    format_send_amount_input(asset.max_batched, asset.decimals)
+                    railgun_ui::group_thousands(&format_send_amount_input(
+                        asset.max_batched,
+                        asset.decimals
+                    ))
                 ),
                 cx,
             );

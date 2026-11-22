@@ -76,7 +76,8 @@ impl WalletRoot {
     /// `shield:estimate-error`, `shield:funding-error`, `shield:native-pending` and
     /// `shield:fallback-pending` stage an inert progress dialog when a Public asset dialog is
     /// opened on a scratch profile. The other `shield:*` fixtures stage the native Shield form
-    /// instead. No action is submitted and no record is written.
+    /// instead, and `hints:*` an ERC-20 Shield form. No action is submitted and no record is
+    /// written.
     #[cfg(debug_assertions)]
     pub(in crate::root) fn open_public_shield_error_ui_fixture(
         &mut self,
@@ -104,17 +105,17 @@ impl WalletRoot {
                 self.stage_native_shield_form_ui_fixture(fixture, window, cx);
                 return false;
             }
+            Some(PublicShieldUiFixture::Hints) => {
+                self.stage_shield_hints_ui_fixture(window, cx);
+                return false;
+            }
         };
         let asset = self
             .effective_chain_configs
             .get(self.last_evm_chain)
             .and_then(|chain| chain.wrapped_native_token)
             .map_or(asset, PublicAssetId::Erc20);
-        let message = if funding_error {
-            "insufficient native balance for public shield estimated network fees"
-        } else {
-            "all public action query RPC attempts failed: estimate public action gas: server returned an error response: error code 3: execution reverted, data: \"0x\""
-        };
+        let message = Self::shield_error_ui_fixture_message(funding_error);
         let states = vec![
             PublicActionStepState {
                 step: PublicActionProgressStep::Approve,
@@ -161,6 +162,16 @@ impl WalletRoot {
         self.show_public_action_progress_dialog(window, cx);
         cx.notify();
         true
+    }
+
+    /// The error the `shield:funding-error` or `shield:estimate-error` progress dialog shows.
+    #[cfg(debug_assertions)]
+    const fn shield_error_ui_fixture_message(funding_error: bool) -> &'static str {
+        if funding_error {
+            "insufficient native balance for public shield estimated network fees"
+        } else {
+            "all public action query RPC attempts failed: estimate public action gas: server returned an error response: error code 3: execution reverted, data: \"0x\""
+        }
     }
 
     #[cfg(debug_assertions)]

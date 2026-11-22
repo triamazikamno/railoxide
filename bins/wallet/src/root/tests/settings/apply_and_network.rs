@@ -445,3 +445,30 @@ fn indexed_artifact_custom_settings_only_show_for_custom_mode() {
         IndexedArtifactSourceModeSetting::Custom
     ));
 }
+
+#[test]
+fn amount_statistics_name_is_optional_for_a_custom_source_and_marked_when_invalid() {
+    let mut settings = WalletSettings::default();
+    apply_indexed_artifact_source_mode(&mut settings, "custom");
+    settings.validate().expect("an empty name is valid");
+    let empty = indexed_artifact_amount_statistics_help(&settings, None);
+    assert!(empty.contains("No amount statistics are fetched for this source"));
+    assert!(empty.contains("show only the privacy factors that need none"));
+    assert!(
+        !empty.contains("off"),
+        "the hints stay on without statistics"
+    );
+
+    settings.indexed_artifacts.amount_statistics_ipns_name = Some("not-an-ipns-name".to_owned());
+    let error = settings.validate().unwrap_err().to_string();
+    let invalid = indexed_artifact_amount_statistics_help(&settings, Some(&error));
+    assert!(invalid.contains("isn't a valid IPNS name"), "{invalid}");
+
+    settings.indexed_artifacts.amount_statistics_ipns_name =
+        Some(wallet_ops::settings::OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME.to_owned());
+    settings.validate().expect("a valid name is accepted");
+    assert!(
+        !indexed_artifact_amount_statistics_help(&settings, None).contains("isn't a valid"),
+        "a valid name is not marked"
+    );
+}

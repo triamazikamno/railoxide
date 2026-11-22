@@ -33,7 +33,7 @@ impl WalletRoot {
                     content.render_send_form(content_root.clone(), key, content_width)
                 }
                 DeliveryFormKind::Unshield => {
-                    content.render_unshield_form(content_root.clone(), key, content_width)
+                    content.render_unshield_form(content_root.clone(), key, content_width, cx)
                 }
             };
             dialog

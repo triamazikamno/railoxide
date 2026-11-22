@@ -445,3 +445,50 @@ fn wallet_sync_tip_publish_forces_time_driven_refresh() {
     assert_eq!(last_tip, advanced_tip);
     assert!(rx.has_changed().expect("watch receiver notified"));
 }
+
+fn ethereum_statistics_status(
+    wallet_settings: &settings::WalletSettings,
+    running_chain_status: impl FnOnce() -> Option<AmountStatisticsStatus>,
+) -> AmountStatisticsStatus {
+    let chains = settings::build_effective_chain_configs(wallet_settings).unwrap();
+    amount_statistics_status_for_chain(chains.get(1), running_chain_status)
+}
+
+#[test]
+fn amount_statistics_status_asks_the_running_chain_only_when_a_source_names_statistics() {
+    let not_asked = || -> Option<AmountStatisticsStatus> {
+        panic!("a chain without an amount-statistics source must not ask the sync manager")
+    };
+    let mut wallet_settings = settings::WalletSettings::default();
+    wallet_settings.indexed_artifacts.source_mode =
+        settings::IndexedArtifactSourceModeSetting::Custom;
+    wallet_settings.indexed_artifacts.publisher_pubkey = Some(format!("0x{}", "11".repeat(32)));
+    wallet_settings.indexed_artifacts.manifest_source =
+        Some(settings::IndexedArtifactManifestSourceSetting::IpnsName(
+            settings::OFFICIAL_INDEXED_ARTIFACT_IPNS_NAME.to_string(),
+        ));
+    assert_eq!(
+        ethereum_statistics_status(&wallet_settings, not_asked),
+        AmountStatisticsStatus::NotConfigured
+    );
+
+    wallet_settings
+        .indexed_artifacts
+        .amount_statistics_ipns_name =
+        Some("k51qzi5uqu5dicmabkge4lkunc4bkd198u9xicp5espmw5zdzbafkez7hyh5ft".to_string());
+    assert_eq!(
+        ethereum_statistics_status(&wallet_settings, || None),
+        AmountStatisticsStatus::NotYetAvailable
+    );
+    assert_eq!(
+        ethereum_statistics_status(&wallet_settings, || Some(AmountStatisticsStatus::OutOfDate)),
+        AmountStatisticsStatus::OutOfDate
+    );
+
+    wallet_settings.indexed_artifacts.source_mode =
+        settings::IndexedArtifactSourceModeSetting::Disabled;
+    assert_eq!(
+        ethereum_statistics_status(&wallet_settings, not_asked),
+        AmountStatisticsStatus::NotConfigured
+    );
+}

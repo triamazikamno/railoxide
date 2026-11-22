@@ -3,13 +3,9 @@ use super::{
     LEGACY_OFFICIAL_POI_ARTIFACT_IPNS_NAME, MAX_INTERVAL_SECS, OFFICIAL_POI_ARTIFACT_GATEWAYS,
     OFFICIAL_POI_ARTIFACT_IPNS_NAME, OFFICIAL_POI_ARTIFACT_PUBLISHER_PUBKEY,
     PUBLIC_BROADCASTER_REPUBLISH_INTERVAL, PoiArtifactManifestSource, PoiArtifactSourceConfig,
-    SensitiveUrl, Serialize, Url, parse_fixed_hex_32, validate_optional_range, validate_range,
-    validate_url_scheme,
+    SensitiveUrl, Serialize, Url, is_valid_ipns_name, parse_fixed_hex_32, validate_optional_range,
+    validate_range, validate_url_scheme,
 };
-use cid::Cid;
-use libp2p::PeerId;
-
-const LIBP2P_KEY_CODEC: u64 = 0x72;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -123,11 +119,7 @@ impl PoiArtifactSettings {
         }
         match &self.manifest_source {
             PoiArtifactManifestSourceSetting::IpnsName(name) => {
-                let valid = Cid::try_from(name.trim()).is_ok_and(|cid| {
-                    cid.codec() == LIBP2P_KEY_CODEC
-                        && PeerId::from_bytes(&cid.hash().to_bytes()).is_ok()
-                });
-                if !valid {
+                if !is_valid_ipns_name(name) {
                     errors
                         .push("poi.artifact.manifest_source must be a valid IPNS name".to_string());
                 }

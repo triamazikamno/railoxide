@@ -1411,6 +1411,14 @@ fn wallet_executor_records(
 }
 
 impl WalletRoot {
+    /// The stored entries, cleared stubs included; empty until the journal has been read.
+    pub(super) fn wallet_activity_entries(&self) -> &[ActivityEntry] {
+        match &self.wallet_activity.data {
+            Some(data) => &data.entries,
+            None => &[],
+        }
+    }
+
     pub(super) const fn selected_activity_network(&self) -> ActivityNetwork {
         match self.selected_network {
             SelectedNetwork::Evm(chain_id) => ActivityNetwork::Evm(chain_id),

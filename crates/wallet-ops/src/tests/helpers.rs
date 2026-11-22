@@ -174,6 +174,7 @@ pub(super) fn selection_info(
         private_output_count,
         public_output_count,
         max_spendable,
+        planned_unshields: Vec::new(),
     }
 }
 

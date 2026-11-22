@@ -242,6 +242,7 @@ pub(super) fn public_broadcaster_cost_estimate(
         relay_call_count: 0,
         uses_relay_adapt: false,
         native_top_up: None,
+        planned_unshields: None,
     }
 }
 

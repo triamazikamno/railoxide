@@ -284,7 +284,7 @@ impl WalletRoot {
                 return;
             }
         };
-        let summary = self.executor_unshield_summary(draft, &quote, bounds, None);
+        let summary = self.executor_unshield_summary(key, draft, &quote, bounds, None);
         let operation = match ExecutorUnshieldOperation::for_action(
             form.executor_operation.as_ref(),
             ExecutorUnshieldBinding::from_draft(draft),
@@ -760,6 +760,7 @@ impl WalletRoot {
                     }
                 } else {
                     let summary = root.executor_unshield_summary(
+                        key,
                         &current,
                         &review.quote,
                         review.bounds,
@@ -793,6 +794,7 @@ impl WalletRoot {
 
     fn executor_unshield_summary(
         &self,
+        key: UnshieldAssetKey,
         draft: &UnshieldSpendDraft,
         quote: &ExecutorUnshieldQuote,
         bounds: Option<PublicBroadcasterApprovalBounds>,
@@ -806,7 +808,7 @@ impl WalletRoot {
         let exact_native_amount = |amount| {
             format!(
                 "{} {}",
-                format_unshield_amount_input(amount, Some(18)),
+                railgun_ui::group_thousands(&format_unshield_amount_input(amount, Some(18))),
                 native_token_display_label(draft.asset.chain_id),
             )
         };
@@ -1132,7 +1134,8 @@ impl WalletRoot {
                 draft.delivery_mode.label(),
                 railgun_ui::chain_name(draft.asset.chain_id).unwrap_or("Chain"),
             ))
-            .requiring_explicit_review();
+            .requiring_explicit_review()
+            .with_privacy_hints(self.unshield_privacy_presentation(key));
         if let Some(amount) = draft.custom_fee_amount {
             summary.with_custom_transaction_fee(super::fee_editor::custom_fee_label(
                 draft.asset.chain_id,

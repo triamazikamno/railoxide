@@ -36,6 +36,7 @@ fn parse_family(family: &str, state: &str) -> Option<Mode> {
         "max" => max_state(state).map(Mode::Max),
         "broadcaster-progress" => broadcaster_progress_state(state).map(Mode::BroadcasterProgress),
         "delivery" => delivery_state(state).map(Mode::Delivery),
+        "hints" => hints_state(state).map(Mode::Hints),
         "rotation" => rotation_waku_failed(state).map(|waku_failed| Mode::Rotation { waku_failed }),
         "speed-up" => speed_up_state(state).map(Mode::SpeedUp),
         "split" => split_stage(state).map(Mode::Split),
@@ -92,6 +93,16 @@ fn delivery_state(state: &str) -> Option<Delivery> {
         "pin-conflict" => Delivery::PinConflict,
         "sponsored" => Delivery::Sponsored,
         "submitted" => Delivery::Submitted,
+        _ => return None,
+    })
+}
+
+fn hints_state(state: &str) -> Option<Hints> {
+    Some(match state {
+        "fresh" => Hints::Fresh,
+        "out-of-date" => Hints::OutOfDate,
+        "direct-exit" => Hints::DirectExit,
+        "no-repeat" => Hints::NoRepeat,
         _ => return None,
     })
 }

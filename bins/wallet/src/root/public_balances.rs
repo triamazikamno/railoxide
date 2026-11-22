@@ -5,7 +5,7 @@ use std::time::Duration;
 use alloy::primitives::U256;
 use gpui::Context;
 use railgun_ui::{
-    format_scaled_amount, format_token_amount, format_usd_micro_value,
+    format_scaled_amount, format_token_amount, format_usd_micro_value, group_thousands,
     native_currency_icon_asset_path, short_address,
 };
 use rand::RngExt as _;
@@ -194,9 +194,9 @@ pub(super) fn public_balance_tile_amount(amount: &PublicBalanceAmount, decimals:
         .min(fraction.len());
     let fraction = fraction[..precision].trim_end_matches('0');
     if fraction.is_empty() {
-        whole.to_owned()
+        group_thousands(whole)
     } else {
-        format!("{whole}.{fraction}")
+        format!("{}.{fraction}", group_thousands(whole))
     }
 }
 

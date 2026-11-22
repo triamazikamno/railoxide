@@ -48,7 +48,7 @@ fn public_list_amounts_keep_dust_visible_and_abbreviate_to_tile_width() {
         (U256::ZERO, 18, "0"),
         (U256::from(1), 18, "<0.0001"),
         (uint!(100_000_000_000_000_U256), 18, "0.0001"),
-        (uint!(1_234_567_890_U256), 6, "1234.567"),
+        (uint!(1_234_567_890_U256), 6, "1,234.567"),
         (uint!(123_456_789_U256), 0, "1.234e8"),
     ] {
         let amount = PublicBalanceAmount::Available(amount);

@@ -556,7 +556,7 @@ fn the_gas_bar_and_custom_minimum_set_a_share_that_a_requote_keeps(cx: &mut Test
             assert!(form.gas_custom);
             assert_eq!(
                 form.gas_minimum_input.read(cx).value().to_string(),
-                railgun_ui::format_token_amount(requoted.suggested_private_minimum(), 6)
+                railgun_ui::format_token_amount_ungrouped(requoted.suggested_private_minimum(), 6)
             );
         });
 

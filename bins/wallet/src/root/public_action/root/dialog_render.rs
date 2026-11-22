@@ -1,4 +1,7 @@
+use std::rc::Rc;
+
 use super::*;
+use crate::root::amount_privacy::{UseAmount, render_amount_privacy_hints};
 
 impl WalletRoot {
     pub(in crate::root) fn render_public_action_dialog_content(
@@ -31,6 +34,7 @@ impl WalletRoot {
         let advanced_estimate_root = root.clone();
         let advanced_submit_root = root.clone();
         let keyboard_submit_root = root.clone();
+        let privacy_hints_root = root.clone();
         let max_root = root;
         let show_form_errors = !self.public_action_has_active_progress();
         let amount_hint = format!("{asset_label} amount");
@@ -163,6 +167,7 @@ impl WalletRoot {
                         max_label,
                         disabled || self.public_form.shielding,
                     ))
+                    .children(self.render_shield_privacy_hints(privacy_hints_root, cx))
                     .child(render_mimic_railway_shield_control(
                         submit_root.clone(),
                         self.mimic_railway_shield_effective(),
@@ -535,5 +540,22 @@ impl WalletRoot {
         }
 
         content
+    }
+
+    /// The Shield form's privacy hints, whose common amounts are offered until shielding starts.
+    fn render_shield_privacy_hints(&self, root: Entity<Self>, cx: &App) -> Option<gpui::Div> {
+        self.shield_privacy_presentation(cx).map(|presentation| {
+            let use_amount: UseAmount = Rc::new(move |amount, window, cx| {
+                root.update(cx, |root, cx| {
+                    root.use_shield_amount(amount, window, cx);
+                });
+            });
+            render_amount_privacy_hints(
+                "wallet-public-shield-privacy",
+                &presentation,
+                (!self.public_form.shielding).then_some(use_amount),
+                cx,
+            )
+        })
     }
 }

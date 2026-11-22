@@ -160,7 +160,7 @@ fn public_broadcaster_cost_display_uses_shared_amount_precision() {
     estimate.protocol_fee_bps = uint!(25_U256);
 
     let display = PublicBroadcasterCostDisplay::from_estimate_chain(1, &estimate, None, None);
-    assert_eq!(display.action_amount(display.recipient_amount), "3217 DAI");
+    assert_eq!(display.action_amount(display.recipient_amount), "3,217 DAI");
     assert_eq!(display.fee_display().fee_amount(), "0.16334 DAI");
 }
 
