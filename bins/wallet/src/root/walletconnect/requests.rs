@@ -264,11 +264,7 @@ pub(super) async fn approve_walletconnect_request_task(
                 message: "Dapp request could not be completed".to_owned(),
             }
         } else {
-            DappRequestError {
-                provider_failure: None,
-                kind: walletconnect_request_approval_error_kind(&response_request, &error),
-                message: format_report_chain(&error),
-            }
+            walletconnect_approval_dapp_error(&response_request, &error)
         }
     });
     if let Err(error) = response_sender.send(response).await {
@@ -434,6 +430,20 @@ pub(super) fn walletconnect_request_approval_error_kind(
         WalletConnectRequestErrorKind::UnsupportedMethod
     } else {
         WalletConnectRequestErrorKind::Internal
+    }
+}
+
+/// Report chains can carry endpoint URLs with API keys and other wallet detail, so the dApp gets
+/// only the kind's fixed text. The wallet UI keeps the full chain.
+pub(super) fn walletconnect_approval_dapp_error(
+    request: &WalletConnectRequestUi,
+    error: &eyre::Report,
+) -> DappRequestError {
+    let kind = walletconnect_request_approval_error_kind(request, error);
+    DappRequestError {
+        provider_failure: None,
+        kind,
+        message: kind.public_message().to_owned(),
     }
 }
 

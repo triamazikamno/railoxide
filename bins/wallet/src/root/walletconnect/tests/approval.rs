@@ -22,27 +22,32 @@ fn hardware_typed_data_error_maps_to_unsupported_method() {
 }
 
 #[test]
-fn hardware_typed_data_recovery_mismatch_maps_to_error_response() {
+fn approval_errors_keep_wallet_detail_from_dapp() {
     let mut request = test_walletconnect_request("session-topic:7", Some(1_700_000_300));
+    let rpc_failure =
+        eyre::eyre!("error sending request for url (https://rpc.example/v2/secret-key)")
+            .wrap_err("fetch public action nonce");
+
+    let error = walletconnect_approval_dapp_error(&request, &rpc_failure);
+
+    assert_eq!(error.kind, WalletConnectRequestErrorKind::Internal);
+    assert!(!error.message.contains("rpc.example"));
+    assert!(!error.message.contains("secret-key"));
+
     request.item.method = WalletConnectSupportedMethod::EthSignTypedDataV4;
     request.account_source = Some(PublicAccountSource::HardwareDerived);
-    let error = eyre::eyre!(
+    let mismatch = eyre::eyre!(
         "hardware public signer address mismatch: expected 0x1111111111111111111111111111111111111111, got 0x2222222222222222222222222222222222222222"
     );
 
-    let response = build_walletconnect_jsonrpc_error(
-        request.item.id,
-        walletconnect_request_approval_error_kind(&request, &error),
-        format_report_chain(&error),
-    );
+    let error = walletconnect_approval_dapp_error(&request, &mismatch);
 
-    assert!(response.result.is_none());
-    let error = response.error.expect("error response");
-    assert_eq!(
-        error.code,
-        WalletConnectRequestErrorKind::UnsupportedMethod.code()
+    assert_eq!(error.kind, WalletConnectRequestErrorKind::UnsupportedMethod);
+    assert!(
+        !error
+            .message
+            .contains("0x2222222222222222222222222222222222222222")
     );
-    assert!(error.message.contains("address mismatch"));
 }
 
 #[test]

@@ -50,6 +50,19 @@ impl WalletConnectRequestErrorKind {
             Self::Internal => -32_603,
         }
     }
+
+    #[must_use]
+    pub const fn public_message(self) -> &'static str {
+        match self {
+            Self::UserRejected => "User rejected the request",
+            Self::UnsupportedMethod => "Unsupported method",
+            Self::UnsupportedChain => "Unsupported chain",
+            Self::MalformedParams => "Invalid parameters",
+            Self::ExpiredRequest => "Request expired",
+            Self::Unauthorized => "Unauthorized",
+            Self::Internal => "Internal error",
+        }
+    }
 }
 
 pub fn build_walletconnect_jsonrpc_error(
