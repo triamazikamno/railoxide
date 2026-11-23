@@ -5,8 +5,8 @@ use super::{
     HardwareDerivationMethod, HardwareDeviceKind, HardwareProfileBindingKind,
     HardwareProfileMetadata, HardwareProfileSession, HardwareRailgunAccountMetadata,
     HardwareSetupErrorFocus, HardwareViewAccessKey, HardwareWalletProfile,
-    HardwareWalletSyncIntent, LedgerHardwareDerivationClient, ParentElement, Styled,
-    SyntheticRailgunEntropy, TrezorHardwareDerivationClient, TrezorPassphraseMode,
+    HardwareWalletSyncIntent, LedgerEip1024Purpose, LedgerHardwareDerivationClient, ParentElement,
+    Styled, SyntheticRailgunEntropy, TrezorHardwareDerivationClient, TrezorPassphraseMode,
     TrezorPinMatrixProvider, TrezorPinMatrixRequestKind, VaultError, VaultState, ViewUnlock,
     WalletMetadataBundle, WalletRoot, WalletSetupMode, Window, WindowExt, Zeroize, Zeroizing,
     app_strong_text, generate_opaque_id, hardware_device_kind_from_source,
@@ -74,11 +74,12 @@ pub(in crate::root) use progress::{
 pub(in crate::root) use types::{
     HardwareAccountPickerRow, HardwareProfileApprovalPrompt, HardwareProfilePickerView,
     HardwareProfileStep, HardwareProfileStepState, HardwareProfileStepStatus, HardwareProfileUi,
-    HardwareProfileUnlockPurpose, HardwareProfileUnlockState, TrezorPinMatrixPromptState,
-    dismiss_hardware_profile_unlock_state,
+    HardwareProfileUnlockPurpose, HardwareProfileUnlockState, HardwareUnlockWarning,
+    TrezorPinMatrixPromptState, dismiss_hardware_profile_unlock_state,
 };
 #[cfg(feature = "hardware")]
 use types::{
-    HardwareProfilePinMatrixRequest, HardwareProfileProgressUpdate, HardwareWalletCreationError,
-    HardwareWalletCreationResult, default_hardware_profile_steps, hardware_approval_error,
+    HardwareAccountUnlock, HardwareProfilePinMatrixRequest, HardwareProfileProgressUpdate,
+    HardwareWalletCreationError, HardwareWalletCreationResult, PendingHardwareUnlockWarning,
+    default_hardware_profile_steps, hardware_approval_error,
 };

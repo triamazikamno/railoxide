@@ -2,6 +2,11 @@
 use gpui::{Entity, FocusHandle};
 #[cfg(feature = "hardware")]
 use gpui_component::input::InputState;
+#[cfg(feature = "hardware")]
+use wallet_ops::hardware::{
+    HardwareAppVersion,
+    ledger::{LedgerEip1024AppStatus, ledger_eip1024_app_status},
+};
 
 #[cfg(feature = "hardware")]
 use super::{
@@ -21,6 +26,44 @@ pub(super) enum HardwareWalletCreationError {
 
 #[cfg(feature = "hardware")]
 pub(super) type HardwareWalletCreationResult = (DesktopViewSession, Vec<WalletMetadataBundle>);
+
+/// What the device that opened a hardware account warns about before its wallet is installed.
+#[cfg(feature = "hardware")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::root) enum HardwareUnlockWarning {
+    LedgerDivergentSecret(HardwareAppVersion),
+    LedgerLeaksWithoutConfirmation(HardwareAppVersion),
+}
+
+#[cfg(feature = "hardware")]
+impl HardwareUnlockWarning {
+    pub(in crate::root) fn for_ledger_app(version: HardwareAppVersion) -> Option<Self> {
+        match ledger_eip1024_app_status(version) {
+            LedgerEip1024AppStatus::DivergentSecret => Some(Self::LedgerDivergentSecret(version)),
+            LedgerEip1024AppStatus::LeaksWithoutConfirmation => {
+                Some(Self::LedgerLeaksWithoutConfirmation(version))
+            }
+            LedgerEip1024AppStatus::NoKnownIssue => None,
+        }
+    }
+}
+
+#[cfg(feature = "hardware")]
+pub(super) struct HardwareAccountUnlock {
+    pub(super) session: DesktopViewSession,
+    pub(super) metadata: Vec<WalletMetadataBundle>,
+    pub(super) warning: Option<HardwareUnlockWarning>,
+}
+
+/// An opened hardware account held behind its warning until Continue installs it.
+#[cfg(feature = "hardware")]
+pub(in crate::root) struct PendingHardwareUnlockWarning {
+    pub(in crate::root) warning: HardwareUnlockWarning,
+    pub(super) session: DesktopViewSession,
+    pub(super) metadata: Vec<WalletMetadataBundle>,
+    pub(super) gateway_unlock: Option<u64>,
+    pub(super) generation: u64,
+}
 
 #[cfg(feature = "hardware")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +191,7 @@ pub(in crate::root) struct HardwareProfileUnlockState {
     pub(in crate::root) picker_view: HardwareProfilePickerView,
     pub(in crate::root) advanced_open: bool,
     pub(super) reconnect_notice: Option<Arc<str>>,
+    pub(in crate::root) unlock_warning: Option<PendingHardwareUnlockWarning>,
 }
 
 #[cfg(feature = "hardware")]
@@ -174,6 +218,7 @@ impl Default for HardwareProfileUnlockState {
             picker_view: HardwareProfilePickerView::Summary,
             advanced_open: false,
             reconnect_notice: None,
+            unlock_warning: None,
         }
     }
 }
@@ -190,7 +235,20 @@ pub(in crate::root) fn dismiss_hardware_profile_unlock_state(
 impl HardwareProfileUnlockState {
     pub(super) fn clear_sensitive(&mut self) {
         self.vault_view_unlock = None;
+        self.unlock_warning = None;
         self.clear_trezor_pin_matrix_prompt();
+    }
+
+    pub(in crate::root) fn dialog_is_open(&self) -> bool {
+        self.dialog_lease.upgrade().is_some_and(|open| open.get())
+    }
+
+    /// `close_all_dialogs` removes the dialog without `on_close`, which would leave the held
+    /// account in root state after its warning disappeared.
+    pub(in crate::root) fn drop_orphaned_unlock_warning(&mut self) {
+        if !self.dialog_is_open() {
+            self.unlock_warning = None;
+        }
     }
 
     pub(super) fn clear_trezor_pin_matrix_prompt(&mut self) {

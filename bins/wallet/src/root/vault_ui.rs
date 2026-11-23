@@ -38,7 +38,7 @@ use super::shell::render_wallet_hero_screen;
 #[cfg(feature = "hardware")]
 use super::vault::{
     HardwareProfileApprovalPrompt, HardwareProfilePickerView, HardwareProfileStep,
-    HardwareProfileStepState, HardwareProfileStepStatus,
+    HardwareProfileStepState, HardwareProfileStepStatus, HardwareUnlockWarning,
 };
 use super::vault::{PendingSoftwareProfileOpenStage, hardware_device_label};
 use super::{Activity, VaultState, WalletRoot, WalletSetupMode, labeled_field, rgb_with_alpha};
@@ -60,6 +60,8 @@ mod hardware_profile_dialog;
 #[cfg(feature = "hardware")]
 mod hardware_profile_picker;
 mod hardware_profile_render;
+#[cfg(feature = "hardware")]
+mod hardware_unlock_warning;
 mod vault_screens;
 mod wallet_setup;
 

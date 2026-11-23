@@ -500,11 +500,7 @@ impl WalletRoot {
     ) {
         if self.device_auth.in_progress
             || self.hardware_profile_unlock.in_progress
-            || !self
-                .hardware_profile_unlock
-                .dialog_lease
-                .upgrade()
-                .is_some_and(|open| open.get())
+            || !self.hardware_profile_unlock.dialog_is_open()
         {
             return;
         }

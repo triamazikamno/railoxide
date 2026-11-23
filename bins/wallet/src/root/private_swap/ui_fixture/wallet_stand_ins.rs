@@ -216,6 +216,19 @@ pub(in crate::root) fn hardware_derive() -> bool {
     matches!(mode(), Some(Mode::HardwareDerive))
 }
 
+/// The warning a `hardware-unlock-warning:` mode's stand-in Ledger opens the selected wallet
+/// behind, in place of detecting a device.
+#[cfg(feature = "hardware")]
+pub(in crate::root) fn hardware_unlock_warning() -> Option<crate::root::vault::HardwareUnlockWarning>
+{
+    match mode()? {
+        Mode::HardwareUnlockWarning(version) => {
+            crate::root::vault::HardwareUnlockWarning::for_ledger_app(version)
+        }
+        _ => None,
+    }
+}
+
 /// Whether the `walletconnect-request` mode stages its canned dapp request.
 pub(in crate::root) fn walletconnect_request() -> bool {
     matches!(mode(), Some(Mode::WalletConnectRequest))

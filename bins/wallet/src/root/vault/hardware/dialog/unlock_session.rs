@@ -88,7 +88,7 @@ impl WalletRoot {
     }
 
     #[cfg(feature = "hardware")]
-    pub(super) fn dismiss_hardware_profile_unlock_dialog(
+    pub(in crate::root) fn dismiss_hardware_profile_unlock_dialog(
         &mut self,
         gateway_unlock: Option<u64>,
         window: &mut Window,

@@ -19,7 +19,7 @@ use wallet_ops::hardware::HardwareDerivationDescriptor;
 #[cfg(feature = "hardware")]
 use wallet_ops::hardware::{
     HardwareDerivationError, HardwareDeviceKind,
-    ledger::LedgerHardwareDerivationClient,
+    ledger::{LedgerEip1024Purpose, LedgerHardwareDerivationClient},
     synthetic_entropy_from_hardware_output,
     trezor::{TrezorHardwareDerivationClient, TrezorPinMatrixProvider},
 };
@@ -709,7 +709,9 @@ pub(in crate::root) async fn hardware_synthetic_entropy(
             let client = LedgerHardwareDerivationClient::connect().await?;
             let active = client.active_profile_session(&descriptor.path).await?;
             active.verify_descriptor(descriptor)?;
-            let output = client.eip1024_shared_secret(&descriptor.path, true).await?;
+            let (_, output) = client
+                .eip1024_shared_secret(&descriptor.path, true, LedgerEip1024Purpose::AccessWallet)
+                .await?;
             synthetic_entropy_from_hardware_output(descriptor, output)?
         }
         HardwareDeviceKind::Trezor => {

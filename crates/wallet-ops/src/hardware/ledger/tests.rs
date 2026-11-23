@@ -259,6 +259,55 @@ fn ledger_typed_data_classification_is_conservative() {
     );
 }
 
+#[test]
+fn ledger_eip1024_admission_blocks_unsafe_creation_and_classifies_access() {
+    use LedgerEip1024AppStatus::{DivergentSecret, LeaksWithoutConfirmation, NoKnownIssue};
+
+    fn outcome(version: HardwareAppVersion, purpose: LedgerEip1024Purpose) -> &'static str {
+        match ledger_eip1024_admission(version, purpose) {
+            Ok(()) => "ok",
+            Err(HardwareDerivationError::UnsupportedLedgerEthereumAppVersion { .. }) => {
+                "unsupported"
+            }
+            Err(HardwareDerivationError::LedgerEthereumAppLeaksSecret { .. }) => "leaks",
+            Err(HardwareDerivationError::LedgerEthereumAppDivergentSecret { .. }) => "divergent",
+            Err(error) => panic!("unexpected admission error: {error}"),
+        }
+    }
+
+    // (version, access, create, status an admitted access reports)
+    let cases = [
+        ((1, 9, 17), "unsupported", "unsupported", None),
+        ((1, 9, 18), "ok", "leaks", Some(LeaksWithoutConfirmation)),
+        ((1, 22, 2), "ok", "leaks", Some(LeaksWithoutConfirmation)),
+        ((1, 22, 3), "ok", "ok", Some(NoKnownIssue)),
+        ((1, 22, 5), "ok", "ok", Some(NoKnownIssue)),
+        ((1, 23, 0), "ok", "divergent", Some(DivergentSecret)),
+        ((1, 23, 1), "ok", "divergent", Some(DivergentSecret)),
+        ((1, 24, 0), "ok", "ok", Some(NoKnownIssue)),
+    ];
+    for ((major, minor, patch), access, create, status) in cases {
+        let version = HardwareAppVersion::new(major, minor, patch);
+        assert_eq!(
+            outcome(version, LedgerEip1024Purpose::AccessWallet),
+            access,
+            "access on {version}"
+        );
+        assert_eq!(
+            outcome(version, LedgerEip1024Purpose::CreateWallet),
+            create,
+            "create on {version}"
+        );
+        if let Some(status) = status {
+            assert_eq!(
+                ledger_eip1024_app_status(version),
+                status,
+                "status of {version}"
+            );
+        }
+    }
+}
+
 fn ledger_clear_info() -> LedgerDeviceInfo {
     LedgerDeviceInfo {
         model: LedgerDeviceModel::NanoX,

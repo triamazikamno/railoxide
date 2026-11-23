@@ -17,16 +17,16 @@ use super::super::visible_wallet_metadata;
 use super::WalletRoot;
 #[cfg(feature = "hardware")]
 use super::{
-    Arc, Context, DesktopVaultStore, Focusable, HardwareAccountPickerRow,
-    HardwareDerivationDescriptor, HardwareDerivationMethod, HardwareDeviceKind,
-    HardwareProfileApprovalPrompt, HardwareProfileMetadata, HardwareProfilePickerView,
-    HardwareProfileSession, HardwareProfileStep, HardwareProfileStepStatus,
-    HardwareProfileUnlockPurpose, HardwareProfileUnlockState, HardwareRailgunAccountMetadata,
-    HardwareWalletCreationError, HardwareWalletSyncIntent, TrezorPassphraseMode, ViewUnlock,
-    WalletMetadataBundle, WalletRoot, Window, create_hardware_profile_accounts, mpsc,
-    open_hardware_account, parse_hardware_exact_recovery_index, parse_hardware_recovery_range,
-    trezor_cipher_key_label, unlock_hardware_profile, vault_error_message,
-    wallet_options_from_metadata,
+    Arc, Context, DesktopVaultStore, DesktopViewSession, Focusable, HardwareAccountPickerRow,
+    HardwareAccountUnlock, HardwareDerivationDescriptor, HardwareDerivationMethod,
+    HardwareDeviceKind, HardwareProfileApprovalPrompt, HardwareProfileMetadata,
+    HardwareProfilePickerView, HardwareProfileSession, HardwareProfileStep,
+    HardwareProfileStepStatus, HardwareProfileUnlockPurpose, HardwareProfileUnlockState,
+    HardwareRailgunAccountMetadata, HardwareWalletCreationError, HardwareWalletSyncIntent,
+    PendingHardwareUnlockWarning, TrezorPassphraseMode, ViewUnlock, WalletMetadataBundle,
+    WalletRoot, Window, create_hardware_profile_accounts, mpsc, open_hardware_account,
+    parse_hardware_exact_recovery_index, parse_hardware_recovery_range, trezor_cipher_key_label,
+    unlock_hardware_profile, vault_error_message, wallet_options_from_metadata,
 };
 
 #[cfg(feature = "hardware")]
@@ -357,6 +357,10 @@ impl WalletRoot {
         else {
             return;
         };
+        #[cfg(debug_assertions)]
+        if self.stage_ui_fixture_hardware_unlock_warning(&store, &vault_view_unlock, window, cx) {
+            return;
+        }
         let trezor_mode = self.hardware_profile_unlock.trezor_passphrase_mode;
         let trezor_app_passphrase = if device_kind == HardwareDeviceKind::Trezor
             && trezor_mode == TrezorPassphraseMode::EnterInApp
@@ -590,10 +594,8 @@ impl WalletRoot {
                 root.hardware_profile_unlock.in_progress = false;
                 root.hardware_profile_unlock.action_label = None;
                 match result {
-                    Ok(Ok((session, metadata))) => {
-                        root.manage_wallets
-                            .mark_hardware_delete_target_opened(session.wallet_id());
-                        root.install_view_session_for_gateway_unlock(session, &metadata, gateway_unlock, window, cx);
+                    Ok(Ok(unlock)) => {
+                        root.finish_hardware_account_unlock(unlock, gateway_unlock, profile_generation, window, cx);
                     }
                     Ok(Err(HardwareWalletCreationError::Vault(error))) => {
                         root.handle_hardware_profile_vault_error(&error);
@@ -621,6 +623,122 @@ impl WalletRoot {
             });
         })
         .detach();
+    }
+
+    /// Installs an opened hardware account, or holds it in the dialog behind its warning.
+    /// Drops it when the dialog is gone: `close_all_dialogs` skips `on_close`, so the action
+    /// generation alone does not show that.
+    #[cfg(feature = "hardware")]
+    pub(super) fn finish_hardware_account_unlock(
+        &mut self,
+        unlock: HardwareAccountUnlock,
+        gateway_unlock: Option<u64>,
+        generation: u64,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.hardware_profile_unlock.dialog_is_open() {
+            return;
+        }
+        let HardwareAccountUnlock {
+            session,
+            metadata,
+            warning,
+        } = unlock;
+        if let Some(warning) = warning {
+            self.hardware_profile_unlock.unlock_warning = Some(PendingHardwareUnlockWarning {
+                warning,
+                session,
+                metadata,
+                gateway_unlock,
+                generation,
+            });
+            return;
+        }
+        self.install_opened_hardware_account(session, &metadata, gateway_unlock, window, cx);
+    }
+
+    /// The warning's Continue installs the held account once, unless a newer action made it
+    /// stale or its dialog is gone. The installer takes over the gateway unlock before it
+    /// closes the dialog.
+    #[cfg(feature = "hardware")]
+    pub(in crate::root) fn continue_hardware_unlock_warning(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(pending) = self.hardware_profile_unlock.unlock_warning.take() else {
+            return;
+        };
+        if !self.hardware_profile_action_is_current(pending.generation)
+            || !self.hardware_profile_unlock.dialog_is_open()
+        {
+            cx.notify();
+            return;
+        }
+        self.install_opened_hardware_account(
+            pending.session,
+            &pending.metadata,
+            pending.gateway_unlock,
+            window,
+            cx,
+        );
+    }
+
+    #[cfg(feature = "hardware")]
+    fn install_opened_hardware_account(
+        &mut self,
+        session: DesktopViewSession,
+        metadata: &[WalletMetadataBundle],
+        gateway_unlock: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.manage_wallets
+            .mark_hardware_delete_target_opened(session.wallet_id());
+        self.install_view_session_for_gateway_unlock(session, metadata, gateway_unlock, window, cx);
+    }
+
+    /// The `hardware-unlock-warning:` UI fixture's stand-in Ledger, which holds the selected
+    /// wallet behind the mode's warning with no device. `true` when the mode is on.
+    #[cfg(all(feature = "hardware", debug_assertions))]
+    fn stage_ui_fixture_hardware_unlock_warning(
+        &mut self,
+        store: &DesktopVaultStore,
+        vault_view_unlock: &ViewUnlock,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> bool {
+        let Some(warning) =
+            crate::root::private_swap::ui_fixture_hardware_unlock_warning().filter(|_| {
+                self.hardware_profile_unlock.device_kind == Some(HardwareDeviceKind::Ledger)
+            })
+        else {
+            return false;
+        };
+        let unlock = self
+            .selected_wallet_id
+            .as_deref()
+            .ok_or(super::VaultError::WalletNotFound)
+            .and_then(|wallet_id| {
+                Ok(HardwareAccountUnlock {
+                    session: store
+                        .load_view_session_with_view_unlock(vault_view_unlock, wallet_id)?,
+                    metadata: store
+                        .list_wallet_metadata_with_view_unlock(vault_view_unlock, true)?,
+                    warning: Some(warning),
+                })
+            });
+        match unlock {
+            Ok(unlock) => {
+                let generation = self.next_hardware_profile_action_generation();
+                let gateway_unlock = self.gateway_unlock_continuation();
+                self.finish_hardware_account_unlock(unlock, gateway_unlock, generation, window, cx);
+            }
+            Err(error) => self.handle_hardware_profile_vault_error(&error),
+        }
+        cx.notify();
+        true
     }
 
     #[cfg(feature = "hardware")]

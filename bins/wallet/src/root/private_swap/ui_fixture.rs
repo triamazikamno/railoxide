@@ -2,8 +2,8 @@
 //! retry review, failed quote, speed-up, split outcome, reported fill, setup progress,
 //! cancelled preparation and delivery to a non-EVM network, at the Stealth accounts inspector, at the refund dialog of a blocked
 //! Shield, at a private Send's broadcaster progress and review, at the rows of the UTXO table,
-//! at the privacy hints of Shield and Unshield and at a hardware wallet's Derive from private
-//! dialog without a device: it opens
+//! at the privacy hints of Shield and Unshield, and at a hardware wallet's Derive from private
+//! dialog and Ledger unlock warnings without a device: it opens
 //! them on a scratch wallet without private
 //! funds and holds a chosen state on screen. It is compiled only with `debug_assertions`, and
 //! does nothing unless `RAILOXIDE_UI_FIXTURE` is set.
@@ -409,6 +409,15 @@
 //!   confirmation of the first selected index that has no account, which the stand-in never
 //!   answers. Close the dialog to leave it. Nothing is read from a device, no account is
 //!   stored, and nothing is sent.
+//! - `hardware-unlock-warning:divergent` and `hardware-unlock-warning:leaks`, in a build with
+//!   the `hardware` feature, show the warning the Ledger wallet dialog ends on when the
+//!   Ethereum app that opened a wallet is 1.23.0, whose keys differ from every other
+//!   version's, or 1.22.2, which hands them out without a prompt on the device. With a
+//!   software wallet selected and unlocked, Add wallet's Ledger-derived wallet opens the
+//!   dialog, where a stand-in Ledger takes the place of device detection and holds the
+//!   selected wallet behind the warning. Its Continue opens that wallet again, as choosing it
+//!   in the wallet selector does, and closing the dialog drops it. Nothing is read from a
+//!   device, and no vault record is written.
 //! - `tron:<state>` replaces the selected wallet's Tron accounts, on Tron in the network
 //!   selector, with three synthesized ones and their balances, priced at a stand-in $0.25 per
 //!   TRX until Tron's price refresh replaces it: Savings holds 2,480.35 TRX and 1,250 USDT,
@@ -554,6 +563,8 @@ pub(in crate::root) use amount_hints::{
     amount_statistics, hints_active, hints_shield_token, own_deposit_stand_ins,
     shield_hint_stand_ins,
 };
+#[cfg(feature = "hardware")]
+pub(in crate::root) use wallet_stand_ins::hardware_unlock_warning;
 pub(in crate::root) use wallet_stand_ins::{
     fill_logs, hardware_derive, holds_delivery, holds_send_review, send_asset, setup_swap_token,
     shows_utxos, tor_rotation, tron, unshield_asset, update_check, utxo_finality_context,
@@ -591,7 +602,9 @@ enum Mode {
     Utxos,
     Unshield,
     Max(Max),
-    Rotation { waku_failed: bool },
+    Rotation {
+        waku_failed: bool,
+    },
     RetryReview,
     QuoteError,
     NativeBuy,
@@ -606,6 +619,8 @@ enum Mode {
     Delivery(Delivery),
     Hints(Hints),
     HardwareDerive,
+    #[cfg(feature = "hardware")]
+    HardwareUnlockWarning(wallet_ops::hardware::HardwareAppVersion),
     NonEvm(NonEvm, NonEvmNetwork),
     Tron(Tron),
     Activity,

@@ -32,6 +32,10 @@ fn parse_keyword(value: &str) -> Option<Mode> {
 fn parse_family(family: &str, state: &str) -> Option<Mode> {
     match family {
         "first-start" => (state == "old-notice").then_some(Mode::FirstStartOldNotice),
+        #[cfg(feature = "hardware")]
+        "hardware-unlock-warning" => {
+            hardware_unlock_warning_version(state).map(Mode::HardwareUnlockWarning)
+        }
         "update-check" => update_check_state(state).map(Mode::UpdateCheck),
         "max" => max_state(state).map(Mode::Max),
         "broadcaster-progress" => broadcaster_progress_state(state).map(Mode::BroadcasterProgress),
@@ -53,6 +57,19 @@ fn parse_family(family: &str, state: &str) -> Option<Mode> {
         "detail" => detail_stage(state).map(Mode::Detail),
         _ => None,
     }
+}
+
+/// The Ledger Ethereum app version a `hardware-unlock-warning:` mode's stand-in Ledger has.
+#[cfg(feature = "hardware")]
+fn hardware_unlock_warning_version(
+    state: &str,
+) -> Option<wallet_ops::hardware::HardwareAppVersion> {
+    use wallet_ops::hardware::HardwareAppVersion;
+    Some(match state {
+        "divergent" => HardwareAppVersion::new(1, 23, 0),
+        "leaks" => HardwareAppVersion::new(1, 22, 2),
+        _ => return None,
+    })
 }
 
 fn update_check_state(state: &str) -> Option<UpdateCheck> {

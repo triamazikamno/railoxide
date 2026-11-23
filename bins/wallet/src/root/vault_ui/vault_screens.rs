@@ -180,14 +180,25 @@ impl WalletRoot {
         window: &mut Window,
         cx: &mut gpui::Context<'_, Self>,
     ) {
-        if matches!(self.vault_state, VaultState::ViewUnlocked) {
+        let unlocked = matches!(self.vault_state, VaultState::ViewUnlocked);
+        if !unlocked && !should_show_pre_unlock_settings_action(&self.vault_state) {
+            return;
+        }
+        // Settings closes every dialog without its `on_close`. Dismiss the hardware unlock dialog
+        // as its close button would, so a browser wallet selection is reported as cancelled.
+        #[cfg(feature = "hardware")]
+        if self.hardware_profile_unlock.dialog_is_open() {
+            let gateway_unlock = self.gateway_unlock_continuation();
+            self.dismiss_hardware_profile_unlock_dialog(gateway_unlock, window, cx);
+        }
+        if unlocked {
             window.close_all_dialogs(cx);
             self.clear_settings_transient_status(cx);
             self.invalidate_settings_data_folder_size(cx);
             self.refresh_device_auth_status();
             self.active_activity = Activity::Settings;
             cx.notify();
-        } else if should_show_pre_unlock_settings_action(&self.vault_state) {
+        } else {
             self.open_pre_unlock_settings_dialog(window, cx);
         }
     }

@@ -29,6 +29,8 @@ impl Render for WalletRoot {
                 cx,
             );
         }
+        #[cfg(feature = "hardware")]
+        self.hardware_profile_unlock.drop_orphaned_unlock_warning();
         self.apply_public_broadcaster_error_amount_adjustments(window, cx);
         self.sync_platform_attention_for_window(window);
         self.ensure_prover_cache_build_monitor(cx);

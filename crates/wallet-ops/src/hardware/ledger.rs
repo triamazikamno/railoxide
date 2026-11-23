@@ -25,7 +25,10 @@ use hidapi_rusb::{DeviceInfo, HidApi, HidDevice};
 use tokio::{sync::Mutex as AsyncMutex, task};
 
 pub const LEDGER_ETHEREUM_EIP1024_MIN_APP_VERSION: HardwareAppVersion =
-    HardwareAppVersion::new(1, 9, 17);
+    HardwareAppVersion::new(1, 9, 18);
+/// The first Ethereum app version that returns an EIP-1024 secret only after a device prompt.
+const LEDGER_ETHEREUM_EIP1024_CONFIRMED_MIN_APP_VERSION: HardwareAppVersion =
+    HardwareAppVersion::new(1, 22, 3);
 pub const LEDGER_ETHEREUM_EIP712_HASH_FALLBACK_MIN_APP_VERSION: HardwareAppVersion =
     HardwareAppVersion::new(1, 5, 0);
 pub const LEDGER_ETHEREUM_EIP712_CLEAR_MIN_APP_VERSION: HardwareAppVersion =
@@ -61,6 +64,65 @@ pub enum LedgerDeviceModel {
 pub struct LedgerDeviceInfo {
     pub model: LedgerDeviceModel,
     pub ethereum_app_version: HardwareAppVersion,
+}
+
+/// What is known to be wrong with the EIP-1024 secret of a Ledger Ethereum app version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerEip1024AppStatus {
+    /// Before 1.22.3, any host can read the secret without a prompt on the device.
+    LeaksWithoutConfirmation,
+    /// 1.23.x derives a different secret than every other version.
+    DivergentSecret,
+    NoKnownIssue,
+}
+
+/// What the EIP-1024 secret is read for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerEip1024Purpose {
+    /// A new or recovered wallet whose keys come from this read. Recovering a wallet that
+    /// depends on the 1.23 secret is refused on purpose: it is lost after any app update.
+    CreateWallet,
+    /// A wallet that already exists, opened or spent from.
+    AccessWallet,
+}
+
+#[must_use]
+pub fn ledger_eip1024_app_status(version: HardwareAppVersion) -> LedgerEip1024AppStatus {
+    if version < LEDGER_ETHEREUM_EIP1024_CONFIRMED_MIN_APP_VERSION {
+        LedgerEip1024AppStatus::LeaksWithoutConfirmation
+    } else if version.major == 1 && version.minor == 23 {
+        LedgerEip1024AppStatus::DivergentSecret
+    } else {
+        LedgerEip1024AppStatus::NoKnownIssue
+    }
+}
+
+/// Every purpose needs EIP-1024 support. A wallet is created only on a version whose secret
+/// neither leaks nor diverges, since the device output is its only backup.
+fn ledger_eip1024_admission(
+    version: HardwareAppVersion,
+    purpose: LedgerEip1024Purpose,
+) -> Result<(), HardwareDerivationError> {
+    if version < LEDGER_ETHEREUM_EIP1024_MIN_APP_VERSION {
+        return Err(
+            HardwareDerivationError::UnsupportedLedgerEthereumAppVersion {
+                actual: version,
+                required: LEDGER_ETHEREUM_EIP1024_MIN_APP_VERSION,
+            },
+        );
+    }
+    if purpose == LedgerEip1024Purpose::AccessWallet {
+        return Ok(());
+    }
+    match ledger_eip1024_app_status(version) {
+        LedgerEip1024AppStatus::LeaksWithoutConfirmation => {
+            Err(HardwareDerivationError::LedgerEthereumAppLeaksSecret { actual: version })
+        }
+        LedgerEip1024AppStatus::DivergentSecret => {
+            Err(HardwareDerivationError::LedgerEthereumAppDivergentSecret { actual: version })
+        }
+        LedgerEip1024AppStatus::NoKnownIssue => Ok(()),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -459,20 +521,15 @@ impl LedgerHardwareDerivationClient {
         ))
     }
 
+    /// The Railgun secret, with the Ethereum app version read to admit `purpose` before it.
     pub async fn eip1024_shared_secret(
         &self,
         path: &[u32],
         display_and_confirm: bool,
-    ) -> Result<HardwareOperationOutput, HardwareDerivationError> {
+        purpose: LedgerEip1024Purpose,
+    ) -> Result<(HardwareAppVersion, HardwareOperationOutput), HardwareDerivationError> {
         let version = self.ethereum_app_version().await?;
-        if version < LEDGER_ETHEREUM_EIP1024_MIN_APP_VERSION {
-            return Err(
-                HardwareDerivationError::UnsupportedLedgerEthereumAppVersion {
-                    actual: version,
-                    required: LEDGER_ETHEREUM_EIP1024_MIN_APP_VERSION,
-                },
-            );
-        }
+        ledger_eip1024_admission(version, purpose)?;
 
         let mut data = ledger_path_payload(path)?;
         data.extend_from_slice(&RAILGUN_LEDGER_EIP1024_REMOTE_PUBLIC_KEY_V1);
@@ -497,7 +554,7 @@ impl LedgerHardwareDerivationClient {
         }
         let mut output = [0u8; 32];
         output.copy_from_slice(data);
-        Ok(HardwareOperationOutput::new(output))
+        Ok((version, HardwareOperationOutput::new(output)))
     }
 }
 
@@ -1369,7 +1426,9 @@ impl HardwareDerivationClient for LedgerHardwareDerivationClient {
                 "Ledger client requires a Ledger EIP-1024 descriptor",
             ));
         }
-        self.eip1024_shared_secret(&descriptor.path, true).await
+        self.eip1024_shared_secret(&descriptor.path, true, LedgerEip1024Purpose::AccessWallet)
+            .await
+            .map(|(_, output)| output)
     }
 }
 

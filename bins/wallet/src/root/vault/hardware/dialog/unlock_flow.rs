@@ -223,7 +223,7 @@ impl WalletRoot {
                 .child(
                     content_root
                         .read(cx)
-                        .render_hardware_profile_unlock_dialog_content(&content_root, content_width)
+                        .render_hardware_profile_unlock_dialog_body(&content_root, content_width)
                         .id("hardware-profile-unlock-content")
                         .role(gpui::accesskit::Role::Group)
                         .aria_label(format!("{device_label} wallet"))

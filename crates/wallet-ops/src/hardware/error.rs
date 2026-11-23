@@ -28,6 +28,14 @@ pub enum HardwareDerivationError {
         actual: HardwareAppVersion,
         required: HardwareAppVersion,
     },
+    #[error(
+        "Ledger Ethereum app {actual} can give this wallet's keys to other software without a prompt on the device. Update the Ethereum app to 1.24.0 or newer, then try again. If this Ledger can't install it, as the original Nano S can't, restore its recovery phrase on a Ledger that can. That Ledger derives the same wallets."
+    )]
+    LedgerEthereumAppLeaksSecret { actual: HardwareAppVersion },
+    #[error(
+        "Ledger Ethereum app {actual} derives different keys than every other version, so a wallet made with it stops working after an app update. If a wallet from this Ledger opens with {actual}, move its funds to another wallet before you update. Otherwise update the Ethereum app to 1.24.0 or newer and try again. If you're restoring a wallet that worked with {actual}, don't update and see the release notes."
+    )]
+    LedgerEthereumAppDivergentSecret { actual: HardwareAppVersion },
     #[cfg(feature = "hardware")]
     #[error("Ledger {operation} failed ({status:#06x}): {message}")]
     LedgerStatus {

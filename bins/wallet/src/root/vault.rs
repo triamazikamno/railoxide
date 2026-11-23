@@ -14,7 +14,7 @@ use wallet_ops::hardware::{
     DEFAULT_HARDWARE_DERIVATION_PATH, HardwareDerivationDescriptor, HardwareDerivationError,
     HardwareDerivationMethod, HardwareViewAccessKey, SyntheticRailgunEntropy,
     hardware_view_access_key_from_hardware_output,
-    ledger::LedgerHardwareDerivationClient,
+    ledger::{LedgerEip1024Purpose, LedgerHardwareDerivationClient},
     parse_bip32_path, synthetic_entropy_from_hardware_output,
     trezor::{
         TrezorHardwareDerivationClient, TrezorPinMatrixProvider, TrezorPinMatrixRequestKind,
@@ -83,10 +83,10 @@ pub(in crate::root) use hardware::{
 pub(in crate::root) use hardware::{
     HardwareAccountPickerRow, HardwareProfileApprovalPrompt, HardwareProfilePickerView,
     HardwareProfileStep, HardwareProfileStepState, HardwareProfileStepStatus, HardwareProfileUi,
-    HardwareProfileUnlockPurpose, HardwareProfileUnlockState, TrezorPinMatrixPromptState,
-    dismiss_hardware_profile_unlock_state, hardware_account_picker_rows,
-    hardware_profile_approval_prompt_for_account, hardware_profile_auto_open_wallet_id,
-    hardware_profile_detection_should_retry,
+    HardwareProfileUnlockPurpose, HardwareProfileUnlockState, HardwareUnlockWarning,
+    TrezorPinMatrixPromptState, dismiss_hardware_profile_unlock_state,
+    hardware_account_picker_rows, hardware_profile_approval_prompt_for_account,
+    hardware_profile_auto_open_wallet_id, hardware_profile_detection_should_retry,
     hardware_profile_detection_should_suppress_initial_ledger_progress,
     hardware_profile_detection_should_suppress_initial_trezor_progress,
     hardware_profile_evm_address_for_session, hardware_profile_hardware_error_message,

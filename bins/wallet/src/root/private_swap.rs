@@ -70,6 +70,8 @@ pub(super) use ui_fixture::activity as ui_fixture_activity;
 pub(super) use ui_fixture::fill_logs as ui_fixture_fill_logs;
 pub(super) use ui_fixture::first_start_old_notice as ui_fixture_first_start_old_notice;
 pub(super) use ui_fixture::hardware_derive as ui_fixture_hardware_derive;
+#[cfg(all(feature = "hardware", debug_assertions))]
+pub(super) use ui_fixture::hardware_unlock_warning as ui_fixture_hardware_unlock_warning;
 #[cfg(debug_assertions)]
 pub(super) use ui_fixture::holds_delivery as ui_fixture_holds_delivery;
 #[cfg(debug_assertions)]

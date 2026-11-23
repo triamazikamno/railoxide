@@ -3,6 +3,8 @@ use std::collections::BTreeSet;
 
 use gpui::Entity;
 use gpui_component::input::InputState;
+#[cfg(feature = "hardware")]
+use wallet_ops::hardware::HardwareOperationOutput;
 
 use super::HardwareWalletSyncIntent;
 #[cfg(not(feature = "hardware"))]
@@ -10,11 +12,12 @@ use super::WalletRoot;
 #[cfg(feature = "hardware")]
 use super::{
     Arc, Context, DEFAULT_HARDWARE_DERIVATION_PATH, DesktopVaultStore, DesktopViewSession,
-    Focusable, HARDWARE_PROFILE_READINESS_RETRY_INTERVAL, HardwareDerivationDescriptor,
-    HardwareDeviceKind, HardwareProfileMetadata, HardwareProfileProgressUpdate,
-    HardwareProfileSession, HardwareProfileStep, HardwareProfileStepStatus,
-    HardwareRailgunAccountMetadata, HardwareSetupErrorFocus, HardwareViewAccessKey,
-    HardwareWalletCreationError, HardwareWalletCreationResult, HardwareWalletProfile,
+    Focusable, HARDWARE_PROFILE_READINESS_RETRY_INTERVAL, HardwareAccountUnlock,
+    HardwareDerivationDescriptor, HardwareDeviceKind, HardwareProfileMetadata,
+    HardwareProfileProgressUpdate, HardwareProfileSession, HardwareProfileStep,
+    HardwareProfileStepStatus, HardwareRailgunAccountMetadata, HardwareSetupErrorFocus,
+    HardwareUnlockWarning, HardwareViewAccessKey, HardwareWalletCreationError,
+    HardwareWalletCreationResult, HardwareWalletProfile, LedgerEip1024Purpose,
     LedgerHardwareDerivationClient, SyntheticRailgunEntropy, TrezorHardwareDerivationClient,
     TrezorPassphraseMode, VaultError, VaultState, ViewUnlock, WalletMetadataBundle, WalletRoot,
     WalletSetupMode, Window, Zeroizing, default_hardware_profile_label,
@@ -427,24 +430,11 @@ pub(super) async fn open_hardware_account(
     trezor_mode: TrezorPassphraseMode,
     trezor_app_passphrase: Option<Zeroizing<String>>,
     progress_tx: mpsc::UnboundedSender<HardwareProfileProgressUpdate>,
-) -> Result<HardwareWalletCreationResult, HardwareWalletCreationError> {
+) -> Result<HardwareAccountUnlock, HardwareWalletCreationError> {
     hardware_session.verify_account(&account)?;
     let descriptor = account.descriptor.clone();
-    let output = match descriptor.device_kind {
-        HardwareDeviceKind::Ledger => {
-            let client = LedgerHardwareDerivationClient::connect().await?;
-            let active = client.active_profile_session(&descriptor.path).await?;
-            active.verify_descriptor(&descriptor)?;
-            let _ = send_hardware_profile_approval_progress(
-                HardwareDeviceKind::Ledger,
-                hardware_profile_approval_prompt_for_descriptor(&descriptor),
-                &progress_tx,
-            );
-            client
-                .eip1024_shared_secret(&descriptor.path, true)
-                .await
-                .map_err(hardware_approval_error)?
-        }
+    let (output, warning) = match descriptor.device_kind {
+        HardwareDeviceKind::Ledger => open_ledger_account_output(&descriptor, &progress_tx).await?,
         HardwareDeviceKind::Trezor => {
             let mut client = TrezorHardwareDerivationClient::connect_with_session(
                 hardware_session.trezor_session_id.clone(),
@@ -472,9 +462,10 @@ pub(super) async fn open_hardware_account(
                 hardware_profile_approval_prompt_for_descriptor(&descriptor),
                 &progress_tx,
             );
-            client
+            let output = client
                 .cipher_key_value(&descriptor)
-                .map_err(hardware_approval_error)?
+                .map_err(hardware_approval_error)?;
+            (output, None)
         }
     };
     let view_access_key = hardware_view_access_key_from_hardware_output(&descriptor, &output)?;
@@ -485,7 +476,32 @@ pub(super) async fn open_hardware_account(
         &view_access_key,
     )?;
     let metadata = store.list_wallet_metadata_with_view_unlock(&vault_view_unlock, true)?;
-    Ok((session, metadata))
+    Ok(HardwareAccountUnlock {
+        session,
+        metadata,
+        warning,
+    })
+}
+
+/// An existing account's secret from the Ledger, with what its Ethereum app version warns about.
+#[cfg(feature = "hardware")]
+async fn open_ledger_account_output(
+    descriptor: &HardwareDerivationDescriptor,
+    progress_tx: &mpsc::UnboundedSender<HardwareProfileProgressUpdate>,
+) -> Result<(HardwareOperationOutput, Option<HardwareUnlockWarning>), HardwareWalletCreationError> {
+    let client = LedgerHardwareDerivationClient::connect().await?;
+    let active = client.active_profile_session(&descriptor.path).await?;
+    active.verify_descriptor(descriptor)?;
+    let _ = send_hardware_profile_approval_progress(
+        HardwareDeviceKind::Ledger,
+        hardware_profile_approval_prompt_for_descriptor(descriptor),
+        progress_tx,
+    );
+    let (version, output) = client
+        .eip1024_shared_secret(&descriptor.path, true, LedgerEip1024Purpose::AccessWallet)
+        .await
+        .map_err(hardware_approval_error)?;
+    Ok((output, HardwareUnlockWarning::for_ledger_app(version)))
 }
 
 #[cfg(feature = "hardware")]
@@ -537,8 +553,12 @@ pub(super) async fn create_hardware_profile_accounts(
                     hardware_profile_approval_prompt_for_descriptor(&descriptor),
                     &progress_tx,
                 );
-                let output = client
-                    .eip1024_shared_secret(&descriptor.path, true)
+                let (_, output) = client
+                    .eip1024_shared_secret(
+                        &descriptor.path,
+                        true,
+                        LedgerEip1024Purpose::CreateWallet,
+                    )
                     .await
                     .map_err(hardware_approval_error)?;
                 let view_access_key =
@@ -701,7 +721,9 @@ pub(super) async fn create_hardware_derived_wallet(
                 profile_fingerprint,
                 sync_intent,
             );
-            let output = client.eip1024_shared_secret(&descriptor.path, true).await?;
+            let (_, output) = client
+                .eip1024_shared_secret(&descriptor.path, true, LedgerEip1024Purpose::CreateWallet)
+                .await?;
             let view_access_key =
                 hardware_view_access_key_from_hardware_output(&descriptor, &output)?;
             let entropy = synthetic_entropy_from_hardware_output(&descriptor, output)?;
