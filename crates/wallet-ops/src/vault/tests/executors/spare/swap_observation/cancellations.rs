@@ -651,7 +651,7 @@ async fn cancellation_fee_selection_excludes_the_swaps_reserved_notes() {
                 master_public_key: U256::ONE,
                 viewing_public_key: [1; 32],
             },
-            role: MixedPrivateSendRole::Other,
+            role: MixedPrivateSendRole::BroadcasterFee,
         }],
         public_unshields: Vec::new(),
         relay_actions: None,

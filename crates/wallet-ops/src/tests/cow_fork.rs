@@ -584,7 +584,7 @@ pub(crate) fn synthetic_transaction(
             }),
             blindedSenderViewingKey: field_element(&[nullifier.as_slice(), b"sender"].concat()),
             blindedReceiverViewingKey: field_element(&[nullifier.as_slice(), b"receiver"].concat()),
-            annotationData: Bytes::new(),
+            annotationData: Bytes::from([0_u8; railgun_wallet::notes::ANNOTATION_DATA_LEN]),
             memo: Bytes::new(),
         }],
         executor,
