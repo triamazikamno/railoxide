@@ -203,7 +203,6 @@ pub(in crate::desktop) async fn prepare_desktop_send_public_broadcaster(
             .collect::<Vec<_>>();
         tracing::info!(target: LOG_TARGET,
             attempt,
-            fee_amount = %fee_amount,
             elapsed_ms = proof_started.elapsed().as_millis(),
             transaction_count = plan.transaction_count(),
             input_count = plan.input_count(),
@@ -234,7 +233,7 @@ pub(in crate::desktop) async fn prepare_desktop_send_public_broadcaster(
         )
         .await?;
         let gas_elapsed_ms = gas_started.elapsed().as_millis();
-        tracing::info!(target: LOG_TARGET,
+        tracing::debug!(target: LOG_TARGET,
             attempt,
             available_fee = %fee_amount,
             computed_fee = %computed_fee,
@@ -248,7 +247,7 @@ pub(in crate::desktop) async fn prepare_desktop_send_public_broadcaster(
         );
         if broadcaster_fee_covers(fee_amount, computed_fee) {
             let protocol_fee_amount = U256::ZERO;
-            tracing::info!(target: LOG_TARGET,
+            tracing::debug!(target: LOG_TARGET,
                 attempt,
                 fee_amount = %fee_amount,
                 computed_fee = %computed_fee,
@@ -334,7 +333,7 @@ pub(in crate::desktop) async fn prepare_desktop_send_public_broadcaster(
             plan.public_output_count(),
             &broadcaster,
         );
-        tracing::info!(target: LOG_TARGET,
+        tracing::debug!(target: LOG_TARGET,
             attempt,
             previous_fee = %fee_amount,
             computed_fee = %computed_fee,

@@ -26,7 +26,7 @@ use tracing::metadata::LevelFilter;
 use tracing_subscriber::field::MakeExt as _;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, filter::filter_fn, fmt};
+use tracing_subscriber::{EnvFilter, Layer as _, filter::filter_fn, fmt};
 use ui::logs::{DEFAULT_LOG_CAPACITY, LogStore, UiLogLayer, compact_log_value, redact_log_urls};
 
 use crate::assets::WalletAssets;
@@ -263,11 +263,18 @@ fn install_tracing(logs: LogStore) -> Result<()> {
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .from_env_lossy();
+    // A desktop launch sends stderr to the journal, so it only gets warnings unless RUST_LOG is set.
+    let console_level = if std::env::var_os(EnvFilter::DEFAULT_ENV).is_some() {
+        LevelFilter::TRACE
+    } else {
+        LevelFilter::WARN
+    };
     let console_layer = fmt::layer()
         .fmt_fields(console_fields())
         .with_target(true)
         .with_level(true)
-        .with_writer(std::io::stderr);
+        .with_writer(std::io::stderr)
+        .with_filter(console_level);
     let ui_layer = UiLogLayer::new(logs);
 
     tracing_subscriber::registry()

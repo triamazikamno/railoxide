@@ -210,8 +210,6 @@ pub(super) async fn public_action_preflight(
         rpc_gas_price: resolved.rpc_gas_price,
         max_fee_per_gas,
         max_priority_fee_per_gas,
-        estimated_native_gas_cost,
-        live_native_balance,
     })
 }
 

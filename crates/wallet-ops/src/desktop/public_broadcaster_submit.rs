@@ -36,7 +36,7 @@ fn initial_public_broadcaster_fee_estimate(
 ) -> Result<Option<PublicBroadcasterCostEstimate>> {
     match estimate {
         Ok(estimate) => {
-            tracing::info!(
+            tracing::debug!(
                 fee_amount = %estimate.fee_amount,
                 gas_limit = estimate.gas_limit,
                 min_gas_price,
@@ -56,8 +56,8 @@ fn initial_public_broadcaster_fee_estimate(
                 return Err(err)
                     .wrap_err(format!("estimate initial public broadcaster {action} fee"));
             }
+            // The error can carry the private spendable limit, so it stays out of the log.
             tracing::warn!(
-                ?err,
                 broadcaster = %broadcaster.railgun_address,
                 fees_id = %broadcaster.fees_id,
                 "failed to estimate initial same-token public broadcaster {action} fee; starting at zero"

@@ -182,15 +182,7 @@ impl ExecutorOwner {
             authorization,
             &crate::desktop::executors::HardwareExecutorAction::Execute(operation),
         )?;
-        let started = Instant::now();
-        tracing::info!(target: "executor_preparation", step = "activity_lock", "started");
         let guard = self.lock_activity().await;
-        tracing::info!(
-            target: "executor_preparation",
-            step = "activity_lock",
-            elapsed_ms = started.elapsed().as_millis(),
-            "finished"
-        );
         self.ensure_active()?;
         let profile = self
             .chain
@@ -218,8 +210,6 @@ impl ExecutorOwner {
         {
             hardware.require_gas_payer(*sender)?;
         }
-        let started = Instant::now();
-        tracing::info!(target: "executor_preparation", step = "reserve_and_derive", "started");
         let record = self.reserve_operation(operation, profile.delegate(), assets, &reservation)?;
         require_unfinished_operation(&record)?;
         if record.is_retired() {
@@ -251,15 +241,7 @@ impl ExecutorOwner {
             self.store.bind_spare_address(index, address)?;
         }
         self.notify_change();
-        tracing::info!(
-            target: "executor_preparation",
-            step = "reserve_and_derive",
-            elapsed_ms = started.elapsed().as_millis(),
-            "finished"
-        );
         drop(guard);
-        let started = Instant::now();
-        tracing::info!(target: "executor_preparation", step = "chain_inspection", "started");
         let result = if record.issued().is_empty() {
             self.unused_inspection(record.index(), address, assets, client)
                 .await
@@ -280,13 +262,6 @@ impl ExecutorOwner {
                 })
             })
         };
-        tracing::info!(
-            target: "executor_preparation",
-            step = "chain_inspection",
-            elapsed_ms = started.elapsed().as_millis(),
-            success = result.is_ok(),
-            "finished"
-        );
         let checked = result?;
         let inspection = &checked.inspection;
         let observed = checked.observed;

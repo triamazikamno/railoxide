@@ -79,8 +79,6 @@ pub(super) struct PublicActionPreflight {
     rpc_gas_price: u128,
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
-    estimated_native_gas_cost: U256,
-    live_native_balance: U256,
 }
 
 #[derive(Debug)]
@@ -127,8 +125,6 @@ pub(super) struct SubmittedPublicActionAttempt {
     pub(super) tx_hash: FixedBytes<32>,
     pub(super) info: PublicActionAttemptInfo,
     rpc_gas_price: u128,
-    estimated_native_gas_cost: U256,
-    live_native_balance: U256,
 }
 
 /// Persists an attempt before its raw send: its hash, the signed request and the signed raw

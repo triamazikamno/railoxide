@@ -83,6 +83,9 @@ enum MockRpcEstimateResult {
     },
 }
 
+/// The hash `MockRpcServer` answers every raw transaction with, whatever was sent.
+const MOCK_RAW_TX_HASH: B256 = B256::repeat_byte(0xcd);
+
 struct MockRpcServer {
     url: String,
     calls: Arc<Mutex<Vec<MockRpcCall>>>,
@@ -267,6 +270,7 @@ async fn handle_mock_rpc_connection(
             },
             "eth_getTransactionCount" => json!("0x7"),
             "eth_getBalance" => json!("0x3635c9adc5dea00000"),
+            "eth_sendRawTransaction" => json!(MOCK_RAW_TX_HASH),
             "eth_call" => json!(format!(
                 "0x{}",
                 alloy::hex::encode(U256::from(0x1234).to_be_bytes::<32>())

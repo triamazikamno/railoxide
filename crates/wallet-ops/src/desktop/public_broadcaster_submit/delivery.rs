@@ -21,8 +21,6 @@ pub(in crate::desktop) async fn submit_public_broadcaster_plan<P>(
         broadcaster = %broadcaster.railgun_address,
         broadcaster_identifier = ?broadcaster.identifier.as_deref(),
         fees_id = %broadcaster.fees_id,
-        token = ?broadcaster.token,
-        fee_amount = %prepared.fee_amount,
         gas_limit = prepared.gas_limit,
         min_gas_price = prepared.min_gas_price,
         bound_min_gas_price = prepared.bound_min_gas_price,

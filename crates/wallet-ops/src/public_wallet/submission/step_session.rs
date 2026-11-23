@@ -401,10 +401,7 @@ pub(in crate::public_wallet) async fn submit_public_action_step_session(
                 if !private_handoff {
                     tracing::info!(target: LOG_TARGET,
                         step = ?step,
-                        tx_hash = %receipt.tx_hash,
                         rpc_gas_price = winner.rpc_gas_price,
-                        estimated_native_gas_cost = %winner.estimated_native_gas_cost,
-                        live_native_balance = %winner.live_native_balance,
                         "public action receipt confirmed from submitted attempts"
                     );
                 }

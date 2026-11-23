@@ -755,44 +755,56 @@ async fn dapp_send_invalidation_stops_before_baseline_or_raw_broadcast() {
 async fn dapp_raw_broadcast_does_not_log_or_return_remote_payloads() {
     use tracing::instrument::WithSubscriber;
 
-    let server = MockRpcServer::spawn(true, 21_000).await;
     let http = HttpContext::direct_for_tests();
-    let pool = crate::query_rpc_pool_for_route(
-        &sensitive(&RpcChainRoute::new(
-            1,
-            vec![Url::parse(&server.url).unwrap()],
-        )),
-        &http,
-    );
     let tx_hash = B256::repeat_byte(0xab);
-    for log_transaction_details in [true, false] {
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        let writer = LogWriter(logs.clone());
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(move || writer.clone())
-            .finish();
-        let error = crate::self_broadcast_send_raw_transaction_to_rpc_pool_with_logging(
-            &pool,
-            WalletNetworkMode::Direct,
-            vec![1, 2, 3],
-            tx_hash,
-            log_transaction_details,
-        )
-        .with_subscriber(subscriber)
-        .await
-        .err()
-        .expect("RPC rejects broadcast");
-        let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
-        if log_transaction_details {
-            assert!(logs.contains("mock route failure"));
-            assert!(logs.contains(&alloy::hex::encode_prefixed(tx_hash)));
-            assert!(error.to_string().contains("mock route failure"));
-        } else {
-            assert!(!logs.contains("mock route failure"));
-            assert!(!logs.contains(&alloy::hex::encode_prefixed(tx_hash)));
-            assert!(!error.to_string().contains("mock route failure"));
+    // A failing RPC answers with its own error, a working one with another transaction's hash.
+    for fail_requests in [true, false] {
+        let server = MockRpcServer::spawn(fail_requests, 21_000).await;
+        let pool = crate::query_rpc_pool_for_route(
+            &sensitive(&RpcChainRoute::new(
+                1,
+                vec![Url::parse(&server.url).unwrap()],
+            )),
+            &http,
+        );
+        for log_transaction_details in [true, false] {
+            let logs = Arc::new(Mutex::new(Vec::new()));
+            let writer = LogWriter(logs.clone());
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let error = crate::self_broadcast_send_raw_transaction_to_rpc_pool_with_logging(
+                &pool,
+                WalletNetworkMode::Direct,
+                vec![1, 2, 3],
+                tx_hash,
+                log_transaction_details,
+            )
+            .with_subscriber(subscriber)
+            .await
+            .err()
+            .expect("RPC rejects broadcast");
+            let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+            let error = error.to_string();
+            for hash in [tx_hash, MOCK_RAW_TX_HASH] {
+                let hash = alloy::hex::encode_prefixed(hash);
+                assert!(!logs.contains(&hash), "{logs}");
+                assert!(!error.contains(&hash), "{error}");
+            }
+            if fail_requests {
+                assert_eq!(logs.contains("mock route failure"), log_transaction_details);
+                assert_eq!(
+                    error.contains("mock route failure"),
+                    log_transaction_details
+                );
+            } else {
+                assert_eq!(
+                    logs.contains("self-broadcast tx rejected by RPC"),
+                    log_transaction_details
+                );
+            }
         }
     }
 }

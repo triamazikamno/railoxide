@@ -34,8 +34,6 @@ pub(in crate::public_wallet) async fn submit_public_action_attempt(
                     max_priority_fee_per_gas: preflight.max_priority_fee_per_gas,
                 },
                 rpc_gas_price: preflight.rpc_gas_price,
-                estimated_native_gas_cost: preflight.estimated_native_gas_cost,
-                live_native_balance: preflight.live_native_balance,
             };
             before_broadcast(&attempt, signed)?;
             handed_off_attempt = Some(attempt);
@@ -67,8 +65,6 @@ async fn sign_send_public_action_transaction(
 ) -> Result<(), PublicActionAttemptError> {
     if log_transaction_details {
         tracing::info!(target: LOG_TARGET,
-            from = %tx_req.from.unwrap_or_default(),
-            to = ?tx_req.to,
             gas = ?tx_req.gas,
             label,
             "signing and sending public action transaction",
@@ -120,7 +116,7 @@ pub(super) async fn broadcast_signed_public_action_transaction(
     .wrap_err_with(|| format!("{label}: send"))
     .map_err(PublicActionAttemptError::Sending)?;
     if log_transaction_details {
-        tracing::info!(target: LOG_TARGET,%tx_hash, providers = provider_handles.len(), label, "sent public action transaction");
+        tracing::info!(target: LOG_TARGET, providers = provider_handles.len(), label, "sent public action transaction");
     }
     Ok(())
 }

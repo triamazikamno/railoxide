@@ -76,8 +76,6 @@ pub(in crate::desktop) fn log_public_broadcaster_fee_prediction_failure(
     tracing::warn!(target: LOG_TARGET,
         action,
         attempt,
-        available_fee = %available_fee,
-        computed_fee = %computed_fee,
         fee_shortfall = %computed_fee.saturating_sub(available_fee),
         gas_limit,
         ?predicted_gas_limit,

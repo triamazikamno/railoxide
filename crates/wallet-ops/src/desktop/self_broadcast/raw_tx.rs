@@ -65,7 +65,6 @@ pub(in crate::desktop) async fn sign_send_self_broadcast_transaction(
     }
     tracing::info!(
         target: LOG_TARGET,
-        %tx_hash,
         providers = provider_handles.len(),
         "sent self-broadcast transaction"
     );
@@ -138,7 +137,6 @@ pub(crate) async fn self_broadcast_send_raw_transaction_to_rpc_pool_with_logging
                         tracing::info!(
                             target: LOG_TARGET,
                             %url,
-                            %tx_hash,
                             "self-broadcast tx accepted by RPC"
                         );
                     }
@@ -153,7 +151,6 @@ pub(crate) async fn self_broadcast_send_raw_transaction_to_rpc_pool_with_logging
                         tracing::info!(
                             target: LOG_TARGET,
                             %url,
-                            %tx_hash,
                             "self-broadcast tx already known by RPC"
                         );
                     }
@@ -168,7 +165,6 @@ pub(crate) async fn self_broadcast_send_raw_transaction_to_rpc_pool_with_logging
                         tracing::warn!(
                             target: LOG_TARGET,
                             %url,
-                            %tx_hash,
                             message,
                             "self-broadcast tx rejected by RPC"
                         );
@@ -217,9 +213,9 @@ pub(in crate::desktop) async fn self_broadcast_send_raw_transaction_to_provider(
             if returned_hash == tx_hash {
                 SelfBroadcastRawTxBroadcastOutcome::Accepted
             } else {
-                SelfBroadcastRawTxBroadcastOutcome::Rejected(format!(
-                    "RPC returned unexpected transaction hash {returned_hash}; expected {tx_hash}"
-                ))
+                SelfBroadcastRawTxBroadcastOutcome::Rejected(
+                    "RPC returned an unexpected transaction hash".to_owned(),
+                )
             }
         }
         Ok(Err(error)) if is_self_broadcast_tx_already_known_error(&error) => {

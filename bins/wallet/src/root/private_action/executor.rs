@@ -423,8 +423,6 @@ impl WalletRoot {
                 return;
             }
         }
-        let preparation_started = Instant::now();
-        tracing::info!(target: "executor_preparation", step = "review_preparation", "started");
         let Some(draft) = self.unshield_spend_draft(key, cx) else {
             return;
         };
@@ -525,15 +523,7 @@ impl WalletRoot {
         let http = self.http.clone();
         let trust_filter = self.public_broadcaster_trust_filter(draft.favorites_only_broadcasters);
         let anchor_cache = Arc::clone(&self.public_broadcaster_anchor_cache);
-        let queued_at = Instant::now();
-        tracing::info!(target: "executor_preparation", step = "runtime_dispatch", "started");
         let join = self.runtime.spawn(async move {
-            tracing::info!(
-                target: "executor_preparation",
-                step = "runtime_dispatch",
-                elapsed_ms = queued_at.elapsed().as_millis(),
-                "finished"
-            );
             let result = async {
                 let mut assets = vec![
                     ExecutorAsset::Native,
@@ -562,8 +552,6 @@ impl WalletRoot {
                         )
                         .await?,
                 );
-                let quote_started = Instant::now();
-                tracing::info!(target: "executor_preparation", step = "quote_refresh", "started");
                 let quote = match prepared.delivery() {
                     ExecutorDelivery::PublicBroadcaster(candidate) => {
                         let quote = estimate_desktop_unshield_public_broadcaster_cost(
@@ -633,12 +621,6 @@ impl WalletRoot {
                         unreachable!("manual delivery rejected before allocation")
                     }
                 };
-                tracing::info!(
-                    target: "executor_preparation",
-                    step = "quote_refresh",
-                    elapsed_ms = quote_started.elapsed().as_millis(),
-                    "finished"
-                );
                 let bounds = quote.approval_bounds(draft.custom_fee_amount)?;
                 Ok::<_, eyre::Report>(ExecutorUnshieldReview {
                     prepared,
@@ -651,24 +633,10 @@ impl WalletRoot {
             }
             .await
             .map_err(|error| error.to_string());
-            tracing::info!(
-                target: "executor_preparation",
-                step = "prepare_review_data",
-                elapsed_ms = preparation_started.elapsed().as_millis(),
-                success = result.is_ok(),
-                "finished"
-            );
             (authorization, result)
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = join.await;
-            tracing::info!(
-                target: "executor_preparation",
-                step = "receive_review_data",
-                elapsed_ms = preparation_started.elapsed().as_millis(),
-                success = result.is_ok(),
-                "finished"
-            );
             let _ = this.update_in(cx, |root, window, cx| {
                 let Some(form) = root.unshield_forms.get_mut(&key) else {
                     return;
@@ -780,12 +748,6 @@ impl WalletRoot {
                         root.open_prepared_spend_review(intent, summary, authorization, window, cx);
                     }
                 }
-                tracing::info!(
-                    target: "executor_preparation",
-                    step = "review_preparation",
-                    elapsed_ms = preparation_started.elapsed().as_millis(),
-                    "finished"
-                );
                 cx.notify();
             });
         })

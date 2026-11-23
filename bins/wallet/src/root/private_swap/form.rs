@@ -12,7 +12,6 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use alloy::primitives::{Address, U256};
@@ -193,8 +192,6 @@ const GAS_BAR_STEP: u16 = 5;
 /// The gas bar's key context, for its arrow, Home and End bindings.
 const GAS_BAR_KEY_CONTEXT: &str = "SwapGasBar";
 const QUOTE_DEBOUNCE: Duration = Duration::from_millis(600);
-// Correlates overlapping quote attempts without logging a wallet or operation identifier.
-static NEXT_QUOTE_TRACE_ID: AtomicU64 = AtomicU64::new(1);
 /// The stealth account row's label column, in rems; the line under the select starts past it.
 const ACCOUNT_LABEL_WIDTH: f32 = 7.5;
 /// The narrowest a labeled row's control gets beside its label. A narrower dialog puts the

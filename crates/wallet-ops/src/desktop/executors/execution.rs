@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Instant;
 
 use alloy::eips::eip7702::Authorization;
 use alloy::network::TransactionBuilder;

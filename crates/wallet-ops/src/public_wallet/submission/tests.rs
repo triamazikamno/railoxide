@@ -112,7 +112,6 @@ async fn custom_native_preparation_signs_observed_envelope_with_reviewed_bounds(
             continue;
         }
         let prepared = prepared.unwrap();
-        let exposure = prepared.estimated_native_gas_cost;
         let signed = signer
             .sign_transaction_request(prepared.tx_req, "custom native test")
             .await
@@ -122,11 +121,6 @@ async fn custom_native_preparation_signs_observed_envelope_with_reviewed_bounds(
         assert_eq!(envelope.value(), U256::from(1_250_000));
         assert_eq!(envelope.gas_limit(), 50_000);
         assert_eq!(envelope.max_fee_per_gas(), 100);
-        assert_eq!(
-            envelope.value()
-                + U256::from(envelope.gas_limit()) * U256::from(envelope.max_fee_per_gas()),
-            exposure
-        );
         assert_eq!(
             matches!(envelope, TxEnvelope::Legacy(_)),
             base_fee.is_none()
@@ -205,8 +199,6 @@ async fn broadcast_handoff_retains_ambiguous_attempt_before_replacement() {
                             max_priority_fee_per_gas: fee / 2,
                         },
                         rpc_gas_price: fee,
-                        estimated_native_gas_cost: U256::ZERO,
-                        live_native_balance: U256::ZERO,
                     },
                 );
                 Ok(())

@@ -49,20 +49,11 @@ pub(super) fn existing_pair_side(
 /// account state, then quote without hooks and price the order
 /// limit. Nothing is signed. The swap's orderbook route is returned for reuse even when
 /// quoting fails.
-#[tracing::instrument(
-    name = "swap_quote",
-    target = "swap_quote",
-    level = "debug",
-    skip_all,
-    fields(quote_id = NEXT_QUOTE_TRACE_ID.fetch_add(1, Ordering::Relaxed))
-)]
 pub(super) async fn quote_swap(
     owner: Arc<ExecutorOwner>,
     session: Arc<WalletSession>,
     request: QuoteRequest,
 ) -> QuoteResult {
-    let started = Instant::now();
-    tracing::debug!(target: "swap_quote", step = "total", "started");
     let mut orderbook = request.orderbook.clone();
     let mut bridge_clients = request
         .bridge_clients
@@ -78,19 +69,6 @@ pub(super) async fn quote_swap(
         &mut bridge,
     )
     .await;
-    let status = match &outcome {
-        Ok(QuoteOutcome::Review(_)) => "ready",
-        Ok(QuoteOutcome::TooLarge(_)) => "too_large",
-        Ok(QuoteOutcome::PriceBlocked(_)) => "price_blocked",
-        Err(_) => "error",
-    };
-    tracing::debug!(
-        target: "swap_quote",
-        step = "total",
-        elapsed_ms = started.elapsed().as_millis(),
-        status,
-        "finished"
-    );
     QuoteResult {
         orderbook,
         bridge_clients,
@@ -107,8 +85,6 @@ async fn quote_swap_terms(
     bridge_clients: &mut Option<SwapBridgeClients>,
     bridge: &mut Option<QuotedBridge>,
 ) -> eyre::Result<QuoteOutcome> {
-    let started = Instant::now();
-    tracing::debug!(target: "swap_quote", step = "executor", "started");
     // A speed-up has no executor to preview: its plan names the open order's.
     let executor = match request.executor {
         QuoteExecutor::Preview => Ok(owner.swap_preview_executor()?),
@@ -118,19 +94,6 @@ async fn quote_swap_terms(
         }
         QuoteExecutor::SpeedUp { operation, order } => Err((operation, order)),
     };
-    tracing::debug!(
-        target: "swap_quote",
-        step = "executor",
-        elapsed_ms = started.elapsed().as_millis(),
-        "finished"
-    );
-    let started = Instant::now();
-    tracing::debug!(
-        target: "swap_quote",
-        step = "orderbook_client",
-        reused = orderbook.is_some(),
-        "started"
-    );
     let client = if let Some(client) = orderbook.clone() {
         client
     } else {
@@ -138,12 +101,6 @@ async fn quote_swap_terms(
         *orderbook = Some(client.clone());
         client
     };
-    tracing::debug!(
-        target: "swap_quote",
-        step = "orderbook_client",
-        elapsed_ms = started.elapsed().as_millis(),
-        "finished"
-    );
     if let Some(request_bridge) = &request.bridge {
         let clients = if let Some(clients) = bridge_clients.clone() {
             clients
@@ -184,8 +141,6 @@ async fn quote_swap_terms(
     let planning_session = Arc::clone(session);
     let inclusion = request.inclusion;
     // Note selection can take a moment on fragmented balances.
-    let started = Instant::now();
-    tracing::debug!(target: "swap_quote", step = "input_planning", "started");
     let plan = tokio::task::spawn_blocking(move || match executor {
         Ok(executor) => {
             planning_owner.plan_swap_amount(&executor, &planning_session, &amount_request)
@@ -196,13 +151,6 @@ async fn quote_swap_terms(
         }
     })
     .await;
-    tracing::debug!(
-        target: "swap_quote",
-        step = "input_planning",
-        elapsed_ms = started.elapsed().as_millis(),
-        success = matches!(&plan, Ok(Ok(_))),
-        "finished"
-    );
     let plan = plan.map_err(|_| eyre::eyre!("Planning the swap stopped unexpectedly."))??;
     let plan = match plan {
         SwapAmountPlan::TooLarge { largest } => {
