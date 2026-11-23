@@ -25,11 +25,11 @@ use super::{
     render_recipient_picker, render_self_broadcast_settings, render_send_result,
     render_sponsored_funding_estimate, render_unshield_generating_status,
     render_unshield_native_top_up_control, render_unshield_output_toggle, render_unshield_result,
-    selected_broadcaster_fee_warning, send_element_id, send_form_max_entered_amount,
-    send_form_submitted, should_render_public_broadcaster_cost_preview,
-    sponsored_estimate_allows_submission, sponsored_funding_choice_visible,
-    sponsored_funding_enabled, sponsored_self_broadcast_availability_reason, unshield_element_id,
-    unshield_form_max_entered_amount, unshield_form_submitted,
+    selected_broadcaster_fee_warning, send_element_id, send_form_max_label, send_form_submitted,
+    should_render_public_broadcaster_cost_preview, sponsored_estimate_allows_submission,
+    sponsored_funding_choice_visible, sponsored_funding_enabled,
+    sponsored_self_broadcast_availability_reason, unshield_element_id, unshield_form_max_label,
+    unshield_form_submitted,
 };
 use crate::root::amount_privacy::{UseAmount, render_amount_privacy_hints};
 
@@ -270,10 +270,7 @@ impl WalletRoot {
                     "Recipient 0zk address",
                     &self.private_send_recipient_options(),
                 ))
-                .child(view.amount_field(
-                    send_form_max_entered_amount(form, form.delivery_mode, form.fee_mode),
-                    submit_disabled,
-                )),
+                .child(view.amount_field(send_form_max_label(form), submit_disabled)),
         );
         (card, submit_disabled)
     }
@@ -328,10 +325,7 @@ impl WalletRoot {
                             form.generating || (executor_unavailable.is_some() && !form.unwrap),
                         )
                     }))
-                    .child(view.amount_field(
-                        unshield_form_max_entered_amount(form, form.delivery_mode, form.fee_mode),
-                        submit_disabled,
-                    )),
+                    .child(view.amount_field(unshield_form_max_label(form), submit_disabled)),
             )
             .children(self.render_unshield_privacy_hints(view, cx))
             .child(render_unshield_native_top_up_control(
@@ -705,7 +699,10 @@ impl DeliveryFormView<'_> {
         .min_w(px(0.0))
     }
 
-    fn amount_field(&self, max_amount: Option<U256>, submit_disabled: bool) -> gpui::Div {
+    /// `max` is the Max label's amount and whether it is only an upper bound.
+    fn amount_field(&self, max: (U256, bool), submit_disabled: bool) -> gpui::Div {
+        let (max_amount, upper_bound) = max;
+        let max_amount = private_action_metric_display_amount(max_amount, self.asset.decimals);
         let unit_hint = if self.asset.decimals.is_some() {
             format!("{} amount", self.asset.label)
         } else {
@@ -716,8 +713,11 @@ impl DeliveryFormView<'_> {
             self.key,
             self.kind,
             unit_hint,
-            max_amount
-                .map(|amount| private_action_metric_display_amount(amount, self.asset.decimals)),
+            Some(if upper_bound {
+                format!("≈ {max_amount}")
+            } else {
+                max_amount
+            }),
             self.generating,
             private_action_amount_input(
                 self.amount_input,

@@ -201,6 +201,7 @@ impl WalletRoot {
                     form.shown_broadcaster =
                         Some(prepared.estimate.broadcaster.railgun_address.clone());
                 }
+                form.latest_estimate = Some(prepared.estimate.clone());
                 form.cost_estimate = Some(prepared.estimate);
                 form.gateway_estimated_at = estimated_at;
                 form.cost_estimate_pending = false;
@@ -217,6 +218,7 @@ impl WalletRoot {
                     form.shown_broadcaster =
                         Some(prepared.estimate.broadcaster.railgun_address.clone());
                 }
+                form.latest_estimate = Some(prepared.estimate.clone());
                 form.cost_estimate = Some(prepared.estimate);
                 form.gateway_estimated_at = estimated_at;
                 form.cost_estimate_pending = false;

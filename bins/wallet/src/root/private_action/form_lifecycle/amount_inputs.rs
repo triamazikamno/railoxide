@@ -36,18 +36,13 @@ impl WalletRoot {
                 let Some(form) = self.send_forms.get(&key) else {
                     return;
                 };
-                send_form_max_entered_amount(form, form.delivery_mode, form.fee_mode)
-                    .unwrap_or(form.asset.max_batched)
+                send_form_max_label(form).0
             }
             DeliveryFormKind::Unshield => {
                 let Some(form) = self.unshield_forms.get(&key) else {
                     return;
                 };
-                unshield_max_fill_amount(
-                    unshield_form_max_entered_amount(form, form.delivery_mode, form.fee_mode),
-                    form.asset.max_batched,
-                    form.fee_mode,
-                )
+                unshield_form_max_label(form).0
             }
         };
         let changed = self.set_programmatic_amount_input(kind, key, amount, window, cx);

@@ -9,20 +9,29 @@ impl WalletRoot {
         key: UnshieldAssetKey,
         cx: &mut Context<'_, Self>,
     ) {
-        let shown = match kind {
-            DeliveryFormKind::Send => self
-                .send_forms
-                .get_mut(&key)
-                .map(|form| &mut form.shown_broadcaster),
-            DeliveryFormKind::Unshield => self
-                .unshield_forms
-                .get_mut(&key)
-                .map(|form| &mut form.shown_broadcaster),
-        };
-        if let Some(shown) = shown {
-            *shown = None;
+        match kind {
+            DeliveryFormKind::Send => {
+                if let Some(form) = self.send_forms.get_mut(&key) {
+                    form.shown_broadcaster = None;
+                }
+                self.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+            }
+            DeliveryFormKind::Unshield => {
+                let replaced = self.unshield_forms.get_mut(&key).and_then(|form| {
+                    form.shown_broadcaster = None;
+                    form.cost_estimate.clone()
+                });
+                self.schedule_public_broadcaster_cost_estimate(kind, key, cx);
+                // While the new estimate is computed, the privacy hints keep the old plan.
+                if let Some(form) = self
+                    .unshield_forms
+                    .get_mut(&key)
+                    .filter(|form| form.estimating_cost)
+                {
+                    form.replaced_estimate = replaced;
+                }
+            }
         }
-        self.schedule_public_broadcaster_cost_estimate(kind, key, cx);
     }
 
     pub(in crate::root) fn schedule_public_broadcaster_cost_estimate(
@@ -75,11 +84,10 @@ impl WalletRoot {
             DeliveryFormKind::Unshield => {
                 if let Some(form) = self.unshield_forms.get_mut(&key) {
                     form.estimate_id = estimate_id;
-                    form.replaced_estimate = if retain_shown {
-                        None
-                    } else {
-                        form.cost_estimate.take()
-                    };
+                    if !retain_shown {
+                        form.cost_estimate = None;
+                    }
+                    form.replaced_estimate = None;
                     form.cost_estimate_pending = false;
                     form.estimating_cost = false;
                     form.error = None;

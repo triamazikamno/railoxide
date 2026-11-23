@@ -195,6 +195,7 @@ impl WalletRoot {
             .update(cx, |input, cx| input.set_value("0.5", window, cx));
         form.recipient_value = recipient.into();
         form.selected_fee_token = fee_token;
+        form.latest_estimate = Some(estimate.clone());
         form.cost_estimate = Some(estimate);
         self.generate_send_calldata_from_form(key, window, cx);
     }
@@ -278,6 +279,7 @@ impl WalletRoot {
                     $form.selected_fee_token = fee_token;
                     $form.fee_mode = fee_mode;
                 }
+                $form.latest_estimate = estimate.clone();
                 $form.cost_estimate = estimate;
                 $form.estimating_cost = state == Delivery::Refreshing;
                 $form.custom_fee_amount = custom_fee;

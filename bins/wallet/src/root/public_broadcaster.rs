@@ -266,13 +266,51 @@ pub(super) fn unshield_form_max_entered_amount(
     }
 }
 
-/// Without an estimate, Max fills the fee-mode batched max; an estimate error clamps it later.
-pub(super) fn unshield_max_fill_amount(
-    limit: Option<U256>,
-    max_batched: U256,
+/// The Max label's amount, and whether it is only an upper bound: the maximum the form validates
+/// against, or without a current broadcaster estimate see [`latest_max_label`].
+pub(super) fn send_form_max_label(form: &SendFormState) -> (U256, bool) {
+    let latest = || {
+        latest_max_label(
+            form.latest_estimate.as_ref(),
+            form.asset.token,
+            form.fee_mode,
+            form.asset.max_batched,
+        )
+    };
+    send_form_max_entered_amount(form, form.delivery_mode, form.fee_mode)
+        .map_or_else(latest, |max| (max, false))
+}
+
+/// The Max label's amount, and whether it is only an upper bound; see [`send_form_max_label`].
+pub(super) fn unshield_form_max_label(form: &UnshieldFormState) -> (U256, bool) {
+    let latest = || {
+        latest_max_label(
+            form.latest_estimate.as_ref(),
+            form.asset.token,
+            form.fee_mode,
+            unshield_max_entered_amount_for_mode(form.asset.max_batched, form.fee_mode),
+        )
+    };
+    unshield_form_max_entered_amount(form, form.delivery_mode, form.fee_mode)
+        .map_or_else(latest, |max| (max, false))
+}
+
+/// The maximum of the latest estimate that succeeded for `token`, kept while the form
+/// re-estimates or after an attempt fails, or else `without_estimate` as an upper bound.
+pub(super) fn latest_max_label(
+    latest: Option<&PublicBroadcasterCostEstimate>,
+    token: Address,
     fee_mode: FeeHandlingMode,
-) -> U256 {
-    limit.unwrap_or_else(|| unshield_max_entered_amount_for_mode(max_batched, fee_mode))
+    without_estimate: U256,
+) -> (U256, bool) {
+    latest
+        .filter(|estimate| estimate.action_token == token)
+        .map_or((without_estimate, true), |estimate| {
+            (
+                cost_estimate_max_entered_amount_for_mode(estimate, fee_mode),
+                false,
+            )
+        })
 }
 
 fn max_broadcaster_fee_token_amount_from_snapshot(

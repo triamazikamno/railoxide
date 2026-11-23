@@ -35,7 +35,7 @@ use super::ui_helpers::now_unix;
 use super::{
     ChainUtxoState, DeliveryMode, PublicActionMode, UnshieldAsset, UnshieldAssetKey,
     UnshieldFormState, WalletRoot, format_send_amount_input, format_unshield_amount_input,
-    public_asset_decimals, public_asset_label, unshield_form_max_entered_amount,
+    public_asset_decimals, public_asset_label, unshield_form_max_label,
 };
 
 mod common_amounts;
@@ -450,7 +450,7 @@ impl WalletRoot {
             route: self.amount_privacy_route(chain_id),
             now: now_unix(),
             entered_amount_with_deducted_fee,
-            max_amount: unshield_form_max_entered_amount(form, form.delivery_mode, form.fee_mode),
+            max_amount: Some(unshield_form_max_label(form).0),
         });
         Some(unshield_presentation(
             &hints,

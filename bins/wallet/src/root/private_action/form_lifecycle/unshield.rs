@@ -412,6 +412,7 @@ impl WalletRoot {
                 cost_estimate_pending: false,
                 estimating_cost: false,
                 cost_estimate: None,
+                latest_estimate: None,
                 replaced_estimate: None,
                 shown_broadcaster: None,
                 refused_broadcasters: Vec::new(),

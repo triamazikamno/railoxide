@@ -107,9 +107,9 @@ use super::{
     labeled_field, native_token_display_label, native_wrapped_output_labels, new_prefilled_input,
     new_text_input, parse_address, public_balance_amount_label,
     public_broadcaster_fee_token_warning, public_broadcaster_submit_disabled_for_fee_token_options,
-    secondary_dialog_content_width, send_form_max_entered_amount, should_show_fee_mode_toggle,
-    token_display_metadata, token_label_row, unshield_form_max_entered_amount,
-    unshield_max_fill_amount, vault_error_kind,
+    secondary_dialog_content_width, send_form_max_entered_amount, send_form_max_label,
+    should_show_fee_mode_toggle, token_display_metadata, token_label_row,
+    unshield_form_max_entered_amount, unshield_form_max_label, vault_error_kind,
 };
 
 mod estimate;

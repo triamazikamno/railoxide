@@ -609,6 +609,9 @@ pub(in crate::root) struct UnshieldFormState {
     pub(in crate::root) cost_estimate_pending: bool,
     pub(in crate::root) estimating_cost: bool,
     pub(in crate::root) cost_estimate: Option<PublicBroadcasterCostEstimate>,
+    /// The latest estimate that succeeded. The Max label keeps its maximum until a newer one
+    /// succeeds, also while the form re-estimates or after an attempt fails.
+    pub(in crate::root) latest_estimate: Option<PublicBroadcasterCostEstimate>,
     /// The estimate a refresh replaced. While the new one is computed, the privacy hints keep
     /// its plan instead of dropping the lines that need one.
     pub(in crate::root) replaced_estimate: Option<PublicBroadcasterCostEstimate>,
@@ -667,6 +670,9 @@ pub(in crate::root) struct SendFormState {
     pub(in crate::root) cost_estimate_pending: bool,
     pub(in crate::root) estimating_cost: bool,
     pub(in crate::root) cost_estimate: Option<PublicBroadcasterCostEstimate>,
+    /// The latest estimate that succeeded. The Max label keeps its maximum until a newer one
+    /// succeeds, also while the form re-estimates or after an attempt fails.
+    pub(in crate::root) latest_estimate: Option<PublicBroadcasterCostEstimate>,
     /// The Random broadcaster the estimate card showed; re-estimates keep it until a re-roll.
     pub(in crate::root) shown_broadcaster: Option<String>,
     /// Broadcasters that refused this form's submission; Random estimates skip them.

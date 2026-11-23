@@ -666,22 +666,36 @@ fn unshield_max_entered_amount_depends_on_fee_handling() {
         format_unshield_amount_input(add_on_top_max, Some(6)),
         "1.995"
     );
+}
+
+#[test]
+fn max_label_keeps_the_latest_estimate_for_the_same_token() {
+    use super::super::public_broadcaster::latest_max_label;
+    let token = Address::from([0x41; 20]);
+    let candidate = public_broadcaster_candidates_for_asset(
+        &[fee_row(1, token, "latest")],
+        1,
+        token,
+        BroadcasterFeePolicy::default(),
+        None,
+    )
+    .expect("candidates")
+    .remove(0);
+    let mut latest = public_broadcaster_cost_estimate(candidate);
+    latest.max_receiver_amount = uint!(7_U256);
+    let fallback = uint!(9_U256);
+    let label = |latest, token| {
+        latest_max_label(latest, token, FeeHandlingMode::DeductFromAmount, fallback)
+    };
+
+    // While the form re-estimates, Max keeps the latest exact maximum.
+    assert_eq!(label(Some(&latest), token), (uint!(7_U256), false));
+    // Another token's estimate does not apply, so Max falls back to an upper bound.
     assert_eq!(
-        super::super::public_broadcaster::unshield_max_fill_amount(
-            None,
-            max_receiver,
-            FeeHandlingMode::AddToAmount,
-        ),
-        add_on_top_max
+        label(Some(&latest), Address::from([0x43; 20])),
+        (fallback, true)
     );
-    assert_eq!(
-        super::super::public_broadcaster::unshield_max_fill_amount(
-            Some(uint!(1_500_000_U256)),
-            max_receiver,
-            FeeHandlingMode::AddToAmount,
-        ),
-        uint!(1_500_000_U256)
-    );
+    assert_eq!(label(None, token), (fallback, true));
 }
 
 #[test]

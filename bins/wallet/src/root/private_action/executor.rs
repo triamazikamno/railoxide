@@ -737,6 +737,7 @@ impl WalletRoot {
                 match &review.quote {
                     ExecutorUnshieldQuote::Broadcaster(quote) => {
                         form.cost_estimate = Some((**quote).clone());
+                        form.latest_estimate.clone_from(&form.cost_estimate);
                         current.cost_estimate.clone_from(&form.cost_estimate);
                     }
                     ExecutorUnshieldQuote::SelfBroadcast { cost, .. } => {
