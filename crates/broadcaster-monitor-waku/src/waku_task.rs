@@ -339,7 +339,16 @@ fn handle_fees_message_at(
         .into_iter()
         .map(|key| Arc::from(key.as_str()))
         .collect();
-    let fee_expiration = SystemTime::UNIX_EPOCH + Duration::from_millis(body.fee_expiration);
+    // A plain `+` panics on Windows, whose SystemTime ends in year 30828.
+    let Some(fee_expiration) =
+        SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(body.fee_expiration))
+    else {
+        tracing::debug!(
+            chain_id,
+            "rejected fees payload with unrepresentable expiration"
+        );
+        return 0;
+    };
     let rows = body
         .fees
         .into_iter()
