@@ -45,6 +45,7 @@ use crate::{WalletConnectDecodedCallKind, WalletConnectSupportedMethod};
 
 mod balances;
 mod dapp_requests;
+mod ens;
 mod fees;
 mod hardware_signer;
 mod native_shielding;

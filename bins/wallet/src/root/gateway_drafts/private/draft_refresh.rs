@@ -302,7 +302,7 @@ impl WalletRoot {
                 && recipient.trim().parse::<Address>().is_err()
             {
                 let client = operation.client().await.map_err(|_| {
-                    "Recipient could not be resolved. Check the address or ENS name.".to_owned()
+                    "Recipient could not be resolved. Check the name or use an address.".to_owned()
                 })?;
                 resolve_public_ens_recipient(
                     recipient.trim(),
@@ -315,7 +315,7 @@ impl WalletRoot {
                 .await
                 .map(|recipient| recipient.to_checksum(None))
                 .map_err(|_| {
-                    "Recipient could not be resolved. Check the address or ENS name.".to_owned()
+                    "Recipient could not be resolved. Check the name or use an address.".to_owned()
                 })
             } else {
                 Ok(recipient)

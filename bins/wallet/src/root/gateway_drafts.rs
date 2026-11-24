@@ -270,7 +270,7 @@ async fn estimate_draft(
             context.recipient = Some(recipient);
             None
         } else {
-            Some("Recipient could not be resolved. Check the address or ENS name.".to_owned())
+            Some("Recipient could not be resolved. Check the name or use an address.".to_owned())
         }
     } else {
         None
