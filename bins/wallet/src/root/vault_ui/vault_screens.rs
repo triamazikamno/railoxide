@@ -262,6 +262,11 @@ impl WalletRoot {
         let start_root = root;
         let progress = self.prover_cache_build.progress.clone();
         let completed = self.prover_cache_build.completed;
+        let completed_text = if self.prover_cache_build.native_module_cache_enabled {
+            "Prover cache build complete."
+        } else {
+            "Prover artifacts are downloaded. Circuits compile on first use after unlock."
+        };
         let percent = progress
             .as_ref()
             .map_or(0, wallet_ops::ProverCacheBuildProgress::percent);
@@ -289,7 +294,7 @@ impl WalletRoot {
             .bg(rgb_with_alpha(theme::SURFACE, 0.72))
             .child(app_strong_text("Prepare prover cache in the background"))
             .child(app_muted_text(
-                "Private transactions and POI proofs need prover artifacts. Building the cache now parses zkeys and compiles circuit WASM ahead of time. It can take a long time and uses about 2.5 GB of disk space in this wallet database.",
+                "Private transactions and POI proofs need prover artifacts. Building the cache now downloads them and parses zkeys ahead of time. It can take a long time and uses about 2.5 GB of disk space in this wallet database.",
             ))
             .child(app_muted_text(
                 "If you skip this, nothing breaks. The wallet will build missing cache entries on demand, so the first private action for each circuit may take much longer.",
@@ -334,8 +339,7 @@ impl WalletRoot {
             })
             .when(completed && progress.is_none(), |this| {
                 this.child(
-                    app_muted_text("Prover cache is ready for this wallet database.")
-                        .text_color(rgb(theme::SUCCESS)),
+                    app_muted_text(completed_text).text_color(rgb(theme::SUCCESS)),
                 )
             })
             .child(app_muted_text(

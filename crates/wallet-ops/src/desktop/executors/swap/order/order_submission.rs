@@ -236,7 +236,7 @@ impl ExecutorOwner {
         let mut request = plan.proof_request(&profile)?;
         request.verify_proof = verify_proof;
         let source = artifact_source(&self.http, &session.db)?;
-        let prover = ProverService::new_with_db(&source, &session.db);
+        let prover = session.prover_service(&source);
         let chain_handle = session
             .sync_manager
             .chain_handle(&session.chain_key)

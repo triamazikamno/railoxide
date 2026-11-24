@@ -449,6 +449,23 @@ impl WalletSettingsEditor {
         cx.notify();
     }
 
+    /// A build started before unlock has no vault key, so it skips native circuit modules.
+    pub(in crate::root) fn prover_cache_build_complete_status(
+        report: wallet_ops::ProverCacheBuildReport,
+    ) -> String {
+        if report.native_module_cache_enabled {
+            format!(
+                "Prover cache build complete: {}/{} variants succeeded",
+                report.succeeded_variants, report.total_variants
+            )
+        } else {
+            format!(
+                "Prover artifacts are downloaded: {}/{} variants succeeded. Circuits compile on first use after unlock.",
+                report.succeeded_variants, report.total_variants
+            )
+        }
+    }
+
     pub(in crate::root) fn start_local_prover_cache_build(
         &mut self,
         params: ProverCacheBuildParams,
@@ -483,9 +500,11 @@ impl WalletSettingsEditor {
                 })
                 .await?
             };
+            // Without an active root there is no unlocked vault key.
             build_cache_with_context_and_progress_with_session(
                 db,
                 &http,
+                None,
                 session,
                 move |progress| {
                     let _ = progress_tx.send(progress);
@@ -504,10 +523,7 @@ impl WalletSettingsEditor {
                             editor.cache_build_progress = None;
                             editor.invalidate_data_folder_size();
                             editor.status = Some(Arc::from(match result {
-                                Ok(Ok(report)) => format!(
-                                    "Prover cache build complete: {}/{} variants succeeded",
-                                    report.succeeded_variants, report.total_variants
-                                ),
+                                Ok(Ok(report)) => Self::prover_cache_build_complete_status(report),
                                 Ok(Err(error)) => format!("Prover cache build failed: {error}"),
                                 Err(error) => format!("Prover cache task failed: {error}"),
                             }));

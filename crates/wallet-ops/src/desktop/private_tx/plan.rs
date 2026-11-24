@@ -27,7 +27,7 @@ pub(in crate::desktop) async fn prepare_desktop_unshield_plan_without_broadcaste
     }
 
     let artifact_source = artifact_source(http, request.session.db.as_ref())?;
-    let prover = ProverService::new_with_db(&artifact_source, &request.session.db);
+    let prover = request.session.prover_service(&artifact_source);
     let chain_handle = request
         .session
         .sync_manager
@@ -514,7 +514,7 @@ pub(in crate::desktop) async fn prepare_blocked_shield_rescue_plan(
     )?;
 
     let artifact_source = artifact_source(http, request.session.db.as_ref())?;
-    let prover = ProverService::new_with_db(&artifact_source, &request.session.db);
+    let prover = request.session.prover_service(&artifact_source);
     let chain_handle = request
         .session
         .sync_manager
@@ -680,7 +680,7 @@ pub(in crate::desktop) async fn prepare_desktop_send_plan_without_broadcaster_fe
     let recipient_data = parse_railgun_recipient(recipient)?;
     let chain = effective_desktop_chain_config(request.chain_id, request.effective_chain)?;
     let artifact_source = artifact_source(http, request.session.db.as_ref())?;
-    let prover = ProverService::new_with_db(&artifact_source, &request.session.db);
+    let prover = request.session.prover_service(&artifact_source);
     let chain_handle = request
         .session
         .sync_manager

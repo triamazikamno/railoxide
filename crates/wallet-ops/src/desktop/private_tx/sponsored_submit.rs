@@ -305,7 +305,7 @@ async fn prepare_desktop_sponsored_calldata(
     );
 
     let artifact_source = artifact_source(http, session.db.as_ref())?;
-    let prover = ProverService::new_with_db(&artifact_source, &session.db);
+    let prover = session.prover_service(&artifact_source);
     let chain_handle = session
         .sync_manager
         .chain_handle(&session.chain_key)

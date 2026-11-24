@@ -57,6 +57,7 @@ pub(super) struct SyncedViewWallet {
     pub(super) start_block: u64,
     pub(super) handle: WalletHandle,
     pub(super) public_data_plane: PublicDataPlaneHandle,
+    pub(super) wasm_module_cache_key: Arc<WasmModuleCacheKey>,
 }
 
 fn initialize_atomic_wallet_cache_metadata(
@@ -512,7 +513,13 @@ pub(super) async fn setup_synced_view_wallet_with_store(
     );
     let scan_keys = view_session.scan_keys();
     let prover_artifact_source = artifact_source(http, db.as_ref())?;
-    let poi_recovery_prover = ProverService::new_with_db(&prover_artifact_source, &db);
+    let wasm_module_cache_key = Arc::new(
+        view_session
+            .wasm_module_cache_key()
+            .wrap_err("derive prover module cache key")?,
+    );
+    let poi_recovery_prover =
+        ProverService::new_with_db(&prover_artifact_source, &db, Some(&wasm_module_cache_key));
     let wallet_cfg = WalletConfig {
         chain: chain_key,
         cache_key,
@@ -543,6 +550,7 @@ pub(super) async fn setup_synced_view_wallet_with_store(
         start_block,
         handle,
         public_data_plane: chain_service.public_data_plane(),
+        wasm_module_cache_key,
     })
 }
 

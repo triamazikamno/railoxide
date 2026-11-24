@@ -273,6 +273,13 @@ impl WalletRoot {
             proxy,
             reusable_http,
         } = params;
+        // Fixed for the whole build: before unlock there is no key, so native modules are skipped.
+        let wasm_module_cache_key = self
+            .vault_view_unlock
+            .as_ref()
+            .map(|unlock| unlock.wasm_module_cache_key().map(Arc::new))
+            .transpose()
+            .map_err(|error| Arc::<str>::from(error.to_string()))?;
         let session = match begin_prover_cache_build(&db_path) {
             Ok(session) => session,
             Err(error) => return Err(Arc::from(error.to_string())),
@@ -297,6 +304,7 @@ impl WalletRoot {
             build_cache_with_context_and_progress_with_session(
                 db,
                 &http,
+                wasm_module_cache_key,
                 session,
                 move |progress| {
                     let _ = progress_tx.send(progress);
@@ -311,11 +319,17 @@ impl WalletRoot {
             loop {
                 tokio::select! {
                     result = &mut join => {
-                        let succeeded = result.as_ref().is_ok_and(Result::is_ok);
+                        let report = result
+                            .as_ref()
+                            .ok()
+                            .and_then(|build| build.as_ref().ok())
+                            .copied();
                         let _ = this.update(cx, |root, cx| {
                             root.finish_prover_cache_build_progress(cx);
-                            if succeeded {
+                            if let Some(report) = report {
                                 root.prover_cache_build.completed = true;
+                                root.prover_cache_build.native_module_cache_enabled =
+                                    report.native_module_cache_enabled;
                             }
                         });
                         editor.update(cx, |editor, cx| {
@@ -323,10 +337,9 @@ impl WalletRoot {
                             editor.cache_build_progress = None;
                             editor.invalidate_data_folder_size();
                             editor.status = Some(Arc::from(match result {
-                                Ok(Ok(report)) => format!(
-                                    "Prover cache build complete: {}/{} variants succeeded",
-                                    report.succeeded_variants, report.total_variants
-                                ),
+                                Ok(Ok(report)) => {
+                                    WalletSettingsEditor::prover_cache_build_complete_status(report)
+                                }
                                 Ok(Err(error)) => format!("Prover cache build failed: {error}"),
                                 Err(error) => format!("Prover cache task failed: {error}"),
                             }));

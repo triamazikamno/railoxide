@@ -3,8 +3,8 @@ use super::{
     DesktopViewSession, EncryptedRecord, HardwareProfileSession, Instant, KEY_LEN, Mutex,
     RailgunError, Serialize, U256, VaultError, ViewUnlock, ViewingKeyData, WalletCacheError,
     WalletCacheKey, WalletChainMetadataBundle, WalletMeta, WalletUtxo, WalletViewBundle,
-    deserialize_wallet_utxo, serialize_wallet_utxo, vault_error_from_wallet_cache,
-    wallet_cache_counts, wallet_utxo_stable_identity,
+    WasmModuleCacheKey, deserialize_wallet_utxo, serialize_wallet_utxo,
+    vault_error_from_wallet_cache, wallet_cache_counts, wallet_utxo_stable_identity,
 };
 use alloy::primitives::FixedBytes;
 use local_db::{
@@ -81,6 +81,11 @@ impl DesktopViewSession {
     #[must_use]
     pub fn clone_vault_view_unlock(&self) -> ViewUnlock {
         self.view.clone_unlock()
+    }
+
+    /// Derived from the vault-level view key, so every wallet in a profile shares the cache.
+    pub fn wasm_module_cache_key(&self) -> Result<WasmModuleCacheKey, VaultError> {
+        self.view.wasm_module_cache_key()
     }
 
     #[must_use]

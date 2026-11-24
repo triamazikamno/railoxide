@@ -9,7 +9,7 @@ use railgun_wallet::tx::{
     BuildError, CompositeAdapter, GasEstimateMode, MixedPrivateActionRequest,
     MixedPrivateOutputRole, MixedPrivateSend, MixedPrivateSendRole, RailgunGasModel,
 };
-use railgun_wallet::{ProverService, TransactionBuilder, Utxo};
+use railgun_wallet::{TransactionBuilder, Utxo};
 use tracing::Instrument as _;
 
 use super::{
@@ -514,7 +514,7 @@ impl ExecutorOwner {
         })
         .await?;
         let source = artifact_source(&self.http, &session.db)?;
-        let prover = ProverService::new_with_db(&source, &session.db);
+        let prover = session.prover_service(&source);
         let chain_handle = session
             .sync_manager
             .chain_handle(&session.chain_key)

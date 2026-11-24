@@ -13,6 +13,8 @@ pub(super) struct ProverCacheBuildUi {
     pub(super) popover_open: bool,
     pub(super) monitor_active: bool,
     pub(super) completed: bool,
+    /// Meaningful only once `completed`: whether the build also compiled circuit modules.
+    pub(super) native_module_cache_enabled: bool,
 }
 
 impl WalletRoot {

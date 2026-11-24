@@ -37,6 +37,7 @@ pub struct WalletSession {
     pub(crate) chain_key: ChainKey,
     pub(crate) handle: WalletHandle,
     pub(crate) public_data_plane: PublicDataPlaneHandle,
+    wasm_module_cache_key: Arc<WasmModuleCacheKey>,
     pub(super) projection_cancel_tx: watch::Sender<bool>,
     pub(super) projection_join: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub(super) executor_owner: Option<Arc<ExecutorOwner>>,
@@ -66,6 +67,12 @@ impl WalletSession {
     #[must_use]
     pub fn executor_owner(&self) -> Option<Arc<ExecutorOwner>> {
         self.executor_owner.clone()
+    }
+
+    /// A prover that caches compiled circuit modules under this vault's key.
+    #[must_use]
+    pub(crate) fn prover_service(&self, artifact_source: &ArtifactSource) -> ProverService {
+        ProverService::new_with_db(artifact_source, &self.db, Some(&self.wasm_module_cache_key))
     }
 
     pub async fn stop(&self) -> Result<()> {
@@ -609,36 +616,13 @@ async fn wallet_session_from_view_synced(
     poi_read_source: PoiReadSource,
     synced: SyncedViewWallet,
 ) -> Result<WalletSession> {
-    wallet_session_from_parts(
-        chain_id,
-        poi_read_source,
-        synced.db,
-        synced.sync_manager,
-        synced.chain_key,
-        synced.start_block,
-        synced.handle,
-        synced.public_data_plane,
-    )
-    .await
-}
-
-async fn wallet_session_from_parts(
-    chain_id: u64,
-    poi_read_source: PoiReadSource,
-    db: Arc<DbStore>,
-    sync_manager: Arc<SyncManager>,
-    chain_key: ChainKey,
-    start_block: u64,
-    handle: WalletHandle,
-    public_data_plane: PublicDataPlaneHandle,
-) -> Result<WalletSession> {
-    let mut core_observation_rx = handle.subscribe_observation();
+    let mut core_observation_rx = synced.handle.subscribe_observation();
     let core_observation = core_observation_rx.borrow_and_update().clone();
     let initial_observation =
-        wallet_session_observation(chain_id, &handle.cache_key, &core_observation)?;
+        wallet_session_observation(chain_id, &synced.handle.cache_key, &core_observation)?;
     let (observation_tx, observation_rx) = watch::channel(initial_observation);
     let (projection_cancel_tx, mut projection_cancel_rx) = watch::channel(false);
-    let snapshot_cache_key = handle.cache_key.clone();
+    let snapshot_cache_key = synced.handle.cache_key.clone();
     let projection_join = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -666,26 +650,29 @@ async fn wallet_session_from_parts(
             }
         }
     });
-    let cache_key = handle.cache_key.to_string();
-    let sync_tip_rx =
-        spawn_wallet_sync_tip_task(handle.clone(), sync_manager.chain_handle(&chain_key).await);
-    let poi_refreshing_rx = handle.poi_refreshing_rx.clone();
-    let poi_artifact_cache_progress_rx = public_data_plane.poi_artifact_cache_progress_rx();
+    let cache_key = synced.handle.cache_key.to_string();
+    let sync_tip_rx = spawn_wallet_sync_tip_task(
+        synced.handle.clone(),
+        synced.sync_manager.chain_handle(&synced.chain_key).await,
+    );
+    let poi_refreshing_rx = synced.handle.poi_refreshing_rx.clone();
+    let poi_artifact_cache_progress_rx = synced.public_data_plane.poi_artifact_cache_progress_rx();
 
     Ok(WalletSession {
         chain_id,
         poi_read_source,
         cache_key,
-        start_block,
+        start_block: synced.start_block,
         observation_rx,
         sync_tip_rx,
         poi_refreshing_rx,
         poi_artifact_cache_progress_rx,
-        db,
-        sync_manager,
-        chain_key,
-        handle,
-        public_data_plane,
+        db: synced.db,
+        sync_manager: synced.sync_manager,
+        chain_key: synced.chain_key,
+        handle: synced.handle,
+        public_data_plane: synced.public_data_plane,
+        wasm_module_cache_key: synced.wasm_module_cache_key,
         projection_cancel_tx,
         projection_join: Mutex::new(Some(projection_join)),
         executor_owner: None,

@@ -48,7 +48,7 @@ use railgun_wallet::tx::{
     MixedPrivateActionRequest, MixedPrivateOutputRole, RailgunGasModel, SelectedInputIdentity,
     SwapAmountCheck, SwapAppDataTemplate, SwapPostHookTemplate, SwapPreHookSize, TransactionShape,
 };
-use railgun_wallet::{ProverService, TransactionBuilder, TransactionCall, Utxo};
+use railgun_wallet::{TransactionBuilder, TransactionCall, Utxo};
 use reqwest::Url;
 use tracing::Instrument as _;
 use zeroize::Zeroizing;

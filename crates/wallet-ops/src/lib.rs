@@ -54,7 +54,7 @@ use railgun_wallet::tx::{
 };
 use railgun_wallet::{
     Note, PoiStatus, ProverService, TransactionBuilder, Utxo, UtxoCommitmentKind, UtxoPoiMetadata,
-    UtxoSource, WalletUtxo,
+    UtxoSource, WalletUtxo, WasmModuleCacheKey,
 };
 use rand::seq::IndexedRandom;
 use reqwest::Url;

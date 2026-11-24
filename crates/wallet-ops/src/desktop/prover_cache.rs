@@ -1,8 +1,8 @@
 use super::{
     ACTIVE_PROVER_CACHE_BUILDS, Arc, DbConfig, DbStore, HttpContext, Path, PathBuf,
     ProverCacheBuildProgress, ProverCacheBuildReport, Result, Url, WalletNetworkConfig,
-    WalletNetworkMode, WrapErr, artifact_source, build_prover_cache_with_progress,
-    build_wallet_network_context, watch,
+    WalletNetworkMode, WasmModuleCacheKey, WrapErr, artifact_source,
+    build_prover_cache_with_progress, build_wallet_network_context, watch,
 };
 use eyre::eyre;
 
@@ -11,6 +11,8 @@ pub struct BuildCacheRequest {
     pub db_path: PathBuf,
     pub network_mode: Option<WalletNetworkMode>,
     pub proxy: Option<Url>,
+    /// Without a key the build skips native circuit module compilation.
+    pub wasm_module_cache_key: Option<Arc<WasmModuleCacheKey>>,
 }
 
 pub struct ProverCacheBuildSession {
@@ -85,31 +87,49 @@ pub async fn build_cache(request: BuildCacheRequest) -> Result<ProverCacheBuildR
         data_dir: &request.db_path,
     })
     .await?;
-    build_cache_with_context_and_progress_with_session(db, &http, session, |_| {}).await
+    build_cache_with_context_and_progress_with_session(
+        db,
+        &http,
+        request.wasm_module_cache_key,
+        session,
+        |_| {},
+    )
+    .await
 }
 
 pub async fn build_cache_with_context(
     db: Arc<DbStore>,
     http: &HttpContext,
+    wasm_module_cache_key: Option<Arc<WasmModuleCacheKey>>,
 ) -> Result<ProverCacheBuildReport> {
-    build_cache_with_context_and_progress(db, http, |_| {}).await
+    build_cache_with_context_and_progress(db, http, wasm_module_cache_key, |_| {}).await
 }
 
 pub async fn build_cache_with_context_and_progress(
     db: Arc<DbStore>,
     http: &HttpContext,
+    wasm_module_cache_key: Option<Arc<WasmModuleCacheKey>>,
     mut on_progress: impl FnMut(ProverCacheBuildProgress) + Send + 'static,
 ) -> Result<ProverCacheBuildReport> {
     let session = begin_prover_cache_build(db.root_dir())?;
-    build_cache_with_context_and_progress_with_session(db, http, session, move |progress| {
-        on_progress(progress);
-    })
+    build_cache_with_context_and_progress_with_session(
+        db,
+        http,
+        wasm_module_cache_key,
+        session,
+        move |progress| {
+            on_progress(progress);
+        },
+    )
     .await
 }
 
+/// The key is fixed for the whole build. Without it, artifacts are downloaded and proving
+/// keys cached, but native circuit modules are left to compile on first use.
 pub async fn build_cache_with_context_and_progress_with_session(
     db: Arc<DbStore>,
     http: &HttpContext,
+    wasm_module_cache_key: Option<Arc<WasmModuleCacheKey>>,
     session: ProverCacheBuildSession,
     mut on_progress: impl FnMut(ProverCacheBuildProgress) + Send + 'static,
 ) -> Result<ProverCacheBuildReport> {
@@ -121,10 +141,15 @@ pub async fn build_cache_with_context_and_progress_with_session(
         artifact_dir = %source.out_dir.display(),
         "starting wallet cache build"
     );
-    let report = build_prover_cache_with_progress(&source, Some(Arc::clone(&db)), |progress| {
-        session.publish(progress.clone());
-        on_progress(progress);
-    })
+    let report = build_prover_cache_with_progress(
+        &source,
+        Some(Arc::clone(&db)),
+        wasm_module_cache_key,
+        |progress| {
+            session.publish(progress.clone());
+            on_progress(progress);
+        },
+    )
     .await?;
     tracing::info!(
         railgun_variants = report.railgun_variants,
@@ -133,6 +158,7 @@ pub async fn build_cache_with_context_and_progress_with_session(
         succeeded_variants = report.succeeded_variants,
         failed_variants = report.failed_variants,
         elapsed_ms = report.elapsed_ms,
+        native_module_cache_enabled = report.native_module_cache_enabled,
         "wallet cache build complete"
     );
     Ok(report)

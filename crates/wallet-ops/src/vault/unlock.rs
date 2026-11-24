@@ -6,8 +6,8 @@ use super::{
     SOFTWARE_CONTEXT_SEED_LEN, SecretKey, SoftwareSeedSessionBinding, TronAccountMetadata,
     VaultError, WalletChainMetadataBundle, WalletConnectRelayIdentity, WalletConnectSessionRecord,
     WalletMetadataBundle, WalletMetadataWire, WalletPrivateRecordKind, WalletSpendBundle,
-    WalletViewBundle, Zeroizing, decrypt_payload, decrypt_serialized, derive_context_key,
-    encrypt_payload, encrypt_serialized,
+    WalletViewBundle, WasmModuleCacheKey, Zeroizing, decrypt_payload, decrypt_serialized,
+    derive_context_key, derive_domain_key, encrypt_payload, encrypt_serialized,
 };
 
 pub struct ViewUnlock {
@@ -430,6 +430,15 @@ impl ViewUnlock {
             )?,
             data: derive_context_key(&self.view_dek, b"cache-data", wallet_chain_uuid.as_bytes())?,
         })
+    }
+
+    /// Key that authenticates the profile's compiled prover module cache.
+    ///
+    /// One-way derivation from the view DEK. The key can only mark compiled modules as trusted,
+    /// so background work that holds it, such as a cache build, may finish after the vault locks.
+    pub fn wasm_module_cache_key(&self) -> Result<WasmModuleCacheKey, VaultError> {
+        derive_domain_key(&self.view_dek, b"wasm-module-cache")
+            .map(|key| WasmModuleCacheKey::new(*key.expose_secret()))
     }
 }
 

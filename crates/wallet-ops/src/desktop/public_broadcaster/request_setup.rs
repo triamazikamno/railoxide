@@ -174,7 +174,7 @@ pub(in crate::desktop) async fn public_broadcaster_setup(
     let fee_candidates = acquire_fee_candidates(http, &route, None).await?;
     let min_gas_price = buffered_gas_price_from_candidates(&fee_candidates, &chain.gas).await?;
     let artifact_source = artifact_source(http, session.db.as_ref())?;
-    let prover = ProverService::new_with_db(&artifact_source, &session.db);
+    let prover = session.prover_service(&artifact_source);
     let chain_handle = session
         .sync_manager
         .chain_handle(&session.chain_key)

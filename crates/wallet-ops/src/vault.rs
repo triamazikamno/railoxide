@@ -22,7 +22,7 @@ use railgun_wallet::wallet_cache::{
     WalletCacheError, deserialize_wallet_utxo, serialize_wallet_utxo, wallet_utxo_stable_identity,
 };
 use railgun_wallet::{
-    RailgunSpendSigner, WalletKeys, WalletUtxo, bip39_entropy_from_mnemonic,
+    RailgunSpendSigner, WalletKeys, WalletUtxo, WasmModuleCacheKey, bip39_entropy_from_mnemonic,
     bip39_mnemonic_from_entropy,
 };
 use serde::de::DeserializeOwned;
