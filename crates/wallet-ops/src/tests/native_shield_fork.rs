@@ -27,10 +27,10 @@ use super::cow_fork::{
 use super::helpers::{TEST_MNEMONIC, TEST_PASSWORD, temp_db_root};
 use crate::public_wallet::{
     NativeShieldContracts, NativeShieldPayer, NativeShieldPreparation, NativeShieldUndelivered,
-    PublicActionGasFeeMode, PublicActionGasFeeSelection, PublicAssetId, PublicShieldApprovalMode,
-    PublicShieldRequest, PublicShieldTransactionProfile, ShieldSendOutput, TxReceiptOutput,
-    prepare_native_shield, public_shield_recipient, stealth_native_shield_contracts,
-    submit_public_shield,
+    PublicActionGasFeeMode, PublicActionGasFeeSelection, PublicActionKind, PublicAssetId,
+    PublicShieldApprovalMode, PublicShieldRequest, PublicShieldTransactionProfile,
+    ShieldSendOutput, TxReceiptOutput, prepare_native_shield, public_action_reviewed_gas_limits,
+    public_shield_recipient, stealth_native_shield_contracts, submit_public_shield,
 };
 use crate::settings::EffectiveChainConfig;
 use crate::vault::{
@@ -213,6 +213,15 @@ impl Payer {
             native_operation: native_preparation
                 .is_some()
                 .then(|| ExecutorOperationId::random().unwrap()),
+            // As a review captures them; a preparation bounds a stealth-route native shield.
+            reviewed_gas_limits: public_action_reviewed_gas_limits(
+                self.chain_id,
+                PublicActionKind::Shield,
+                asset,
+                profile,
+                self.chain.gas.gas_limit_buffer,
+            )
+            .filter(|_| native_preparation.is_none()),
             native_preparation,
             gateway_origin: None,
             gas_fee: GAS_FEE,

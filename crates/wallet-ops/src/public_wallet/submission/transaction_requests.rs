@@ -105,16 +105,43 @@ pub(in crate::public_wallet) fn public_action_native_exposure(
     value + (U256::from(gas_limit) * U256::from(max_fee_per_gas))
 }
 
-pub(in crate::public_wallet) fn ensure_advanced_gas_estimate_authorized(
+pub(in crate::public_wallet) const fn ensure_advanced_gas_estimate_authorized(
     estimated_gas: u64,
     authorized_gas_limit: u64,
-) -> Result<()> {
+) -> std::result::Result<(), PublicActionPreflightError> {
     if estimated_gas > authorized_gas_limit {
-        return Err(eyre!(
-            "advanced transaction gas estimate {estimated_gas} exceeds authorized limit {authorized_gas_limit}; refresh the estimate and authorize again"
-        ));
+        return Err(PublicActionPreflightError::GasAboveReviewedLimit {
+            required_gas_units: estimated_gas,
+            reviewed_gas_units: authorized_gas_limit,
+        });
     }
     Ok(())
+}
+
+/// A model-priced action signs within the limit its fee was reviewed at. Railoxide signs exactly
+/// that limit over a raw estimate within it. Mimic Railway signs its 120% of the raw estimate
+/// unclamped, which a clamp would no longer match, so it refuses once that exceeds the limit.
+/// An estimate above the limit means unusual execution, such as a token or receiver that burns
+/// gas. It is refused rather than reviewed again, because a fresh review computes the same limit.
+pub(in crate::public_wallet) fn reviewed_signing_gas_limit(
+    profile: PublicShieldTransactionProfile,
+    raw_gas_limit: u64,
+    reviewed_gas_limit: u64,
+) -> std::result::Result<u64, PublicActionPreflightError> {
+    let (required_gas_units, gas_limit) = match profile {
+        PublicShieldTransactionProfile::Railway => {
+            let gas_limit = crate::public_wallet::gas::railway_gas_limit(raw_gas_limit);
+            (gas_limit, gas_limit)
+        }
+        PublicShieldTransactionProfile::Railoxide => (raw_gas_limit, reviewed_gas_limit),
+    };
+    if required_gas_units > reviewed_gas_limit {
+        return Err(PublicActionPreflightError::GasAboveReviewedLimit {
+            required_gas_units,
+            reviewed_gas_units: reviewed_gas_limit,
+        });
+    }
+    Ok(gas_limit)
 }
 
 /// A native shield signs its profile's buffer over its final raw estimate, at most its

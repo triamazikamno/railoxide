@@ -356,14 +356,15 @@ fn railway_profile_uses_floor_multiplier_and_no_native_gas_model() {
                 + public_shield_gas_units(&ETHEREUM_GAS_MODEL, GasEstimateMode::Expected)
         )
     );
+    let buffer = default_effective_chain(1).gas.gas_limit_buffer;
     assert_eq!(
         erc20.maximum_cost,
         U256::from(
-            railway_gas_limit(PUBLIC_NATIVE_APPROVE_GAS_UNITS)
-                + railway_gas_limit(public_shield_gas_units(
-                    &ETHEREUM_GAS_MODEL,
-                    GasEstimateMode::UpperBound
-                ))
+            railway_gas_limit(PUBLIC_NATIVE_APPROVE_GAS_UNITS + buffer)
+                + railway_gas_limit(
+                    public_shield_gas_units(&ETHEREUM_GAS_MODEL, GasEstimateMode::UpperBound)
+                        + buffer
+                )
         )
     );
 }

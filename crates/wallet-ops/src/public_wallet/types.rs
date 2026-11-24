@@ -140,6 +140,13 @@ pub(super) enum PublicActionGasLimitStrategy {
         reviewed_gas_limit: u64,
         profile: PublicShieldTransactionProfile,
     },
+    /// A model-priced action's limit as its fee was reviewed. Railoxide signs exactly that limit
+    /// over a raw estimate within it; Mimic Railway signs its unclamped 120% of the raw
+    /// estimate. Either refuses an estimate that needs more.
+    Reviewed {
+        reviewed_gas_limit: u64,
+        profile: PublicShieldTransactionProfile,
+    },
 }
 
 impl PublicShieldTransactionProfile {
@@ -157,7 +164,8 @@ impl PublicShieldTransactionProfile {
         matches!(self, Self::Railway) && chain_id == 56 && matches!(asset, PublicAssetId::Erc20(_))
     }
 
-    /// A prepared native shield instead signs within its reviewed limit.
+    /// The uncapped strategy of a dynamically estimated transaction. A model-priced action and a
+    /// prepared native shield instead sign within their reviewed limits.
     pub(super) const fn gas_limit_strategy(self) -> PublicActionGasLimitStrategy {
         match self {
             Self::Railway => PublicActionGasLimitStrategy::RailwayEstimate120,
@@ -325,6 +333,9 @@ pub struct PublicSendRequest {
     pub public_account_uuid: String,
     pub intent: PublicTransactionIntent,
     pub advanced_authorization: Option<PublicAdvancedTransactionAuthorization>,
+    /// The gas limit a transfer, wrap or unwrap was reviewed at and signs within. A raw
+    /// transaction has none; its advanced authorization bounds it.
+    pub reviewed_gas_limit: Option<u64>,
     /// The origin of the gateway draft this submits, which its journal entry is tagged with.
     pub gateway_origin: Option<String>,
     pub gas_fee: PublicActionGasFeeSelection,
@@ -386,6 +397,9 @@ pub struct PublicShieldRequest {
     /// The stealth account operation a native shield is sent from. A retry of the same
     /// shield passes the same one.
     pub native_operation: Option<crate::vault::ExecutorOperationId>,
+    /// The wrap, approval and Shield gas limits the fee was reviewed at, which each step signs
+    /// within. Required unless a native preparation bounds the shield.
+    pub reviewed_gas_limits: Option<(u64, u64, u64)>,
     /// The origin of the gateway draft this submits, which its journal entry is tagged with.
     pub gateway_origin: Option<String>,
     pub gas_fee: PublicActionGasFeeSelection,

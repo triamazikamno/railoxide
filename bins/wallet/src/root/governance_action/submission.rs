@@ -283,6 +283,7 @@ impl WalletRoot {
                 payload_fingerprint: estimate.payload_fingerprint,
                 gas_limit: estimate.gas_limit,
             }),
+            reviewed_gas_limit: None,
             gateway_origin: None,
             gas_fee,
             command_rx: Some(command_rx),

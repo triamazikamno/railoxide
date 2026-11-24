@@ -200,6 +200,8 @@ impl WalletRoot {
         ) {
             return;
         }
+        // Every caller runs after the worker returned, so a retry has nothing left to reach.
+        self.public_form.action_command_tx = None;
         if let Some(step) = self
             .public_form
             .action_progress
@@ -232,7 +234,6 @@ impl WalletRoot {
             let step = &mut self.public_form.action_progress[step_index];
             step.status = PublicActionStepStatus::Error;
             step.message = Some(Arc::from(message));
-            self.public_form.action_command_tx = None;
             self.public_form.action_action_error = None;
             cx.notify();
         }

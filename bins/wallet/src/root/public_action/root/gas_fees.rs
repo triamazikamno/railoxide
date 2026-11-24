@@ -254,18 +254,33 @@ impl WalletRoot {
         )
     }
 
+    /// The per-transaction gas limits `mode`'s maximum gas cost is priced at, from the same chain
+    /// settings and profile, which its submission signs within.
+    pub(super) fn public_form_reviewed_gas_limits(
+        &self,
+        mode: PublicActionMode,
+        asset: PublicAssetId,
+    ) -> Option<(u64, u64, u64)> {
+        let (_, profile) = self.public_action_quote_route(mode);
+        public_action_reviewed_gas_limits(
+            self.last_evm_chain,
+            public_action_kind(mode),
+            asset,
+            profile,
+            self.effective_chain_configs
+                .get(self.last_evm_chain)?
+                .gas
+                .gas_limit_buffer,
+        )
+    }
+
     pub(super) fn public_action_estimated_gas_cost(
         &self,
         mode: PublicActionMode,
         asset: PublicAssetId,
         cx: &App,
     ) -> Option<Eip1559GasCostProjection> {
-        let kind = match mode {
-            PublicActionMode::Shield => PublicActionKind::Shield,
-            PublicActionMode::Send => PublicActionKind::Send,
-            PublicActionMode::Wrap => PublicActionKind::Wrap,
-            PublicActionMode::Unwrap => PublicActionKind::Unwrap,
-        };
+        let kind = public_action_kind(mode);
         let gas_fee = self.public_form.gas_fee(mode);
         let quote = self.public_action_quote(mode);
         if self.native_shield_stealth_applies(mode) {
@@ -340,5 +355,14 @@ impl WalletRoot {
                 ))
             }
         }
+    }
+}
+
+const fn public_action_kind(mode: PublicActionMode) -> PublicActionKind {
+    match mode {
+        PublicActionMode::Shield => PublicActionKind::Shield,
+        PublicActionMode::Send => PublicActionKind::Send,
+        PublicActionMode::Wrap => PublicActionKind::Wrap,
+        PublicActionMode::Unwrap => PublicActionKind::Unwrap,
     }
 }

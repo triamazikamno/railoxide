@@ -153,7 +153,12 @@ pub(in crate::public_wallet) async fn public_action_preflight_from_rpc_pool_with
                 candidates.succeeded(&provider_handle);
                 return Ok(preflight);
             }
-            Err(error @ PublicActionPreflightError::FeeAuthorizationRequired { .. }) => {
+            // A gas refusal isn't an endpoint failure. A lower estimate elsewhere doesn't make this
+            // one wrong, and signing below it risks an out-of-gas revert that spends the whole fee.
+            Err(
+                error @ (PublicActionPreflightError::FeeAuthorizationRequired { .. }
+                | PublicActionPreflightError::GasAboveReviewedLimit { .. }),
+            ) => {
                 return Err(error);
             }
             Err(error) => {

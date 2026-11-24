@@ -37,7 +37,7 @@ use wallet_ops::{
     format_protocol_fee_percentage, parse_send_amount, prepare_native_shield,
     prepare_native_shield_max, project_public_action_fee,
     public_action_maximum_gas_cost_is_significant, public_action_replacement_bumped_fee,
-    public_shield_protocol_fee_amount, public_shield_recipient,
+    public_action_reviewed_gas_limits, public_shield_protocol_fee_amount, public_shield_recipient,
     quote_public_action_gas_fee_bundle_with_profile, resolve_public_action_gas_fee,
     select_native_shield_route, submit_public_send_with_progress,
     submit_public_shield_with_progress,

@@ -73,7 +73,7 @@ impl WalletRoot {
             self.public_form.action_mode,
             PublicActionMode::Wrap | PublicActionMode::Unwrap
         );
-        let (amount, recipient, intent, advanced_estimate, gas_fee, fee_display) =
+        let (amount, recipient, intent, advanced_estimate, reviewed_limit, gas_fee, fee_display) =
             if self.public_form.public_send_kind.is_advanced() && !wrap_mode {
                 if asset != PublicAssetId::Native {
                     self.public_form.send_error = Some(Arc::from(
@@ -161,6 +161,7 @@ impl WalletRoot {
                     to.unwrap_or_default(),
                     intent,
                     Some(estimate.clone()),
+                    None,
                     PublicActionGasFeeSelection::Custom {
                         max_fee_per_gas: estimate.max_fee_per_gas,
                         max_priority_fee_per_gas: estimate.max_priority_fee_per_gas,
@@ -245,6 +246,9 @@ impl WalletRoot {
                     }
                 };
                 let fee_display = self.public_action_fee_display(mode, Some(amount), cx);
+                let reviewed_limit = self
+                    .public_form_reviewed_gas_limits(mode, asset)
+                    .map(|(_, _, gas_limit)| gas_limit);
                 if fee_display.expected_gas_cost.is_none() || fee_display.maximum_gas_cost.is_none()
                 {
                     self.public_form.send_error = Some(Arc::from(
@@ -270,7 +274,15 @@ impl WalletRoot {
                         }
                     }
                 };
-                (amount, recipient, intent, None, gas_fee, fee_display)
+                (
+                    amount,
+                    recipient,
+                    intent,
+                    None,
+                    reviewed_limit,
+                    gas_fee,
+                    fee_display,
+                )
             };
         let operation = self.public_form_operation(&public_account_uuid);
         Some(PublicSendDraft {
@@ -289,6 +301,7 @@ impl WalletRoot {
             recipient,
             intent,
             advanced_estimate,
+            reviewed_gas_limit: reviewed_limit,
             gas_fee,
             fee_display,
             operation,
@@ -343,6 +356,7 @@ impl WalletRoot {
             vault_store,
             intent,
             advanced_estimate,
+            reviewed_gas_limit,
             gas_fee,
             operation,
             ..
@@ -431,6 +445,7 @@ impl WalletRoot {
                     gas_limit: estimate.gas_limit,
                 }
             }),
+            reviewed_gas_limit,
             gateway_origin: gateway_execution
                 .as_ref()
                 .and_then(wallet_ops::gateway::GatewayDraftExecution::origin),

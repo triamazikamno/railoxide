@@ -103,6 +103,9 @@ pub async fn submit_public_shield_with_progress(
         ))
         .await;
     }
+    let (wrap_gas_units, approval_gas_units, shield_gas_units) = request
+        .reviewed_gas_limits
+        .ok_or_else(|| eyre!("public shield requires the gas limits its fee was reviewed at"))?;
     // The wrap fallback shields the wrapped token it deposits as an ERC-20.
     let shield_asset = PublicAssetId::Erc20(token);
     let approval_mode = request.profile.approval_mode(request.approval_mode);
@@ -176,14 +179,6 @@ pub async fn submit_public_shield_with_progress(
 
             let from_address = signer.address();
 
-            let (wrap_gas_units, approval_gas_units, shield_gas_units) =
-                crate::public_wallet::gas::public_shield_estimated_gas_units(
-                    railgun_wallet::tx::RailgunGasModel::for_chain(request.chain_id),
-                    request.asset,
-                    request.profile,
-                    chain.gas.gas_limit_buffer,
-                )
-                .ok_or_else(|| eyre!("public shield has no gas model"))?;
             let wrap_receipt = if wrap_fallback {
                 let wrap_tx = TransactionRequest::default()
                     .with_chain_id(request.chain_id)
@@ -197,7 +192,10 @@ pub async fn submit_public_shield_with_progress(
                     wrap_tx,
                     request.profile,
                     request.asset,
-                    request.profile.gas_limit_strategy(),
+                    PublicActionGasLimitStrategy::Reviewed {
+                        reviewed_gas_limit: wrap_gas_units,
+                        profile: request.profile,
+                    },
                     &signer,
                     "public-shield-wrap",
                     &pools,
@@ -332,7 +330,10 @@ pub async fn submit_public_shield_with_progress(
                     approve_tx,
                     request.profile,
                     shield_asset,
-                    request.profile.gas_limit_strategy(),
+                    PublicActionGasLimitStrategy::Reviewed {
+                        reviewed_gas_limit: approval_gas_units,
+                        profile: request.profile,
+                    },
                     &signer,
                     "public-shield-approve",
                     &pools,
@@ -400,7 +401,10 @@ pub async fn submit_public_shield_with_progress(
                 shield_tx,
                 request.profile,
                 shield_asset,
-                request.profile.gas_limit_strategy(),
+                PublicActionGasLimitStrategy::Reviewed {
+                    reviewed_gas_limit: shield_gas_units,
+                    profile: request.profile,
+                },
                 &signer,
                 "public-shield",
                 &pools,

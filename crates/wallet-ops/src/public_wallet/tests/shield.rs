@@ -124,22 +124,23 @@ async fn shield_submission_checks_remaining_funding_before_estimation_and_signin
         ),
         ("retry", token, PublicShieldTransactionProfile::Railoxide),
         (
-            "estimate_reserve",
+            "railway_estimate",
             token,
-            PublicShieldTransactionProfile::Railoxide,
+            PublicShieldTransactionProfile::Railway,
         ),
     ] {
         let mut chain = default_effective_chain(42161);
-        let (_, approval_gas, shield_gas) = super::gas::public_shield_estimated_gas_units(
+        let reviewed_gas_limits = super::gas::public_shield_estimated_gas_units(
             railgun_wallet::tx::RailgunGasModel::for_chain(42161),
             asset,
             profile,
             chain.gas.gas_limit_buffer,
         )
         .unwrap();
-        let estimate_gas = approval_gas.saturating_add(shield_gas.saturating_mul(2));
-        let estimate = if case == "estimate_reserve" {
-            MockRpcEstimateResult::Success(estimate_gas)
+        let (_, approval_gas, shield_gas) = reviewed_gas_limits;
+        let estimate = if case == "railway_estimate" {
+            // An approval estimated at its reviewed limit needs 120% of it, which is never clamped.
+            MockRpcEstimateResult::Success(approval_gas)
         } else {
             MockRpcEstimateResult::Error {
                 code: -32000,
@@ -152,10 +153,6 @@ async fn shield_submission_checks_remaining_funding_before_estimation_and_signin
         let max_fee = match case {
             "approval" => native_balance / u128::from(approval_gas),
             "allowance" => native_balance / u128::from(shield_gas + approval_gas / 2),
-            "estimate_reserve" => {
-                native_balance
-                    / u128::from(estimate_gas + chain.gas.gas_limit_buffer + shield_gas / 2)
-            }
             _ => 1,
         };
         let fee = |max_fee_per_gas| PublicActionGasFeeSelection::Custom {
@@ -201,6 +198,7 @@ async fn shield_submission_checks_remaining_funding_before_estimation_and_signin
                 approval_mode: PublicShieldApprovalMode::Exact,
                 native_preparation: None,
                 native_operation: None,
+                reviewed_gas_limits: Some(reviewed_gas_limits),
                 gateway_origin: None,
                 gas_fee: fee(max_fee),
                 gas_fee_mode: if case == "auto_ceiling" {
@@ -222,22 +220,34 @@ async fn shield_submission_checks_remaining_funding_before_estimation_and_signin
         .await
         .unwrap_err();
         let message = format!("{error:#}");
-        if case == "allowance" {
-            assert!(message.contains("estimation reached"), "{message}");
-            assert!(!message.contains("insufficient native balance"));
-        } else {
-            assert!(
-                message.contains("insufficient native balance"),
-                "{case}: {message}"
-            );
-            if case != "estimate_reserve" {
+        match case {
+            "allowance" => {
+                assert!(message.contains("estimation reached"), "{message}");
+                assert!(!message.contains("insufficient native balance"));
+            }
+            "railway_estimate" => assert!(
+                matches!(
+                    error.downcast_ref::<super::submission::PublicActionPreflightError>(),
+                    Some(super::submission::PublicActionPreflightError::GasAboveReviewedLimit {
+                        required_gas_units,
+                        reviewed_gas_units,
+                    }) if (*required_gas_units, *reviewed_gas_units)
+                        == (super::gas::railway_gas_limit(approval_gas), approval_gas)
+                ),
+                "{message}"
+            ),
+            _ => {
+                assert!(
+                    message.contains("insufficient native balance"),
+                    "{case}: {message}"
+                );
                 assert!(message.contains("estimated Shield fees"), "{message}");
             }
         }
         let calls = server.calls();
         assert_eq!(
             rpc_calls_for(&calls, "eth_estimateGas").len(),
-            usize::from(matches!(case, "allowance" | "retry" | "estimate_reserve")),
+            usize::from(matches!(case, "allowance" | "retry" | "railway_estimate")),
             "{case}",
         );
         assert_eq!(
@@ -295,6 +305,14 @@ async fn shield_allowance_read_failure_waits_for_retry_and_adopts_its_fee() {
     server.fail_eth_call.store(true, Ordering::SeqCst);
     let mut chain = default_effective_chain(42161);
     chain.rpc_route = RpcChainRoute::new(42161, vec![Url::parse(&server.url).unwrap()]);
+    let asset = PublicAssetId::Erc20(Address::repeat_byte(7));
+    let reviewed_gas_limits = public_action_reviewed_gas_limits(
+        42161,
+        PublicActionKind::Shield,
+        asset,
+        PublicShieldTransactionProfile::Railoxide,
+        chain.gas.gas_limit_buffer,
+    );
     let fee = |max_fee_per_gas| PublicActionGasFeeSelection::Custom {
         max_fee_per_gas,
         max_priority_fee_per_gas: 1,
@@ -322,13 +340,14 @@ async fn shield_allowance_read_failure_waits_for_retry_and_adopts_its_fee() {
             trezor_app_passphrase: None,
             trezor_pin_matrix_provider: None,
             public_account_uuid: account.public_account_uuid.clone(),
-            asset: PublicAssetId::Erc20(Address::repeat_byte(7)),
+            asset,
             // Below the mock allowance, so no approval is needed after the retried read.
             amount: U256::from(1),
             profile: PublicShieldTransactionProfile::Railoxide,
             approval_mode: PublicShieldApprovalMode::UnlimitedWhenShort,
             native_preparation: None,
             native_operation: None,
+            reviewed_gas_limits,
             gateway_origin: None,
             gas_fee: fee(1),
             gas_fee_mode: PublicActionGasFeeMode::Custom,

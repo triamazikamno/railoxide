@@ -68,6 +68,7 @@ pub async fn submit_public_send_with_progress(
                 &request.intent,
                 &signer,
                 request.advanced_authorization,
+                request.reviewed_gas_limit,
                 false,
                 request.gas_fee,
                 &mut command_rx,

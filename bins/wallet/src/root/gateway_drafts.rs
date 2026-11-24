@@ -22,7 +22,7 @@ use wallet_ops::{
         GatewayDraftStatus, GatewayDraftView,
     },
     parse_send_amount, prepare_native_shield, prepare_native_shield_max,
-    public_shield_protocol_fee_amount, public_shield_recipient,
+    public_action_reviewed_gas_limits, public_shield_protocol_fee_amount, public_shield_recipient,
     quote_public_action_gas_fee_bundle_with_profile, resolve_public_ens_recipient,
     select_native_shield_route,
     settings::{EffectiveChainConfig, EffectiveTokenRegistry},
@@ -471,6 +471,7 @@ fn prepare_draft(
         gas_fee
     };
     let unestimable = || "This action cannot be estimated on the selected network.".to_owned();
+    let kind = public_action_kind(input.kind);
     let costs = match &native_preparation {
         // A stealth-route native shield is priced from its own prepared raw and buffered gas.
         Some(preparation) => native_shield_gas_cost_projection(
@@ -485,11 +486,7 @@ fn prepare_draft(
         None => estimate_public_action_gas_cost_with_profile_and_ceiling(
             input.chain_id,
             &effective_chain,
-            if input.kind == GatewayDraftKind::Shield {
-                PublicActionKind::Shield
-            } else {
-                PublicActionKind::Send
-            },
+            kind,
             asset,
             profile,
             gas_fee,
@@ -498,6 +495,16 @@ fn prepare_draft(
         )
         .map_err(|_| unestimable())?,
     };
+    // The limits the maximum cost was priced at, which the submission signs within; a
+    // stealth-route native shield's preparation bounds it instead.
+    let reviewed_gas_limits = public_action_reviewed_gas_limits(
+        input.chain_id,
+        kind,
+        asset,
+        profile,
+        effective_chain.gas.gas_limit_buffer,
+    )
+    .filter(|_| native_preparation.is_none());
     let amount = match &native_preparation {
         Some(preparation) => checked_draft_amount(
             preparation.amount(),
@@ -590,6 +597,7 @@ fn prepare_draft(
                     recipient,
                 },
                 advanced_estimate: None,
+                reviewed_gas_limit: reviewed_gas_limits.map(|(_, _, gas_limit)| gas_limit),
                 gas_fee,
                 fee_display,
                 gateway_execution: None,
@@ -612,6 +620,7 @@ fn prepare_draft(
             approval_mode: draft_approval_mode(profile, input.approval),
             native_preparation,
             native_operation: None,
+            reviewed_gas_limits,
             gas_fee,
             gas_fee_mode,
             authorized_fee_ceiling: ceiling,
@@ -621,6 +630,13 @@ fn prepare_draft(
         })),
     };
     Ok((Some(prepared), estimate))
+}
+
+const fn public_action_kind(kind: GatewayDraftKind) -> PublicActionKind {
+    match kind {
+        GatewayDraftKind::Send => PublicActionKind::Send,
+        GatewayDraftKind::Shield => PublicActionKind::Shield,
+    }
 }
 
 /// The approval mode a Shield draft signs with: the extension's choice, or Mimic Railway's own.

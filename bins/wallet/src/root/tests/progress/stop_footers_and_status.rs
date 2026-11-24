@@ -270,3 +270,60 @@ fn stale_progress_update_guards_reject_stopped_generations() {
         None,
     );
 }
+
+/// A governance worker that ends on a gas refusal reports its failed step before the task
+/// result arrives. The result must still drop the retry sender and keep the refusal visible.
+#[gpui::test]
+fn terminal_failure_after_a_failed_step_drops_the_retry_sender(cx: &mut gpui::TestAppContext) {
+    let path = temp_wallet_db_root("terminal-failure-retry-sender");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _entered = runtime.enter();
+    let (root, cx) = wallet_view_root(&path, &runtime, cx);
+    let (command_tx, _command_rx) = tokio::sync::mpsc::unbounded_channel();
+    let reason = "This transaction needs more gas (105000) than its reviewed limit (100000), so it was not sent.";
+    root.update_in(cx, |root, _, cx| {
+        let generation = root.start_public_action_progress_with_steps(
+            crate::root::public_action::PublicActionMode::Send,
+            vec![PublicActionProgressStep::Vote],
+            "Governance".to_owned(),
+            None,
+            PublicAccountSource::Derived,
+            Some(command_tx),
+            None,
+            true,
+        );
+        root.apply_public_action_progress_update(
+            generation,
+            wallet_ops::PublicActionProgressUpdate {
+                step: PublicActionProgressStep::Vote,
+                status: wallet_ops::PublicActionProgressStatus::Error,
+                tx_hash: None,
+                message: Some(reason.to_owned()),
+            },
+            cx,
+        );
+        assert!(root.public_form.action_command_tx.is_some());
+        root.fail_public_action_progress(
+            generation,
+            format!(
+                "advanced transaction requires a refreshed estimate and authorization: {reason}"
+            ),
+            cx,
+        );
+        assert!(root.public_form.action_command_tx.is_none());
+        let step = &root.public_form.action_progress[0];
+        assert_eq!(step.status, PublicActionStepStatus::Error);
+        assert!(
+            step.message
+                .as_deref()
+                .is_some_and(|message| message.contains(reason))
+        );
+    });
+    cx.update(|window, _| window.remove_window());
+    drop(root);
+    cx.run_until_parked();
+    std::fs::remove_dir_all(path).unwrap();
+}

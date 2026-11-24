@@ -95,32 +95,35 @@ pub fn public_shield_protocol_fee_amount(amount: U256) -> U256 {
     railgun_protocol_fee_amount(amount, RAILGUN_PROTOCOL_FEE_BPS)
 }
 
-pub(super) fn public_action_estimated_gas_units_with_buffer(
-    model: &RailgunGasModel,
+/// The gas limits an ordinary action's transactions are reviewed at and signed within, in wrap,
+/// approval and main-transaction order; their sum prices the reviewed maximum gas cost. Only a
+/// Shield wraps or approves, and a transaction it doesn't sign is 0. A stealth-route native
+/// shield has none: its limit comes from its preparation. The chain's gas-limit buffer is the
+/// only headroom over the model's units, so a smaller buffer refuses more estimates. On Arbitrum
+/// the estimate also carries L1 data gas, so during an L1 price spike an estimate beyond the
+/// buffer is refused until the spike passes.
+#[must_use]
+pub fn public_action_reviewed_gas_limits(
+    chain_id: u64,
     kind: PublicActionKind,
     asset: PublicAssetId,
     profile: PublicShieldTransactionProfile,
     gas_limit_buffer: u64,
-) -> Option<u64> {
+) -> Option<(u64, u64, u64)> {
+    let single = |gas_units: u64| Some((0, 0, gas_units.saturating_add(gas_limit_buffer)));
     match kind {
-        PublicActionKind::Send => {
-            let gas_units = match asset {
-                PublicAssetId::Native => PUBLIC_NATIVE_SEND_GAS_UNITS,
-                PublicAssetId::Erc20(_) => PUBLIC_ERC20_SEND_GAS_UNITS,
-            };
-            Some(gas_units.saturating_add(gas_limit_buffer))
-        }
-        PublicActionKind::Wrap => {
-            Some(PUBLIC_NATIVE_WRAP_GAS_UNITS.saturating_add(gas_limit_buffer))
-        }
-        PublicActionKind::Unwrap => {
-            Some(PUBLIC_NATIVE_UNWRAP_GAS_UNITS.saturating_add(gas_limit_buffer))
-        }
-        PublicActionKind::Shield => {
-            let (wrap, approve, shield) =
-                public_shield_estimated_gas_units(model, asset, profile, gas_limit_buffer)?;
-            Some(wrap.saturating_add(approve).saturating_add(shield))
-        }
+        PublicActionKind::Send => single(match asset {
+            PublicAssetId::Native => PUBLIC_NATIVE_SEND_GAS_UNITS,
+            PublicAssetId::Erc20(_) => PUBLIC_ERC20_SEND_GAS_UNITS,
+        }),
+        PublicActionKind::Wrap => single(PUBLIC_NATIVE_WRAP_GAS_UNITS),
+        PublicActionKind::Unwrap => single(PUBLIC_NATIVE_UNWRAP_GAS_UNITS),
+        PublicActionKind::Shield => public_shield_estimated_gas_units(
+            RailgunGasModel::for_chain(chain_id),
+            asset,
+            profile,
+            gas_limit_buffer,
+        ),
     }
 }
 
@@ -141,10 +144,12 @@ pub(in crate::public_wallet) fn public_shield_estimated_gas_units(
             PUBLIC_NATIVE_APPROVE_GAS_UNITS.saturating_add(gas_limit_buffer),
             shield.saturating_add(gas_limit_buffer),
         )),
+        // 120% of the Railoxide limits, so both profiles admit the same raw estimates, such as
+        // Arbitrum's, which include an L1 data charge the model leaves out.
         (PublicAssetId::Erc20(_), PublicShieldTransactionProfile::Railway) => Some((
             0,
-            railway_gas_limit(PUBLIC_NATIVE_APPROVE_GAS_UNITS),
-            railway_gas_limit(shield),
+            railway_gas_limit(PUBLIC_NATIVE_APPROVE_GAS_UNITS.saturating_add(gas_limit_buffer)),
+            railway_gas_limit(shield.saturating_add(gas_limit_buffer)),
         )),
         (PublicAssetId::Erc20(_), PublicShieldTransactionProfile::Railoxide) => Some((
             0,

@@ -127,6 +127,10 @@ pub(in crate::public_wallet) async fn submit_public_action_step_session(
                 continue;
             }
             Err(error) => {
+                let gas_refused = matches!(
+                    error,
+                    PublicActionPreflightError::GasAboveReviewedLimit { .. }
+                );
                 let error = error.into_report();
                 let message = report_chain_string(&error);
                 progress(public_action_progress_update(
@@ -152,6 +156,10 @@ pub(in crate::public_wallet) async fn submit_public_action_step_session(
                 ) {
                     return Err(error)
                         .wrap_err("native shield requires refreshed preparation and review");
+                }
+                // A retry at another fee can't widen the reviewed gas limit.
+                if gas_refused {
+                    return Err(error);
                 }
                 let Some(command) = recv_public_action_command(command_rx).await else {
                     return Err(error);

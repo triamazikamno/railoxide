@@ -156,6 +156,17 @@ pub(super) async fn public_action_preflight(
                     reviewed_gas_limit,
                 )?
             }
+            PublicActionGasLimitStrategy::Reviewed {
+                reviewed_gas_limit,
+                profile,
+            } => {
+                let raw_gas_limit =
+                    public_action_estimate_gas(&provider_handle, chain_id, &tx_req, rpc_reads)
+                        .await
+                        .wrap_err("estimate public action gas")?;
+                *stage = "gas_limit_authorization";
+                reviewed_signing_gas_limit(profile, raw_gas_limit, reviewed_gas_limit)?
+            }
             PublicActionGasLimitStrategy::ChainBuffer => {
                 public_action_estimate_gas(&provider_handle, chain_id, &tx_req, rpc_reads)
                     .await

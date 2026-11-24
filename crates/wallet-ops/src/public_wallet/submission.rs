@@ -89,6 +89,11 @@ pub(super) enum PublicActionPreflightError {
         message: String,
     },
     InsufficientShieldFunding(eyre::Report),
+    /// The estimate needs more gas than was reviewed or authorized, so the step ends unsigned.
+    GasAboveReviewedLimit {
+        required_gas_units: u64,
+        reviewed_gas_units: u64,
+    },
     Other(eyre::Report),
 }
 
@@ -102,6 +107,13 @@ impl std::fmt::Display for PublicActionPreflightError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::FeeAuthorizationRequired { message, .. } => formatter.write_str(message),
+            Self::GasAboveReviewedLimit {
+                required_gas_units,
+                reviewed_gas_units,
+            } => write!(
+                formatter,
+                "This transaction needs more gas ({required_gas_units}) than its reviewed limit ({reviewed_gas_units}), so it was not sent."
+            ),
             Self::InsufficientShieldFunding(error) | Self::Other(error) => {
                 std::fmt::Display::fmt(error, formatter)
             }
@@ -115,6 +127,8 @@ impl PublicActionPreflightError {
     pub(super) fn into_report(self) -> eyre::Report {
         match self {
             Self::FeeAuthorizationRequired { message, .. } => eyre!("{}", message),
+            // Kept typed, so a caller can tell this refusal apart.
+            refused @ Self::GasAboveReviewedLimit { .. } => eyre::Report::new(refused),
             Self::InsufficientShieldFunding(error) | Self::Other(error) => error,
         }
     }

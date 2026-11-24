@@ -13,6 +13,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
     intent: &PublicTransactionIntent,
     signer: &crate::public_wallet::signer::VaultedPublicSigner,
     advanced_authorization: Option<PublicAdvancedTransactionAuthorization>,
+    reviewed_gas_limit: Option<u64>,
     dynamic_gas_preflight: bool,
     gas_fee: PublicActionGasFeeSelection,
     command_rx: &mut Option<PublicActionCommandReceiver>,
@@ -41,7 +42,7 @@ pub(crate) async fn submit_public_action_step_with_signer(
         tx_req,
         PublicShieldTransactionProfile::Railoxide,
         PublicAssetId::Native,
-        PublicShieldTransactionProfile::Railoxide.gas_limit_strategy(),
+        public_action_gas_limit_strategy(intent, reviewed_gas_limit)?,
         signer,
         operation_label,
         &pools,
@@ -162,4 +163,26 @@ pub(super) fn public_action_authorized_gas_limit(
         return Ok(None);
     }
     public_send_authorized_gas_limit(chain_id, from, intent, authorization, gas_fee)
+}
+
+/// A transfer, wrap or unwrap signs within the gas limit its fee was reviewed at. A raw call is
+/// bounded by its advanced authorization, or estimated freely as a dynamic workflow step.
+fn public_action_gas_limit_strategy(
+    intent: &PublicTransactionIntent,
+    reviewed_gas_limit: Option<u64>,
+) -> Result<PublicActionGasLimitStrategy> {
+    let profile = PublicShieldTransactionProfile::Railoxide;
+    match (intent, reviewed_gas_limit) {
+        (PublicTransactionIntent::Raw { .. }, None) => Ok(profile.gas_limit_strategy()),
+        (PublicTransactionIntent::Raw { .. }, Some(_)) => Err(eyre!(
+            "a reviewed gas limit cannot be used for a raw transaction"
+        )),
+        (_, Some(reviewed_gas_limit)) => Ok(PublicActionGasLimitStrategy::Reviewed {
+            reviewed_gas_limit,
+            profile,
+        }),
+        (_, None) => Err(eyre!(
+            "a transfer, wrap or unwrap requires the gas limit its fee was reviewed at"
+        )),
+    }
 }

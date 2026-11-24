@@ -717,6 +717,122 @@ async fn native_shield_preflight_failure_ends_session_despite_queued_retry() {
 }
 
 #[tokio::test]
+async fn ordinary_send_signs_its_reviewed_gas_limit_and_refuses_a_larger_estimate() {
+    use crate::public_wallet::tests::{
+        TEST_IMPORTED_PRIVATE_KEY, TEST_PASSWORD, public_action_request_parts,
+    };
+
+    let (root_dir, db, store, view) = public_action_request_parts();
+    let account = store
+        .import_public_account(TEST_PASSWORD, &view, TEST_IMPORTED_PRIVATE_KEY, None, false)
+        .unwrap();
+    let asset = PublicAssetId::Erc20(Address::repeat_byte(7));
+    let mut chain =
+        crate::settings::build_effective_chain_configs(&crate::settings::WalletSettings::default())
+            .unwrap()
+            .get(1)
+            .cloned()
+            .unwrap();
+    let (_, _, reviewed_gas_limit) = crate::public_action_reviewed_gas_limits(
+        1,
+        crate::PublicActionKind::Send,
+        asset,
+        PublicShieldTransactionProfile::Railoxide,
+        chain.gas.gas_limit_buffer,
+    )
+    .unwrap();
+    // A buffer raised after review doesn't raise what is signed.
+    chain.gas.gas_limit_buffer += 100_000;
+    let http = HttpContext::direct_for_tests();
+    let client = http.operation_http_client().await.unwrap();
+    for estimate in [50_000, reviewed_gas_limit + 1] {
+        let (endpoint, server, methods) = session_endpoint(estimate, |_| {}).await;
+        chain.rpc_route = RpcChainRoute::new(1, vec![endpoint]);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let send = Box::pin(crate::submit_public_send(
+            crate::PublicSendRequest {
+                executor_owner: None,
+                transaction_tracking: None,
+                chain_id: 1,
+                effective_chain: chain.clone(),
+                view_session: Arc::clone(&view),
+                vault_store: Arc::clone(&store),
+                authorization: Some(crate::DesktopPrivateSpendAuthorization::VaultPassword(
+                    zeroize::Zeroizing::new(TEST_PASSWORD.into()),
+                )),
+                trezor_app_passphrase: None,
+                trezor_pin_matrix_provider: None,
+                public_account_uuid: account.public_account_uuid.clone(),
+                intent: crate::PublicTransactionIntent::Transfer {
+                    asset,
+                    amount: U256::from(5),
+                    recipient: Address::repeat_byte(2),
+                },
+                advanced_authorization: None,
+                reviewed_gas_limit: Some(reviewed_gas_limit),
+                gateway_origin: None,
+                gas_fee: PublicActionGasFeeSelection::Custom {
+                    max_fee_per_gas: 100,
+                    max_priority_fee_per_gas: 2,
+                },
+                command_rx: None,
+                event_tx: Some(event_tx),
+            },
+            &http,
+            &client,
+        ));
+        if estimate <= reviewed_gas_limit {
+            let submitted = async {
+                loop {
+                    if let PublicActionSessionEvent::AttemptSubmitted { attempt, .. } =
+                        event_rx.recv().await.unwrap()
+                    {
+                        break attempt;
+                    }
+                }
+            };
+            let attempt = tokio::time::timeout(Duration::from_secs(30), async {
+                tokio::select! {
+                    result = send => panic!("send ended early: {:?}", result.err()),
+                    attempt = submitted => attempt,
+                }
+            })
+            .await
+            .expect("the send is submitted");
+            assert_eq!(attempt.gas_limit, reviewed_gas_limit);
+        } else {
+            let error = tokio::time::timeout(Duration::from_secs(30), send)
+                .await
+                .expect("the refusal ends the send")
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error.downcast_ref::<PublicActionPreflightError>(),
+                    Some(PublicActionPreflightError::GasAboveReviewedLimit {
+                        required_gas_units,
+                        reviewed_gas_units,
+                    }) if *required_gas_units == estimate
+                        && *reviewed_gas_units == reviewed_gas_limit
+                ),
+                "{error:#}"
+            );
+            assert!(
+                !methods
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|method| method == "eth_sendRawTransaction")
+            );
+        }
+        server.abort();
+    }
+    drop(store);
+    drop(view);
+    drop(db);
+    std::fs::remove_dir_all(root_dir).unwrap();
+}
+
+#[tokio::test]
 async fn public_action_reads_go_to_sensitive_endpoints_and_broadcast_to_submit_ones() {
     let (general_only, general_server, general_methods) = session_endpoint(21_000, |_| {}).await;
     let (reader, reader_server, reader_methods) = session_endpoint(21_000, |_| {}).await;
@@ -1035,6 +1151,7 @@ async fn authorized_governance_request(
                 payload_fingerprint: estimate.payload_fingerprint,
                 gas_limit: estimate.gas_limit,
             }),
+            reviewed_gas_limit: None,
             gateway_origin: None,
             gas_fee: PublicActionGasFeeSelection::Custom {
                 max_fee_per_gas: fee.max_fee_per_gas,

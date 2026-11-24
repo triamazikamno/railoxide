@@ -19,6 +19,9 @@ pub(in crate::root) struct PublicSendDraft {
     pub(in crate::root) recipient: Address,
     pub(in crate::root) intent: PublicTransactionIntent,
     pub(in crate::root) advanced_estimate: Option<PublicAdvancedTransactionEstimate>,
+    /// The gas limit a transfer, wrap or unwrap's maximum fee was reviewed at, which it signs
+    /// within. An advanced transaction's estimate bounds it instead.
+    pub(in crate::root) reviewed_gas_limit: Option<u64>,
     pub(in crate::root) gas_fee: PublicActionGasFeeSelection,
     pub(in crate::root) fee_display: PublicActionFeeDisplay,
     /// The owner's operation client, which the submission uses.
@@ -202,6 +205,9 @@ pub(in crate::root) struct PublicShieldDraft {
     /// The native shield's stealth-account operation, which a Ledger or Trezor wallet
     /// approves before submission.
     pub(in crate::root) native_operation: Option<wallet_ops::vault::ExecutorOperationId>,
+    /// The wrap, approval and Shield gas limits the maximum fee was reviewed at, which each
+    /// step signs within. A stealth-route native shield's preparation bounds it instead.
+    pub(in crate::root) reviewed_gas_limits: Option<(u64, u64, u64)>,
     pub(in crate::root) gas_fee: PublicActionGasFeeSelection,
     pub(in crate::root) gas_fee_mode: PublicActionGasFeeMode,
     pub(in crate::root) authorized_fee_ceiling: PublicActionGasFeeSelection,

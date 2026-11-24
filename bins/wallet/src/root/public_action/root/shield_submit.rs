@@ -156,6 +156,10 @@ impl WalletRoot {
         };
         let fee_display =
             self.public_action_fee_display(PublicActionMode::Shield, Some(amount), cx);
+        let reviewed_gas_limits = native_preparation
+            .is_none()
+            .then(|| self.public_form_reviewed_gas_limits(PublicActionMode::Shield, asset))
+            .flatten();
         if fee_display.expected_gas_cost.is_none()
             || fee_display.maximum_gas_cost.is_none()
             || fee_display.protocol_fee.is_none()
@@ -206,6 +210,7 @@ impl WalletRoot {
             approval_mode: profile.approval_mode(self.public_form.shield_approval_mode),
             native_preparation,
             native_operation,
+            reviewed_gas_limits,
             gas_fee,
             gas_fee_mode,
             authorized_fee_ceiling,
@@ -265,6 +270,7 @@ impl WalletRoot {
             approval_mode,
             native_preparation,
             native_operation,
+            reviewed_gas_limits,
             gas_fee,
             gas_fee_mode,
             authorized_fee_ceiling,
@@ -354,6 +360,7 @@ impl WalletRoot {
             approval_mode,
             native_preparation,
             native_operation,
+            reviewed_gas_limits,
             gateway_origin: gateway_execution
                 .as_ref()
                 .and_then(wallet_ops::gateway::GatewayDraftExecution::origin),

@@ -58,14 +58,15 @@ pub fn estimate_public_action_gas_cost_with_profile_and_ceiling(
     })?;
     let model = RailgunGasModel::for_chain(chain_id);
     let expected_gas_units = public_action_estimated_gas_usage_units(model, kind, asset);
-    let maximum_gas_units = public_action_estimated_gas_units_with_buffer(
-        model,
+    let (wrap, approve, main) = public_action_reviewed_gas_limits(
+        chain_id,
         kind,
         asset,
         profile,
         chain.gas.gas_limit_buffer,
     )
     .ok_or_else(|| eyre!("a stealth-route native shield's fees come from its prepared estimate"))?;
+    let maximum_gas_units = wrap.saturating_add(approve).saturating_add(main);
     if public_action_uses_legacy_envelope(chain_id, profile, asset, quote) {
         return Ok(legacy_gas_cost_projection(
             expected_gas_units,
