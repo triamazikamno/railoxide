@@ -1,6 +1,7 @@
 use super::*;
 use crate::public_wallet::{
-    WalletConnectPersonalSignRequest, admitted_public_signer, walletconnect_sign_personal_message,
+    WalletConnectPersonalSignRequest, WalletConnectTypedDataSignRequest, admitted_public_signer,
+    walletconnect_sign_personal_message, walletconnect_sign_typed_data_v4,
 };
 use crate::{DesktopPrivateSpendAuthorization, ExecutorOwner, HttpContext};
 use alloy::network::TransactionBuilder as _;
@@ -426,5 +427,80 @@ async fn executor_public_message_signing_requires_the_original_passphrase_sessio
     }
     owner.shutdown().await;
     drop((owner, store, view, vault, db));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A `RelayAdapt7702` signed multicall: whoever holds the signature runs its calls as the account.
+fn multicall(verifying_contract: Address) -> serde_json::Value {
+    serde_json::json!({
+        "types": {
+            "EIP712Domain": [
+                { "name": "name", "type": "string" },
+                { "name": "version", "type": "string" },
+                { "name": "chainId", "type": "uint256" },
+                { "name": "verifyingContract", "type": "address" }
+            ],
+            "Multicall": [{ "name": "payloadHash", "type": "bytes32" }]
+        },
+        "primaryType": "Multicall",
+        "domain": {
+            "name": "RelayAdapt7702",
+            "version": "1",
+            "chainId": 1,
+            "verifyingContract": verifying_contract
+        },
+        "message": { "payloadHash": B256::repeat_byte(0x11) }
+    })
+}
+
+#[tokio::test]
+async fn executor_public_typed_data_refuses_the_accounts_own_delegate_domain() {
+    let (root, db, vault) = desktop_store_with_vault();
+    let view = Arc::new(import_wallet_with_metadata(
+        &vault,
+        TEST_WALLET_ID,
+        "Wallet",
+    ));
+    let record = restore(&vault, &view, &db, 5);
+    let owner = Arc::new(
+        ExecutorOwner::new(
+            0,
+            db.clone(),
+            view.clone(),
+            chain(),
+            HttpContext::direct_for_tests(),
+        )
+        .unwrap(),
+    );
+    let account = owner
+        .register_public_account(record.operation(), &authorization())
+        .await
+        .unwrap();
+    let vault = Arc::new(vault);
+    let sign = |typed_data| {
+        walletconnect_sign_typed_data_v4(
+            WalletConnectTypedDataSignRequest {
+                chain_id: 1,
+                executor_owner: Some(owner.clone()),
+                request_control: None,
+                view_session: view.clone(),
+                vault_store: vault.clone(),
+                authorization: Some(authorization()),
+                trezor_app_passphrase: None,
+                trezor_pin_matrix_provider: None,
+                public_account_uuid: account.public_account_uuid.clone(),
+                typed_data,
+                hash_fallback_confirmed: false,
+                event_tx: None,
+            },
+            crate::OperationHttpClient::direct_for_tests(),
+        )
+    };
+    let error = sign(multicall(account.address)).await.unwrap_err();
+    assert!(format!("{error:#}").contains("move all funds"), "{error:#}");
+    // Another contract's domain is an ordinary dapp request.
+    assert!(sign(multicall(Address::repeat_byte(0x22))).await.is_ok());
+    owner.shutdown().await;
+    drop((owner, view, vault, db));
     std::fs::remove_dir_all(root).unwrap();
 }

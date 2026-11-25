@@ -136,6 +136,8 @@ pub async fn walletconnect_sign_typed_data(
                 HardwareEip712Model::from_walletconnect_typed_data_json(request.typed_data)
                     .wrap_err("WalletConnect typed-data payload")
                     .wrap_err_with(|| format!("WalletConnect {operation}"))?;
+            ensure_not_executor_own_domain(&signer, &typed_data)
+                .wrap_err_with(|| format!("WalletConnect {operation}"))?;
             let event_tx = request.event_tx.as_ref();
             let requires_device_approval = signer.requires_device_approval();
             let hardware_typed_data_mode = signer
@@ -213,6 +215,22 @@ pub async fn walletconnect_sign_typed_data(
             Ok(alloy::hex::encode_prefixed(signature.as_bytes()))
         })
         .await
+}
+
+/// A stealth account's own domain is its `RelayAdapt7702` delegate's: a signature there
+/// authorizes arbitrary calls from the account, which only the wallet itself may sign.
+fn ensure_not_executor_own_domain(
+    signer: &VaultedPublicSigner,
+    typed_data: &HardwareEip712Model,
+) -> Result<()> {
+    if matches!(signer, VaultedPublicSigner::Executor(..))
+        && typed_data.typed_data().domain.verifying_contract == Some(signer.address())
+    {
+        return Err(eyre!(
+            "refused a typed-data signature that would let anyone move all funds out of this Stealth account"
+        ));
+    }
+    Ok(())
 }
 
 pub async fn walletconnect_sign_typed_data_v4(
