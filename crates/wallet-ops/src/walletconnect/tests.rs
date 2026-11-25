@@ -15,3 +15,5 @@ mod approval;
 mod lifecycle;
 
 mod request;
+
+mod typed_data_depth;

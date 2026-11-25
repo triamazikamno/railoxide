@@ -64,11 +64,7 @@ impl HardwareEip712Model {
             let message_value = typed_data.coerce().map_err(|_| {
                 HardwareEip712Error::InvalidPayload("message values do not match typed-data types")
             })?;
-            Some(struct_value_from_dyn(
-                &message_type,
-                &message_value,
-                HardwareEip712ValuePath::root(HardwareEip712Root::Message),
-            )?)
+            Some(struct_value_from_dyn(&message_type, &message_value)?)
         };
 
         Ok(Self {
@@ -195,50 +191,9 @@ pub(crate) enum HardwareEip712PrimitiveType {
     String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HardwareEip712Root {
-    Domain,
-    Message,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HardwareEip712ValuePath {
-    pub(crate) root: HardwareEip712Root,
-    pub(crate) segments: Vec<HardwareEip712PathSegment>,
-}
-
-impl HardwareEip712ValuePath {
-    const fn root(root: HardwareEip712Root) -> Self {
-        Self {
-            root,
-            segments: Vec::new(),
-        }
-    }
-
-    fn field(&self, name: &str) -> Self {
-        let mut path = self.clone();
-        path.segments
-            .push(HardwareEip712PathSegment::Field(name.to_owned()));
-        path
-    }
-
-    fn index(&self, index: usize) -> Self {
-        let mut path = self.clone();
-        path.segments.push(HardwareEip712PathSegment::Index(index));
-        path
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HardwareEip712PathSegment {
-    Field(String),
-    Index(usize),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HardwareEip712StructValue {
     pub(crate) type_name: String,
-    pub(crate) path: HardwareEip712ValuePath,
     pub(crate) fields: Vec<HardwareEip712FieldValue>,
 }
 
@@ -247,13 +202,11 @@ pub(crate) struct HardwareEip712FieldValue {
     pub(crate) name: String,
     pub(crate) type_name: String,
     pub(crate) value_type: HardwareEip712Type,
-    pub(crate) path: HardwareEip712ValuePath,
     pub(crate) value: HardwareEip712Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HardwareEip712ArrayElement {
-    pub(crate) path: HardwareEip712ValuePath,
     pub(crate) value: HardwareEip712Value,
 }
 
@@ -422,28 +375,22 @@ fn domain_value(
     domain: &Eip712Domain,
     definitions: Option<&[HardwareEip712FieldDefinition]>,
 ) -> Result<HardwareEip712StructValue, HardwareEip712Error> {
-    let path = HardwareEip712ValuePath::root(HardwareEip712Root::Domain);
     let fields = if let Some(definitions) = definitions {
-        domain_fields_from_definitions(domain, &path, definitions)?
+        domain_fields_from_definitions(domain, definitions)?
     } else {
-        canonical_domain_fields(domain, &path)
+        canonical_domain_fields(domain)
     };
 
     Ok(HardwareEip712StructValue {
         type_name: Eip712Domain::NAME.to_owned(),
-        path,
         fields,
     })
 }
 
-fn canonical_domain_fields(
-    domain: &Eip712Domain,
-    path: &HardwareEip712ValuePath,
-) -> Vec<HardwareEip712FieldValue> {
+fn canonical_domain_fields(domain: &Eip712Domain) -> Vec<HardwareEip712FieldValue> {
     let mut fields = Vec::new();
     if let Some(name) = domain.name.as_ref() {
         fields.push(domain_field(
-            path,
             "name",
             "string",
             HardwareEip712Type::Primitive(HardwareEip712PrimitiveType::String),
@@ -452,7 +399,6 @@ fn canonical_domain_fields(
     }
     if let Some(version) = domain.version.as_ref() {
         fields.push(domain_field(
-            path,
             "version",
             "string",
             HardwareEip712Type::Primitive(HardwareEip712PrimitiveType::String),
@@ -461,7 +407,6 @@ fn canonical_domain_fields(
     }
     if let Some(chain_id) = domain.chain_id {
         fields.push(domain_field(
-            path,
             "chainId",
             "uint256",
             HardwareEip712Type::Primitive(HardwareEip712PrimitiveType::Uint(256)),
@@ -473,7 +418,6 @@ fn canonical_domain_fields(
     }
     if let Some(verifying_contract) = domain.verifying_contract {
         fields.push(domain_field(
-            path,
             "verifyingContract",
             "address",
             HardwareEip712Type::Primitive(HardwareEip712PrimitiveType::Address),
@@ -482,7 +426,6 @@ fn canonical_domain_fields(
     }
     if let Some(salt) = domain.salt {
         fields.push(domain_field(
-            path,
             "salt",
             "bytes32",
             HardwareEip712Type::Primitive(HardwareEip712PrimitiveType::FixedBytes(32)),
@@ -498,7 +441,6 @@ fn canonical_domain_fields(
 
 fn domain_fields_from_definitions(
     domain: &Eip712Domain,
-    path: &HardwareEip712ValuePath,
     definitions: &[HardwareEip712FieldDefinition],
 ) -> Result<Vec<HardwareEip712FieldValue>, HardwareEip712Error> {
     for definition in definitions {
@@ -513,23 +455,16 @@ fn domain_fields_from_definitions(
     }
 
     let mut fields = Vec::with_capacity(definitions.len());
-    append_domain_field_from_definitions(domain, path, definitions, &mut fields, "name")?;
-    append_domain_field_from_definitions(domain, path, definitions, &mut fields, "version")?;
-    append_domain_field_from_definitions(domain, path, definitions, &mut fields, "chainId")?;
-    append_domain_field_from_definitions(
-        domain,
-        path,
-        definitions,
-        &mut fields,
-        "verifyingContract",
-    )?;
-    append_domain_field_from_definitions(domain, path, definitions, &mut fields, "salt")?;
+    append_domain_field_from_definitions(domain, definitions, &mut fields, "name")?;
+    append_domain_field_from_definitions(domain, definitions, &mut fields, "version")?;
+    append_domain_field_from_definitions(domain, definitions, &mut fields, "chainId")?;
+    append_domain_field_from_definitions(domain, definitions, &mut fields, "verifyingContract")?;
+    append_domain_field_from_definitions(domain, definitions, &mut fields, "salt")?;
     Ok(fields)
 }
 
 fn append_domain_field_from_definitions(
     domain: &Eip712Domain,
-    path: &HardwareEip712ValuePath,
     definitions: &[HardwareEip712FieldDefinition],
     fields: &mut Vec<HardwareEip712FieldValue>,
     name: &str,
@@ -553,7 +488,7 @@ fn append_domain_field_from_definitions(
         }
         return Ok(());
     };
-    fields.push(domain_field_from_definition(domain, path, definition)?);
+    fields.push(domain_field_from_definition(domain, definition)?);
     Ok(())
 }
 
@@ -575,8 +510,7 @@ fn normalize_domain_definition_order(
     let Some(definitions) = type_definitions.get(Eip712Domain::NAME) else {
         return Ok(());
     };
-    let path = HardwareEip712ValuePath::root(HardwareEip712Root::Domain);
-    let fields = domain_fields_from_definitions(domain, &path, definitions)?;
+    let fields = domain_fields_from_definitions(domain, definitions)?;
     let definitions = fields
         .into_iter()
         .map(|field| HardwareEip712FieldDefinition {
@@ -591,7 +525,6 @@ fn normalize_domain_definition_order(
 
 fn domain_field_from_definition(
     domain: &Eip712Domain,
-    root_path: &HardwareEip712ValuePath,
     definition: &HardwareEip712FieldDefinition,
 ) -> Result<HardwareEip712FieldValue, HardwareEip712Error> {
     match definition.name.as_str() {
@@ -604,7 +537,6 @@ fn domain_field_from_definition(
                     "domain field value is missing",
                 ))?;
             Ok(domain_field(
-                root_path,
                 &definition.name,
                 &definition.type_name,
                 definition.value_type.clone(),
@@ -620,7 +552,6 @@ fn domain_field_from_definition(
                     "domain field value is missing",
                 ))?;
             Ok(domain_field(
-                root_path,
                 &definition.name,
                 &definition.type_name,
                 definition.value_type.clone(),
@@ -633,7 +564,6 @@ fn domain_field_from_definition(
                 "domain field value is missing",
             ))?;
             Ok(domain_field(
-                root_path,
                 &definition.name,
                 &definition.type_name,
                 definition.value_type.clone(),
@@ -648,7 +578,6 @@ fn domain_field_from_definition(
                     "domain field value is missing",
                 ))?;
             Ok(domain_field(
-                root_path,
                 &definition.name,
                 &definition.type_name,
                 definition.value_type.clone(),
@@ -661,7 +590,6 @@ fn domain_field_from_definition(
                 "domain field value is missing",
             ))?;
             Ok(domain_field(
-                root_path,
                 &definition.name,
                 &definition.type_name,
                 definition.value_type.clone(),
@@ -692,7 +620,6 @@ fn ensure_domain_field_type(
 }
 
 fn domain_field(
-    root_path: &HardwareEip712ValuePath,
     name: &str,
     type_name: &str,
     value_type: HardwareEip712Type,
@@ -702,7 +629,6 @@ fn domain_field(
         name: name.to_owned(),
         type_name: type_name.to_owned(),
         value_type,
-        path: root_path.field(name),
         value,
     }
 }
@@ -710,7 +636,6 @@ fn domain_field(
 fn struct_value_from_dyn(
     value_type: &DynSolType,
     value: &DynSolValue,
-    path: HardwareEip712ValuePath,
 ) -> Result<HardwareEip712StructValue, HardwareEip712Error> {
     let DynSolType::CustomStruct {
         name,
@@ -730,7 +655,7 @@ fn struct_value_from_dyn(
             "typed-data value does not match struct type",
         ));
     };
-    struct_value_from_parts(name, prop_names, prop_types, prop_values, path)
+    struct_value_from_parts(name, prop_names, prop_types, prop_values)
 }
 
 fn struct_value_from_parts(
@@ -738,7 +663,6 @@ fn struct_value_from_parts(
     prop_names: &[String],
     prop_types: &[DynSolType],
     prop_values: &[DynSolValue],
-    path: HardwareEip712ValuePath,
 ) -> Result<HardwareEip712StructValue, HardwareEip712Error> {
     if prop_names.len() != prop_types.len() || prop_names.len() != prop_values.len() {
         return Err(HardwareEip712Error::UnsupportedValueShape(
@@ -750,20 +674,17 @@ fn struct_value_from_parts(
         .zip(prop_types)
         .zip(prop_values)
         .map(|((field_name, field_type), field_value)| {
-            let field_path = path.field(field_name);
             Ok(HardwareEip712FieldValue {
                 name: field_name.clone(),
                 type_name: type_name_from_dyn(field_type),
                 value_type: HardwareEip712Type::from_dyn(field_type)?,
-                path: field_path.clone(),
-                value: value_from_dyn(field_type, field_value, field_path)?,
+                value: value_from_dyn(field_type, field_value)?,
             })
         })
         .collect::<Result<Vec<_>, HardwareEip712Error>>()?;
 
     Ok(HardwareEip712StructValue {
         type_name: name.to_owned(),
-        path,
         fields,
     })
 }
@@ -771,7 +692,6 @@ fn struct_value_from_parts(
 fn value_from_dyn(
     value_type: &DynSolType,
     value: &DynSolValue,
-    path: HardwareEip712ValuePath,
 ) -> Result<HardwareEip712Value, HardwareEip712Error> {
     match (value_type, value) {
         (DynSolType::Bool, DynSolValue::Bool(value)) => Ok(HardwareEip712Value::Bool(*value)),
@@ -804,19 +724,16 @@ fn value_from_dyn(
         (DynSolType::String, DynSolValue::String(value)) => {
             Ok(HardwareEip712Value::String(value.clone()))
         }
-        (DynSolType::Array(element_type), DynSolValue::Array(values)) => array_value(
-            element_type,
-            values,
-            &path,
-            HardwareEip712Value::DynamicArray,
-        ),
+        (DynSolType::Array(element_type), DynSolValue::Array(values)) => {
+            array_value(element_type, values, HardwareEip712Value::DynamicArray)
+        }
         (DynSolType::FixedArray(element_type, expected_len), DynSolValue::FixedArray(values)) => {
             if values.len() != *expected_len {
                 return Err(HardwareEip712Error::UnsupportedValueShape(
                     "fixed-array value length does not match type",
                 ));
             }
-            array_value(element_type, values, &path, HardwareEip712Value::FixedArray)
+            array_value(element_type, values, HardwareEip712Value::FixedArray)
         }
         (
             DynSolType::CustomStruct {
@@ -832,7 +749,6 @@ fn value_from_dyn(
             prop_names,
             tuple,
             prop_values,
-            path,
         )?)),
         _ => Err(HardwareEip712Error::UnsupportedValueShape(
             "typed-data value does not match resolved type",
@@ -843,17 +759,13 @@ fn value_from_dyn(
 fn array_value(
     element_type: &DynSolType,
     values: &[DynSolValue],
-    path: &HardwareEip712ValuePath,
     wrap: impl FnOnce(Vec<HardwareEip712ArrayElement>) -> HardwareEip712Value,
 ) -> Result<HardwareEip712Value, HardwareEip712Error> {
     values
         .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            let element_path = path.index(index);
+        .map(|value| {
             Ok(HardwareEip712ArrayElement {
-                path: element_path.clone(),
-                value: value_from_dyn(element_type, value, element_path)?,
+                value: value_from_dyn(element_type, value)?,
             })
         })
         .collect::<Result<Vec<_>, HardwareEip712Error>>()

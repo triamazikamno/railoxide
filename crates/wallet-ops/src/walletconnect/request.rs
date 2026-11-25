@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
-use alloy::dyn_abi::TypedData;
+use alloy::dyn_abi::{Eip712Types, TypedData};
 use alloy::hex;
 use alloy::primitives::{Address, U256};
 use alloy::rpc::types::transaction::AccessList;
 use alloy::sol;
 use alloy::sol_types::SolCall;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::vault::{
@@ -22,6 +23,12 @@ use super::relay::{
     WalletConnectJsonRpcError, WalletConnectJsonRpcRequest, WalletConnectJsonRpcResponse,
 };
 use super::{Result, WalletConnectError};
+
+mod typed_data_limits;
+use typed_data_limits::{
+    MAX_TYPED_DATA_TYPE_DEPTH, MAX_TYPED_DATA_TYPE_WEIGHT, MAX_TYPED_DATA_TYPES_BYTES,
+    typed_data_types_within_limits,
+};
 
 const WC_SESSION_REQUEST_EXPIRED: i64 = 8_000;
 const WC_SESSION_REQUEST_MAX_EXPIRY_INTERVAL_SECS: u64 = 604_800;
@@ -820,17 +827,16 @@ fn parse_typed_data(
         .ok_or_else(|| malformed_params(format!("{method_name} params must be an array")))?;
     let account = parse_address_value(values.first())
         .ok_or_else(|| malformed_params(format!("{method_name} account is required")))?;
-    let typed_data = values
+    let mut typed_data = values
         .get(1)
         .cloned()
         .ok_or_else(|| malformed_params(format!("{method_name} payload is required")))?;
-    let typed_data = if let Some(encoded) = typed_data.as_str() {
-        serde_json::from_str(encoded).map_err(|error| {
+    // Each decode shortens the string, so this ends.
+    while let Some(encoded) = typed_data.as_str() {
+        typed_data = serde_json::from_str(encoded).map_err(|error| {
             malformed_params(format!("{method_name} payload must be JSON: {error}"))
-        })?
-    } else {
-        typed_data
-    };
+        })?;
+    }
     let domain_chain_id = typed_data
         .get("domain")
         .and_then(|domain| domain.get("chainId"))
@@ -1034,6 +1040,16 @@ fn validate_typed_data_payload(method: &str, value: &Value) -> Result<()> {
     let typed_data: TypedData = serde_json::from_value(value.clone()).map_err(|error| {
         malformed_params(format!("{method} payload is invalid EIP-712: {error}"))
     })?;
+    // The resolver drops keys such as `Junk[]`, which the hardware model still parses.
+    let types = Eip712Types::deserialize(&value["types"]).map_err(|error| {
+        malformed_params(format!("{method} payload is invalid EIP-712: {error}"))
+    })?;
+    if !typed_data_types_within_limits(&types, &typed_data.primary_type) {
+        return Err(malformed_params(format!(
+            "{method} payload types exceed the typed-data limits ({MAX_TYPED_DATA_TYPES_BYTES} \
+             bytes, {MAX_TYPED_DATA_TYPE_DEPTH} levels, {MAX_TYPED_DATA_TYPE_WEIGHT} weight)"
+        )));
+    }
     typed_data.coerce().map_err(|error| {
         malformed_params(format!("{method} payload is invalid EIP-712: {error}"))
     })?;
