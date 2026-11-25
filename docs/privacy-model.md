@@ -55,9 +55,15 @@ Self-broadcast and public-account actions may preflight or submit against multip
 
 Artifact gateways can observe artifact downloads, including timing and requested artifact paths. With the recommended Tor or proxy modes, those requests are routed through the selected network path. In direct mode, gateways can also observe your network address.
 
+## Chain Data Sources
+
+The wallet trusts its RPC providers, indexers and artifact sources for the commitment and nullifier data it syncs, and does not cross-check them against each other or against the contract. A dishonest source can hide incoming funds or show notes that don't exist, so balances can be wrong. It can't spend or redirect your private funds this way, because the Railgun contract rejects proofs built on unknown data. The wallet simulates a send before submitting it, which catches bad data unless the same provider also fakes the simulation. A self-broadcast send can then be mined and fail, and your public account still pays its gas.
+
 ## Public Broadcasters
 
 Public broadcasters help submit private transactions without using your own public account for every transaction. A broadcaster can still observe metadata required to evaluate and relay the request it receives.
+
+A private send or unshield that takes several transactions goes to the broadcaster as one batch. A broadcaster can submit only part of it, for example just the transaction that pays its fee, and still report the batch as submitted. Unshields that pay out the native token or add a gas top-up are bound into one execution and can't be split. The send review warns when a batch can be split, unless a remembered spend approval skips the review. Before sending again after such a send, check what arrived, since part of the batch may already have gone through.
 
 RailOxide also monitors public broadcaster availability through Waku. In proxy mode, embedded Waku libp2p transports are disabled to prevent proxy bypass.
 
@@ -75,6 +81,10 @@ Matching against your amount, notes and history happens on your device. The hint
 - Each shield counts once. The statistics do not count distinct depositors.
 - The number of deposits large enough to fund an exit is a lower bound.
 - A good factor does not make a transaction unlinkable. Observers can also use timing, the gas payer, recipient history and other signals the hints do not cover.
+
+## Browser Extension
+
+A paired browser extension is wallet UI. It can show the selected accounts and their balances and edit chain settings, including RPC endpoints that bypass Tor. If you turn on Allow unlocking for the pairing, which is off by default, it can also unlock the wallet with the vault password and any mnemonic passphrase typed into it. Its own confirmations, such as the one for bypassing Tor, run in the browser. Settings saved from the extension stay after you remove the pairing. Pair only browsers you control, and if you remove a pairing because you stopped trusting that browser, review Settings > Chains.
 
 ## Wallet Storage
 
