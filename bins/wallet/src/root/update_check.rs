@@ -588,7 +588,7 @@ fn render_release_notes(tag: &str, body: Option<&str>) -> AnyElement {
     let Some(body) = body.map(str::trim).filter(|body| !body.is_empty()) else {
         return app_muted_text("No release notes").into_any_element();
     };
-    let source = sanitize_render_source(body).unwrap_or_else(|| {
+    let source = sanitize_render_source(body, usize::MAX).unwrap_or_else(|_| {
         let fence = "`".repeat(max_backtick_run(body).saturating_add(1).max(3));
         format!("{fence}\n{body}\n{fence}")
     });

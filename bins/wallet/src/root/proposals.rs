@@ -29,7 +29,7 @@ use gpui_component::{
     text::TextView,
     tooltip::Tooltip,
 };
-use markdown::{ParseOptions, mdast::Node, to_mdast};
+use markdown::mdast::Node;
 use railgun_ui::short_address;
 use ui::clipboard::clipboard_with_toast;
 use ui::controls::{
@@ -53,7 +53,9 @@ use super::governance_action::{
     ProposalActionKind, ProposalParticipationRow, proposal_participation_key,
     validate_proposal_action,
 };
-use super::markdown_sanitize::{max_backtick_run, sanitize_render_source};
+use super::markdown_sanitize::{
+    MarkdownParseError, SanitizeFailure, max_backtick_run, parse_markdown, sanitize_render_source,
+};
 use super::spend_authorization::spend_authorization_recipient_display;
 use super::tokens::{
     format_native_token_amount_for_display, format_send_amount_input,
@@ -85,7 +87,8 @@ use action_form::render_proposal_action_form;
 use decoded_preview_render::render_proposal_decoded_preview;
 #[cfg(test)]
 use markdown_tables::{
-    ensure_mdast_node_limit, parse_proposal_blocks, prepared_markdown_source_len, table_fingerprint,
+    ensure_mdast_node_limit, parse_proposal_block_nodes, parse_proposal_blocks,
+    prepared_markdown_source_len, proposal_markdown_admitted, table_fingerprint,
 };
 use markdown_tables::{inert_raw_fallback_source, prepare_proposal_presentation};
 pub(super) use participation_card::*;
@@ -110,8 +113,11 @@ pub(super) const PROPOSALS_PAGE_SIZE: usize = 5;
 const DOCUMENT_RESOLUTION_CONCURRENCY: usize = 4;
 const CONTENT_WIDTH: gpui::Pixels = px(1080.0);
 const MAX_MDAST_NODES: usize = 4_096;
+/// markdown-rs parse time grows superlinearly with input size; real proposals are under 6 KB.
+const MAX_PROPOSAL_DESCRIPTION_BYTES: usize = 32 * 1024;
 const MAX_RENDER_COMPLEXITY: usize = 256;
-const MAX_PREPARED_SOURCE_BYTES: usize = 4 * 1024 * 1024;
+/// Bounds parser memory per preparation; real proposals prepare under 6 KB with no definitions.
+const MAX_PREPARED_SOURCE_BYTES: usize = 256 * 1024;
 const DEFAULT_TABLE_COLUMN_LENGTH: usize = 5;
 const MAX_TABLE_COLUMN_LENGTH: usize = 150;
 const TABLE_COLUMN_CHROME_PX: usize = 17;

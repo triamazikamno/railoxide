@@ -296,6 +296,54 @@ fn proposal_preparation_rejects_mdast_node_limit_before_building_leaves() {
 }
 
 #[test]
+fn proposal_admission_bounds_description_size_and_line_nesting() {
+    let section = "## Rationale\n\nThis proposal funds an audit of the broadcaster code.[^1]\n\n- scope\n  - contracts\n    - fees\n      - limits\n\n| Item | Cost |\n| --- | --- |\n| audit | 10 |\n\n[^1]: Scope is in the forum post.\n\n";
+    let mut description = section.repeat(MAX_PROPOSAL_DESCRIPTION_BYTES / section.len());
+    description.push_str(&"x".repeat(MAX_PROPOSAL_DESCRIPTION_BYTES - description.len()));
+    assert!(proposal_markdown_admitted(&description));
+    description.push('x');
+    assert!(!proposal_markdown_admitted(&description));
+    // A single paragraph over the cap would otherwise prepare, so this checks the wiring.
+    assert!(matches!(
+        prepare_proposal_presentation(&"word ".repeat(MAX_PROPOSAL_DESCRIPTION_BYTES / 5 + 1)),
+        ProposalPresentation::TooComplex
+    ));
+
+    let nested_after_cr = format!("Summary\r{}x", ">".repeat(MAX_LINE_CONTAINER_PREFIX + 1));
+    // Footnote definitions are containers too, and markers can follow them on the same line.
+    let nested_after_footnote = format!("[^a]:{}x", ">".repeat(MAX_LINE_CONTAINER_PREFIX));
+    let nested_after_escaped_label =
+        format!("[^a\\]:b]:{}x", "- ".repeat(MAX_LINE_CONTAINER_PREFIX / 2));
+    for nested in [
+        nested_after_cr,
+        nested_after_footnote,
+        nested_after_escaped_label,
+    ] {
+        assert_eq!(
+            parse_markdown(&nested).err(),
+            Some(MarkdownParseError::TooDeep)
+        );
+    }
+    // Dashes that cannot open a list item, here a delimiter row without a leading pipe, do not
+    // count toward the prefix.
+    let table = format!(
+        "a | b\n{} | ---\n1 | 2",
+        "-".repeat(MAX_LINE_CONTAINER_PREFIX + 2)
+    );
+    assert!(matches!(
+        parse_proposal_blocks(&table).as_deref(),
+        Some([ProposalBlock::Table(_)])
+    ));
+
+    // The text inside n nested quotes and their paragraph sits at depth n + 2.
+    let deepest = format!("{}x", ">".repeat(MAX_MARKDOWN_DEPTH - 2));
+    assert!(matches!(
+        prepare_proposal_presentation(&deepest),
+        ProposalPresentation::Prepared(_)
+    ));
+}
+
+#[test]
 fn proposal_preparation_counts_definition_appendix_bytes_cumulatively() {
     let referenced = ["[guide]: https://example.com/guide"];
     let source_len = MAX_PREPARED_SOURCE_BYTES - 40;
@@ -330,12 +378,17 @@ fn proposal_block_parser_prepares_lists_nested_in_blockquotes() {
 
 #[test]
 fn proposal_destination_entities_are_counted_in_prepared_source_budget() {
-    let destination = "/".repeat(MAX_PREPARED_SOURCE_BYTES / 4);
-    let source = format!("[label](<{destination}>)");
-    assert!(matches!(
-        prepare_proposal_presentation(&source),
-        ProposalPresentation::TooComplex
-    ));
+    let source = format!("[label](<{}>)", "/".repeat(64));
+    let root = parse_markdown(&source).expect("markdown parses");
+    // Leave room for exactly the raw leaf; sanitizing spells each `/` as a longer entity.
+    let mut budget = PreparationBudget::default();
+    budget
+        .account_markdown(MAX_PREPARED_SOURCE_BYTES - source.len())
+        .expect("the budget should admit the prefill");
+    assert_eq!(
+        parse_proposal_block_nodes(&source, root.children(), &[], &mut budget, &mut 0),
+        Err(ProposalPreparationFailure::TooComplex)
+    );
 }
 
 #[test]

@@ -108,6 +108,8 @@ pub(super) async fn hydrate_page(
                     .await
                 {
                     Ok(presentation) => presentation,
+                    // A panic can only come from parsing, which follows admission, so this
+                    // source is within the description cap.
                     Err(_) => ProposalPresentation::RawParseFallback(inert_raw_fallback_source(
                         &fallback_source,
                     )),

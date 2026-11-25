@@ -70,10 +70,8 @@ fn proposal_table_render_width_px(table: &markdown::mdast::Table) -> Option<u16>
 }
 
 fn parsed_table_fingerprint(source: &str) -> Option<TableFingerprint> {
-    let Node::Root(root) = to_mdast(source, &ParseOptions::gfm()).ok()? else {
-        return None;
-    };
-    let [Node::Table(table)] = root.children.as_slice() else {
+    let root = parse_markdown(source).ok()?;
+    let [Node::Table(table)] = root.children() else {
         return None;
     };
     table_fingerprint(table)
@@ -244,18 +242,18 @@ fn validate_prepared_table_source(
     fingerprint: &TableFingerprint,
     expected_definition_ids: &[&str],
 ) -> bool {
-    let Ok(Node::Root(root)) = to_mdast(source, &ParseOptions::gfm()) else {
+    let Ok(root) = parse_markdown(source) else {
         return false;
     };
-    let Some(Node::Table(table)) = root.children.first() else {
+    let Some(Node::Table(table)) = root.children().first() else {
         return false;
     };
     if table_fingerprint(table).as_ref() != Some(fingerprint)
-        || root.children.len() != expected_definition_ids.len() + 1
+        || root.children().len() != expected_definition_ids.len() + 1
     {
         return false;
     }
-    root.children[1..]
+    root.children()[1..]
         .iter()
         .map(|node| match node {
             Node::Definition(definition) => Some(definition.identifier.as_str()),
@@ -272,21 +270,28 @@ pub(super) fn parse_proposal_blocks(source: &str) -> Option<Vec<ProposalBlock>> 
     }
 }
 
+/// Rejects descriptions whose size would make parsing slow. `parse_markdown` bounds line nesting.
+pub(super) const fn proposal_markdown_admitted(source: &str) -> bool {
+    source.len() <= MAX_PROPOSAL_DESCRIPTION_BYTES
+}
+
 pub(super) fn prepare_proposal_presentation(source: &str) -> ProposalPresentation {
+    if !proposal_markdown_admitted(source) {
+        return ProposalPresentation::TooComplex;
+    }
     let prepared = (|| {
-        let Node::Root(root) = to_mdast(source, &ParseOptions::gfm())
-            .map_err(|_| ProposalPreparationFailure::RawParseFallback)?
-        else {
-            return Err(ProposalPreparationFailure::RawParseFallback);
-        };
-        ensure_mdast_node_limit(&root.children)?;
-        let definitions = collect_effective_definitions(source, &root.children)
+        let root = parse_markdown(source).map_err(|error| match error {
+            MarkdownParseError::Invalid => ProposalPreparationFailure::RawParseFallback,
+            MarkdownParseError::TooDeep => ProposalPreparationFailure::TooComplex,
+        })?;
+        ensure_mdast_node_limit(root.children())?;
+        let definitions = collect_effective_definitions(source, root.children())
             .ok_or(ProposalPreparationFailure::RawParseFallback)?;
         let mut budget = PreparationBudget::default();
         let mut table_ordinal = 0;
         let blocks = parse_proposal_block_nodes(
             source,
-            &root.children,
+            root.children(),
             &definitions,
             &mut budget,
             &mut table_ordinal,
@@ -302,6 +307,15 @@ pub(super) fn prepare_proposal_presentation(source: &str) -> ProposalPresentatio
             ProposalPresentation::RawParseFallback(inert_raw_fallback_source(source))
         }
         Err(ProposalPreparationFailure::TooComplex) => ProposalPresentation::TooComplex,
+    }
+}
+
+impl From<SanitizeFailure> for ProposalPreparationFailure {
+    fn from(failure: SanitizeFailure) -> Self {
+        match failure {
+            SanitizeFailure::TooLarge => Self::TooComplex,
+            SanitizeFailure::Unsupported => Self::RawParseFallback,
+        }
     }
 }
 
@@ -338,6 +352,22 @@ impl PreparationBudget {
         }
         self.weighted_complexity = next;
         Ok(())
+    }
+
+    const fn remaining_source_bytes(&self) -> usize {
+        MAX_PREPARED_SOURCE_BYTES.saturating_sub(self.prepared_source_bytes)
+    }
+
+    fn ensure_markdown_fits(
+        &self,
+        source_len: usize,
+        referenced: &[&str],
+    ) -> Result<(), ProposalPreparationFailure> {
+        let prepared_len = prepared_markdown_source_len(source_len, referenced)?;
+        match self.prepared_source_bytes.checked_add(prepared_len) {
+            Some(next) if next <= MAX_PREPARED_SOURCE_BYTES => Ok(()),
+            _ => Err(ProposalPreparationFailure::TooComplex),
+        }
     }
 
     pub(super) fn account_markdown(
@@ -427,7 +457,7 @@ fn collect_definition_nodes(
     Some(())
 }
 
-fn parse_proposal_block_nodes(
+pub(super) fn parse_proposal_block_nodes(
     source: &str,
     nodes: &[Node],
     definitions: &[(String, String)],
@@ -502,7 +532,7 @@ fn parse_proposal_block_nodes(
                     .filter(|(identifier, _)| references.contains(identifier))
                     .map(|(identifier, _)| identifier.as_str())
                     .collect::<Vec<_>>();
-                let _ = prepared_markdown_source_len(source_slice.len(), &referenced)?;
+                budget.ensure_markdown_fits(source_slice.len(), &referenced)?;
                 let source = if referenced.is_empty() {
                     source_slice
                 } else {
@@ -512,8 +542,8 @@ fn parse_proposal_block_nodes(
                 {
                     return Err(ProposalPreparationFailure::RawParseFallback);
                 }
-                let render_source = sanitize_render_source(&source)
-                    .ok_or(ProposalPreparationFailure::RawParseFallback)?;
+                let render_source =
+                    sanitize_render_source(&source, budget.remaining_source_bytes())?;
                 if !validate_prepared_table_source(
                     &render_source,
                     &fingerprint,
@@ -563,14 +593,14 @@ fn parse_proposal_block_nodes(
                     .map(str::to_owned)
                     .ok_or(ProposalPreparationFailure::RawParseFallback)?;
                 let referenced = referenced_definitions(&references, definitions);
-                let _ = prepared_markdown_source_len(source_slice.len(), &referenced)?;
+                budget.ensure_markdown_fits(source_slice.len(), &referenced)?;
                 let source_slice = if referenced.is_empty() {
                     source_slice
                 } else {
                     format!("{source_slice}\n\n{}", referenced.join("\n"))
                 };
-                let source_slice = sanitize_render_source(&source_slice)
-                    .ok_or(ProposalPreparationFailure::RawParseFallback)?;
+                let source_slice =
+                    sanitize_render_source(&source_slice, budget.remaining_source_bytes())?;
                 budget.account_markdown(source_slice.len())?;
                 index = next;
                 ProposalBlock::Markdown(source_slice)

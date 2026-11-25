@@ -1,9 +1,169 @@
 //! Rewrites Markdown so links, images and raw HTML become inert visible text.
-//! Returns `None` when the source cannot be rewritten or would still contain activatable nodes.
+//! Fails when the source cannot be rewritten, would still contain activatable nodes, or would
+//! exceed the caller's output limit.
 
 use std::collections::BTreeMap;
 
 use markdown::{ParseOptions, mdast::Node, to_mdast};
+
+pub(super) const MAX_MARKDOWN_DEPTH: usize = 128;
+/// markdown-rs parse time grows superlinearly with container nesting on one line; real
+/// proposals nest under 10.
+pub(super) const MAX_LINE_CONTAINER_PREFIX: usize = 128;
+
+/// Root children of parsed Markdown, dismantled iteratively on drop because the default
+/// recursive drop of a deep `mdast` tree overflows the stack.
+pub(super) struct ParsedMarkdown {
+    children: Vec<Node>,
+}
+
+impl ParsedMarkdown {
+    pub(super) fn children(&self) -> &[Node] {
+        &self.children
+    }
+}
+
+impl Drop for ParsedMarkdown {
+    fn drop(&mut self) {
+        let mut pending = std::mem::take(&mut self.children);
+        while let Some(mut node) = pending.pop() {
+            if let Some(children) = node.children_mut() {
+                pending.append(children);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum MarkdownParseError {
+    Invalid,
+    TooDeep,
+}
+
+/// Parses GFM Markdown and rejects trees deeper than `MAX_MARKDOWN_DEPTH`, which bounds the
+/// stack use of recursive visitors. It rejects long line container prefixes before parsing,
+/// which bounds parse time.
+pub(super) fn parse_markdown(source: &str) -> Result<ParsedMarkdown, MarkdownParseError> {
+    if source
+        .split(['\n', '\r'])
+        .any(|line| container_prefix_len(line.as_bytes()) > MAX_LINE_CONTAINER_PREFIX)
+    {
+        return Err(MarkdownParseError::TooDeep);
+    }
+    let root = match to_mdast(source, &ParseOptions::gfm()) {
+        Ok(Node::Root(root)) => root,
+        Ok(other) => {
+            // Dropped through the guard so a deep non-root tree is also dismantled iteratively.
+            drop(ParsedMarkdown {
+                children: vec![other],
+            });
+            return Err(MarkdownParseError::Invalid);
+        }
+        Err(_) => return Err(MarkdownParseError::Invalid),
+    };
+    let parsed = ParsedMarkdown {
+        children: root.children,
+    };
+    let mut pending = parsed
+        .children
+        .iter()
+        .map(|node| (node, 1usize))
+        .collect::<Vec<_>>();
+    while let Some((node, depth)) = pending.pop() {
+        if depth > MAX_MARKDOWN_DEPTH {
+            return Err(MarkdownParseError::TooDeep);
+        }
+        if let Some(children) = node.children() {
+            pending.extend(children.iter().map(|child| (child, depth + 1)));
+        }
+    }
+    Ok(parsed)
+}
+
+/// Length of the run at the start of `line` that can open block quotes, list items and GFM
+/// footnote definitions, the containers markdown-rs nests within one line. A BOM does not end
+/// the run, since markdown-rs strips one from the start of each input and preparation parses
+/// fragments that start mid-line.
+fn container_prefix_len(line: &[u8]) -> usize {
+    let mut len = 0;
+    loop {
+        let rest = &line[len..];
+        let marker = match rest {
+            [b'>' | b' ' | b'\t', ..] => 1,
+            [0xEF, 0xBB, 0xBF, ..] => 3,
+            [b'-' | b'+' | b'*', after @ ..] if list_marker_ends(after) => 1,
+            [b'0'..=b'9', ..] => ordered_list_marker_len(rest).unwrap_or(0),
+            _ => footnote_opener_len(rest).unwrap_or(0),
+        };
+        if marker == 0 {
+            return len;
+        }
+        len += marker;
+    }
+}
+
+/// A list item marker opens a container only before a space, a tab or the end of the line.
+const fn list_marker_ends(after: &[u8]) -> bool {
+    matches!(after.first(), None | Some(b' ' | b'\t'))
+}
+
+/// Length of an ordered list item marker at the start of `bytes`: up to 9 digits, then `.` or
+/// `)`, following the pinned markdown-rs value limit.
+fn ordered_list_marker_len(bytes: &[u8]) -> Option<usize> {
+    let digits = bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    (digits <= 9
+        && matches!(bytes.get(digits), Some(b'.' | b')'))
+        && list_marker_ends(&bytes[digits + 1..]))
+    .then_some(digits + 1)
+}
+
+/// Length of a `[^label]:` footnote definition opener at the start of `bytes`, following the
+/// pinned markdown-rs label rules.
+fn footnote_opener_len(bytes: &[u8]) -> Option<usize> {
+    let label = bytes.strip_prefix(b"[^")?;
+    let mut index = 0;
+    loop {
+        match label.get(index)? {
+            b'\\' if matches!(label.get(index + 1), Some(b'[' | b'\\' | b']')) => index += 2,
+            b']' if index > 0 => break,
+            b']' | b'[' | b' ' | b'\t' => return None,
+            _ => index += 1,
+        }
+    }
+    (label.get(index + 1) == Some(&b':')).then_some(index + 4)
+}
+
+/// Why `sanitize_render_source` could not produce inert Markdown.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum SanitizeFailure {
+    /// The projected output exceeded the caller's limit.
+    TooLarge,
+    /// The source cannot be rewritten or would still contain activatable nodes.
+    Unsupported,
+}
+
+/// Output bytes left in one sanitizer pass. The pass starts from its input length, which covers
+/// every span copied unchanged, and charges each generated piece once where it is created, so
+/// the projection only grows and bounds the output.
+struct OutputBudget {
+    remaining: usize,
+    exceeded: bool,
+}
+
+impl OutputBudget {
+    fn charge(&mut self, piece: String) -> Option<String> {
+        if let Some(remaining) = self.remaining.checked_sub(piece.len()) {
+            self.remaining = remaining;
+            Some(piece)
+        } else {
+            self.exceeded = true;
+            None
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceEdit {
@@ -82,14 +242,15 @@ fn inert_equivalent_label_source(
     source: &str,
     node: &Node,
     definitions: &BTreeMap<String, String>,
+    budget: &mut OutputBudget,
 ) -> Option<String> {
     match node {
-        Node::Text(text) => Some(inert_text_source(&text.value)),
+        Node::Text(text) => budget.charge(inert_text_source(&text.value)),
         Node::Link(_)
         | Node::LinkReference(_)
         | Node::Image(_)
         | Node::ImageReference(_)
-        | Node::Html(_) => sanitized_node_source(source, node, definitions),
+        | Node::Html(_) => sanitized_node_source(source, node, definitions, budget),
         _ => {
             let position = node.position()?;
             let original = source.get(position.start.offset..position.end.offset)?;
@@ -106,7 +267,12 @@ fn inert_equivalent_label_source(
                     return None;
                 }
                 rendered.push_str(source.get(cursor..child_position.start.offset)?);
-                rendered.push_str(&inert_equivalent_label_source(source, child, definitions)?);
+                rendered.push_str(&inert_equivalent_label_source(
+                    source,
+                    child,
+                    definitions,
+                    budget,
+                )?);
                 cursor = child_position.end.offset;
             }
             rendered.push_str(source.get(cursor..position.end.offset)?);
@@ -133,16 +299,21 @@ fn child_discloses_destination(
     }
 }
 
-fn sanitized_image_source(alt: &str, destination: &str) -> String {
-    if label_represents_destination(alt, destination) {
-        inert_text_source(alt)
-    } else {
-        format!(
-            "{} ({})",
-            inert_text_source(alt),
-            inert_text_source(destination)
-        )
+/// The ` (destination)` suffix that discloses a link or image destination.
+fn inert_destination_suffix(destination: &str, budget: &mut OutputBudget) -> Option<String> {
+    budget.charge(format!(" ({})", inert_text_source(destination)))
+}
+
+fn sanitized_image_source(
+    alt: &str,
+    destination: &str,
+    budget: &mut OutputBudget,
+) -> Option<String> {
+    let mut rendered = budget.charge(inert_text_source(alt))?;
+    if !label_represents_destination(alt, destination) {
+        rendered.push_str(&inert_destination_suffix(destination, budget)?);
     }
+    Some(rendered)
 }
 
 fn sanitized_link_source(
@@ -150,15 +321,16 @@ fn sanitized_link_source(
     children: &[Node],
     destination: &str,
     definitions: &BTreeMap<String, String>,
+    budget: &mut OutputBudget,
 ) -> Option<String> {
     let visible_label = children.iter().map(visible_node_text).collect::<String>();
     let represents_destination = label_represents_destination(&visible_label, destination);
     let mut rendered = String::new();
     for child in children {
         let child_source = if represents_destination {
-            inert_equivalent_label_source(source, child, definitions)?
+            inert_equivalent_label_source(source, child, definitions, budget)?
         } else {
-            sanitized_node_source(source, child, definitions)?
+            sanitized_node_source(source, child, definitions, budget)?
         };
         rendered.push_str(&child_source);
     }
@@ -167,9 +339,7 @@ fn sanitized_link_source(
             .iter()
             .any(|child| child_discloses_destination(child, destination, definitions))
     {
-        rendered.push_str(" (");
-        rendered.push_str(&inert_text_source(destination));
-        rendered.push(')');
+        rendered.push_str(&inert_destination_suffix(destination, budget)?);
     }
     Some(rendered)
 }
@@ -178,19 +348,28 @@ fn sanitized_node_source(
     source: &str,
     node: &Node,
     definitions: &BTreeMap<String, String>,
+    budget: &mut OutputBudget,
 ) -> Option<String> {
     match node {
-        Node::Link(link) => sanitized_link_source(source, &link.children, &link.url, definitions),
+        Node::Link(link) => {
+            sanitized_link_source(source, &link.children, &link.url, definitions, budget)
+        }
         Node::LinkReference(reference) => {
             let destination = definitions.get(&reference.identifier)?;
-            sanitized_link_source(source, &reference.children, destination, definitions)
+            sanitized_link_source(
+                source,
+                &reference.children,
+                destination,
+                definitions,
+                budget,
+            )
         }
-        Node::Image(image) => Some(sanitized_image_source(&image.alt, &image.url)),
+        Node::Image(image) => sanitized_image_source(&image.alt, &image.url, budget),
         Node::ImageReference(image) => {
             let destination = definitions.get(&image.identifier)?;
-            Some(sanitized_image_source(&image.alt, destination))
+            sanitized_image_source(&image.alt, destination, budget)
         }
-        Node::Html(html) => Some(inert_code_span(&html.value)),
+        Node::Html(html) => budget.charge(inert_code_span(&html.value)),
         _ => {
             let position = node.position()?;
             let original = source.get(position.start.offset..position.end.offset)?;
@@ -207,7 +386,7 @@ fn sanitized_node_source(
                     return None;
                 }
                 rendered.push_str(source.get(cursor..child_position.start.offset)?);
-                rendered.push_str(&sanitized_node_source(source, child, definitions)?);
+                rendered.push_str(&sanitized_node_source(source, child, definitions, budget)?);
                 cursor = child_position.end.offset;
             }
             rendered.push_str(source.get(cursor..position.end.offset)?);
@@ -220,6 +399,7 @@ fn collect_sanitizer_edits(
     source: &str,
     nodes: &[Node],
     definitions: &BTreeMap<String, String>,
+    budget: &mut OutputBudget,
     edits: &mut Vec<SourceEdit>,
 ) -> Option<()> {
     for node in nodes {
@@ -233,7 +413,7 @@ fn collect_sanitizer_edits(
         );
         if target {
             let position = node.position()?;
-            let replacement = sanitized_node_source(source, node, definitions)?;
+            let replacement = sanitized_node_source(source, node, definitions, budget)?;
             source.get(position.start.offset..position.end.offset)?;
             edits.push(SourceEdit {
                 start: position.start.offset,
@@ -241,7 +421,7 @@ fn collect_sanitizer_edits(
                 replacement,
             });
         } else if let Some(children) = node.children() {
-            collect_sanitizer_edits(source, children, definitions, edits)?;
+            collect_sanitizer_edits(source, children, definitions, budget, edits)?;
         }
     }
     Some(())
@@ -297,31 +477,43 @@ fn collect_effective_definition_urls(nodes: &[Node]) -> BTreeMap<String, String>
     definitions
 }
 
-pub(super) fn sanitize_render_source(source: &str) -> Option<String> {
-    let Node::Root(root) = to_mdast(source, &ParseOptions::gfm()).ok()? else {
-        return None;
+/// Rewrites one parse of `source`, stopping before the edits are applied once the projected
+/// output exceeds `max_len`.
+fn sanitize_pass(source: &str, nodes: &[Node], max_len: usize) -> Result<String, SanitizeFailure> {
+    let remaining = max_len
+        .checked_sub(source.len())
+        .ok_or(SanitizeFailure::TooLarge)?;
+    let mut budget = OutputBudget {
+        remaining,
+        exceeded: false,
     };
-    let definitions = collect_effective_definition_urls(&root.children);
+    let definitions = collect_effective_definition_urls(nodes);
     let mut edits = Vec::new();
-    collect_sanitizer_edits(source, &root.children, &definitions, &mut edits)?;
-    let mut rendered = apply_source_edits(source, edits)?;
-    let Node::Root(mut rendered_root) = to_mdast(&rendered, &ParseOptions::gfm()).ok()? else {
-        return None;
-    };
-    if contains_activatable_markdown(&rendered_root.children) {
-        let definitions = collect_effective_definition_urls(&rendered_root.children);
-        let mut edits = Vec::new();
-        collect_sanitizer_edits(&rendered, &rendered_root.children, &definitions, &mut edits)?;
-        rendered = apply_source_edits(&rendered, edits)?;
-        let Node::Root(reparsed_root) = to_mdast(&rendered, &ParseOptions::gfm()).ok()? else {
-            return None;
-        };
-        rendered_root = reparsed_root;
+    let rendered = collect_sanitizer_edits(source, nodes, &definitions, &mut budget, &mut edits)
+        .and_then(|()| apply_source_edits(source, edits));
+    match rendered {
+        Some(rendered) => Ok(rendered),
+        None if budget.exceeded => Err(SanitizeFailure::TooLarge),
+        None => Err(SanitizeFailure::Unsupported),
     }
-    if contains_activatable_markdown(&rendered_root.children) {
-        return None;
+}
+
+/// Sanitizes `source` into inert Markdown of at most `max_len` bytes.
+pub(super) fn sanitize_render_source(
+    source: &str,
+    max_len: usize,
+) -> Result<String, SanitizeFailure> {
+    let root = parse_markdown(source).map_err(|_| SanitizeFailure::Unsupported)?;
+    let mut rendered = sanitize_pass(source, root.children(), max_len)?;
+    let mut rendered_root = parse_markdown(&rendered).map_err(|_| SanitizeFailure::Unsupported)?;
+    if contains_activatable_markdown(rendered_root.children()) {
+        rendered = sanitize_pass(&rendered, rendered_root.children(), max_len)?;
+        rendered_root = parse_markdown(&rendered).map_err(|_| SanitizeFailure::Unsupported)?;
     }
-    Some(rendered)
+    if contains_activatable_markdown(rendered_root.children()) {
+        return Err(SanitizeFailure::Unsupported);
+    }
+    Ok(rendered)
 }
 
 #[cfg(test)]

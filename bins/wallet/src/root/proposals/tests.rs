@@ -11,24 +11,27 @@ use markdown::{ParseOptions, mdast::Node, to_mdast};
 
 use super::{
     CONTENT_WIDTH, DecodedProposalAction, DocumentCompletion, MAX_MDAST_NODES,
-    MAX_PREPARED_SOURCE_BYTES, MAX_TABLE_RENDER_WIDTH_PX, PreparationBudget,
-    ProposalActionIdentity, ProposalBlock, ProposalCapacityKind, ProposalCapacitySummaryState,
-    ProposalClosedHistoryKind, ProposalDecodedDetail, ProposalDelegator, ProposalDetailTab,
-    ProposalDocumentState, ProposalErc20, ProposalGovernanceToken, ProposalGovernorRewards,
-    ProposalOpStackSender, ProposalOwnable, ProposalPreparationFailure, ProposalPresentation,
-    ProposalProxyAdmin, ProposalRailgun, ProposalSelection, ProposalTreasury,
-    ProposalWrappedNative, ProposalsPage, ProposalsState, ResolvedProposal, TABLE_COLUMN_CHROME_PX,
-    TABLE_OUTER_BORDER_PX, TimelineDeadline, action_calldata_hex, compact_calldata_display,
-    decode_proposal_action, ensure_mdast_node_limit, format_compact_rail_amount,
-    format_compact_rail_amount_with_unit, inert_raw_fallback_source, list_voting_deadline,
-    next_proposal_page, parse_proposal_blocks, prepare_proposal_presentation,
-    prepared_markdown_source_len, proposal_action_id, proposal_action_target_label,
-    proposal_capacity_kind, proposal_capacity_summary_state, proposal_closed_history_kind,
-    proposal_decoded_preview, proposal_role_label, proposal_table_scroll_key,
-    send_document_completions, table_fingerprint, timeline_deadline_completed,
-    timeline_sponsorship_completed, vote_split,
+    MAX_PREPARED_SOURCE_BYTES, MAX_PROPOSAL_DESCRIPTION_BYTES, MAX_TABLE_RENDER_WIDTH_PX,
+    PreparationBudget, ProposalActionIdentity, ProposalBlock, ProposalCapacityKind,
+    ProposalCapacitySummaryState, ProposalClosedHistoryKind, ProposalDecodedDetail,
+    ProposalDelegator, ProposalDetailTab, ProposalDocumentState, ProposalErc20,
+    ProposalGovernanceToken, ProposalGovernorRewards, ProposalOpStackSender, ProposalOwnable,
+    ProposalPreparationFailure, ProposalPresentation, ProposalProxyAdmin, ProposalRailgun,
+    ProposalSelection, ProposalTreasury, ProposalWrappedNative, ProposalsPage, ProposalsState,
+    ResolvedProposal, TABLE_COLUMN_CHROME_PX, TABLE_OUTER_BORDER_PX, TimelineDeadline,
+    action_calldata_hex, compact_calldata_display, decode_proposal_action, ensure_mdast_node_limit,
+    format_compact_rail_amount, format_compact_rail_amount_with_unit, inert_raw_fallback_source,
+    list_voting_deadline, next_proposal_page, parse_proposal_block_nodes, parse_proposal_blocks,
+    prepare_proposal_presentation, prepared_markdown_source_len, proposal_action_id,
+    proposal_action_target_label, proposal_capacity_kind, proposal_capacity_summary_state,
+    proposal_closed_history_kind, proposal_decoded_preview, proposal_markdown_admitted,
+    proposal_role_label, proposal_table_scroll_key, send_document_completions, table_fingerprint,
+    timeline_deadline_completed, timeline_sponsorship_completed, vote_split,
 };
-use crate::root::markdown_sanitize::{contains_activatable_markdown, visible_node_text};
+use crate::root::markdown_sanitize::{
+    MAX_LINE_CONTAINER_PREFIX, MAX_MARKDOWN_DEPTH, MarkdownParseError,
+    contains_activatable_markdown, parse_markdown, visible_node_text,
+};
 use ui::theme::APP_TEXT_SIZE;
 use wallet_ops::{
     GovernanceContractRules, GovernanceContractSummary, GovernanceContractVersion,
