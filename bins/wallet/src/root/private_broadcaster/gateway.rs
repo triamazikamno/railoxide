@@ -165,7 +165,7 @@ impl WalletRoot {
             match &result.result {
                 PublicBroadcasterResultKind::Submitted { tx_hash } => {
                     projection.result = Some(GatewayPrivateDraftResult::Submitted);
-                    projection.transaction_hash = Some(tx_hash.clone());
+                    projection.transaction_hash = Some(tx_hash.to_string());
                     status = GatewayDraftStatus::Done;
                     label = "Submitted".into();
                     message =

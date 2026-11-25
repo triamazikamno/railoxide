@@ -88,7 +88,7 @@ pub async fn submit_desktop_unshield_public_broadcaster(
     if let Some((owner, identity)) = &executor
         && let PublicBroadcasterResultKind::Submitted { tx_hash } = &result.result
     {
-        owner.record_submission(*identity, tx_hash.parse()?)?;
+        owner.record_submission(*identity, *tx_hash)?;
     }
     if executor.is_none() {
         mark_submitted_inputs_pending_spent(&session, &pending_spent_inputs, &result).await;

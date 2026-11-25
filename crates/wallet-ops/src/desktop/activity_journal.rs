@@ -402,9 +402,7 @@ impl ActivitySubmission {
     pub(crate) fn finish_relay(&self, result: Option<&PublicBroadcasterResultKind>) {
         match result {
             Some(PublicBroadcasterResultKind::Submitted { tx_hash }) => {
-                if let Ok(hash) = tx_hash.parse() {
-                    self.add_attempt(hash);
-                }
+                self.add_attempt(*tx_hash);
             }
             Some(PublicBroadcasterResultKind::TimedOut) => {
                 self.save("timeout", |entry| {

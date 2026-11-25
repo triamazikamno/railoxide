@@ -434,7 +434,7 @@ mod tests {
             (refused(), None),
             (
                 PublicBroadcasterResultKind::Submitted {
-                    tx_hash: "0xabc".into(),
+                    tx_hash: alloy::primitives::B256::repeat_byte(0xab),
                 },
                 Some(vec![note(3)]),
             ),

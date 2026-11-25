@@ -679,12 +679,11 @@ impl ExecutorOwner {
             .instrument(span.clone())
             .await?;
             if let PublicBroadcasterResultKind::Submitted { tx_hash } = &result {
-                let transaction_hash: B256 = tx_hash.parse()?;
                 trace_step("paid_record_submission", async {
                     self.store.record_submission(
                         issued.operation(),
                         issued.payload_hash(),
-                        transaction_hash,
+                        *tx_hash,
                     )
                 })
                 .instrument(span)

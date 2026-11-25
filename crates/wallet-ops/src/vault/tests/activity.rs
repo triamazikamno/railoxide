@@ -504,7 +504,7 @@ fn relayed_private_entries_stay_unless_the_broadcaster_definitely_failed() {
     // A `Submitted` response adds the broadcaster's hash.
     let submitted = submission();
     submitted.finish_relay(Some(&PublicBroadcasterResultKind::Submitted {
-        tx_hash: alloy::hex::encode_prefixed(B256::repeat_byte(4)),
+        tx_hash: B256::repeat_byte(4),
     }));
     let relayed = journal
         .list(&wallet)

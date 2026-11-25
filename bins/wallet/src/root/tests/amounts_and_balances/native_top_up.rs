@@ -61,7 +61,7 @@ fn native_top_up_plan_display_and_request_use_fixed_native_amount() {
         relay_call_count: estimate.relay_call_count,
         uses_relay_adapt: estimate.uses_relay_adapt,
         result: PublicBroadcasterResultKind::Submitted {
-            tx_hash: "0xabc".to_string(),
+            tx_hash: alloy::primitives::B256::repeat_byte(0xab),
         },
         native_top_up: estimate.native_top_up.clone(),
         payload_inputs: None,

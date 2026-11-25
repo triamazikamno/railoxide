@@ -133,7 +133,7 @@ fn private_broadcaster_progress_submitted_marks_all_steps_done() {
     finish_private_broadcaster_progress_steps(
         &mut steps,
         &PublicBroadcasterResultKind::Submitted {
-            tx_hash: "0xabc".to_string(),
+            tx_hash: alloy::primitives::B256::repeat_byte(0xab),
         },
     );
 

@@ -50,7 +50,7 @@ impl WalletRoot {
             && let PublicBroadcasterResultKind::Submitted { tx_hash } = &result.result
         {
             content = content.child(render_public_broadcaster_tx_hash_row(
-                tx_hash.clone(),
+                tx_hash.to_string(),
                 delivery_element_id(progress.key, progress.kind, "progress-copy-public-tx"),
             ));
         }

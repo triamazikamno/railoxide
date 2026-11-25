@@ -426,7 +426,7 @@ fn swap_detail_shows_the_setup_until_its_account_is_ready(cx: &mut TestAppContex
                 operation,
                 SetupSide::Origin,
                 Some(Ok(&PublicBroadcasterResultKind::Submitted {
-                    tx_hash: "0x01".to_owned(),
+                    tx_hash: B256::repeat_byte(1),
                 })),
             ));
         });

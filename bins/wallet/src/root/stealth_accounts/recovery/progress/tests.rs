@@ -139,7 +139,7 @@ fn recovery_stepper_renders_all_stages_at_desktop_and_narrow_widths(cx: &mut gpu
     });
     let view = view.unwrap();
     for (width, rem, hash_byte) in [(560., 16., 0x31), (360., 20., 0x42)] {
-        let tx_hash = format!("{:#x}", alloy::primitives::B256::repeat_byte(hash_byte));
+        let tx_hash = alloy::primitives::B256::repeat_byte(hash_byte);
         cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(1200.)));
         for stage in [ProvingTransaction, WaitingForBroadcasterResponse] {
             sender.send(stage).unwrap();
@@ -181,9 +181,7 @@ fn recovery_stepper_renders_all_stages_at_desktop_and_narrow_widths(cx: &mut gpu
         cx.update(|window, cx| {
             view.update(cx, |view, cx| {
                 view.0
-                    .finish_broadcaster(PublicBroadcasterResultKind::Submitted {
-                        tx_hash: tx_hash.clone(),
-                    });
+                    .finish_broadcaster(PublicBroadcasterResultKind::Submitted { tx_hash });
                 cx.notify();
             });
             window.draw(cx).clear(cx);
@@ -199,7 +197,7 @@ fn recovery_stepper_renders_all_stages_at_desktop_and_narrow_widths(cx: &mut gpu
         );
         assert_eq!(
             cx.read_from_clipboard().unwrap().text(),
-            Some(tx_hash.clone())
+            Some(tx_hash.to_string())
         );
 
         cx.update(|window, cx| {

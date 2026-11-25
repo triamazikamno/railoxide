@@ -515,7 +515,7 @@ mod tests {
         let submitted = ended(
             TransactionGenerationStage::WaitingForBroadcasterResponse,
             Ok(&PublicBroadcasterResultKind::Submitted {
-                tx_hash: "0x01".to_owned(),
+                tx_hash: alloy::primitives::B256::repeat_byte(1),
             }),
         );
         assert_eq!(submitted.end, Some(SetupProgressEnd::Submitted));

@@ -377,10 +377,5 @@ fn public_broadcaster_response_decodes_tx_hash() {
         .expect("decode response")
         .expect("decryptable response");
 
-    assert_eq!(
-        decoded,
-        PublicBroadcasterResultKind::Submitted {
-            tx_hash: tx_hash.to_string()
-        }
-    );
+    assert_eq!(decoded, PublicBroadcasterResultKind::Submitted { tx_hash });
 }

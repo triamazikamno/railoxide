@@ -1,4 +1,5 @@
 use super::*;
+use alloy::primitives::TxHash;
 use alloy::uint;
 use eyre::eyre;
 use railgun_wallet::tx::{GasEstimateMode, RailgunGasModel, TransactGasShape};
@@ -378,7 +379,7 @@ impl PublicBroadcasterCostEstimate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicBroadcasterResultKind {
-    Submitted { tx_hash: String },
+    Submitted { tx_hash: TxHash },
     Failed { error: String },
     TimedOut,
 }

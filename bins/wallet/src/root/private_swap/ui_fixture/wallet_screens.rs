@@ -391,7 +391,7 @@ fn stand_in_submission(
         relay_call_count: estimate.relay_call_count,
         uses_relay_adapt: estimate.uses_relay_adapt,
         result: PublicBroadcasterResultKind::Submitted {
-            tx_hash: alloy::hex::encode_prefixed(B256::repeat_byte(0x5d)),
+            tx_hash: B256::repeat_byte(0x5d),
         },
         native_top_up: None,
         payload_inputs: None,

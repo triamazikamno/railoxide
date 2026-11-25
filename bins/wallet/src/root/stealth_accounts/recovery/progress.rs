@@ -138,7 +138,7 @@ impl RecoveryProgress {
     pub(super) fn finish_broadcaster(&mut self, result: PublicBroadcasterResultKind) {
         let (message, status) = match result {
             PublicBroadcasterResultKind::Submitted { tx_hash } => {
-                self.tx_hash = Some(tx_hash);
+                self.tx_hash = Some(tx_hash.to_string());
                 ("Broadcaster submitted the transaction. Waiting for the recovery to confirm and for its shield to reach your private balance.".to_owned(), PublicActionStepStatus::Done)
             }
             PublicBroadcasterResultKind::Failed { error } => {

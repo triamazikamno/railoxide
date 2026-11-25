@@ -260,7 +260,7 @@ pub(in crate::desktop) async fn mark_submitted_inputs_pending_spent(
         return;
     };
     session
-        .mark_pending_spent_utxos(inputs, parse_submitted_tx_hash(tx_hash))
+        .mark_pending_spent_utxos(inputs, Some(*tx_hash))
         .await;
 }
 

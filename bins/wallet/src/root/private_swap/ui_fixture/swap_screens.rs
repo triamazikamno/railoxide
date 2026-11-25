@@ -257,7 +257,7 @@ impl PrivateSwapsView {
             error: "fee too low".to_owned(),
         };
         let submitted = PublicBroadcasterResultKind::Submitted {
-            tx_hash: keccak256("setup").to_string(),
+            tx_hash: keccak256("setup"),
         };
         // What the setup job ended with. A failure its stages show isn't the swap's error too.
         let failed = "Fixture: the setup fee is above the limit approved with the swap.";

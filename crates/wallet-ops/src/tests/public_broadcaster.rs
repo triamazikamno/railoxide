@@ -523,7 +523,7 @@ mod submission_nodes {
                     .await
                     .unwrap();
                 PublicBroadcasterResultKind::Submitted {
-                    tx_hash: TxHash::repeat_byte(3).to_string(),
+                    tx_hash: TxHash::repeat_byte(3),
                 }
             } else {
                 PublicBroadcasterResultKind::TimedOut
@@ -723,7 +723,7 @@ mod submission_nodes {
         assert_eq!(
             submission.await.unwrap().unwrap(),
             PublicBroadcasterResultKind::Submitted {
-                tx_hash: TxHash::repeat_byte(3).to_string(),
+                tx_hash: TxHash::repeat_byte(3),
             }
         );
         // Closed with its counts kept.
@@ -780,7 +780,7 @@ mod submission_nodes {
         assert_eq!(
             submission.await.unwrap().unwrap(),
             PublicBroadcasterResultKind::Submitted {
-                tx_hash: TxHash::repeat_byte(3).to_string(),
+                tx_hash: TxHash::repeat_byte(3),
             }
         );
     }
@@ -860,7 +860,7 @@ mod submission_nodes {
                     .await
                     .unwrap();
                 PublicBroadcasterResultKind::Submitted {
-                    tx_hash: TxHash::repeat_byte(3).to_string(),
+                    tx_hash: TxHash::repeat_byte(3),
                 }
             } else {
                 PublicBroadcasterResultKind::TimedOut
