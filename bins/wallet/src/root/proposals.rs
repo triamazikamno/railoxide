@@ -88,9 +88,11 @@ use decoded_preview_render::render_proposal_decoded_preview;
 #[cfg(test)]
 use markdown_tables::{
     ensure_mdast_node_limit, parse_proposal_block_nodes, parse_proposal_blocks,
-    prepared_markdown_source_len, proposal_markdown_admitted, table_fingerprint,
+    prepared_markdown_source_len, table_fingerprint,
 };
-use markdown_tables::{inert_raw_fallback_source, prepare_proposal_presentation};
+use markdown_tables::{
+    inert_raw_fallback_source, prepare_proposal_presentation, proposal_markdown_admitted,
+};
 pub(super) use participation_card::*;
 use proposal_cards::{
     proposal_card, proposal_document_card, render_details_card, render_proposal_actions_card,
@@ -111,10 +113,22 @@ const LOG_TARGET: &str = module_path!();
 
 pub(super) const PROPOSALS_PAGE_SIZE: usize = 5;
 const DOCUMENT_RESOLUTION_CONCURRENCY: usize = 4;
+// Together these cap live preparation threads at four; prefetch has its own permit so cancelled
+// prefetch threads cannot hold the active page's permits.
+const ACTIVE_PAGE_PREPARATION_CONCURRENCY: usize = 3;
+const PREFETCH_PREPARATION_CONCURRENCY: usize = 1;
 const CONTENT_WIDTH: gpui::Pixels = px(1080.0);
 const MAX_MDAST_NODES: usize = 4_096;
-/// markdown-rs parse time grows superlinearly with input size; real proposals are under 6 KB.
-const MAX_PROPOSAL_DESCRIPTION_BYTES: usize = 32 * 1024;
+/// markdown-rs parse time grows superlinearly with input size, and its link and image label
+/// recursion grows with it; real proposals are under 6 KB, and the slowest crafted document found
+/// at this cap prepares in about 1.2 s.
+const MAX_PROPOSAL_DESCRIPTION_BYTES: usize = 16 * 1024;
+/// markdown-rs recurses through link and image labels before `parse_markdown` checks depth; about
+/// 0.9 MiB was measured at the description cap, so this leaves about 9x. Reparses during
+/// preparation fit the same budget: leaf and table reparses parse slices of the admitted original,
+/// and sanitizer output replaces every image with entity-encoded alt text and keeps only link
+/// labels that already passed the depth check.
+const PROPOSAL_PREPARATION_STACK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RENDER_COMPLEXITY: usize = 256;
 /// Bounds parser memory per preparation; real proposals prepare under 6 KB with no definitions.
 const MAX_PREPARED_SOURCE_BYTES: usize = 256 * 1024;

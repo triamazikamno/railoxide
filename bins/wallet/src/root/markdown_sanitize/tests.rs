@@ -44,17 +44,25 @@ fn markdown_parse_rejects_trees_deeper_than_limit() {
 fn markdown_parse_rejects_long_line_prefixes_before_parsing() {
     // Each tree is a quote holding indented code, so only the line-prefix check rejects these.
     // markdown-rs strips a BOM from the start of each input, and a fragment can start after `> `.
-    let spaces = " ".repeat(super::MAX_LINE_CONTAINER_PREFIX);
+    let spaces = " ".repeat(super::MAX_LINE_CONTAINER_PREFIX - 1);
     for prefix in ["", "\u{feff}", "> \u{feff}"] {
         assert_eq!(
-            super::parse_markdown(&format!("{prefix}>{spaces}x")).err(),
+            super::parse_markdown(&format!("{prefix}>{spaces}>x")).err(),
             Some(super::MarkdownParseError::TooDeep)
         );
     }
     // Sanitizing copies link labels verbatim, so its reparse must be bounded too.
     assert_eq!(
-        super::sanitize_render_source(&format!("[>{spaces}x](u)"), usize::MAX),
+        super::sanitize_render_source(&format!("[>{spaces}>x](u)"), usize::MAX),
         Err(super::SanitizeFailure::Unsupported)
+    );
+    let padded_code = format!(
+        "# Heading\n\n```\n{}x\n```\n",
+        " ".repeat(super::MAX_LINE_CONTAINER_PREFIX + 1)
+    );
+    assert_eq!(
+        super::sanitize_render_source(&padded_code, usize::MAX),
+        Ok(padded_code)
     );
 }
 

@@ -296,6 +296,41 @@ fn proposal_preparation_rejects_mdast_node_limit_before_building_leaves() {
 }
 
 #[test]
+fn proposal_preparation_fits_deepest_admitted_label_in_half_its_stack() {
+    let repeats = (MAX_PROPOSAL_DESCRIPTION_BYTES - "![x](u)".len()) / "*a *".len();
+    let description = format!("![{}x{}](u)", "*a ".repeat(repeats), "*".repeat(repeats));
+    assert!(proposal_markdown_admitted(&description));
+    assert!(MAX_PROPOSAL_DESCRIPTION_BYTES - description.len() <= 64);
+    // Guards the stack margin against cap increases and parser or toolchain frame growth; an
+    // overflow aborts the test binary.
+    let presentation = std::thread::Builder::new()
+        .stack_size(PROPOSAL_PREPARATION_STACK_BYTES / 2)
+        .spawn(move || prepare_proposal_presentation(&description))
+        .expect("preparation thread spawns")
+        .join()
+        .expect("preparation does not panic");
+    assert!(matches!(presentation, ProposalPresentation::Prepared(_)));
+}
+
+#[tokio::test]
+async fn prefetch_preparation_cannot_hold_active_page_permits() {
+    static ACTIVE_PAGE_PERMITS: Semaphore = Semaphore::const_new(1);
+    static PREFETCH_PERMITS: Semaphore = Semaphore::const_new(1);
+    let _held = PREFETCH_PERMITS
+        .try_acquire()
+        .expect("prefetch permit is free");
+    assert!(
+        prepare_admitted_presentation("Summary", &PREFETCH_PERMITS)
+            .now_or_never()
+            .is_none()
+    );
+    assert!(matches!(
+        prepare_admitted_presentation("Summary", &ACTIVE_PAGE_PERMITS).await,
+        ProposalPresentation::Prepared(_)
+    ));
+}
+
+#[test]
 fn proposal_admission_bounds_description_size_and_line_nesting() {
     let section = "## Rationale\n\nThis proposal funds an audit of the broadcaster code.[^1]\n\n- scope\n  - contracts\n    - fees\n      - limits\n\n| Item | Cost |\n| --- | --- |\n| audit | 10 |\n\n[^1]: Scope is in the forum post.\n\n";
     let mut description = section.repeat(MAX_PROPOSAL_DESCRIPTION_BYTES / section.len());

@@ -461,18 +461,7 @@ impl WalletRoot {
         } else {
             self.proposals.active_page_token
         };
-        let http = self.http.clone();
-        let vault_store = self.vault_store.clone();
-        let semaphore = Arc::clone(&self.proposals.document_semaphore);
-        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
-        let join = self.runtime.spawn(async move {
-            hydrate_page(rows, vault_store.as_ref(), &http, semaphore, completion_tx).await;
-        });
-        if prefetch {
-            self.proposals.prefetch_task_tracker.track(join);
-        } else {
-            self.proposals.active_page_task_tracker.track(join);
-        }
+        let mut completion_rx = self.spawn_proposals_hydration(rows, prefetch);
         cx.spawn(async move |this, cx| {
             while let Some(first) = completion_rx.recv().await {
                 let mut completions = vec![first];
@@ -516,6 +505,33 @@ impl WalletRoot {
             });
         })
         .detach();
+    }
+    fn spawn_proposals_hydration(
+        &mut self,
+        rows: Vec<ResolvedProposal>,
+        prefetch: bool,
+    ) -> mpsc::UnboundedReceiver<DocumentCompletion> {
+        let http = self.http.clone();
+        let vault_store = self.vault_store.clone();
+        let semaphore = Arc::clone(&self.proposals.document_semaphore);
+        let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+        let join = self.runtime.spawn(async move {
+            hydrate_page(
+                rows,
+                vault_store.as_ref(),
+                &http,
+                semaphore,
+                preparation_permits(prefetch),
+                completion_tx,
+            )
+            .await;
+        });
+        if prefetch {
+            self.proposals.prefetch_task_tracker.track(join);
+        } else {
+            self.proposals.active_page_task_tracker.track(join);
+        }
+        completion_rx
     }
 
     pub(super) fn ensure_proposal_list(

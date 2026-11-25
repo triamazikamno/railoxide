@@ -66,6 +66,7 @@ pub(super) async fn hydrate_page(
     store: Option<&Arc<DesktopVaultStore>>,
     http: &HttpContext,
     semaphore: Arc<Semaphore>,
+    preparation_semaphore: &'static Semaphore,
     completion_tx: mpsc::UnboundedSender<DocumentCompletion>,
 ) {
     let Some(db) = store.map(|store| store.db()) else {
@@ -102,17 +103,11 @@ pub(super) async fn hydrate_page(
                 Err(_) => unavailable_document(),
             };
             let presentation = if document.available {
-                let source = document.description.clone();
-                let fallback_source = source.clone();
-                match tokio::task::spawn_blocking(move || prepare_proposal_presentation(&source))
-                    .await
-                {
-                    Ok(presentation) => presentation,
-                    // A panic can only come from parsing, which follows admission, so this
-                    // source is within the description cap.
-                    Err(_) => ProposalPresentation::RawParseFallback(inert_raw_fallback_source(
-                        &fallback_source,
-                    )),
+                if proposal_markdown_admitted(&document.description) {
+                    prepare_admitted_presentation(&document.description, preparation_semaphore)
+                        .await
+                } else {
+                    ProposalPresentation::TooComplex
                 }
             } else {
                 ProposalPresentation::RawParseFallback(inert_raw_fallback_source(
@@ -127,6 +122,50 @@ pub(super) async fn hydrate_page(
         });
     }
     send_document_completions(futures, completion_tx).await;
+}
+
+// Bound live preparation threads process-wide, one pool per page kind; a cancelled hydration
+// leaves its thread running until preparation ends.
+static ACTIVE_PAGE_PREPARATION_PERMITS: Semaphore =
+    Semaphore::const_new(ACTIVE_PAGE_PREPARATION_CONCURRENCY);
+static PREFETCH_PREPARATION_PERMITS: Semaphore =
+    Semaphore::const_new(PREFETCH_PREPARATION_CONCURRENCY);
+
+pub(super) fn preparation_permits(prefetch: bool) -> &'static Semaphore {
+    if prefetch {
+        &PREFETCH_PREPARATION_PERMITS
+    } else {
+        &ACTIVE_PAGE_PREPARATION_PERMITS
+    }
+}
+
+/// Prepares on a dedicated thread because markdown-rs label recursion can outgrow the 2 MiB
+/// default stack of Tokio blocking threads.
+pub(super) async fn prepare_admitted_presentation(
+    source: &str,
+    permits: &'static Semaphore,
+) -> ProposalPresentation {
+    // A failed spawn or a panic in preparation shows the raw source, which admission already
+    // bounded to the description cap.
+    let fallback = || ProposalPresentation::RawParseFallback(inert_raw_fallback_source(source));
+    let Ok(permit) = permits.acquire().await else {
+        return fallback();
+    };
+    let (presentation_tx, presentation_rx) = oneshot::channel();
+    let thread_source = source.to_owned();
+    // The thread owns the permit, so it is released only when preparation ends, even if this
+    // future is dropped first.
+    let spawned = std::thread::Builder::new()
+        .name("proposal-preparation".to_owned())
+        .stack_size(PROPOSAL_PREPARATION_STACK_BYTES)
+        .spawn(move || {
+            let _ = presentation_tx.send(prepare_proposal_presentation(&thread_source));
+            drop(permit);
+        });
+    if spawned.is_err() {
+        return fallback();
+    }
+    presentation_rx.await.unwrap_or_else(|_| fallback())
 }
 
 pub(super) async fn send_document_completions<F>(

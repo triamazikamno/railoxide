@@ -83,7 +83,8 @@ pub(super) fn parse_markdown(source: &str) -> Result<ParsedMarkdown, MarkdownPar
 /// Length of the run at the start of `line` that can open block quotes, list items and GFM
 /// footnote definitions, the containers markdown-rs nests within one line. A BOM does not end
 /// the run, since markdown-rs strips one from the start of each input and preparation parses
-/// fragments that start mid-line.
+/// fragments that start mid-line. Trailing spaces and tabs are not counted because they cannot
+/// open a container, so padded code lines stay within the limit.
 fn container_prefix_len(line: &[u8]) -> usize {
     let mut len = 0;
     loop {
@@ -96,7 +97,7 @@ fn container_prefix_len(line: &[u8]) -> usize {
             _ => footnote_opener_len(rest).unwrap_or(0),
         };
         if marker == 0 {
-            return len;
+            return line[..len].trim_ascii_end().len();
         }
         len += marker;
     }
