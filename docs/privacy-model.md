@@ -84,7 +84,7 @@ Matching against your amount, notes and history happens on your device. The hint
 
 ## Browser Extension
 
-A paired browser extension is wallet UI. It can show the selected accounts and their balances and edit chain settings, including RPC endpoints that bypass Tor. If you turn on Allow unlocking for the pairing, which is off by default, it can also unlock the wallet with the vault password and any mnemonic passphrase typed into it. Its own confirmations, such as the one for bypassing Tor, run in the browser. Settings saved from the extension stay after you remove the pairing. Pair only browsers you control, and if you remove a pairing because you stopped trusting that browser, review Settings > Chains.
+A paired browser extension is wallet UI. It can show the selected accounts and their balances and edit chain settings, including RPC endpoints that bypass Tor. If you turn on Allow unlocking for the pairing, which is off by default, it can also unlock the wallet with the vault password and any mnemonic passphrase typed into it. Its own confirmations, such as the one for bypassing Tor, run in the browser. Settings saved from the extension stay after you remove the pairing. The pairing credential is stored unencrypted in the browser profile and in the desktop app's settings, so a program running under your OS account can copy it and act as the paired browser, including reading private balances while the wallet is unlocked. Pair only browsers you control, and if you remove a pairing because you stopped trusting that browser, review Settings > Chains.
 
 ## Wallet Storage
 
