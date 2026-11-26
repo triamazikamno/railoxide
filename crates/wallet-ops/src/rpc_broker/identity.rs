@@ -1,4 +1,5 @@
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::Provider;
+use broadcaster_core::provider::connect_reqwest_capped;
 use broadcaster_core::query_rpc_pool::{QueryRpcPool, RpcAdmission};
 use futures_util::future::{self, Join, Ready, join_all};
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
@@ -253,7 +254,7 @@ impl RpcChainRoute {
         let url = endpoint.expose_url();
         let client = clients.get(self.endpoint_transport(url)).clone();
         self.pace(url).await;
-        let provider = ProviderBuilder::new().connect_reqwest(client.clone(), url.clone());
+        let provider = connect_reqwest_capped(client.clone(), url.clone());
         let id = provider
             .get_chain_id()
             .await

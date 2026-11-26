@@ -4,9 +4,10 @@ use crate::settings::CustomTokenSettings;
 use crate::{DappRpcReadClient, RpcBrokerError, SensitiveUrl};
 use alloy::{
     primitives::{Address, Bytes, U256},
-    providers::{MULTICALL3_ADDRESS, Provider, ProviderBuilder},
+    providers::{MULTICALL3_ADDRESS, Provider},
     sol_types::SolCall,
 };
+use broadcaster_core::provider::connect_reqwest_capped;
 
 /// Alloy has no add-chain request type. Read only the required metadata here;
 /// the original request, including extension fields, remains on the approval.
@@ -146,8 +147,7 @@ async fn probe_common_multicall(
     let probe = async {
         for endpoint in endpoints {
             control.ensure_current()?;
-            let provider =
-                ProviderBuilder::new().connect_reqwest(rpc.clone(), endpoint.expose_url().clone());
+            let provider = connect_reqwest_capped(rpc.clone(), endpoint.expose_url().clone());
             let result = provider
                 .multicall()
                 .get_chain_id()

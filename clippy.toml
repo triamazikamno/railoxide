@@ -1,4 +1,13 @@
 disallowed-methods = [
     { path = "gpui_component::WindowExt::open_dialog", reason = "use ui::dialog::WalletDialogExt::open_wallet_dialog so dismissal unmounts synchronously" },
     { path = "gpui_component::WindowExt::open_alert_dialog", reason = "use ui::dialog::WalletDialogExt::open_wallet_alert_dialog so dismissal unmounts synchronously" },
+    # alloy's default CCIP Read client fetches contract-chosen gateway URLs outside Tor and HttpContext.
+    { path = "alloy_ens::ProviderEnsExt::resolve_name", reason = "bypasses Tor; use resolve_name_with_ccip_read with a client built on HttpContext" },
+    { path = "alloy_ens::ProviderEnsExt::resolve_name_for_coin_type", reason = "bypasses Tor; use resolve_name_for_coin_type_with_ccip_read with a client built on HttpContext" },
+    { path = "alloy_ens::ProviderEnsExt::lookup_address", reason = "bypasses Tor; use lookup_address_with_ccip_read with a client built on HttpContext" },
+    { path = "alloy_ens::ProviderEnsExt::lookup_txt", reason = "bypasses Tor; use lookup_txt_with_ccip_read with a client built on HttpContext" },
+    { path = "alloy_ens::NameOrAddress::resolve", reason = "bypasses Tor; use resolve_name_with_ccip_read with a client built on HttpContext" },
+    { path = "alloy_provider::ProviderCcipReadExt::call_with_ccip_read", reason = "bypasses Tor; use CcipReadClient::call with a client built on HttpContext" },
+    { path = "alloy_provider::ProviderCcipReadExt::call_with_ccip_read_at", reason = "bypasses Tor; use CcipReadClient::call_at with a client built on HttpContext" },
+    { path = "alloy_provider::shared_http_ccip_read_client", reason = "bypasses Tor; build a CcipReadClient on HttpContext's client" },
 ]
