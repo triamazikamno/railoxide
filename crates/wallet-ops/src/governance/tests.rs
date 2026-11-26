@@ -237,7 +237,10 @@ fn spawn_governance_rpc_fixture(
                                 sponsorInterval: U256::from(600_u64 + marker),
                                 votingInterval: U256::from(700_u64 + marker),
                             };
-                            GovernanceVotingV2::proposalsCall::abi_encode_returns(&proposal).into()
+                            proposal_return_data(
+                                GovernanceVotingV2::proposalsCall::abi_encode_returns(&proposal),
+                                marker == 0,
+                            )
                         } else {
                             assert_eq!(call.target, v1);
                             let (yay_votes, nay_votes) = if malformed_v1 && marker == 1 {
@@ -257,7 +260,10 @@ fn spawn_governance_rpc_fixture(
                                 sponsorInterval: U256::from(600_u64 + marker),
                                 votingInterval: U256::from(700_u64 + marker),
                             };
-                            GovernanceVoting::proposalsCall::abi_encode_returns(&proposal).into()
+                            proposal_return_data(
+                                GovernanceVoting::proposalsCall::abi_encode_returns(&proposal),
+                                marker == 1,
+                            )
                         }
                     };
                     IMulticall3::Result {
@@ -295,6 +301,18 @@ fn spawn_governance_rpc_fixture(
         calls: calls_rx,
         task,
     }
+}
+
+/// An invalid document gets 0xff, which is never valid UTF-8, over the `c` of its `cid-N`.
+fn proposal_return_data(mut encoded: Vec<u8>, invalid_document: bool) -> Bytes {
+    if invalid_document {
+        let start = encoded
+            .windows(4)
+            .position(|window| window == b"cid-")
+            .expect("encoded proposal document");
+        encoded[start] = 0xff;
+    }
+    encoded.into()
 }
 
 fn spawn_governance_participation_fixture() -> ParticipationFixture {
@@ -474,12 +492,12 @@ async fn overview_and_page_decode_across_v2_v1_seam() {
     assert_eq!(page[0].actions[1].value, U256::from(7));
     assert!(!page[0].executed);
     assert_eq!(page[1].proposer, Address::from([0; 20]));
-    assert_eq!(page[1].proposal_document, "cid-0");
+    assert_eq!(page[1].proposal_document, "\u{FFFD}id-0");
     assert_eq!(page[1].actions, [] as [GovernanceProposalAction; 0]);
     assert!(page[1].executed);
     assert_eq!(page[2].contract_version, GovernanceContractVersion::V1);
     assert_eq!(page[2].index, U256::from(1));
-    assert_eq!(page[2].proposal_document, "cid-1");
+    assert_eq!(page[2].proposal_document, "\u{FFFD}id-1");
     assert_eq!(page[2].actions.len(), 1);
     assert_eq!(page[2].actions[0].value, U256::from(11));
     assert_eq!(page[2].publish_time, U256::from(101));

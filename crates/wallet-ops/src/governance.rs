@@ -1204,9 +1204,11 @@ async fn fetch_proposal_calls(
                 "governance {version:?} proposal call failed at index {index}"
             ));
         };
+        // Anyone can store any bytes as a proposal document, so these decodes skip validation:
+        // alloy then replaces invalid UTF-8 instead of failing the whole page.
         let proposal = match version {
             GovernanceContractVersion::V2 => {
-                GovernanceVotingV2::proposalsCall::abi_decode_returns_validate(proposal_return_data)
+                GovernanceVotingV2::proposalsCall::abi_decode_returns(proposal_return_data)
                     .map(|proposal| GovernanceProposal {
                         contract_version: *version,
                         index: *index,
@@ -1226,7 +1228,7 @@ async fn fetch_proposal_calls(
                     .map_err(|_| eyre!("ABI decoding failed"))
             }
             GovernanceContractVersion::V1 => {
-                GovernanceVoting::proposalsCall::abi_decode_returns_validate(proposal_return_data)
+                GovernanceVoting::proposalsCall::abi_decode_returns(proposal_return_data)
                     .map(|proposal| GovernanceProposal {
                         contract_version: *version,
                         index: *index,
