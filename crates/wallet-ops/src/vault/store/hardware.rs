@@ -5,14 +5,14 @@ use super::{
     HardwareProfileBinding, HardwareProfileBindingKind, HardwareProfileMetadata,
     HardwareProfileSession, HardwareRailgunAccountIdentity, HardwareRailgunAccountMetadata,
     HardwareViewAccessKey, HardwareWalletAccountIndexReservation, HardwareWalletProfile,
-    MAX_HARDWARE_RECOVERY_RANGE_COUNT, SoftwareRailgunSpendSigner, StoredHardwareWalletRecord,
-    VaultError, VaultRecordEntries, ViewUnlock, WalletKeys, WalletMetadataBundle, WalletSource,
-    WalletViewBundle, generate_opaque_id, hardware_profile_record_entry,
-    hardware_wallet_account_index_record_entry, sort_hardware_profile_metadata, unlock_view,
-    wallet_chain_index_complete_record_entry, wallet_metadata_record_entry,
-    wallet_metadata_record_key, wallet_view_record_key,
+    LEGACY_HARDWARE_PROFILE_PREFIX, MAX_HARDWARE_RECOVERY_RANGE_COUNT, SoftwareRailgunSpendSigner,
+    StoredHardwareWalletRecord, VaultError, VaultRecordEntries, ViewUnlock, WalletKeys,
+    WalletMetadataBundle, WalletSource, WalletViewBundle, generate_opaque_id,
+    hardware_profile_record_entry, hardware_wallet_account_index_record_entry,
+    sort_hardware_profile_metadata, unlock_view, wallet_chain_index_complete_record_entry,
+    wallet_metadata_record_entry, wallet_metadata_record_key, wallet_view_record_key,
 };
-use crate::DesktopWalletVaultDbExt as _;
+use crate::{DESKTOP_WALLET_VAULT_TABLE, DesktopWalletVaultDbExt as _};
 
 fn hardware_wallet_receive_address(wallet: &WalletKeys) -> Result<String, VaultError> {
     wallet
@@ -464,20 +464,64 @@ impl DesktopVaultStore {
         Ok(profiles.into_iter().collect())
     }
 
+    /// Rekeys hardware profile rows still stored under their address-derived profile id, in one
+    /// transaction, and asks the next open to compact the old keys out of the database file.
+    pub(super) fn migrate_legacy_hardware_profiles(
+        &self,
+        view: &ViewUnlock,
+    ) -> Result<(), VaultError> {
+        if self
+            .db
+            .list_desktop_wallet_vault_records(LEGACY_HARDWARE_PROFILE_PREFIX)?
+            .is_empty()
+        {
+            return Ok(());
+        }
+        self.db.write_app_tables(|tables| {
+            let legacy_rows =
+                tables.list_prefix(DESKTOP_WALLET_VAULT_TABLE, LEGACY_HARDWARE_PROFILE_PREFIX)?;
+            if legacy_rows.is_empty() {
+                return Ok(());
+            }
+            for (legacy_key, payload) in legacy_rows {
+                let Some(legacy_id) = legacy_key.strip_prefix(LEGACY_HARDWARE_PROFILE_PREFIX)
+                else {
+                    continue;
+                };
+                let record: EncryptedRecord = rmp_serde::from_slice(&payload)?;
+                let profile = view.decrypt_hardware_profile_metadata(legacy_id, &record)?;
+                let (new_key, new_payload) = hardware_profile_record_entry(view, &profile)?;
+                match tables.get(DESKTOP_WALLET_VAULT_TABLE, &new_key)? {
+                    // Only current builds write these rows, so an existing one is newer.
+                    Some(existing) => {
+                        let record: EncryptedRecord = rmp_serde::from_slice(&existing)?;
+                        let row_id = &new_key[HARDWARE_PROFILE_PREFIX.len()..];
+                        view.decrypt_hardware_profile_metadata(row_id, &record)?;
+                    }
+                    None => tables.insert(DESKTOP_WALLET_VAULT_TABLE, &new_key, &new_payload)?,
+                }
+                tables.remove(DESKTOP_WALLET_VAULT_TABLE, &legacy_key)?;
+            }
+            tables.request_compaction()?;
+            Ok::<_, VaultError>(())
+        })
+    }
+
     fn list_hardware_profile_metadata_with_view(
         &self,
         view: &ViewUnlock,
     ) -> Result<Vec<HardwareProfileMetadata>, VaultError> {
+        self.migrate_legacy_hardware_profiles(view)?;
         let records = self
             .db
             .list_desktop_wallet_vault_records(HARDWARE_PROFILE_PREFIX)?;
         let mut profiles = Vec::with_capacity(records.len());
         for stored in records {
-            let Some(profile_id) = stored.key.strip_prefix(HARDWARE_PROFILE_PREFIX) else {
+            let Some(row_id) = stored.key.strip_prefix(HARDWARE_PROFILE_PREFIX) else {
                 continue;
             };
             let record: EncryptedRecord = rmp_serde::from_slice(&stored.payload)?;
-            profiles.push(view.decrypt_hardware_profile_metadata(profile_id, &record)?);
+            profiles.push(view.decrypt_hardware_profile_metadata(row_id, &record)?);
         }
 
         let mut known_ids = profiles

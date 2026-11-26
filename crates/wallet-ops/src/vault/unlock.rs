@@ -195,28 +195,44 @@ impl ViewUnlock {
         )
     }
 
+    /// Vault row id for a hardware profile, so the stored key does not reveal the
+    /// address-derived profile id.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if HMAC rejects a fixed-size SHA-256 key, which should be
+    /// unreachable for the selected MAC implementation.
+    pub(super) fn hardware_profile_row_id(&self, profile_id: &str) -> Result<String, VaultError> {
+        let key = derive_domain_key(&self.view_dek, b"hardware-profile-row")?;
+        let mut mac =
+            HmacSha256::new_from_slice(key.expose_secret()).expect("HMAC accepts any key length");
+        mac.update(b"hardware-profile-row:v1");
+        mac.update(profile_id.as_bytes());
+        Ok(alloy::hex::encode(mac.finalize().into_bytes()))
+    }
+
     pub(super) fn encrypt_hardware_profile_metadata(
         &self,
-        profile_id: &str,
+        record_id: &str,
         profile: &HardwareProfileMetadata,
     ) -> Result<EncryptedRecord, VaultError> {
         encrypt_serialized(
             &self.view_dek,
             RecordKind::HardwareProfileMetadata,
-            profile_id,
+            record_id,
             profile,
         )
     }
 
     pub(super) fn decrypt_hardware_profile_metadata(
         &self,
-        profile_id: &str,
+        record_id: &str,
         record: &EncryptedRecord,
     ) -> Result<HardwareProfileMetadata, VaultError> {
         decrypt_serialized(
             &self.view_dek,
             RecordKind::HardwareProfileMetadata,
-            profile_id,
+            record_id,
             record,
         )
     }

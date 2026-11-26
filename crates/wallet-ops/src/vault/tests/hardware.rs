@@ -1566,3 +1566,168 @@ fn permanent_wallet_delete_refuses_password_or_wrong_wallet_session() {
     drop(db);
     fs::remove_dir_all(root_dir).expect("remove temp db dir");
 }
+
+// Released builds stored profile rows under this key.
+const LEGACY_PROFILE_PREFIX: &str = "hardware-profile|";
+
+fn seed_legacy_hardware_profile(
+    db: &DbStore,
+    view: &ViewUnlock,
+    profile: &HardwareProfileMetadata,
+) {
+    let record = view
+        .encrypt_hardware_profile_metadata(&profile.profile_id, profile)
+        .expect("encrypt legacy hardware profile")
+        .to_record_entry(format!("{LEGACY_PROFILE_PREFIX}{}", profile.profile_id))
+        .expect("encode legacy hardware profile");
+    db.put_desktop_wallet_vault_records(&[record])
+        .expect("seed legacy hardware profile");
+}
+
+fn labeled_profile(
+    descriptor: &HardwareDerivationDescriptor,
+    label: &str,
+) -> HardwareProfileMetadata {
+    HardwareProfileMetadata {
+        label: label.to_owned(),
+        ..HardwareProfileMetadata::from_descriptor(descriptor)
+    }
+}
+
+fn hardware_profile_row_key_in_new_vault(profile: &HardwareProfileMetadata) -> String {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let view = store.unlock_view(TEST_PASSWORD).expect("unlock view");
+    store
+        .store_hardware_profile_metadata_with_view_unlock(&view, profile)
+        .expect("store hardware profile");
+    let mut rows = db
+        .list_desktop_wallet_vault_records(HARDWARE_PROFILE_PREFIX)
+        .expect("list profile rows");
+    assert_eq!(rows.len(), 1);
+    let key = rows.remove(0).key;
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+    key
+}
+
+fn sorted_profiles(mut profiles: Vec<HardwareProfileMetadata>) -> Vec<HardwareProfileMetadata> {
+    sort_hardware_profile_metadata(&mut profiles);
+    profiles
+}
+
+#[test]
+fn unlock_rekeys_legacy_hardware_profile_rows() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let view = store.unlock_view(TEST_PASSWORD).expect("unlock view");
+    let ledger = labeled_profile(&test_hardware_descriptor(0), "Legacy Ledger");
+    let trezor = labeled_profile(&test_trezor_hardware_descriptor(0), "Legacy Trezor");
+    let newer_trezor = HardwareProfileMetadata {
+        label: "Newer Trezor".to_owned(),
+        ..trezor.clone()
+    };
+    seed_legacy_hardware_profile(&db, &view, &ledger);
+    seed_legacy_hardware_profile(&db, &view, &trezor);
+    store
+        .store_hardware_profile_metadata_with_view_unlock(&view, &newer_trezor)
+        .expect("store newer hardware profile");
+
+    store.unlock_view(TEST_PASSWORD).expect("unlock migrates");
+
+    assert_eq!(
+        db.list_desktop_wallet_vault_records(LEGACY_PROFILE_PREFIX)
+            .expect("list legacy rows"),
+        [] as [crate::DesktopWalletVaultRecord; 0]
+    );
+    let rows = db
+        .list_desktop_wallet_vault_records(HARDWARE_PROFILE_PREFIX)
+        .expect("list profile rows");
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| {
+        !row.key.contains(&ledger.profile_id) && !row.key.contains(&trezor.profile_id)
+    }));
+    // The key must depend on the vault's view DEK, not on the profile alone.
+    let other_vault_key = hardware_profile_row_key_in_new_vault(&ledger);
+    assert!(rows.iter().all(|row| row.key != other_vault_key));
+    assert_eq!(
+        store
+            .list_hardware_profile_metadata(TEST_PASSWORD)
+            .expect("list migrated profiles"),
+        sorted_profiles(vec![ledger.clone(), newer_trezor.clone()])
+    );
+
+    let renamed_ledger = HardwareProfileMetadata {
+        label: "Renamed Ledger".to_owned(),
+        ..ledger
+    };
+    store
+        .store_hardware_profile_metadata(TEST_PASSWORD, &renamed_ledger)
+        .expect("store renamed hardware profile");
+    assert_eq!(
+        db.list_desktop_wallet_vault_records(HARDWARE_PROFILE_PREFIX)
+            .expect("list profile rows after update")
+            .len(),
+        2
+    );
+    assert_eq!(
+        store
+            .list_hardware_profile_metadata(TEST_PASSWORD)
+            .expect("list updated profiles"),
+        sorted_profiles(vec![renamed_ledger, newer_trezor])
+    );
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn listing_with_supplied_view_rekeys_legacy_hardware_profile_rows() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    let view = unlock_view(&store.metadata().expect("vault metadata"), TEST_PASSWORD)
+        .expect("unlock view");
+    let ledger = labeled_profile(&test_hardware_descriptor(0), "Legacy Ledger");
+    seed_legacy_hardware_profile(&db, &view, &ledger);
+
+    assert_eq!(
+        store
+            .list_hardware_profile_metadata_with_view_unlock(&view)
+            .expect("list profiles"),
+        vec![ledger]
+    );
+    assert_eq!(
+        db.list_desktop_wallet_vault_records(LEGACY_PROFILE_PREFIX)
+            .expect("list legacy rows"),
+        [] as [crate::DesktopWalletVaultRecord; 0]
+    );
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}
+
+#[test]
+fn corrupt_legacy_hardware_profile_row_does_not_block_unlock() {
+    let (root_dir, db, store) = desktop_store_with_vault();
+    import_wallet_with_metadata(&store, TEST_WALLET_ID, "Software");
+    let legacy_key = format!("{LEGACY_PROFILE_PREFIX}corrupt");
+    db.put_desktop_wallet_vault_record(&legacy_key, b"not an encrypted record")
+        .expect("seed corrupt legacy row");
+
+    store
+        .unlock_view(TEST_PASSWORD)
+        .expect("unlock with corrupt legacy row");
+    store
+        .export_wallet_mnemonic(TEST_PASSWORD, TEST_WALLET_ID)
+        .expect("export mnemonic with corrupt legacy row");
+    assert!(store.list_hardware_profile_metadata(TEST_PASSWORD).is_err());
+    assert!(
+        db.get_desktop_wallet_vault_record(&legacy_key)
+            .expect("load corrupt legacy row")
+            .is_some()
+    );
+
+    drop(store);
+    drop(db);
+    fs::remove_dir_all(root_dir).expect("remove temp db dir");
+}

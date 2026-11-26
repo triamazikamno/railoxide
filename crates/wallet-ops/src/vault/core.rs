@@ -21,7 +21,9 @@ pub(super) const WALLET_CHAIN_METADATA_PREFIX: &str = "wallet-chain-meta|";
 pub(super) const WALLET_CHAIN_INDEX_PREFIX: &str = "wallet-chain-index|";
 pub(super) const WALLET_CHAIN_INDEX_COMPLETE_PREFIX: &str = "wallet-chain-index-complete|";
 pub(super) const WALLET_CHAIN_INDEX_COMPLETE_VERSION: u8 = 1;
-pub(super) const HARDWARE_PROFILE_PREFIX: &str = "hardware-profile|";
+pub(super) const HARDWARE_PROFILE_PREFIX: &str = "hardware-profile-v2|";
+// Released builds keyed these rows by the address-derived profile id.
+pub(super) const LEGACY_HARDWARE_PROFILE_PREFIX: &str = "hardware-profile|";
 pub(super) const HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX: &str = "hardware-wallet-account-index|";
 pub const MAX_HARDWARE_RECOVERY_RANGE_COUNT: u32 = 255;
 pub(super) const PUBLIC_ACCOUNT_METADATA_PREFIX: &str = "public-account-meta|";

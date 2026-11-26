@@ -109,8 +109,8 @@ pub(super) fn hardware_wallet_account_index_record_key(reservation_uuid: &str) -
     format!("{HARDWARE_WALLET_ACCOUNT_INDEX_PREFIX}{reservation_uuid}")
 }
 
-pub(super) fn hardware_profile_record_key(profile_id: &str) -> String {
-    format!("{HARDWARE_PROFILE_PREFIX}{profile_id}")
+pub(super) fn hardware_profile_record_key(row_id: &str) -> String {
+    format!("{HARDWARE_PROFILE_PREFIX}{row_id}")
 }
 
 pub(super) fn public_account_metadata_record_key(public_account_uuid: &str) -> String {
@@ -203,8 +203,9 @@ pub(super) fn hardware_profile_record_entry(
     view: &ViewUnlock,
     profile: &HardwareProfileMetadata,
 ) -> Result<(String, Vec<u8>), VaultError> {
-    let key = hardware_profile_record_key(&profile.profile_id);
-    let record = view.encrypt_hardware_profile_metadata(&profile.profile_id, profile)?;
+    let row_id = view.hardware_profile_row_id(&profile.profile_id)?;
+    let key = hardware_profile_record_key(&row_id);
+    let record = view.encrypt_hardware_profile_metadata(&row_id, profile)?;
     record.to_record_entry(key)
 }
 

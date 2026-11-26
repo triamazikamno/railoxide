@@ -82,6 +82,10 @@ impl DesktopVaultStore {
         let mut metadata = self.metadata()?;
         let view = unlock_view(&metadata, password)?;
         self.upgrade_vault_metadata_version_if_legacy(&mut metadata)?;
+        // A bad profile row must not block unlock; listing hardware profiles reports it.
+        if let Err(error) = self.migrate_legacy_hardware_profiles(&view) {
+            tracing::warn!(%error, "failed to migrate hardware profile records");
+        }
         Ok(view)
     }
 
