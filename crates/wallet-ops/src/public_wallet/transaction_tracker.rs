@@ -174,11 +174,42 @@ impl PublicTransactionTracker {
 
     /// # Panics
     /// Panics if the registry mutex is poisoned.
+    #[cfg(test)]
     #[must_use]
-    pub fn lookup(&self, chain_id: u64, hash: B256) -> PublicTransactionLookup {
+    pub(crate) fn lookup(&self, chain_id: u64, hash: B256) -> PublicTransactionLookup {
         self.registry
             .lock()
             .expect("public transaction registry poisoned")
+            .hashes
+            .get(&(chain_id, hash))
+            .copied()
+            .unwrap_or(PublicTransactionLookup::Untracked)
+    }
+
+    /// Another account's hashes must look untracked to a site granted only this account.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
+    #[must_use]
+    pub fn lookup_for_account(
+        &self,
+        chain_id: u64,
+        public_account_uuid: &str,
+        hash: B256,
+    ) -> PublicTransactionLookup {
+        let registry = self
+            .registry
+            .lock()
+            .expect("public transaction registry poisoned");
+        let owned = registry.families.iter().any(|family| {
+            family.scope.chain_id() == chain_id
+                && family.account.public_account_uuid == public_account_uuid
+                && family.hashes.contains(&hash)
+        });
+        if !owned {
+            return PublicTransactionLookup::Untracked;
+        }
+        registry
             .hashes
             .get(&(chain_id, hash))
             .copied()
@@ -554,10 +585,19 @@ impl Drop for PublicTransactionFamily {
 #[cfg(test)]
 pub(crate) fn test_tracking_context() -> (PublicTransactionTracker, PublicTransactionTrackingContext)
 {
+    let tracker = PublicTransactionTracker::default();
+    let context = test_tracking_context_for(&tracker, "account");
+    (tracker, context)
+}
+
+#[cfg(test)]
+pub(crate) fn test_tracking_context_for(
+    tracker: &PublicTransactionTracker,
+    public_account_uuid: &str,
+) -> PublicTransactionTrackingContext {
     use crate::vault::{PublicAccountScope, PublicAccountSource, PublicAccountStatus};
     use alloy::primitives::Address;
 
-    let tracker = PublicTransactionTracker::default();
     let http = crate::HttpContext::direct_for_tests();
     let scope = PublicBalanceScope::new(
         "wallet".into(),
@@ -566,7 +606,7 @@ pub(crate) fn test_tracking_context() -> (PublicTransactionTracker, PublicTransa
         crate::RpcChainRoute::new(1, Vec::<url::Url>::new()),
     );
     let account = PublicAccountMetadata {
-        public_account_uuid: "account".into(),
+        public_account_uuid: public_account_uuid.into(),
         address: Address::ZERO,
         label: None,
         source: PublicAccountSource::Derived,
@@ -580,8 +620,7 @@ pub(crate) fn test_tracking_context() -> (PublicTransactionTracker, PublicTransa
     };
     let cache = PublicBalanceCache::default();
     cache.set_scope(scope.clone());
-    let context = tracker.context(scope, account, cache);
-    (tracker, context)
+    tracker.context(scope, account, cache)
 }
 
 #[cfg(test)]

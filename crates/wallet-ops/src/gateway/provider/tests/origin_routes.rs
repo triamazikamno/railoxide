@@ -151,7 +151,9 @@ async fn each_origin_reads_over_its_own_client_while_it_keeps_a_document_and_its
     assert_eq!(sent(), std::slice::from_ref(&own));
 
     // A tracked transaction's included answer reads its block over the origin's client.
-    let (tracker, context) = crate::public_wallet::test_tracking_context();
+    let tracker = crate::PublicTransactionTracker::default();
+    let context =
+        crate::public_wallet::test_tracking_context_for(&tracker, &permission.public_account_uuid);
     provider.wallet.public_transaction_tracker = tracker;
     let family = context.start_family();
     family.register(hash);

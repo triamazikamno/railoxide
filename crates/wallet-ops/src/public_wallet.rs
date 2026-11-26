@@ -78,12 +78,12 @@ pub use submission::{
     sanitize_walletconnect_transaction_request, validate_walletconnect_reviewed_transaction,
     walletconnect_transaction_payload_fingerprint,
 };
-#[cfg(test)]
-pub(crate) use transaction_tracker::test_tracking_context;
 pub(crate) use transaction_tracker::{PublicTransactionFamily, PublicTransactionObservationGuard};
 pub use transaction_tracker::{
     PublicTransactionLookup, PublicTransactionTracker, PublicTransactionTrackingContext,
 };
+#[cfg(test)]
+pub(crate) use transaction_tracker::{test_tracking_context, test_tracking_context_for};
 pub use types::{
     EvmFeeModel, HardwareTrezorPinMatrixProvider, PublicAccountBalance, PublicActionAttemptInfo,
     PublicActionCommand, PublicActionCommandKind, PublicActionCommandReceiver,

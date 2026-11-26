@@ -97,7 +97,11 @@ impl DappProvider {
                             read.owner
                                 .wallet
                                 .public_transaction_tracker
-                                .lookup(permission.chain_id, hash),
+                                .lookup_for_account(
+                                    permission.chain_id,
+                                    &permission.public_account_uuid,
+                                    hash,
+                                ),
                         )
                     });
                 read.phase = ReadPhase::Running;

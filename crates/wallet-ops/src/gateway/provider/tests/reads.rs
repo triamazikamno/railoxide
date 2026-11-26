@@ -333,12 +333,15 @@ async fn terminal_delivery_retains_document_ownership_when_broker_finishes_first
 async fn tracked_hashes_stay_local_and_external_hashes_forward_without_waiting() {
     use alloy::primitives::B256;
     use std::sync::Mutex;
-    let methods = Arc::new(Mutex::new(Vec::new()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
     let (endpoint, server) = crate::rpc_broker::tests::spawn_rpc_mock(
         {
-            let methods = methods.clone();
+            let requests = requests.clone();
             Arc::new(move |request| {
-                methods.lock().unwrap().push(request["method"].clone());
+                requests
+                    .lock()
+                    .unwrap()
+                    .push((request["method"].clone(), request["params"][0].clone()));
                 json!({"jsonrpc":"2.0", "id":request["id"], "result":null})
             })
         },
@@ -347,12 +350,19 @@ async fn tracked_hashes_stay_local_and_external_hashes_forward_without_waiting()
     )
     .await;
     let (path, mut provider, view) = fixture();
-    authorize(&mut provider, &view, endpoint);
-    let (tracker, context) = crate::public_wallet::test_tracking_context();
+    let (_, permission) = authorize(&mut provider, &view, endpoint);
+    let tracker = crate::PublicTransactionTracker::default();
+    let context =
+        crate::public_wallet::test_tracking_context_for(&tracker, &permission.public_account_uuid);
+    // Another account's pending transaction on the same tracker must not be revealed.
+    let other_context = crate::public_wallet::test_tracking_context_for(&tracker, "other-account");
     provider.wallet.public_transaction_tracker = tracker;
     let family = context.start_family();
     let hash = B256::repeat_byte(7);
     family.register(hash);
+    let other_family = other_context.start_family();
+    let other_hash = B256::repeat_byte(9);
+    other_family.register(other_hash);
     for method in ["eth_getTransactionByHash", "eth_getTransactionReceipt"] {
         let malformed = lookup_response(&mut provider, method, json!([hash, "extra"])).await;
         assert_eq!(malformed["error"]["code"], -32602);
@@ -364,18 +374,25 @@ async fn tracked_hashes_stay_local_and_external_hashes_forward_without_waiting()
         let unavailable = lookup_response(&mut provider, method, json!([hash])).await;
         assert_eq!(unavailable["error"]["code"], -32002);
     }
-    assert!(methods.lock().unwrap().is_empty());
-    for method in ["eth_getTransactionByHash", "eth_getTransactionReceipt"] {
-        let external = lookup_response(&mut provider, method, json!([B256::repeat_byte(8)])).await;
-        assert!(external.get("result").is_some_and(Value::is_null));
+    assert!(requests.lock().unwrap().is_empty());
+    let external_hash = B256::repeat_byte(8);
+    for forwarded in [external_hash, other_hash] {
+        for method in ["eth_getTransactionByHash", "eth_getTransactionReceipt"] {
+            let response = lookup_response(&mut provider, method, json!([forwarded])).await;
+            assert!(response.get("result").is_some_and(Value::is_null));
+        }
     }
+    // Local and forwarded pending answers are both null; only the recorded request differs.
     assert_eq!(
-        *methods.lock().unwrap(),
+        *requests.lock().unwrap(),
         vec![
-            json!("eth_getTransactionByHash"),
-            json!("eth_getTransactionReceipt")
+            (json!("eth_getTransactionByHash"), json!(external_hash)),
+            (json!("eth_getTransactionReceipt"), json!(external_hash)),
+            (json!("eth_getTransactionByHash"), json!(other_hash)),
+            (json!("eth_getTransactionReceipt"), json!(other_hash)),
         ]
     );
+    drop(other_family);
     server.abort();
     drop(provider);
     drop(view);
@@ -434,7 +451,7 @@ async fn exhausted_block_discovery_unlocks_authorized_hash_lookups() {
     )
     .await;
     let (path, mut provider, view) = fixture();
-    authorize(&mut provider, &view, endpoint.clone());
+    let (_, permission) = authorize(&mut provider, &view, endpoint.clone());
     let http = provider.wallet.http.as_ref().unwrap();
     let route =
         crate::rpc_broker::tests::general(&crate::RpcChainRoute::new(1, vec![endpoint.clone()]));
@@ -447,7 +464,9 @@ async fn exhausted_block_discovery_unlocks_authorized_hash_lookups() {
         crate::block_observer::BlockObserver::establish(pool, 2, http.rpc_broker(), &route)
             .await
             .unwrap();
-    let (tracker, context) = crate::public_wallet::test_tracking_context();
+    let tracker = crate::PublicTransactionTracker::default();
+    let context =
+        crate::public_wallet::test_tracking_context_for(&tracker, &permission.public_account_uuid);
     provider.wallet.public_transaction_tracker = tracker.clone();
     let mut guard = context.admit_observer(observer).unwrap();
     guard.register(hash, 0);
@@ -555,8 +574,10 @@ async fn included_lookups_preserve_raw_json_and_never_fallback_when_block_data_d
     )
     .await;
     let (path, mut provider, view) = fixture();
-    authorize(&mut provider, &view, endpoint);
-    let (tracker, context) = crate::public_wallet::test_tracking_context();
+    let (_, permission) = authorize(&mut provider, &view, endpoint);
+    let tracker = crate::PublicTransactionTracker::default();
+    let context =
+        crate::public_wallet::test_tracking_context_for(&tracker, &permission.public_account_uuid);
     provider.wallet.public_transaction_tracker = tracker;
     let family = context.start_family();
     family.register(hash);
@@ -619,8 +640,10 @@ async fn included_lookup_drains_after_owner_invalidation_without_delivering_old_
     )
     .await;
     let (path, mut provider, view) = fixture();
-    authorize(&mut provider, &view, endpoint);
-    let (tracker, context) = crate::public_wallet::test_tracking_context();
+    let (_, permission) = authorize(&mut provider, &view, endpoint);
+    let tracker = crate::PublicTransactionTracker::default();
+    let context =
+        crate::public_wallet::test_tracking_context_for(&tracker, &permission.public_account_uuid);
     provider.wallet.public_transaction_tracker = tracker;
     let family = context.start_family();
     family.register(hash);
