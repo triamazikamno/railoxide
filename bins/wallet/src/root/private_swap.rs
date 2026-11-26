@@ -432,6 +432,9 @@ struct SwapTracking {
     cursor: Option<u64>,
     /// The last observation or submission problem, shown in the swap's progress.
     error: Option<String>,
+    /// A failed Check status's problem. It stays until the swap's next job, shown in place of
+    /// `error` while the detail offers Check status. Background reads never touch it.
+    check_error: Option<String>,
     /// The latest successful explicit status check, scoped to the order the swap followed
     /// then and its completion time.
     status_checked: Option<(OrderUid, u64)>,
@@ -512,6 +515,14 @@ impl SwapTracking {
     fn clear_setup_progress(&mut self) {
         self.setup_progress = None;
         self.destination_setup_progress = None;
+    }
+
+    /// The swap's error in a detail that `offered` Check status: a failed check's while it's
+    /// offered, otherwise the last observation or submission problem.
+    fn shown_error(&self, offered: Option<progress::StatusCheck>) -> Option<String> {
+        offered
+            .and_then(|_| self.check_error.clone())
+            .or_else(|| self.error.clone())
     }
 
     /// Replaces the swap's route, or drops it with `None`. A read still opening a route through

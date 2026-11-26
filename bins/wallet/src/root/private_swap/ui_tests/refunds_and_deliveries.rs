@@ -343,7 +343,7 @@ fn checking_an_across_refund_asks_across_before_the_balance(cx: &mut TestAppCont
                 );
                 // The stub's deposit record is invalid, and the unreachable RPC then fails the
                 // balance check, whose error is the one shown.
-                let error = swaps.tracking[&operation].error.clone().unwrap();
+                let error = swaps.tracking[&operation].check_error.clone().unwrap();
                 assert!(!error.contains("Across"), "{error}");
             });
         });

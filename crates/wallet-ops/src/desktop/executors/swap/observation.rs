@@ -54,6 +54,13 @@ use facts::read_swap_facts;
 /// The most blocks one observation page, and so one of its log queries, spans.
 pub(super) const MAX_OBSERVATION_BLOCKS: u64 = 64;
 
+/// The endpoint read the account at a confirmed block before the page's last block, as when it
+/// lags the wallet's sync. Background observers keep the page due and read it again; an
+/// explicit check reports it.
+#[derive(Debug, thiserror::Error)]
+#[error("the RPC endpoint hasn't confirmed this swap's latest blocks yet; check again shortly")]
+pub struct SwapPageUnconfirmed;
+
 // The pinned shared bindings have no settlement event or reads, and no getter for
 // Railgun's public nullifier map. These match the deployed contracts.
 alloy::sol! {
@@ -252,6 +259,17 @@ impl ExecutorOwner {
         sync: Option<&WalletCurrentSnapshot>,
         client: &OperationHttpClient,
     ) -> Result<SwapObserved> {
+        // Every endpoint reads the page at the record's confirmed block, so a page past it is
+        // lag, not an endpoint's failure. A record left without one had the read withheld as
+        // older than a recorded resolution, so the endpoint lags that too.
+        let unconfirmed = record.nonce_observation().is_none_or(|observed| {
+            !range.is_empty()
+                && range.end - range.start <= MAX_OBSERVATION_BLOCKS
+                && range.end - 1 > observed.block().number
+        });
+        if unconfirmed {
+            return Err(SwapPageUnconfirmed.into());
+        }
         let mut chain = self
             .chain_for_delegate(record.delegate())
             .ok_or_else(|| eyre!("chain does not support Railgun"))?;
@@ -411,9 +429,7 @@ async fn observe_swap_orders(
             Err(error) => endpoints.failed(&provider, &error),
         }
     }
-    Err(eyre!(
-        "swap observations are unavailable; the swap's recorded state is unchanged"
-    ))
+    Err(eyre!("swap observations are unavailable"))
 }
 
 /// One read's result: every order's observations and the swap's verified fundings.

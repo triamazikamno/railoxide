@@ -232,6 +232,52 @@ fn reported_by_across(record: &ExecutorRecord) -> bool {
         })
 }
 
+/// What a swap's Check status reads.
+#[derive(Clone, Copy)]
+pub(super) enum StatusCheck {
+    /// The destination stealth account's balance, for held proceeds.
+    Destination,
+    /// A Bridge order's provider and the stealth account. With `across_reported`, the delivery
+    /// that Across only reported.
+    Bridge { across_reported: bool },
+    /// The stealth account's state, for retry or recovery.
+    Order,
+}
+
+/// The status check the detail of `record` at `stage` offers at Unix time `now`, if any.
+fn offered_status_check(
+    record: &ExecutorRecord,
+    stage: SwapStage,
+    now: u64,
+) -> Option<StatusCheck> {
+    let valid_to = swap_valid_to(record)?;
+    // A Bridge swap's check asks its provider again about a deposit that needs attention,
+    // that Across refunds or whose delivery Across only reported, and reads the stealth
+    // account for a refund or a deposit that wasn't sent.
+    let across_reported =
+        stage == SwapStage::Order(SwapOrderState::Done) && reported_by_across(record);
+    let bridge = swap_delivery(record).is_bridge()
+        && (across_reported
+            || matches!(
+                stage,
+                SwapStage::Order(
+                    SwapOrderState::NeedsAttention
+                        | SwapOrderState::Refunding
+                        | SwapOrderState::NotDelivered
+                )
+            ));
+    // Held proceeds are looked for in the destination stealth account, on its network.
+    if stage.is_held_on_destination() {
+        Some(StatusCheck::Destination)
+    } else if bridge {
+        Some(StatusCheck::Bridge { across_reported })
+    } else {
+        (stage.is_observed()
+            && (valid_to < now || stage == SwapStage::Order(SwapOrderState::Traded)))
+        .then_some(StatusCheck::Order)
+    }
+}
+
 /// One attempt of a swap, as the detail's Orders section lists it.
 pub(super) struct SwapAttemptRow {
     /// "Order 1 · Bridge deposit", or the attempt's own state after its number.

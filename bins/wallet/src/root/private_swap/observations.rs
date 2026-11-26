@@ -548,13 +548,9 @@ impl PrivateSwapsView {
                 .entry(result.destination.unwrap_or(result.operation))
                 .or_default()
                 .keep_route(&result.route);
-            // Another task updated the account during this background read. Keep the page
-            // due for the next pass; no action failed and no stale result may advance it.
-            if result
-                .outcome
-                .as_ref()
-                .is_err_and(eyre::Report::is::<wallet_ops::ExecutorRecordChanged>)
-            {
+            // Keep the page due for the next pass; no action failed and no stale result may
+            // advance it.
+            if result.outcome.as_ref().is_err_and(reads_again) {
                 continue;
             }
             // A destination account's result is kept with its swap.
@@ -713,4 +709,10 @@ impl PrivateSwapsView {
             Ok(SwapPlacementReadiness::WaitForSetupChange)
         )
     }
+}
+
+/// Whether a background read's `error` found nothing wrong with the swap: another task updated
+/// the account during the read, or the endpoint hasn't confirmed the page's blocks yet.
+fn reads_again(error: &eyre::Report) -> bool {
+    error.is::<wallet_ops::ExecutorRecordChanged>() || error.is::<wallet_ops::SwapPageUnconfirmed>()
 }

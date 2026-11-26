@@ -84,6 +84,7 @@ impl PrivateSwapsView {
         self.focus_active_dialog(window, cx);
         let tracking = self.tracking.entry(operation).or_default();
         tracking.error = None;
+        tracking.check_error = None;
         tracking.status_checked = None;
         self.job_revision = self.job_revision.wrapping_add(1);
         let revision = self.job_revision;
@@ -113,10 +114,7 @@ impl PrivateSwapsView {
                     Ok(Err(error))
                         if kind == SwapJobKind::Order
                             && this.lost_setup_inclusion(operation, &error) => {}
-                    Ok(Err(error)) => {
-                        let message = this.job_error(&error, cx);
-                        this.fail(operation, message);
-                    }
+                    Ok(Err(error)) => this.fail_job(operation, kind, &error, cx),
                     Err(error) if !error.is_cancelled() => this.fail(
                         operation,
                         "The local operation stopped unexpectedly. Check the swap before retrying."
@@ -236,7 +234,30 @@ impl PrivateSwapsView {
             tracking.pending_order = None;
         }
         tracking.error = Some(message.clone());
+        tracking.check_error = None;
         self.error = Some(message);
+    }
+
+    /// Tell a failed Check status on its swap alone, in its own slot. It stays until the swap's
+    /// next job and shows while the detail offers Check status; background reads never touch it.
+    pub(super) fn fail_check(&mut self, operation: ExecutorOperationId, message: String) {
+        self.tracking.entry(operation).or_default().check_error = Some(message);
+    }
+
+    /// Tell a `kind` job's failure, a check's as [`Self::fail_check`] does.
+    pub(super) fn fail_job(
+        &mut self,
+        operation: ExecutorOperationId,
+        kind: SwapJobKind,
+        error: &eyre::Report,
+        cx: &gpui::App,
+    ) {
+        let message = self.job_error(error, cx);
+        if kind == SwapJobKind::Check {
+            self.fail_check(operation, message);
+        } else {
+            self.fail(operation, message);
+        }
     }
 
     pub(super) fn request_authorization(

@@ -661,3 +661,48 @@ async fn an_unchanged_open_order_reads_no_logs_until_its_fill_moves() {
     assert_eq!(state(&record, 0), SwapOrderState::Traded);
     fixture.finish().await;
 }
+
+// A page past the block an endpoint read the account at fails as unconfirmed, also when private
+// sync's newer resolution withheld that read, and succeeds once the endpoint confirms the page.
+#[tokio::test]
+async fn a_page_past_the_accounts_confirmed_block_waits_for_it() {
+    let fixture = Fixture::start().await;
+    fixture.record_attempt(0, 100);
+    // The account is read at block 19, one short of the page.
+    fixture.chain.lock().unwrap().head = 20;
+    let error = fixture
+        .owner
+        .observe_swap(
+            fixture.operation,
+            20..21,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(error.is::<crate::SwapPageUnconfirmed>(), "{error:#}");
+    assert!(fixture.record().nonce_observation().is_none());
+    // Private sync resolved the pre-hook's nonce in block 20, so the read at 19 is withheld.
+    fund(&fixture, 20);
+    fixture
+        .store
+        .record_synced(
+            fixture.operation,
+            Some(ExecutorNonceWatermark::new(U256::from(2), 20)),
+            20,
+        )
+        .unwrap();
+    let error = fixture
+        .owner
+        .observe_swap(
+            fixture.operation,
+            20..21,
+            crate::OperationHttpClient::direct_for_tests(),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+    assert!(error.is::<crate::SwapPageUnconfirmed>(), "{error:#}");
+    fixture.observe(21, 20).await;
+    fixture.finish().await;
+}

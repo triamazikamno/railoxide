@@ -399,7 +399,7 @@ fn expired_order_can_be_checked_and_hidden_without_releasing_inputs(cx: &mut Tes
                     .read(cx)
                     .tracking
                     .get(&operation)
-                    .is_some_and(|tracking| tracking.error.is_some()),
+                    .is_some_and(|tracking| tracking.check_error.is_some()),
                 "a check without a synced head must explain why it cannot run"
             );
         });
@@ -418,13 +418,13 @@ fn expired_order_can_be_checked_and_hidden_without_releasing_inputs(cx: &mut Tes
         cx.update(|_, cx| {
             let swaps = swaps.read(cx);
             assert_eq!(swaps.job.as_ref().unwrap().kind, SwapJobKind::Check);
-            assert!(swaps.tracking[&operation].error.is_none());
+            assert!(swaps.tracking[&operation].check_error.is_none());
         });
         drive_until(cx, runtime, |cx| {
             swaps.read_with(cx, |swaps, _| swaps.job.is_none())
         });
         cx.update(|window, cx| {
-            assert!(swaps.read(cx).tracking[&operation].error.is_some());
+            assert!(swaps.read(cx).tracking[&operation].check_error.is_some());
             window.draw(cx).clear(cx);
         });
         let remove = cx.debug_bounds("swap-progress-remove").unwrap();

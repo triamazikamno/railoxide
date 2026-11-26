@@ -14,7 +14,7 @@ impl PrivateSwapsView {
             return;
         }
         let Some(confirmed) = self.confirmed_block(cx) else {
-            self.fail(
+            self.fail_check(
                 operation,
                 "Status is unavailable until the network has synced. Try again once sync resumes."
                     .into(),
@@ -26,7 +26,7 @@ impl PrivateSwapsView {
             .record(operation)
             .and_then(crate::root::private_swap::model::swap_observation_start)
         else {
-            self.fail(
+            self.fail_check(
                 operation,
                 "This order's saved history is unavailable, so its status could not be checked."
                     .into(),
@@ -201,7 +201,7 @@ impl PrivateSwapsView {
                         outcome == Some(SwapBridgeOutcome::Refunding),
                         None,
                     ),
-                    Some(Err(error)) if across_refund => (None, true, Some(format!("{error:#}"))),
+                    Some(Err(error)) if across_refund => (None, true, Some(error)),
                     Some(Err(error)) => return Err(error),
                     None => (
                         None,
@@ -228,7 +228,7 @@ impl PrivateSwapsView {
                 };
                 Ok((route, balance, problem))
             },
-            move |this, (route, balance, problem), _, _| {
+            move |this, (route, balance, problem), _, cx| {
                 let tracking = this.tracking.entry(operation).or_default();
                 if let Some((client, clients)) = route {
                     tracking.set_route(Some(client));
@@ -239,7 +239,7 @@ impl PrivateSwapsView {
                 }
                 tracking.error = None;
                 if let Some(problem) = problem {
-                    this.fail(operation, problem);
+                    this.fail_job(operation, SwapJobKind::Check, &problem, cx);
                 }
             },
             window,
@@ -393,7 +393,7 @@ impl PrivateSwapsView {
         else {
             self.ensure_destination_load(chain_id, cx);
             self.reload_destinations(cx);
-            self.fail(
+            self.fail_check(
                 operation,
                 format!(
                     "{} isn't loaded yet. Check again once it has synced.",

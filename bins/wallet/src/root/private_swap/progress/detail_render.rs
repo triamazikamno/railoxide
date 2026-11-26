@@ -136,6 +136,7 @@ impl PrivateSwapsView {
         let cancelling = tracking.is_some_and(|tracking| tracking.cancelling)
             || job == Some(SwapJobKind::Cancel);
         let now = now_unix();
+        let offered = offered_status_check(record, stage, now);
         let past_valid_to = swap_valid_to(record).is_some_and(|valid_to| now > valid_to);
         // A stopped setup can't issue more swap work. Its account stays in Stealth accounts.
         let mut actions = if stopped {
@@ -267,7 +268,7 @@ impl PrivateSwapsView {
                 )
             });
         let error = tracking
-            .and_then(|tracking| tracking.error.clone())
+            .and_then(|tracking| tracking.shown_error(offered))
             .or_else(|| self.error.clone());
         // A setup's stages show the problem its job ended with.
         let failed_in_steps = setups.as_ref().is_some_and(|setups| {
@@ -474,7 +475,7 @@ impl PrivateSwapsView {
             .children(error.map(progress_error));
         (
             body,
-            Some(self.render_progress_actions(operation, stage, actions, job, cx)),
+            Some(self.render_progress_actions(operation, stage, offered, actions, job, cx)),
         )
     }
 

@@ -841,3 +841,141 @@ fn unfilled_expiry(cx: &mut TestAppContext, legacy: bool) {
         });
     });
 }
+
+/// A failed status check stays in the open detail until the swap's next job, whatever
+/// background reads find, and isn't shown while the detail offers no check. Once no check is
+/// offered, a background read's error shows.
+#[gpui::test]
+fn a_failed_check_stays_until_the_next_job_while_a_check_is_offered(cx: &mut TestAppContext) {
+    use wallet_ops::vault::{BridgeDelivery, BridgeProvider, BridgeSurplus};
+
+    with_approved_swap_view(cx, |_, swaps, executors, operation, runtime, cx| {
+        // A Bridge order past its expiry, whose detail offers Check status.
+        let delivery = SwapDelivery::Bridge(BridgeDelivery {
+            provider: BridgeProvider::Across,
+            destination_chain: 137,
+            receiver: Address::repeat_byte(0x51),
+            destination_token: STUB_POLYGON_USDC,
+            surplus: BridgeSurplus::Reshield,
+            private: None,
+        });
+        let (uid, observed) = placed_swap(executors, operation, delivery);
+        let read = |cx: &mut gpui::VisualTestContext, outcome| {
+            read_shows_error(cx, swaps, operation, outcome)
+        };
+        let shown = |cx: &mut gpui::VisualTestContext| detail_error(cx, swaps, operation);
+        // A page the endpoint hasn't confirmed yet is no failed read.
+        open_detail(cx, swaps, operation);
+        assert!(!read(cx, Err(wallet_ops::SwapPageUnconfirmed.into())));
+        assert!(read(cx, Err(eyre::eyre!("account reads are unavailable"))));
+
+        // No background read retries the account history the check failed to read.
+        let unavailable = "swap observations are unavailable";
+        let check = eyre::eyre!(unavailable);
+        failed_check(cx, swaps, operation, runtime, check);
+        assert!(read(
+            cx,
+            Err(eyre::eyre!("settlement verification is unavailable"))
+        ));
+        assert_eq!(shown(cx).as_deref(), Some(unavailable));
+        assert!(read(cx, Ok(None)));
+        assert_eq!(shown(cx).as_deref(), Some(unavailable));
+
+        // Reloaded as an owner change does, the deposit's handoff offers no check.
+        let handed_off = bridge_observations(observed, Some(U256::from(7)), None);
+        executors
+            .record_swap_observations(operation, uid, handed_off)
+            .unwrap();
+        cx.update(|_, cx| swaps.update(cx, |swaps, _| swaps.reload_records()));
+        assert!(!error_shown(cx));
+        assert!(cx.debug_bounds("swap-progress-check").is_none());
+        assert!(read(cx, Err(eyre::eyre!("account reads are unavailable"))));
+        assert_eq!(shown(cx).as_deref(), Some("account reads are unavailable"));
+        assert!(cx.debug_bounds("swap-progress-check").is_none());
+    });
+}
+
+/// Whether the open detail shows the swap's error.
+fn error_shown(cx: &mut gpui::VisualTestContext) -> bool {
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.debug_bounds("swap-progress-error").is_some()
+}
+
+/// The swap's error the open detail of `operation` shows.
+fn detail_error(
+    cx: &mut gpui::VisualTestContext,
+    swaps: &Entity<PrivateSwapsView>,
+    operation: ExecutorOperationId,
+) -> Option<String> {
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    // Only whether the detail offers a check matters to the error it shows.
+    let offered = cx
+        .debug_bounds("swap-progress-check")
+        .map(|_| progress::StatusCheck::Order);
+    swaps.read_with(cx, |swaps, _| {
+        swaps.tracking[&operation].shown_error(offered)
+    })
+}
+
+/// Open the detail of `operation` as its store holds it.
+fn open_detail(
+    cx: &mut gpui::VisualTestContext,
+    swaps: &Entity<PrivateSwapsView>,
+    operation: ExecutorOperationId,
+) {
+    cx.update(|window, cx| {
+        swaps.update(cx, |swaps, cx| {
+            swaps.reload_records();
+            swaps.show_detail(operation, window, cx);
+        });
+    });
+}
+
+/// Run a check of `operation` from its open detail that fails with `error`.
+fn failed_check(
+    cx: &mut gpui::VisualTestContext,
+    swaps: &Entity<PrivateSwapsView>,
+    operation: ExecutorOperationId,
+    runtime: &tokio::runtime::Runtime,
+    error: eyre::Report,
+) {
+    open_detail(cx, swaps, operation);
+    cx.update(|window, cx| {
+        swaps.update(cx, |swaps, cx| {
+            swaps.start_job(
+                operation,
+                SwapJobKind::Check,
+                async move { Err::<(), _>(error) },
+                |_, (), _, _| {},
+                window,
+                cx,
+            );
+        });
+    });
+    drive_until(cx, runtime, |cx| {
+        swaps.read_with(cx, |swaps, _| swaps.job.is_none())
+    });
+}
+
+/// Whether the open detail shows an error after a background read of `operation` gave
+/// `outcome`.
+fn read_shows_error(
+    cx: &mut gpui::VisualTestContext,
+    swaps: &Entity<PrivateSwapsView>,
+    operation: ExecutorOperationId,
+    outcome: eyre::Result<Option<wallet_ops::SwapSetupObservation>>,
+) -> bool {
+    cx.update(|window, cx| {
+        swaps.update(cx, |swaps, cx| {
+            let read = ObservationResult {
+                operation,
+                range_end: None,
+                outcome,
+                destination: None,
+                route: Arc::default(),
+            };
+            swaps.apply_observations(vec![read], window, cx);
+        });
+    });
+    error_shown(cx)
+}

@@ -63,7 +63,7 @@ pub use continuing::{
     swap_continuing_approvals,
 };
 pub use destination::{SwapBridgeReport, SwapDeliverySeen};
-pub use observation::{SwapOrderState, swap_attempt_state, swap_order_state};
+pub use observation::{SwapOrderState, SwapPageUnconfirmed, swap_attempt_state, swap_order_state};
 pub(super) use order::invalidates_order;
 #[cfg(test)]
 pub(crate) use order::{

@@ -484,6 +484,7 @@ impl PrivateSwapsView {
         &self,
         operation: ExecutorOperationId,
         stage: SwapStage,
+        offered: Option<StatusCheck>,
         actions: crate::root::private_swap::model::SwapActions,
         job: Option<SwapJobKind>,
         cx: &Context<'_, Self>,
@@ -535,37 +536,9 @@ impl PrivateSwapsView {
                         this.resubmit_order(operation, window, cx);
                     }))
             });
-        // A Bridge swap's check asks its provider again about a deposit that needs attention,
-        // that Across refunds or whose delivery Across only reported, and reads the stealth
-        // account for a refund or a deposit that wasn't sent.
         let across_refund = stage == SwapStage::Order(SwapOrderState::Refunding)
             && record.is_some_and(refunds_across_deposit);
-        let across_reported = stage == SwapStage::Order(SwapOrderState::Done)
-            && record.is_some_and(reported_by_across);
-        let bridge_check = record.is_some_and(|record| {
-            swap_delivery(record).is_bridge()
-                && (across_reported
-                    || matches!(
-                        stage,
-                        SwapStage::Order(
-                            SwapOrderState::NeedsAttention
-                                | SwapOrderState::Refunding
-                                | SwapOrderState::NotDelivered
-                        )
-                    ))
-        });
-        // Held proceeds are looked for in the destination stealth account, on its network.
-        let held = stage.is_held_on_destination();
-        let check = record
-            .and_then(swap_valid_to)
-            .filter(|valid_to| {
-                bridge_check
-                    || held
-                    || (stage.is_observed()
-                        && (*valid_to < now_unix()
-                            || stage == SwapStage::Order(SwapOrderState::Traded)))
-            })
-            .map(|_| {
+        let check = offered.map(|offered| {
                 let checking = job == Some(SwapJobKind::Check);
                 let label = if checking {
                     "Checking status"
@@ -579,28 +552,32 @@ impl PrivateSwapsView {
                     .disabled(busy)
                     .when(checking, |button| button.icon(IconName::LoaderCircle))
                     .loading(checking)
-                    .tooltip(match stage {
-                        _ if held => "Checks the destination stealth account's balance with that network's RPC provider",
-                        _ if !bridge_check => "Checks this stealth account's state with the RPC provider for retry or recovery",
-                        SwapStage::Order(SwapOrderState::NeedsAttention) => {
+                    .tooltip(match offered {
+                        StatusCheck::Destination => "Checks the destination stealth account's balance with that network's RPC provider",
+                        StatusCheck::Order => "Checks this stealth account's state with the RPC provider for retry or recovery",
+                        StatusCheck::Bridge { .. }
+                            if stage == SwapStage::Order(SwapOrderState::NeedsAttention) =>
+                        {
                             "Asks the provider about the deposit, then checks this stealth account for a refund"
                         }
-                        _ if across_refund => {
+                        StatusCheck::Bridge { .. } if across_refund => {
                             "Asks Across about the deposit and confirms its refund, then checks this stealth account's balance"
                         }
-                        _ if across_reported => {
+                        StatusCheck::Bridge { across_reported: true } => {
                             "Asks Across about the deposit again and checks its delivery on the destination network"
                         }
-                        _ => "Checks this stealth account's balance with the RPC provider",
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if held {
-                            this.check_destination_status(operation, window, cx);
-                        } else if bridge_check {
-                            this.check_bridge_status(operation, window, cx);
-                        } else {
-                            this.check_order_status(operation, window, cx);
+                        StatusCheck::Bridge { .. } => {
+                            "Checks this stealth account's balance with the RPC provider"
                         }
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| match offered {
+                        StatusCheck::Destination => {
+                            this.check_destination_status(operation, window, cx);
+                        }
+                        StatusCheck::Bridge { .. } => {
+                            this.check_bridge_status(operation, window, cx);
+                        }
+                        StatusCheck::Order => this.check_order_status(operation, window, cx),
                     }))
             });
         // A refund is recovered once an explicit check finds it in the stealth account. Kept
